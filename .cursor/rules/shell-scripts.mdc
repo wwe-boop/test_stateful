@@ -1,0 +1,32 @@
+---
+description: Shell 脚本编写规范
+globs: scripts/bash/**/*.sh
+alwaysApply: false
+---
+
+# Shell 脚本规范
+
+## 结构
+
+- 库函数放在 `scripts/bash/lib/*.sh`，通过 `tools.sh` 聚合
+- 每个 lib 文件用 `_LIB_*_LOADED` 守卫防止重复加载
+- 调用方只需 `source tools.sh` 即可获得全部函数
+
+## 现有库模块
+
+| 模块 | 功能 |
+|------|------|
+| `logging.sh` | `log_info`, `log_warn`, `log_error`, `log_step` |
+| `utils.sh` | `retry`, `require_cmd`, `ensure_workdir`, `check_gpu` |
+| `prerequisites.sh` | `check_prerequisites`, `ensure_git_lfs`, `detect_cuda_version`, `cuda_to_torch_tag` |
+| `venv.sh` | `ensure_venv` (mamba > conda > python3-venv 自动选择) |
+| `pip.sh` | `pip_install`, `install_torch_cuda`, `install_qwen3_tts`, `validate_python_env` |
+| `network.sh` | `github_url`, `hf_url`, `download_model`, `download_qwen3_tts_models` (ModelScope 优先) |
+
+## 编写要求
+
+- `set -euo pipefail`
+- 所有函数必须幂等（安全重复运行）
+- 网络操作必须有 `retry` + 超时
+- 中国网络环境：GitHub 走 `GITHUB_MIRROR`，HuggingFace 走 `HF_MIRROR`，模型下载走 ModelScope
+- 用 `log_*` 函数输出，不要裸 `echo`

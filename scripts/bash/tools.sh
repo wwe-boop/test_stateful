@@ -14,6 +14,7 @@ _TOOLS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source "${_TOOLS_DIR}/lib/logging.sh"
 source "${_TOOLS_DIR}/lib/utils.sh"
+source "${_TOOLS_DIR}/lib/prerequisites.sh"
 source "${_TOOLS_DIR}/lib/venv.sh"
 source "${_TOOLS_DIR}/lib/pip.sh"
 source "${_TOOLS_DIR}/lib/network.sh"
