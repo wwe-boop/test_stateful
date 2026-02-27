@@ -4,7 +4,7 @@
 >
 > **推理精度**: BF16 (BFloat16)。BF16 与 FP32 共享 8 位指数范围，彻底避免 FP16 在 RoPE / LayerNorm / Softmax 中的 overflow 风险，同时保持与 FP16 相同的显存占用和吞吐。
 >
-> **核心策略**: Talker Backbone → TRT (含 KV Cache)，Code Predictor → TRT (无 KV Cache，31 步循环展开为单引擎)，其余 → ONNX
+> **核心策略**: Talker Backbone → **TRT-LLM** (含 KV Cache，由 TRT-LLM 运行时管理)，Code Predictor → TRT (无 KV Cache，15 步循环展开为单引擎)，其余 → ONNX
 
 ---
 
@@ -29,27 +29,102 @@
 | **Text Embedder** | `Embedding(151936, 2048)` + `ResizeMLP(2048→1024)` | ~312M | PyTorch 权重 | 每请求 1 次 + 文本到达时 |
 | **Speaker Encoder** | ECAPA-TDNN, mel=128, enc_dim=1024 | ~6M | ONNX | 每请求 1 次 (仅 voice clone) |
 | **Speech Tokenizer Encoder** | MimiModel, 16 codebooks | ~26M | ONNX | 每请求 1 次 (仅 ICL 模式) |
-| **Talker Backbone** | Qwen3-style, 20L, h=1024, GQA(16h/2kv), head_dim=64 | ~180M | **TensorRT** | 每 decode step 1 次 (最热路径) |
-| **Code Predictor** | Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128 + 31×embed + 31×lm_head | ~200M | **TensorRT (单引擎, 31 步展开)** | 每 decode step 1 次调用 |
+| **Talker Backbone** | Qwen3-style, 20L, h=1024, GQA(16h/2kv), head_dim=64 | ~180M | **TRT-LLM** | 每 decode step 1 次 (最热路径) |
+| **Code Predictor** | Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128 + 15×embed + 15×lm_head | ~200M | **TensorRT (单引擎, 15 步展开)** | 每 decode step 1 次调用 |
 | **Code2Wav Decoder** | RVQ Dequant + Transformer(8L) + BigVGAN ConvNet | ~60M | ONNX | 每 chunk 1 次 |
 
 ### 2.1 Embedding 权重 (内置于 Orchestrator)
 
 以下权重直接加载到 Orchestrator 进程中，不通过 Triton 模型调度：
 - Talker 的 codec embedding (`Embedding(vocab, 1024)`)
-- Talker 的 32 个 codec sum embedding (用于构造 decode step 输入)
+- Talker 的 16 个 codec sum embedding (用于构造 decode step 输入)
 - 特殊 embedding: `tts_pad_embed`, `tts_bos_embed`, `tts_eos_embed`
 - Text Embedder: `Embedding(151936, 2048)` + `ResizeMLP(2048→1024)`, ~312M 参数, ~624MB BF16
 
 > **显存规划**: Text Embedder 权重 (~624MB) 由 PyTorch 管理，不在 Triton memory pool 内。需在总显存预算中显式计入：
 > - Text Embedder: ~624MB
-> - Codec Embeddings (32 × Embedding): ~128MB
+> - Codec Embeddings (16 × Embedding): ~64MB
 > - 特殊 Embeddings: <1MB
-> - 合计 Orchestrator 占用: **~760MB**
+> - 合计 Orchestrator 占用: **~690MB**
 
-> **Codec Embedding Sum 优化**: 每个 decode step 需计算 `Σ embed_i(codec_ids[i]), i=0..31`。朴素实现为 32 次 Embedding.forward() + 逐元素加法，产生大量小 kernel launch（~0.3ms Python 循环开销）。优化方案：
-> - 预合并为 `[32, vocab, 1024]` 的 3D 查找表，单次 `torch.gather` + `sum(dim=0)` 完成
-> - 或导出为独立 ONNX 模型（输入: `[B, 32]` codec ids，输出: `[B, 1024]` sum），消除 Python 循环
+> **Codec Embedding Sum 优化**: 每个 decode step 需计算 `Σ embed_i(codec_ids[i]), i=0..15`。朴素实现为 16 次 Embedding.forward() + 逐元素加法，产生大量小 kernel launch（~0.15ms Python 循环开销）。优化方案：
+> - 预合并为 `[16, vocab, 1024]` 的 3D 查找表，单次 `torch.gather` + `sum(dim=0)` 完成
+> - 或导出为独立 ONNX 模型（输入: `[B, 16]` codec ids，输出: `[B, 1024]` sum），消除 Python 循环
+
+### 2.2 模型变体与任务类型
+
+Qwen3-TTS 提供三个模型变体，**架构完全相同**（均为 `Qwen3TTSForConditionalGeneration`），仅权重不同：
+
+| 变体 | tts_model_type | 核心能力 | 需要 Speaker Encoder | 需要 Speech Tokenizer | 需要 instruct |
+|------|---------------|---------|---------------------|----------------------|--------------|
+| **Base** | `base` | 3 秒声音克隆 (voice clone) | **是** (ref_audio → spk_embed) | ICL 模式: **是** | 否 |
+| **CustomVoice** | `custom_voice` | 9 个预置音色 + 指令控制 | **否** (spk_id 查表) | 否 | 可选 (风格控制) |
+| **VoiceDesign** | `voice_design` | 自然语言描述设计音色 | **否** (无 speaker) | 否 | **必需** (音色描述) |
+
+#### 2.2.1 任务类型与子模式
+
+```
+TaskType
+├── VOICE_CLONE         ← Base 模型
+│   ├── ICL 模式        ← ref_audio + ref_text → Speaker Encoder + Speech Tokenizer
+│   │                     prefill 含参考音频的 codec tokens，克隆质量最高
+│   └── X_VECTOR_ONLY   ← ref_audio → Speaker Encoder (仅 spk embedding)
+│                         不需要 ref_text，克隆质量略低但更简单
+├── CUSTOM_VOICE        ← CustomVoice 模型
+│   └── speaker (9选1) + 可选 instruct (风格/情感控制)
+└── VOICE_DESIGN        ← VoiceDesign 模型
+    └── instruct (必需, 描述目标音色)
+```
+
+#### 2.2.2 Speaker 来源差异
+
+三种任务类型的 speaker embedding 来源完全不同，Orchestrator 必须按 task_type 分支处理：
+
+| 任务类型 | speaker_embed 来源 | 值 |
+|----------|-------------------|-----|
+| Base (ICL / X_VECTOR) | Speaker Encoder ONNX 推理 | `extract_speaker_embedding(ref_audio)` → `[1, 1024]` |
+| CustomVoice | Talker codec embedding 查表 | `codec_embed(spk_id[speaker_name])` → `[1, 1, 1024]` |
+| VoiceDesign | 无 (None) | prefill 中不插入 speaker 位置 |
+
+#### 2.2.3 部署策略: 单变体 vs 多变体
+
+**推荐: 单变体部署** (Phase 1-3)
+
+每个 Triton 实例加载**一套模型权重**，通过部署配置选择变体：
+
+```
+优点:
+  - 显存零浪费 (Talker ~360MB + CP ~400MB + 其他 ~200MB ≈ 960MB)
+  - 部署配置简单
+  - 不同变体可独立扩缩容
+
+缺点:
+  - 需要多种音色功能时须部署多个实例
+
+配置方式:
+  model_repository/tts_orchestrator/config.pbtxt:
+    parameters: {
+      key: "model_variant"
+      value: { string_value: "Qwen3-TTS-12Hz-1.7B-CustomVoice" }
+    }
+```
+
+**备选: 多变体部署** (Phase 4+)
+
+```
+方案 A: 多 Orchestrator 实例 (推荐)
+  - 同一 Triton 进程内注册多个 Orchestrator (tts_base / tts_custom / tts_design)
+  - 共享 Talker/CP/Code2Wav 引擎 (架构相同)
+  - 仅 Orchestrator 内的 spk_id 查表权重不同 (~几 KB)
+  - ⚠️ 前提: 确认不同变体的 Talker/CP 权重差异可忽略 (待验证)
+
+方案 B: Gateway 路由
+  - Gateway 按 task_type 路由到不同 Triton 实例
+  - 各实例独立加载不同权重
+  - 适合异构部署 (不同 GPU 跑不同变体)
+```
+
+> **关键发现**: 三个变体的 Talker Backbone 和 Code Predictor 权重可能**不完全相同** (fine-tuning 结果)。Phase 1 先验证: 加载 Base 权重运行 CustomVoice 的 prefill，对比输出差异。若差异显著则必须分开部署。
 
 ---
 
@@ -92,7 +167,7 @@
 │  │  │                                                │   │  │
 │  │  │  1. Talker Backbone (decode) → logits          │   │  │
 │  │  │  2. Sample → codec_token_0                     │   │  │
-│  │  │  3. Code Predictor (单次调用) → codec #1~#31   │   │  │
+│  │  │  3. Code Predictor (单次调用) → codec #1~#15   │   │  │
 │  │  │  4. Accumulate → Code2Wav (异步) → audio       │   │  │
 │  │  │  5. Construct next input → loop                │   │  │
 │  │  └───────────────────────────────────────────────┘   │  │
@@ -102,8 +177,8 @@
 │  ┌──────┐┌──────┐┌──────┐┌──────────┐┌──────────────────┐  │
 │  │ Text ││ Spk  ││Speech││ Talker   ││ Code Predictor   │  │
 │  │Embed ││ Enc  ││Token ││ Backbone ││ (TRT 单引擎      │  │
-│  │(Torch││(ONNX)││ Enc  ││(TRT-LLM) ││  31步展开,无KV)  │  │
-│  │ Wts) ││      ││(ONNX)││ +KVCache ││ (fallback:31调用)│  │
+│  │(Torch││(ONNX)││ Enc  ││(TRT-LLM) ││  15步展开,无KV)  │  │
+│  │ Wts) ││      ││(ONNX)││ +KVCache ││ (fallback:15调用)│  │
 │  └──────┘└──────┘└──────┘└──────────┘└──────────────────┘  │
 │                                      ┌────────┐            │
 │                                      │Code2Wav│            │
@@ -139,41 +214,89 @@ Triton 有自己的 gRPC 协议 (`tritonclient`)，与自定义的 `TTSService` 
 ### 4.1 完整生成流程 (单请求视角)
 
 ```
-Phase 0: 初始化
-═══════════════
-[Request: ref_audio, task_type, language]
+Phase 0: 初始化 (按 task_type 分支)
+════════════════════════════════════
+
+[共通] Tokenize: text → input_ids, instruct → instruct_ids (if any)
+       Text Embedding: text_embed(ids) → text_proj(·) → [1, S, 1024]
+
+[VOICE_CLONE — Base 模型]
      │
-     ├── Speaker Encoder (ONNX)
-     │   mel_spectrogram(ref_audio) → [1, T, 128] → spk_embedding [1, 1024]
+     ├── Speaker Encoder (ONNX):
+     │   mel_spectrogram(ref_audio, sr=24000) → [1, T, 128]
+     │   → spk_embedding [1, 1024]
      │
-     └── Speech Tokenizer Encoder (ONNX)  (仅 ICL 模式)
+     └── Speech Tokenizer Encoder (ONNX, 仅 ICL 模式):
          ref_audio → ref_codes [T_ref, 16]
+         (x_vector_only 模式跳过此步)
+
+[CUSTOM_VOICE — CustomVoice 模型]
+     │
+     └── Speaker ID 查表 (Orchestrator 内):
+         config.spk_id[speaker_name] → spk_id (int)
+         codec_embed(spk_id) → speaker_embed [1, 1, 1024]
+         (无 Speaker Encoder / Speech Tokenizer 调用)
+
+[VOICE_DESIGN — VoiceDesign 模型]
+     │
+     └── 无 speaker 处理
+         (speaker_embed = None, 音色由 instruct 隐式指定)
 
 
-Phase 1: Prefill (首个文本 token 到达后即可启动)
-═══════════════════════════════════════════════
-1. Text Embedding:
-   text_embedding(token_ids) → [1, S_text, 2048]
-   text_projection(·)        → [1, S_text, 1024]
+Phase 1: Prefill 构造 (按 task_type 分支)
+══════════════════════════════════════════
 
-2. 构造 Prefill 输入:
-   ┌───────────────────────────────────────────────────┐
-   │  role_embed │ tag_embed │ spk │ bos │ first_text  │
-   │  (3 tokens) │(3~4 tokens)│(1) │(1)  │  (1)       │
-   └───────────────────────────────────────────────────┘
-   每个位置 = text_proj(text_embed) + codec_embed(pad)
+所有任务类型共享的基础结构:
+  role_embed = text_proj(text_embed(input_ids[:3]))    # <|im_start|>assistant\n
+  tag_embed  = codec_embed([think_id, think_bos, lang_id?, think_eos])  # 3~4 tokens
+  bos_embed  = codec_embed(codec_bos)
+  text 层:  tts_pad × (tag_len-1) + tts_bos  对齐 codec 层
+  每个位置 = text_proj + codec_embed (双轨叠加)
 
-3. 初始化 trailing_text_hidden 队列:
+[CUSTOM_VOICE] instruct + speaker_id:
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ role (3) │ instruct_embed (S_ins) │ tag (3~4) │ spk (1) │ bos+t₀  │
+   └─────────────────────────────────────────────────────────────────────┘
+   instruct_embed = text_proj(text_embed(instruct_ids))
+   spk = codec_embed(spk_id[speaker_name])  ← 从 config 查表, 非 Speaker Encoder
+
+[VOICE_DESIGN] instruct, 无 speaker:
+   ┌────────────────────────────────────────────────────────────────┐
+   │ role (3) │ instruct_embed (S_ins) │ tag (3~4) │ bos+t₀       │
+   └────────────────────────────────────────────────────────────────┘
+   instruct_embed = text_proj(text_embed(instruct_ids))
+   无 speaker 位置 (speaker_embed = None)
+
+[VOICE_CLONE, x_vector_only] speaker_embed, 无 ICL:
+   ┌──────────────────────────────────────────────────────┐
+   │ role (3) │ tag (3~4) │ spk_embed (1) │ bos+t₀       │
+   └──────────────────────────────────────────────────────┘
+   spk_embed = Speaker Encoder(ref_audio) → [1, 1024]
+
+[VOICE_CLONE, ICL] speaker_embed + ref_code:
+   ┌───────────────────────────────────────────────────────────────────────────────┐
+   │ role (3) │ tag (3~4) │ spk_embed (1) │ bos │ ref_text+ref_codec (T_ref) │ t… │
+   └───────────────────────────────────────────────────────────────────────────────┘
+   spk_embed = Speaker Encoder(ref_audio)
+   ref_text_embed = text_proj(text_embed(ref_ids))  ← 参考文本 embedding
+   ref_codec_embed = Σ codec_embed_i(ref_code[:, i])  ← 参考音频 codec embedding
+   ICL 段: ref_text_embed + ref_codec_embed (双轨叠加, 类似 decode step)
+   trailing_text_hidden 从 ICL 段尾部开始 (ref 文本后的生成文本)
+
+
+1. 初始化 trailing_text_hidden 队列:
+   - 非 ICL: text_proj(text_embed(input_ids[4:-5])) + tts_eos_embed
+   - ICL: 由 generate_icl_prompt 内部切分 (见上)
    - 已到达的后续文本 → embed 后入队
    - 未到达的 → 后续动态追加 (token 级或句级, 取决于当前流控模式)
 
-4. Talker Backbone Forward (Prefill, TRT):
-   inputs_embeds [1, S_prefill, 1024]
+2. Talker Backbone Forward (Prefill, TRT-LLM):
+   inputs_embeds [1, S_prefill, 1024]   ← S_prefill 因 task_type 而异
    → hidden_states [1, S_prefill, 1024]
    → logits [1, S_prefill, 3072]
    → KV Cache 初始化
 
-5. past_hidden = hidden_states[:, -1:, :]
+3. past_hidden = hidden_states[:, -1:, :]
 
 
 Phase 2: Decode Loop (流式)
@@ -185,9 +308,9 @@ Phase 2: Decode Loop (流式)
 │                                                      │
 │   ② Code Predictor 单次调用 (TRT, 无 KV Cache):      │
 │      输入: past_hidden [B,1,1024], codec_token_0 [B] │
-│      内部: 31 stage 全量 prefill (循环展开)            │
-│      输出: codec_ids [B, 31]                         │
-│      全部 32 个 codebook: [codec_0, codec_ids]       │
+│      内部: 15 stage 全量 prefill (循环展开)            │
+│      输出: codec_ids [B, 15]                         │
+│      全部 16 个 codebook: [codec_0, codec_ids]       │
 │                                                      │
 │   ③ Accumulate → Code2Wav (每 25 frames):            │
 │      Code2Wav chunked_decode → audio chunk           │
@@ -201,7 +324,7 @@ Phase 2: Decode Loop (流式)
 │        持续缺失 → PAUSE decode (冻结 KV cache)        │
 │      input = codec_sum + text_add                    │
 │                                                      │
-│   ⑤ Talker Backbone Forward (Decode, TRT):            │
+│   ⑤ Talker Backbone Forward (Decode, TRT-LLM):         │
 │      inputs_embeds [B, 1, 1024] → logits, KV update  │
 │      past_hidden = hidden_states                     │
 │                                                      │
@@ -250,21 +373,21 @@ Phase 3: 收尾
 
 ## 5. Code Predictor: 无 KV Cache 循环展开方案
 
-这是本架构的关键优化。Code Predictor 的 31 步自回归**去掉 KV Cache**，每步从头做全量 prefill，31 步展开为**单一 TRT 引擎**的一次调用。
+这是本架构的关键优化。Code Predictor 的 15 步自回归**去掉 KV Cache**，每步从头做全量 prefill，15 步展开为**单一 TRT 引擎**的一次调用。
 
-> **⚠️ TRT 编译风险**: 31 步展开的单引擎方案存在 TRT 编译层面的不确定性（详见 5.5 节），需在 Phase 1 优先验证。已准备 fallback 方案（5.6 节）。
+> **⚠️ TRT 编译风险**: 15 步展开的单引擎方案存在 TRT 编译层面的不确定性（详见 5.5 节），需在 Phase 1 优先验证。已准备 fallback 方案（5.6 节）。
 
 ### 5.1 方案对比
 
 | 维度 | 传统 KV Cache 方案 | 无 KV Cache 展开方案 (首选) | 无 KV Cache 单 stage 方案 (fallback) |
 |------|-------------------|--------------------|--------------------------------------|
-| **TRT 导出难度** | 高（KV Cache 显式管理 + 循环 + 31 个 lm_head 切换） | **中（纯静态图，但 argmax→Gather 链路需验证）** | **低（单 stage，确定可行）** |
-| **权重读取量** | 31 × 153MB = 4.74GB | 31 × 153MB = 4.74GB（**相同**） | 31 × 153MB = 4.74GB（**相同**） |
-| **额外计算** | 无 | 前缀重算 ~0.24ms（**可忽略**） | 前缀重算 ~0.24ms（**可忽略**） |
+| **TRT 导出难度** | 高（KV Cache 显式管理 + 循环 + 15 个 lm_head 切换） | **中（纯静态图，但 argmax→Gather 链路需验证）** | **低（单 stage，确定可行）** |
+| **权重读取量** | 15 × 153MB = 2.30GB | 15 × 153MB = 2.30GB（**相同**） | 15 × 153MB = 2.30GB（**相同**） |
+| **额外计算** | 无 | 前缀重算 ~0.12ms（**可忽略**） | 前缀重算 ~0.12ms（**可忽略**） |
 | **Batch 效率** | GEMV [B,1,1024]×W（GPU 利用率低） | **GEMM [B,S,1024]×W（GPU 利用率高）** | **GEMM [B,S,1024]×W（GPU 利用率高）** |
-| **性能 (B=1)** | ~3-4ms | ~3-4ms | ~5ms（+31 次 launch 开销） |
-| **性能 (B=8)** | ~4ms | **~3-4ms（更好）** | ~5.5ms |
-| **实现复杂度** | 需管理 CP 的 KV Cache | **无状态，单次 forward** | **无状态，但需 Python 循环 31 次** |
+| **性能 (B=1)** | ~2ms | ~2ms | ~3ms（+15 次 launch 开销） |
+| **性能 (B=8)** | ~2ms | **~2ms（更好）** | ~3.5ms |
+| **实现复杂度** | 需管理 CP 的 KV Cache | **无状态，单次 forward** | **无状态，但需 Python 循环 15 次** |
 
 ### 5.2 为什么额外计算可以忽略
 
@@ -272,8 +395,8 @@ Code Predictor: 5 层 Transformer，hidden=1024。
 
 - 瓶颈是**权重读取**（memory bandwidth bound），不是计算
 - 每步必须从 HBM 读取全部 153MB 权重，无论是否使用 KV Cache
-- 前缀重算的激活值计算量: 5L × Σ(seq=2..32) × 30M FLOPs ≈ 79G FLOPs
-- RTX 4090 BF16: 330 TFLOPS → 79G / 330T = **0.24ms**（vs 总耗时 ~3.5ms，占比 7%）
+- 前缀重算的激活值计算量: 5L × Σ(seq=2..16) × 30M FLOPs ≈ 20G FLOPs
+- RTX 4090 BF16: 330 TFLOPS → 20G / 330T = **0.06ms**（vs 总耗时 ~2ms，占比 3%）
 
 ### 5.3 TRT 引擎结构
 
@@ -298,18 +421,18 @@ Code Predictor: 5 层 Transformer，hidden=1024。
 │  │ → token_2                                          │   │
 │  └────────────────────────────────────────────────────┘   │
 │                         ↓ token_2                         │
-│  ...  (31 个 stage, 共享 Transformer 权重)                 │
+│  ...  (15 个 stage, 共享 Transformer 权重)                 │
 │                                                           │
-│  ┌─ Stage 30 ─────────────────────────────────────────┐   │
-│  │ seq = [all 32 tokens]  → [B,32,D]                  │   │
-│  │ → projection → Transformer_5L → lm_head_30 → argmax│  │
-│  │ → token_31                                          │  │
+│  ┌─ Stage 14 ─────────────────────────────────────────┐   │
+│  │ seq = [all 16 tokens]  → [B,16,D]                  │   │
+│  │ → projection → Transformer_5L → lm_head_14 → argmax│  │
+│  │ → token_15                                          │  │
 │  └─────────────────────────────────────────────────────┘  │
 │                                                           │
-│  输出: codec_tokens [B, 31]                               │
+│  输出: codec_tokens [B, 15]                               │
 └───────────────────────────────────────────────────────────┘
 
-权重共享: 31 个 stage 引用同一组 Transformer 权重 (IConstantLayer)
+权重共享: 15 个 stage 引用同一组 Transformer 权重 (IConstantLayer)
          TRT 自动识别共享, 只存储一份, 优化 L2 cache 复用
 ```
 
@@ -317,7 +440,7 @@ Code Predictor: 5 层 Transformer，hidden=1024。
 
 ```python
 class CodePredictorUnrolled(nn.Module):
-    """31 步全部展开为单次 forward，无 KV Cache"""
+    """15 步全部展开为单次 forward，无 KV Cache"""
 
     def __init__(self, transformer_layers, norm, rotary_emb,
                  projection, embeddings, lm_heads):
@@ -326,8 +449,8 @@ class CodePredictorUnrolled(nn.Module):
         self.norm = norm
         self.rotary_emb = rotary_emb
         self.projection = projection           # Linear(1024, 1024) 或 Identity
-        self.embeddings = nn.ModuleList(embeddings)  # 31 个 Embedding(2048, 1024)
-        self.lm_heads = nn.ModuleList(lm_heads)      # 31 个 Linear(1024, 2048)
+        self.embeddings = nn.ModuleList(embeddings)  # 15 个 Embedding(2048, 1024)
+        self.lm_heads = nn.ModuleList(lm_heads)      # 15 个 Linear(1024, 2048)
 
     def _transformer_forward(self, x):
         seq_len = x.shape[1]
@@ -348,7 +471,7 @@ class CodePredictorUnrolled(nn.Module):
         """
         past_hidden:   [B, 1, 1024]
         codec_token_0: [B]
-        returns:       [B, 31]
+        returns:       [B, 15]
         """
         embed_0 = self.embeddings[0](codec_token_0).unsqueeze(1)
         sequence = self.projection(
@@ -356,13 +479,13 @@ class CodePredictorUnrolled(nn.Module):
         )
 
         output_tokens = []
-        for stage in range(31):
+        for stage in range(15):
             hidden = self._transformer_forward(sequence)
             logits = self.lm_heads[stage](hidden[:, -1:])
             token = logits.argmax(dim=-1).squeeze(-1)
             output_tokens.append(token)
 
-            if stage < 30:
+            if stage < 14:
                 next_embed = self.projection(
                     self.embeddings[stage + 1](token).unsqueeze(1)
                 )
@@ -377,16 +500,16 @@ import onnx
 model_onnx = onnx.load("code_predictor_unrolled.onnx")
 n_inits = len(model_onnx.graph.initializer)
 n_nodes = len(model_onnx.graph.node)
-# n_inits 应 ≈ 5层权重 + 31 embeddings + 31 lm_heads ≈ 100
-# 而不是 31 × 5层权重 ≈ 1100 (说明权重正确共享)
+# n_inits 应 ≈ 5层权重 + 15 embeddings + 15 lm_heads ≈ 60
+# 而不是 15 × 5层权重 ≈ 550 (说明权重正确共享)
 ```
 
 ### 5.5 TRT 编译风险分析
 
-31 步展开为单引擎虽然在理论上等价于纯静态图，但存在以下 TRT 编译层面的风险：
+15 步展开为单引擎虽然在理论上等价于纯静态图，但存在以下 TRT 编译层面的风险：
 
 1. **argmax → Embedding Gather 链路**：每个 stage 的 `argmax` 产生整数索引，然后用于 `Embedding` 查表。这是**数据依赖的动态索引**（`ArgMax → Gather`），ONNX 导出和 TRT parser 对此链路的支持需实测验证。
-2. **图规模**：31 stage × 5 层 = 155 次 Transformer layer forward。即使权重共享，执行计划的 node 数量仍为 155 份，TRT 编译时间可能达数小时，engine 序列化体积较大。
+2. **图规模**：15 stage × 5 层 = 75 次 Transformer layer forward。即使权重共享，执行计划的 node 数量仍为 75 份，TRT 编译时间可能较长，engine 序列化体积较大。
 3. **Stage 间串行依赖**：每个 stage 依赖前一个的 argmax 结果，TRT 无法跨 stage 并行优化，kernel fusion 空间有限。
 4. **编译器限制**：极大的静态图可能触发 TRT 的内部限制（如最大 node 数、最大 tensor 数），导致编译失败。
 
@@ -413,7 +536,7 @@ class CodePredictorSingleStage(nn.Module):
 
     def forward(self, sequence, lm_head_weight, lm_head_bias):
         """
-        sequence:       [B, S, 1024]  (S 从 2 递增到 32)
+        sequence:       [B, S, 1024]  (S 从 2 递增到 16)
         lm_head_weight: [2048, 1024]  (外部传入, 每 stage 不同)
         lm_head_bias:   [2048]
         returns:        logits [B, 1, 2048]
@@ -442,13 +565,13 @@ async def code_predictor_fallback(engine, past_hidden, codec_token_0,
     sequence = projection(torch.cat([past_hidden, embed_0], dim=1))
     output_tokens = []
 
-    for stage in range(31):
+    for stage in range(15):
         logits = engine.forward(sequence,
                                 lm_heads[stage].weight,
                                 lm_heads[stage].bias)
         token = logits.argmax(dim=-1).squeeze(-1)
         output_tokens.append(token)
-        if stage < 30:
+        if stage < 14:
             next_embed = projection(
                 embeddings[stage + 1](token).unsqueeze(1))
             sequence = torch.cat([sequence, next_embed], dim=1)
@@ -456,11 +579,11 @@ async def code_predictor_fallback(engine, past_hidden, codec_token_0,
     return torch.stack(output_tokens, dim=1)
 ```
 
-**Fallback 性能预估**: 31 次 TRT launch × ~0.05ms + 计算 ~3.5ms ≈ **~5ms/step**。总步长 ~5.5ms，仍远优于 vllm-omni 的 20ms+。
+**Fallback 性能预估**: 15 次 TRT launch × ~0.05ms + 计算 ~2ms ≈ **~2.8ms/step**。总步长 ~3.5ms，仍远优于 vllm-omni 的 20ms+。
 
 ---
 
-## 6. Talker Backbone: TRT-LLM / TRT 导出 (含 KV Cache)
+## 6. Talker Backbone: TRT-LLM 部署 (含 KV Cache)
 
 Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 - 序列长度可达数千步，前缀重算代价不可忽略
@@ -477,7 +600,7 @@ Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 | Prefill/Decode 分离 | 需手动实现 | **内置 chunked prefill + continuous decode** |
 | 开发成本 | 高（KV cache I/O wrapper + mask 构造 + profile 切换） | **低（定义模型配置即可）** |
 
-> **决策**: TRT-LLM 作为**首选方案**。Talker Backbone 的规格 (20L, GQA 16h/2kv, dim=1024, head_dim=64) 完全在 TRT-LLM 支持范围内。纯 TRT 作为 fallback 保留。
+> **决策**: Talker Backbone **确定走 TRT-LLM**。其规格 (20L, GQA 16h/2kv, dim=1024, head_dim=64) 完全在 TRT-LLM 支持范围内。KV Cache、paged attention、continuous batching 均由 TRT-LLM 运行时原生管理。
 >
 > **KV Cache I/O 风险 (纯 TRT 方案)**: KV cache 形状 `[20, 2, B, 2, S_max, 64]`，B=8, S_max=4096 时约 160MB BF16。作为 TRT 显式 I/O，每 decode step 的 device→device memcpy 约 0.16ms（HBM ~1TB/s），来回 0.32ms，占单步 8%。TRT-LLM 通过 in-place buffer 完全消除此开销。
 
@@ -648,26 +771,26 @@ model_repository/
 │   ├── config.pbtxt
 │   └── 1/model.onnx
 │
-├── talker_backbone/                     # TensorRT (含 KV Cache)
-│   ├── config.pbtxt                     # platform: tensorrt_plan
-│   └── 1/model.plan
-│   # Inputs:
-│   #   inputs_embeds:  [B, S, 1024]
-│   #   kv_cache:       [20, 2, B, 2, S_max, 64]
-│   #   cache_position: [S]
+├── talker_backbone/                     # TRT-LLM (KV Cache 由 TRT-LLM 运行时管理)
+│   ├── config.pbtxt                     # backend: tensorrtllm
+│   └── 1/
+│       ├── config.json                  # TRT-LLM checkpoint config
+│       └── *.engine                     # TRT-LLM engine(s)
+│   # TRT-LLM 管理:
+│   #   inputs_embeds:  [B, S, 1024]     (Orchestrator 构建后传入)
+│   #   KV Cache:       TRT-LLM 运行时内置管理 (零拷贝 in-place)
 │   # Outputs:
 │   #   hidden_states:  [B, S, 1024]
-│   #   logits:         [B, S, 3072]
-│   #   kv_cache_out:   [20, 2, B, 2, S_max, 64]
+│   #   logits:         [B, S, 3072]     (codec_head)
 │
-├── code_predictor/                      # TensorRT (无 KV Cache, 31 步展开)
+├── code_predictor/                      # TensorRT (无 KV Cache, 15 步展开)
 │   ├── config.pbtxt
 │   └── 1/model.plan
 │   # Inputs:
 │   #   past_hidden:    [B, 1, 1024]
 │   #   codec_token_0:  [B]
 │   # Outputs:
-│   #   codec_tokens:   [B, 31]
+│   #   codec_tokens:   [B, 15]
 │
 └── code2wav/                            # ONNX Runtime
     ├── config.pbtxt                     # dynamic batching enabled
@@ -768,7 +891,7 @@ Code Predictor 无 KV Cache，所有 active slots 的请求打包为一次调用
 active slots 的 (past_hidden, codec_token_0)
 → 拼成 batch: past_hidden [B_active, 1, 1024], codec_token_0 [B_active]
 → Code Predictor TRT Engine 单次调用
-→ 输出 [B_active, 31] codec_tokens
+→ 输出 [B_active, 15] codec_tokens
 
 无 per-session 状态, 无 KV Cache 管理, batch 组装极简
 ```
@@ -780,6 +903,14 @@ active slots 的 (past_hidden, codec_token_0)
 ### 10.1 Session State
 
 ```python
+class TaskType(Enum):
+    """任务类型 — 决定 prefill 构造和初始化流程"""
+    VOICE_CLONE_ICL = "voice_clone_icl"        # Base 模型, ref_audio + ref_text
+    VOICE_CLONE_XVEC = "voice_clone_xvec"      # Base 模型, ref_audio only
+    CUSTOM_VOICE = "custom_voice"               # CustomVoice 模型, speaker + instruct
+    VOICE_DESIGN = "voice_design"               # VoiceDesign 模型, instruct only
+
+
 class FlowMode(Enum):
     """流控模式 — 类似 TCP 拥塞控制, 按需自动升降级"""
     TOKEN_LEVEL = "token"          # 默认: token 级消费, 最低延迟
@@ -800,11 +931,23 @@ class TTSSession:
     session_id: str
     slot_id: int
 
-    # 请求参数
-    task_type: str
+    # ── 请求参数 (按 task_type 部分可选) ──
+    task_type: TaskType
     language: str
-    spk_embedding: Optional[torch.Tensor]
-    ref_codes: Optional[torch.Tensor]
+
+    # Voice Clone (Base): Speaker Encoder 输出
+    spk_embedding: Optional[torch.Tensor] = None       # [1, 1024], from Speaker Encoder
+
+    # Voice Clone ICL: Speech Tokenizer 输出
+    ref_codes: Optional[torch.Tensor] = None            # [T_ref, 16], from Speech Tokenizer
+    ref_text_ids: Optional[torch.Tensor] = None         # [1, S_ref], ref_text token ids
+
+    # CustomVoice: 预置 speaker
+    speaker_name: Optional[str] = None                  # e.g. "Chelsie"
+    speaker_codec_embed: Optional[torch.Tensor] = None  # [1, 1, 1024], codec_embed(spk_id)
+
+    # CustomVoice / VoiceDesign: 指令控制
+    instruct_hidden: Optional[torch.Tensor] = None      # [1, S_ins, 1024], text_proj(instruct)
 
     # 生成状态
     flow_state: FlowState = FlowState.WAITING
@@ -870,7 +1013,63 @@ class TTSSession:
         self.good_segment_count = 0
 ```
 
-### 10.2 Generation Loop (伪代码)
+### 10.2 Session 初始化 (按 task_type 分支)
+
+```python
+async def init_session(req: InitRequest, scheduler: BatchScheduler) -> TTSSession:
+    """收到 gRPC InitRequest 后创建 session, 按 task_type 分支初始化."""
+    slot = scheduler.allocate_slot()  # 可能排队等待
+
+    session = TTSSession(
+        session_id=gen_uuid(),
+        slot_id=slot,
+        task_type=parse_task_type(req),
+        language=req.language or "auto",
+    )
+
+    # ── 按 task_type 分支处理 ──
+    if session.task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
+        # Speaker Encoder (ONNX) — 提取说话人嵌入
+        audio_np = decode_audio(req.ref_audio)
+        mel = mel_spectrogram(audio_np, sr=24000)           # [1, T, 128]
+        session.spk_embedding = speaker_encoder.infer(mel)  # [1, 1024]
+
+        if session.task_type == TaskType.VOICE_CLONE_ICL:
+            # Speech Tokenizer (ONNX) — 提取参考 codec
+            session.ref_codes = speech_tok_encoder.infer(audio_np)  # [T_ref, 16]
+            session.ref_text_ids = tokenize(req.ref_text)
+
+    elif session.task_type == TaskType.CUSTOM_VOICE:
+        spk_id = config.talker_config.spk_id[req.speaker.lower()]
+        session.speaker_codec_embed = codec_embed(spk_id)   # [1, 1, 1024]
+        session.speaker_name = req.speaker
+        if req.instruct:
+            session.instruct_hidden = text_proj(
+                text_embed(tokenize(build_instruct_text(req.instruct))))
+
+    elif session.task_type == TaskType.VOICE_DESIGN:
+        session.instruct_hidden = text_proj(
+            text_embed(tokenize(build_instruct_text(req.instruct))))
+
+    # ── 共通: tokenize 生成文本 ──
+    session.input_ids = tokenize(build_assistant_text(first_text_chunk))
+
+    scheduler.register(session)
+    return session
+
+
+def parse_task_type(req: InitRequest) -> TaskType:
+    if req.task_type == "voice_clone":
+        return TaskType.VOICE_CLONE_XVEC if req.x_vector_only else TaskType.VOICE_CLONE_ICL
+    elif req.task_type == "custom_voice":
+        return TaskType.CUSTOM_VOICE
+    elif req.task_type == "voice_design":
+        return TaskType.VOICE_DESIGN
+    else:
+        raise ValueError(f"Unknown task_type: {req.task_type}")
+```
+
+### 10.3 Generation Loop (伪代码)
 
 ```python
 async def generation_loop(scheduler: BatchScheduler):
@@ -999,7 +1198,97 @@ async def generation_loop(scheduler: BatchScheduler):
                 scheduler.release_slot(session.slot_id)
 ```
 
-### 10.3 错误隔离与 Session 保护
+### 10.4 Prefill 构建分支 (build_prefill_embeds)
+
+`build_prefill_embeds(session)` 是 10.2 中 generation loop 调用的核心函数，按 `task_type` 分支构建 prefill 输入。以下伪代码对应源码 `Qwen3TTSForConditionalGeneration.generate()` 中 L2068-L2234 的逻辑：
+
+```python
+def build_prefill_embeds(s: TTSSession) -> torch.Tensor:
+    """
+    按 task_type 构建 prefill inputs_embeds.
+    返回: [1, S_prefill, 1024] — 直接传给 Talker Backbone TRT-LLM.
+    """
+    # ── 共通: role 段 (<|im_start|>assistant\n) ──
+    role_embed = text_proj(text_embed(s.input_ids[:, :3]))  # [1, 3, 1024]
+
+    # ── 共通: tag 段 (think/language tokens) ──
+    if s.language == "auto":
+        tag_ids = [codec_nothink_id, codec_think_bos_id, codec_think_eos_id]
+    else:
+        lang_id = codec_language_id[s.language]
+        tag_ids = [codec_think_id, codec_think_bos_id, lang_id, codec_think_eos_id]
+    tag_codec_embed = codec_embed(tag_ids)                  # [1, 3~4, 1024]
+
+    bos_codec_embed = codec_embed([codec_bos_id])           # [1, 1, 1024]
+
+    # ── 共通: 特殊 text embedding ──
+    tts_bos, tts_eos, tts_pad = text_proj(text_embed(
+        [tts_bos_token_id, tts_eos_token_id, tts_pad_token_id]
+    )).chunk(3)                                             # 各 [1, 1, 1024]
+
+    # ── 按 task_type 分支: instruct 段 ──
+    instruct_embed = None
+    if s.task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN):
+        if s.instruct_hidden is not None:
+            instruct_embed = s.instruct_hidden              # [1, S_ins, 1024]
+
+    # ── 按 task_type 分支: speaker 段 ──
+    if s.task_type == TaskType.CUSTOM_VOICE:
+        speaker_embed = s.speaker_codec_embed               # [1, 1, 1024] — 从 config 查表
+    elif s.task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
+        speaker_embed = s.spk_embedding.view(1, 1, -1)     # [1, 1, 1024] — Speaker Encoder 输出
+    else:  # VOICE_DESIGN
+        speaker_embed = None
+
+    # ── 组装 codec 层 (下轨) ──
+    if speaker_embed is not None:
+        codec_layer = cat([tag_codec_embed, speaker_embed, bos_codec_embed], dim=1)
+    else:
+        codec_layer = cat([tag_codec_embed, bos_codec_embed], dim=1)
+
+    # ── 组装 text 层 (上轨) — pad 对齐 codec 层 ──
+    text_layer = cat([tts_pad.expand(-1, codec_layer.shape[1] - 2, -1),
+                      tts_bos], dim=1)  # tag+spk 位置用 pad, bos 前用 tts_bos
+
+    # ── 双轨叠加: 基础 prefill ──
+    base_prefill = cat([role_embed,
+                        text_layer + codec_layer[:, :-1]], dim=1)
+
+    # ── 按 task_type 分支: instruct + ICL / first_text ──
+    if instruct_embed is not None:
+        base_prefill = cat([role_embed, instruct_embed,
+                            text_layer + codec_layer[:, :-1]], dim=1)
+
+    if s.task_type == TaskType.VOICE_CLONE_ICL:
+        # ICL: 参考文本 + 参考 codec 双轨拼接
+        icl_embed, trailing = generate_icl_prompt(
+            text_id=s.input_ids[:, 3:-5],
+            ref_id=s.ref_text_ids[:, 3:-2],
+            ref_code=s.ref_codes,
+            tts_pad_embed=tts_pad, tts_eos_embed=tts_eos,
+            non_streaming_mode=False)
+        first_text = text_proj(text_embed(s.input_ids[:, 3:4])) + codec_layer[:, -1:]
+        prefill = cat([base_prefill, first_text, icl_embed], dim=1)
+        s.trailing_text_hidden = trailing  # ICL 模式由内部切分
+    else:
+        # 非 ICL: 添加 first_text token
+        first_text = text_proj(text_embed(s.input_ids[:, 3:4])) + codec_layer[:, -1:]
+        prefill = cat([base_prefill, first_text], dim=1)
+        # trailing_text_hidden 已在 session 初始化时设置
+
+    return prefill  # [1, S_prefill, 1024]
+```
+
+> **S_prefill 长度差异**:
+> - CustomVoice (无 instruct): ~8 tokens
+> - CustomVoice (有 instruct): 8 + S_ins tokens
+> - VoiceDesign: 7 + S_ins tokens (无 speaker)
+> - Voice Clone (x_vec): ~8 tokens
+> - Voice Clone (ICL): 8 + T_ref + S_ref tokens (最长, 含参考音频)
+>
+> Talker TRT-LLM 的 prefill profile 需覆盖最大情况 (ICL 模式, S_prefill 可达 ~200+)
+
+### 10.5 错误隔离与 Session 保护
 
 单个 session 的异常**不得影响** batch 中的其他 session：
 
@@ -1023,14 +1312,14 @@ for i, session in enumerate(still_active):
 
 **超时 slot 回收**: 对 `PAUSED` 或 `WAITING` 超过 `max_idle_ms` (默认 10s) 的 session 强制终止并释放 slot。
 
-### 10.4 Python GIL 与控制面开销
+### 10.6 Python GIL 与控制面开销
 
 Orchestrator 运行在 Python BLS 后端中，GIL 约束下的控制面开销需关注：
 
 | 操作 | 预估耗时 | 说明 |
 |------|---------|------|
 | 流控状态机更新 | ~0.01ms | 纯 Python 计算 |
-| Codec embedding sum (朴素) | ~0.3ms | 32 次 Embedding + Python 循环 |
+| Codec embedding sum (朴素) | ~0.15ms | 16 次 Embedding + Python 循环 |
 | Codec embedding sum (优化) | ~0.05ms | 单次 3D gather + sum |
 | Batch 组装/拆分 | ~0.05ms | torch.stack/index |
 | gRPC stream 收发 | ~0.05ms | 非阻塞 try_recv |
@@ -1387,24 +1676,78 @@ message TTSRequest {
     }
 }
 
+// 统一初始化请求 — 按 task_type 选择性填充字段
 message InitRequest {
-    string task_type = 1;
-    string language = 2;
-    bytes ref_audio = 3;
-    string ref_text = 4;
-    string speaker = 5;
+    // ── 必填 ──
+    string task_type = 1;           // "voice_clone" | "custom_voice" | "voice_design"
+    string language = 2;            // "chinese" | "english" | ... | "auto"
+
+    // ── Voice Clone (Base 模型) ──
+    bytes ref_audio = 3;            // 参考音频 (PCM/WAV bytes, 建议 3~10 秒)
+    string ref_text = 4;            // 参考文本 (ICL 模式必填, x_vector_only 可省略)
+    bool x_vector_only = 5;         // true: 仅用 speaker embedding; false: ICL 模式 (默认)
+
+    // ── CustomVoice 模型 ──
+    string speaker = 6;             // 预置音色名 ("Chelsie" | "Ethan" | ... 共 9 个)
+
+    // ── CustomVoice / VoiceDesign 共用 ──
+    string instruct = 7;            // 自然语言指令 (VoiceDesign 必填, CustomVoice 可选)
+                                    // 示例: "用温柔的女声朗读" / "A young energetic male voice"
+
+    // ── 采样参数 (可选, 有默认值) ──
+    SamplingParams sampling = 10;
+}
+
+message SamplingParams {
+    float temperature = 1;          // default: 0.9
+    int32 top_k = 2;                // default: 50
+    float top_p = 3;                // default: 1.0
+    float repetition_penalty = 4;   // default: 1.05
+    int32 max_new_tokens = 5;       // default: 4096
+    bool do_sample = 6;             // default: true
+    // Code Predictor 采样 (通常使用默认值)
+    float subtalker_temperature = 7;
+    int32 subtalker_top_k = 8;
+    float subtalker_top_p = 9;
 }
 
 message TextChunk {
     string text = 1;
 }
 
+message TextComplete {}             // 标记文本流结束
+
 message TTSResponse {
-    bytes audio_chunk = 1;    // PCM16
-    int32 sample_rate = 2;    // 24000
-    bool is_final = 3;
+    oneof response {
+        AudioChunk audio = 1;
+        TTSError error = 2;
+    }
+}
+
+message AudioChunk {
+    bytes pcm_data = 1;             // PCM16 LE, mono, 24000 Hz
+    int32 sample_rate = 2;          // 24000
+    bool is_final = 3;              // true = 最后一个 chunk
+}
+
+message TTSError {
+    int32 code = 1;                 // 错误码
+    string message = 2;             // 错误描述
 }
 ```
+
+**各 task_type 的必填/可选字段**:
+
+| 字段 | voice_clone (ICL) | voice_clone (x_vec) | custom_voice | voice_design |
+|------|:-:|:-:|:-:|:-:|
+| `language` | 必填 | 必填 | 必填 | 可选 (默认 auto) |
+| `ref_audio` | **必填** | **必填** | - | - |
+| `ref_text` | **必填** | - | - | - |
+| `x_vector_only` | false (默认) | true | - | - |
+| `speaker` | - | - | **必填** | - |
+| `instruct` | - | - | 可选 | **必填** |
+
+> **服务端校验**: Orchestrator 收到 `InitRequest` 后，根据 `task_type` 校验必填字段。缺失必填字段 → 返回 `TTSError(code=400, message="...")`。提供了不相关字段 (如 voice_design 带了 ref_audio) → 忽略并记录 warning。
 
 ---
 
@@ -1416,14 +1759,14 @@ message TTSResponse {
 |------|------|------|------|
 | **Talker Backbone** | Decode (B=1, S=1) | ~0.4ms | 20L, memory bandwidth bound |
 | **Talker Backbone** | Decode (B=8, S=1) | ~0.5ms | GEMV, 批量摊薄 launch |
-| **Code Predictor** | 31 步展开 (B=1) | ~3.5ms | 无 KV Cache, 单引擎 |
-| **Code Predictor** | 31 步展开 (B=8) | ~3.5ms | GEMM 效率高, 批量几乎不增耗时 |
-| **Code Predictor** | fallback 单stage×31 (B=1) | ~5.0ms | 31 次 launch 开销 ~1.5ms |
+| **Code Predictor** | 15 步展开 (B=1) | ~2ms | 无 KV Cache, 单引擎 |
+| **Code Predictor** | 15 步展开 (B=8) | ~2ms | GEMM 效率高, 批量几乎不增耗时 |
+| **Code Predictor** | fallback 单stage×15 (B=1) | ~2.8ms | 15 次 launch 开销 ~0.75ms |
 | Codec Embedding Sum | 优化后 (3D gather) | ~0.05ms | 原朴素实现 ~0.3ms |
 | Orchestrator 控制 | Python 状态机 + 调度 | ~0.1ms | GIL 约束下的控制面 |
 | **单步总计 (首选)** | B=1 | **~4.1ms** | CP 展开成功 |
 | **单步总计 (首选)** | B=8 | **~4.2ms** | 批量效率极高 |
-| **单步总计 (fallback)** | B=1 | **~5.6ms** | CP 单stage×31 |
+| **单步总计 (fallback)** | B=1 | **~3.5ms** | CP 单stage×15 |
 | Code2Wav | 每 chunk (异步) | ~15ms | 独立 CUDA stream, 不阻塞 decode |
 
 > **Code2Wav 异步化**: Code2Wav 在独立 CUDA stream 执行，与 decode 循环 overlap。仅在推送音频时需同步检查完成状态，decode 循环无 15ms 峰值延迟。
@@ -1492,14 +1835,14 @@ Qwen3-TTS-Triton/
 │
 ├── scripts/
 │   ├── export/
-│   │   ├── export_talker_trt.py
+│   │   ├── export_talker_backbone.py          # TRT-LLM checkpoint (engine 由 build_engines.sh 编译)
 │   │   ├── export_code_predictor_trt.py    # 无 KV Cache 展开版
 │   │   ├── export_speaker_encoder_onnx.py
 │   │   ├── export_speech_tok_enc_onnx.py
 │   │   ├── export_code2wav_onnx.py
 │   │   └── export_embeddings.py
-│   ├── build/
-│   │   └── build_trt_engines.sh
+│   ├── bash/
+│   │   ├── build_engines.sh                # Phase B: docker run trtllm-build
 │   └── test/
 │       ├── test_pipeline.py
 │       ├── test_streaming.py
@@ -1543,6 +1886,42 @@ Qwen3-TTS-Triton/
 
 ## 15. 实施路线图 (AI 辅助编程)
 
+### 构建流程 (两阶段)
+
+构建拆分为 **Phase A (host)** 和 **Phase B (Docker 容器)** 两个阶段，解决 TRT-LLM 环境依赖问题：
+
+```
+Phase A — autorun.sh (host, conda/venv):
+  PyTorch + qwen_tts + ONNX 工具
+  → ONNX 模型 + TRT-LLM checkpoints + Embedding 权重
+
+Phase B — build_engines.sh (docker run --gpus all, NGC TRT-LLM 容器):
+  trtllm-build + checkpoint 文件
+  → TRT-LLM engine (.engine)
+```
+
+- **Phase A** 不需要 TRT-LLM，只需要 PyTorch 环境即可完成所有权重提取和 checkpoint 转换
+- **Phase B** 不需要 PyTorch/qwen_tts，只在 NGC 容器内运行 `trtllm-build` CLI
+- 两阶段通过 `workspace/exported/` 目录传递中间产物
+
+```bash
+# Phase A: 环境搭建 + 模型导出 (host)
+bash scripts/bash/autorun.sh
+
+# Phase B: TRT-LLM engine 编译 (Docker 容器)
+bash scripts/bash/build_engines.sh
+```
+
+单独运行 `export_models.sh`、`download_models.sh` 或 `scripts/export/` 下的 Python 脚本时，需先手动激活虚拟环境：
+
+```bash
+# conda/mamba 环境（autorun.sh 默认创建名为 qwen3-tts 的 conda 环境）
+conda activate qwen3-tts
+
+# 或 venv 环境（若 autorun.sh 回退使用了 python3 venv）
+source <venv-path>/bin/activate
+```
+
 ### Phase 1: 模型导出 + 基础验证 + 风险阻断 (2-3 天)
 
 > **关键路径**: 第 5 项 (CP TRT 编译验证) 是全项目最大风险点，需最优先执行。
@@ -1550,39 +1929,42 @@ Qwen3-TTS-Triton/
 1. [ ] Speaker Encoder → ONNX
 2. [ ] Speech Tokenizer Encoder → ONNX
 3. [ ] Code2Wav Decoder → ONNX (含 chunked decode)
-4. [ ] Talker Backbone 单步 wrapper + ONNX 导出
+4. [ ] Talker Backbone → TRT-LLM checkpoint (Phase A) + engine build via build_engines.sh (Phase B)
 5. [ ] **⚠️ Code Predictor 无 KV Cache 展开版 + ONNX 导出 + TRT 编译验证** (5.5 节验证清单)
    - 若失败 → 立即切换 fallback: 单 stage ONNX + TRT (5.6 节)
 6. [ ] 单请求 Python 端到端验证 (PyTorch + ONNX)
 7. [ ] **pad 容忍度实验**: 原始 PyTorch 模型，句中插入 1/2/3/5 个 pad，A/B 对比音频质量
+8. [ ] **多任务 prefill 验证**: 分别用 Base/CustomVoice/VoiceDesign 权重走通 prefill 构建 (4.1 节)
+   - 对比三种 task_type 的 prefill 输出与原始 PyTorch 的 cosine similarity
+   - 验证三种变体的 Talker/CP 权重差异 (2.2.3 节: 是否可共享引擎)
 
 ### Phase 2: TensorRT / TRT-LLM 优化 (3-5 天)
 
-8. [ ] **Talker Backbone → TRT-LLM** (首选方案, 6.0/6.2 节)
-   - 若 TRT-LLM 集成受阻 → fallback: 纯 TRT + 自定义 wrapper (6.1/6.3 节)
-9. [ ] Code Predictor ONNX → TRT (BF16, 验证权重共享)
-   - 或 fallback 方案的 single-stage TRT engine
-10. [ ] Codec Embedding Sum 优化 (3D gather, 2.1 节)
-11. [ ] 单请求 TRT 端到端验证 + BF16 长序列精度对比 (6.5 节)
+9. [ ] **Talker Backbone TRT-LLM 集成验证** (build_engines.sh 编译 engine + 精度对比, 6.0/6.2 节)
+10. [ ] Code Predictor ONNX → TRT (BF16, 验证权重共享)
+    - 或 fallback 方案的 single-stage TRT engine
+11. [ ] Codec Embedding Sum 优化 (3D gather, 2.1 节)
+12. [ ] 单请求 TRT 端到端验证 + BF16 长序列精度对比 (6.5 节)
 
 ### Phase 3: 流式 + Batch (1-1.5 周)
 
-12. [ ] Orchestrator BLS Python 后端 (含错误隔离, 10.3 节)
-13. [ ] Session Manager + Flow Controller (自适应流控: TOKEN/ADAPTIVE/SENTENCE)
-14. [ ] Batch Scheduler (continuous insert/remove + prefill/decode 交错调度, 9.2 节)
-15. [ ] Slot 耗尽处理 + 请求排队 (9.3 节)
-16. [ ] 流式音频输出 (自适应首包 chunk + Code2Wav 异步执行, 12.1/12.2 节)
-17. [ ] TTS Gateway 或 Triton 原生接口 (3.1 节)
+13. [ ] Orchestrator BLS Python 后端 (含错误隔离, 10.5 节; 多任务初始化, 10.2 节)
+14. [ ] Session Manager + Flow Controller (自适应流控: TOKEN/ADAPTIVE/SENTENCE)
+15. [ ] Batch Scheduler (continuous insert/remove + prefill/decode 交错调度, 9.2 节)
+16. [ ] Slot 耗尽处理 + 请求排队 (9.3 节)
+17. [ ] 流式音频输出 (自适应首包 chunk + Code2Wav 异步执行, 12.1/12.2 节)
+18. [ ] gRPC 接口实现 (多任务 InitRequest, 12.3 节) + TTS Gateway 或 Triton 原生接口 (3.1 节)
 
 ### Phase 4: 优化 + 生产化 (1-1.5 周)
 
-18. [ ] CUDA Graphs (Talker decode step)
-19. [ ] Chunked Prefill / 异步 Prefill (9.2 节策略 B)
-20. [ ] 内存优化 (embedding 共享, KV cache pooling)
-21. [ ] Python 控制面优化 (10.4 节, 必要时迁移 C++ backend)
-22. [ ] 监控指标 (延迟/吞吐/GPU 利用率/流控状态)
-23. [ ] 压力测试 + 流控参数调优
-24. [ ] (可选) Delay Manager v2 (11.9 节, 按需引入)
+19. [ ] CUDA Graphs (Talker decode step)
+20. [ ] Chunked Prefill / 异步 Prefill (9.2 节策略 B)
+21. [ ] 内存优化 (embedding 共享, KV cache pooling)
+22. [ ] Python 控制面优化 (10.6 节, 必要时迁移 C++ backend)
+23. [ ] 监控指标 (延迟/吞吐/GPU 利用率/流控状态)
+24. [ ] 压力测试 + 流控参数调优
+25. [ ] (可选) 多变体部署 — Gateway 路由 / 多 Orchestrator 实例 (2.2.3 节)
+26. [ ] (可选) Delay Manager v2 (11.9 节, 按需引入)
 
 **总计: 约 3-4 周**
 
@@ -1592,9 +1974,9 @@ Qwen3-TTS-Triton/
 
 | 风险 | 严重度 | 影响 | 缓解措施 |
 |------|--------|------|---------|
-| **CP 31步展开 TRT 编译** | **高** | argmax→Gather 链路 + 155 层图规模，可能编译失败或耗时数小时 | Phase 1 优先验证 (5.5 节); fallback: 单 stage TRT + 31 次调用 (5.6 节) |
-| Talker TRT 导出 KV Cache 兼容性 | 中高 | DynamicCache → 静态 tensor 可能困难 | 首选 TRT-LLM (6.0 节); fallback: 自定义 wrapper + in-place binding |
-| **Python GIL 控制面瓶颈** | **中高** | Orchestrator 每步 Python 开销可能达 0.5-1ms（朴素实现） | Codec embed sum 优化 (2.1 节); Phase 4 考虑 C++ backend (10.4 节) |
+| **CP 15步展开 TRT 编译** | **中高** | argmax→Gather 链路 + 75 层图规模，可能编译失败或耗时较长 | Phase 1 优先验证 (5.5 节); fallback: 单 stage TRT + 15 次调用 (5.6 节) |
+| Talker TRT-LLM 集成 | 中 | 模型配置映射 + 权重转换需适配 | TRT-LLM 原生支持 Qwen3 架构 (6.0 节); KV Cache 由 TRT-LLM 运行时管理 |
+| **Python GIL 控制面瓶颈** | **中高** | Orchestrator 每步 Python 开销可能达 0.5-1ms（朴素实现） | Codec embed sum 优化 (2.1 节); Phase 4 考虑 C++ backend (10.6 节) |
 | Code Predictor ONNX 权重膨胀 | 中 | torch.onnx.export 可能复制共享权重 | 导出后验证 initializer 数量; 必要时用 TRT API 直接构建 |
 | **Prefill 阻塞 Decode 循环** | **中** | 新请求 prefill (~20ms) 期间，现有 session decode 停滞 | 交错调度 (Phase 3); 异步/chunked prefill (Phase 4, 9.2 节) |
 | **LLM-TTS 速率不匹配** | 中 | 句中 pad 导致音频质量退化 | 自适应流控 + Phase 1 pad 容忍度实验验证 (11.4 节) |
@@ -1603,8 +1985,10 @@ Qwen3-TTS-Triton/
 | **Pause 导致 Batch 碎片化** | 中 | 频繁 pause 使 batch size 波动 | AIMD 自适应阈值 + 动态 batch 重组 |
 | Attention mask 批量处理 | 中 | 不同 slot 的 seq_len 不同 | TRT-LLM 原生支持; 纯 TRT: max_seq_len mask + per-slot length |
 | BF16 精度验证 | **低** | BF16 尾数精度略低于 FP16（7 vs 10 位），需确认生成质量无退化 | 导出后做长序列精度对比 (6.5 节)；BF16 指数范围与 FP32 相同，overflow 风险已消除 |
-| 错误隔离 | 中 | 单 session 异常影响 batch 中其他 session | try-except 隔离 + 超时 slot 回收 (10.3 节) |
+| 错误隔离 | 中 | 单 session 异常影响 batch 中其他 session | try-except 隔离 + 超时 slot 回收 (10.5 节) |
 | gRPC 协议集成 | 低中 | 自定义 proto 与 Triton 协议不兼容 | TTS Gateway 做协议桥接 (3.1 节); 或直接用 Triton 协议 |
+| **多变体权重差异** | **中** | 三变体 Talker/CP 权重不同, 无法共享单引擎实现多任务 | Phase 1 验证权重差异 (2.2.3 节); 单变体部署兜底 |
+| ICL 模式 prefill 过长 | 低中 | ICL 包含参考音频 codec (S_prefill~200+), 可能超 profile 范围 | Talker TRT-LLM max_input_len 设 512 (6.2 节) |
 | Text Embedder 显存碎片 | 低 | ~624MB PyTorch 权重不在 Triton memory pool 内 | 显存预算显式计入 (2.1 节) |
 | Batch 内序列长度差异 | 低 | 不同请求 prefill 长度不同 | 分离 prefill/decode (9.2 节) |
 
@@ -1642,10 +2026,10 @@ Qwen3-TTS-Triton/
 
 ### 为什么 Code Predictor 去掉 KV Cache
 
-**原因**: Code Predictor 最大序列长度仅 32, 前缀重算代价可忽略 (~0.24ms), 但获得巨大工程收益:
+**原因**: Code Predictor 最大序列长度仅 16, 前缀重算代价可忽略 (~0.06ms), 但获得巨大工程收益:
 
 - TRT 导出难度从"高"降为"低" (纯静态图, 无状态, 无循环)
-- 单引擎单次调用, 消除 Python 循环和 31 次 kernel launch 开销
+- 单引擎单次调用, 消除 Python 循环和 15 次 kernel launch 开销
 - Batch 效率更高 (GEMM vs GEMV)
 
 **Talker Backbone 保留 KV Cache**: 序列可达数千步, 前缀重算不可接受。

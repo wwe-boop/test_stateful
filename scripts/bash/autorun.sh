@@ -8,6 +8,12 @@
 #  This is the BUILD phase — the final Triton image does NOT need PyTorch
 #  or the qwen-tts package; it only ships the exported engines.
 #
+#  Steps: prerequisites → submodule → workspace → mirrors → venv → deps
+#         → models → export deps → export
+#
+#  Engine build (TRT-LLM) is a separate step — run build_engines.sh after
+#  this script completes.  See docs/architecture.md for the two-phase flow.
+#
 #  Usage:
 #    bash scripts/bash/autorun.sh [workdir] [env_name] [python_version] [model_variant]
 #
@@ -19,6 +25,8 @@
 #    MODEL_SOURCE     Download source           (auto | hf | modelscope)
 #    SKIP_MODELS      Set to 1 to skip model download
 #    SKIP_DEPS        Set to 1 to skip dependency installation
+#    SKIP_EXPORT      Set to 1 to skip ONNX model export
+#    CONFIGURE_MIRRORS  Mirror config (auto | china | skip)  (default: auto)
 # ===========================================================================
 
 set -euo pipefail
@@ -30,10 +38,11 @@ source "${SCRIPT_DIR}/tools.sh"
 WORKDIR="${WORKDIR:-${1:-${REPO_ROOT}/workspace}}"
 ENV_NAME="${ENV_NAME:-${2:-qwen3-tts}}"
 PYTHON_VERSION="${PYTHON_VERSION:-${3:-3.10}}"
-MODEL_VARIANT="${MODEL_VARIANT:-${4:-base-1.7b}}"
+MODEL_VARIANT="${MODEL_VARIANT:-${4:-}}"
 MODEL_SOURCE="${MODEL_SOURCE:-auto}"
 SKIP_MODELS="${SKIP_MODELS:-0}"
 SKIP_DEPS="${SKIP_DEPS:-0}"
+SKIP_EXPORT="${SKIP_EXPORT:-0}"
 
 SUBMODULE_PATH="third_party/Qwen3-TTS"
 MODEL_DIR="${WORKDIR}/models"
@@ -110,11 +119,16 @@ install_dependencies() {
 
     log_step "Installing dependencies..."
 
-    python3 -m pip install --upgrade pip setuptools wheel -q \
+    # setuptools>=82 removed pkg_resources, which modelscope still needs
+    python3 -m pip install --upgrade pip "setuptools<81" wheel -q \
         || log_warn "pip/setuptools upgrade failed (non-fatal)"
 
     # PyTorch with CUDA
     install_torch_cuda
+
+    # flash-attn: fused attention kernels used by Qwen3-TTS Talker backbone
+    install_flash_attn \
+        || log_warn "flash-attn install failed (non-fatal, will fall back to manual attention)"
 
     # modelscope CLI (official recommended download tool)
     pip_install modelscope
@@ -138,7 +152,43 @@ download_models() {
     download_qwen3_tts_models "$MODEL_DIR" "$MODEL_VARIANT" "$MODEL_SOURCE"
 }
 
-# ---- Step 5: Validation --------------------------------------------------
+# ---- Step 5: Export dependencies -----------------------------------------
+
+install_export_deps() {
+    log_step "Installing export dependencies ..."
+    install_onnx_export_deps
+    install_safetensors
+}
+
+# ---- Step 6: Model export ------------------------------------------------
+
+export_models() {
+    if [ "$SKIP_EXPORT" = "1" ]; then
+        log_info "SKIP_EXPORT=1, skipping model export"
+        return 0
+    fi
+    if [ "$SKIP_MODELS" = "1" ]; then
+        log_info "SKIP_MODELS=1, no models to export"
+        return 0
+    fi
+
+    log_step "Exporting models (ONNX / TRT-LLM checkpoints / PyTorch weights)..."
+
+    local export_dir="${REPO_ROOT}/scripts/export"
+    local export_args=()
+
+    if [ "$MODEL_VARIANT" != "all" ] && [ "$MODEL_VARIANT" != "all-1.7b" ]; then
+        export_args+=(--variant "$MODEL_VARIANT")
+    fi
+
+    cd "$export_dir"
+    python3 export_all.py "${export_args[@]}" \
+        || { log_error "Model export failed"; return 1; }
+
+    log_info "Models exported to: ${REPO_ROOT}/workspace/exported/"
+}
+
+# ---- Step 7: Validation --------------------------------------------------
 
 validate_setup() {
     log_step "Validating setup..."
@@ -154,47 +204,80 @@ validate_setup() {
             log_warn "Model directory is empty: $MODEL_DIR"
         fi
     fi
+
+    # Check exported models
+    local exported_dir="${REPO_ROOT}/workspace/exported"
+    if [ -d "$exported_dir" ] && [ "$(ls -A "$exported_dir" 2>/dev/null)" ]; then
+        log_info "Exported models: $exported_dir"
+        find "$exported_dir" \( -name "*.onnx" -o -name "*.pt" -o -name "*.safetensors" \) 2>/dev/null \
+            | while read -r f; do
+                local size
+                size=$(du -h "$f" | cut -f1)
+                log_info "  ${f#$exported_dir/}  ($size)"
+            done
+        # TRT-LLM checkpoints (engine compiled separately by build_engines.sh)
+        find "$exported_dir" -path "*/trtllm_checkpoint/config.json" 2>/dev/null \
+            | while read -r f; do
+                log_info "  ${f#$exported_dir/}  (TRT-LLM checkpoint — run build_engines.sh to compile engine)"
+            done
+    fi
 }
 
 # ---- Main -----------------------------------------------------------------
 
 main() {
+    # If model variant not explicitly specified and download is not skipped,
+    # ask the user which model(s) to download before proceeding.
+    if [ -z "$MODEL_VARIANT" ] && [ "$SKIP_MODELS" != "1" ]; then
+        MODEL_VARIANT=$(select_model_variant)
+    fi
+    MODEL_VARIANT="${MODEL_VARIANT:-base-1.7b}"
+
     show_banner
 
-    log_step "[1/6] Checking prerequisites..."
+    log_step "[1/9] Checking prerequisites..."
     check_prerequisites || exit 1
 
-    log_step "[2/6] Initialising Qwen3-TTS submodule..."
+    log_step "[2/9] Initialising Qwen3-TTS submodule..."
     init_qwen3_tts
 
-    log_step "[3/6] Preparing workspace..."
+    log_step "[3/9] Preparing workspace..."
     ensure_workdir "$WORKDIR"
     link_into_workdir
 
-    log_step "[4/6] Setting up Python environment..."
+    log_step "[4/9] Configuring package mirrors..."
+    configure_mirrors
+
+    log_step "[5/9] Setting up Python environment..."
     ensure_venv "$ENV_NAME" "$PYTHON_VERSION"
 
-    log_step "[5/6] Installing dependencies..."
+    log_step "[6/9] Installing dependencies..."
     install_dependencies
 
-    log_step "[6/6] Downloading model weights..."
+    log_step "[7/9] Downloading model weights..."
     download_models
+
+    log_step "[8/9] Installing export dependencies ..."
+    install_export_deps
+
+    log_step "[9/9] Exporting models..."
+    export_models
 
     echo ""
     echo -e "${_CLR_BLUE}──────────────────────────────────────────────────${_CLR_RESET}"
     validate_setup
     echo -e "${_CLR_BLUE}──────────────────────────────────────────────────${_CLR_RESET}"
     echo ""
-    echo -e "${_CLR_GREEN}Setup complete!${_CLR_RESET}"
+    echo -e "${_CLR_GREEN}Build complete!${_CLR_RESET}"
     echo ""
     echo "  Workspace:   $WORKDIR"
     echo "  Models:      $MODEL_DIR"
+    echo "  Exported:    ${REPO_ROOT}/workspace/exported/"
     echo "  Activate:    conda activate $ENV_NAME  (or source .venv/bin/activate)"
     echo ""
     echo "  Next steps:"
-    echo "    1. Activate the environment"
-    echo "    2. Run model export:   python scripts/export/export_*.py"
-    echo "    3. Build TRT engines:  bash scripts/build/build_trt_engines.sh"
+    echo "    1. Build TRT-LLM engines:  bash scripts/bash/build_engines.sh  (auto-selects NGC container)"
+    echo "    2. Launch Triton:           tritonserver --model-repository model_repository/"
     echo ""
 }
 

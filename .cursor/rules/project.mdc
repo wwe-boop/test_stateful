@@ -7,13 +7,13 @@ alwaysApply: true
 
 ## 项目目标
 
-将阿里 Qwen3-TTS 模型拆分为 6 个独立组件，导出为 ONNX / TensorRT 引擎，部署在 Triton Inference Server 上，构建可量产的高性能流式 TTS 推理服务。
+将阿里 Qwen3-TTS 模型拆分为 6 个独立组件，导出为 ONNX / TRT-LLM / TensorRT 引擎，部署在 Triton Inference Server 上，构建可量产的高性能流式 TTS 推理服务。
 
 ## 技术路线
 
 - **推理引擎**: Triton Inference Server + TensorRT (/ TRT-LLM) + ONNX Runtime
 - **精度**: BF16（与 FP32 同指数范围，规避 RoPE/LayerNorm/Softmax overflow）
-- **核心策略**: Talker Backbone → TRT-LLM (含 KV Cache)，Code Predictor → TRT (无 KV Cache，31 步展开)，其余 → ONNX
+- **核心策略**: Talker Backbone → TRT-LLM (含 KV Cache)，Code Predictor → TRT (无 KV Cache，15 步展开)，其余 → ONNX
 
 ## 模型组件 (从 Qwen3TTSForConditionalGeneration 拆分)
 
@@ -22,31 +22,61 @@ alwaysApply: true
 | Text Embedder (~312M) | PyTorch 权重 (Orchestrator 内置) | 每请求 1 次 |
 | Speaker Encoder (ECAPA-TDNN, ~6M) | ONNX | 每请求 1 次 |
 | Speech Tokenizer Encoder (MimiModel, ~26M) | ONNX | 每请求 1 次 |
-| **Talker Backbone** (20L Qwen3, ~180M) | **TensorRT / TRT-LLM** | 每 decode step |
-| **Code Predictor** (5L Qwen3 + 31 heads, ~200M) | **TensorRT** | 每 decode step |
+| **Talker Backbone** (20L Qwen3, ~180M) | **TRT-LLM** | 每 decode step |
+| **Code Predictor** (5L Qwen3 + 15 heads, ~200M) | **TensorRT** | 每 decode step |
 | Code2Wav Decoder (~60M) | ONNX | 每 chunk |
 
-## 两阶段构建
+## 三阶段构建
 
 ```
-构建环境 (autorun.sh):  PyTorch + qwen_tts + 模型权重 → 导出 ONNX/TRT engines
-部署镜像 (Triton):      导出后的 engines + Orchestrator Python 后端 (无 PyTorch)
+Phase A — autorun.sh (host):     PyTorch + qwen_tts → ONNX 模型 + TRT-LLM checkpoints + .pt 权重
+Phase B — build_engines.sh (Docker):  NGC TRT-LLM 容器 → trtllm-build → .engine 文件
+Phase C — 部署镜像 (Triton):     engines + Orchestrator Python 后端 (无 PyTorch)
 ```
+
+- Phase A 不需要 TRT-LLM，只需 PyTorch + qwen_tts + ONNX 工具
+- Phase B 通过 `docker run --gpus all` 在 NGC 容器内运行 `trtllm-build`，不需要 PyTorch
+- 容器镜像根据 NVIDIA 驱动版本自动选择最佳兼容版本（`lib/docker.sh` NGC 兼容矩阵）
+- Phase A 会预检驱动/Docker 并打印推荐镜像，及早发现环境问题
+- 两阶段通过 `workspace/exported/` 目录传递中间产物
+- 单独运行 `export_models.sh`、`download_models.sh` 或 `scripts/export/*.py` 时，需先激活虚拟环境：`conda activate qwen3-tts`（或 `source <venv>/bin/activate`）
 
 ## 目录结构
 
 ```
 Qwen3-TTS-Triton/
-├── docs/architecture.md          ← 详细架构设计 (1600+ 行，核心参考文档)
+├── docs/architecture.md              ← 详细架构设计 (1650+ 行，核心参考文档)
 ├── scripts/
-│   ├── bash/                     ← 构建环境脚本 (autorun.sh + lib/)
-│   ├── export/                   ← 模型导出脚本 (TODO)
-│   └── build/                    ← TRT 编译脚本 (TODO)
-├── model_repository/             ← Triton 模型仓库 (TODO)
-├── gateway/                      ← TTS Gateway gRPC 服务 (TODO)
-├── client/                       ← 客户端示例 (TODO)
-├── third_party/Qwen3-TTS/        ← 官方仓库 (git submodule)
-└── workspace/models/             ← 下载的模型权重 (gitignored)
+│   ├── bash/
+│   │   ├── autorun.sh                ← Phase A: 一键构建环境 (9 步, host 端)
+│   │   ├── build_engines.sh          ← Phase B: docker run trtllm-build (容器端)
+│   │   ├── download_models.sh        ← 独立模型下载脚本
+│   │   ├── export_models.sh          ← 独立模型导出脚本
+│   │   ├── tools.sh                  ← lib/ 聚合入口
+│   │   └── lib/                      ← 模块化函数库
+│   │       ├── logging.sh            ← 彩色日志
+│   │       ├── utils.sh              ← retry, require_cmd, check_gpu
+│   │       ├── prerequisites.sh      ← 系统检查 (CUDA/磁盘/GPU/Docker)
+│   │       ├── venv.sh               ← Python 环境 (mamba>conda>venv)
+│   │       ├── pip.sh                ← pip 安装 (PyTorch/qwen-tts/onnx)
+│   │       ├── mirrors.sh            ← 国内镜像配置 (TUNA)
+│   │       ├── network.sh            ← 下载 (ModelScope/HF/git clone)
+│   │       └── docker.sh             ← NGC 容器自动选择 (驱动检测/兼容矩阵/镜像拉取)
+│   ├── export/                       ← 模型导出脚本
+│   │   ├── export_all.py             ← 总入口 (一键导出全部组件)
+│   │   ├── export_01_speech_tokenizer_encoder.py  ← Step 01 → ONNX
+│   │   ├── export_02_code2wav_decoder.py          ← Step 02 → ONNX
+│   │   ├── export_03_speaker_encoder.py           ← Step 03 → ONNX (base only)
+│   │   ├── export_04_talker_backbone.py           ← Step 04 → TRT-LLM checkpoint (engine 由 build_engines.sh)
+│   │   ├── export_05_code_predictor.py            ← Step 05 → ONNX (展开 + fallback)
+│   │   ├── export_06_embeddings.py                ← Step 06 → .pt 权重 + config
+│   │   └── utils.py                  ← 共享工具 (设备检测/dtype/导出/验证)
+│   └── python/                       ← Python 工具脚本 (TODO)
+├── model_repository/                  ← Triton 模型仓库 (TODO)
+├── gateway/                           ← TTS Gateway gRPC 服务 (TODO)
+├── client/                            ← 客户端示例 (TODO)
+├── third_party/Qwen3-TTS/             ← 官方仓库 (git submodule)
+└── workspace/models/                  ← 下载的模型权重 (gitignored)
 ```
 
 ## 关键依赖来源
@@ -55,6 +85,8 @@ Qwen3-TTS-Triton/
 - 模型权重官方推荐从 **ModelScope** 下载 (`modelscope download --model Qwen/...`)
 - Tokenizer: `Qwen/Qwen3-TTS-Tokenizer-12Hz` (所有模型共用)
 - TTS 模型变体: Base (voice clone) / CustomVoice (9 音色) / VoiceDesign
+- 模型变体选项: `base-1.7b` | `custom-1.7b` | `design-1.7b` | `base-0.6b` | `custom-0.6b` | `all-1.7b` | `all`（交互式选择，非显式指定时询问用户）
+- 版本钉扎: `scripts/bash/model_versions.conf` (防止上游模型更新破坏项目, `--pin` 命令锁定当前版本)
 
 ## 性能目标
 
@@ -65,14 +97,15 @@ Qwen3-TTS-Triton/
 
 ## 实施阶段
 
-- Phase 1: 模型导出 + 基础验证 + CP TRT 编译风险验证
-- Phase 2: TensorRT / TRT-LLM 优化
+- **Phase 1** (当前): 构建环境 + 模型导出 (Phase A) + TRT-LLM engine 编译 (Phase B) + 基础验证
+- Phase 2: TRT-LLM 集成验证 + Code Predictor TRT 优化
 - Phase 3: 流式 + Batch (Orchestrator / Session / Flow Control)
 - Phase 4: 优化 + 生产化 (CUDA Graphs, 监控, 压测)
 
 ## 约定
 
 - 所有对话使用**中文**
+- 代码注释使用**英语**
 - 详细技术细节参考 `docs/architecture.md`
 - Shell 脚本遵循现有 `scripts/bash/lib/` 的模块化风格（幂等、带重试、支持镜像）
 - Python 代码使用 BF16 精度，除非有明确理由

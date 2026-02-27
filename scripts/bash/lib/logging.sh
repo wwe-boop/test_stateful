@@ -15,7 +15,7 @@ _CLR_YELLOW='\033[0;33m'
 _CLR_BLUE='\033[0;34m'
 _CLR_RESET='\033[0m'
 
-log_info()  { echo -e "${_CLR_GREEN}[INFO]${_CLR_RESET}  $*"; }
+log_info()  { echo -e "${_CLR_GREEN}[INFO]${_CLR_RESET}  $*" >&2; }
 log_warn()  { echo -e "${_CLR_YELLOW}[WARN]${_CLR_RESET}  $*" >&2; }
 log_error() { echo -e "${_CLR_RED}[ERROR]${_CLR_RESET} $*" >&2; }
-log_step()  { echo -e "${_CLR_BLUE}[STEP]${_CLR_RESET}  $*"; }
+log_step()  { echo -e "${_CLR_BLUE}[STEP]${_CLR_RESET}  $*" >&2; }
