@@ -14,7 +14,7 @@
 #    - NVIDIA GPU with driver >= 550.54
 #    - Docker with NVIDIA Container Toolkit (docker run --gpus all)
 #    - Checkpoints at workspace/exported/<variant>/trtllm_checkpoint/
-#      (produced by: bash scripts/bash/autorun.sh  or  export_models.sh)
+#      (produced by: bash scripts/bash/autorun.sh setup  or  setup_env.sh / export_models.sh)
 #
 #  Usage:
 #    bash scripts/bash/build_engines.sh                          # auto everything
@@ -108,7 +108,7 @@ fi
 # ── Check checkpoints ──
 if [ ! -d "$EXPORTED_DIR" ]; then
     log_error "No exported models found at: $EXPORTED_DIR"
-    log_error "Run autorun.sh or export_models.sh first (Phase A)."
+    log_error "Run 'autorun.sh setup' or export_models.sh first (Phase A)."
     exit 1
 fi
 
@@ -136,7 +136,7 @@ else
     read -ra VARIANTS <<< "$(discover_checkpoints)"
     if [ ${#VARIANTS[@]} -eq 0 ]; then
         log_error "No TRT-LLM checkpoints found in $EXPORTED_DIR/*/trtllm_checkpoint/"
-        log_error "Run autorun.sh or export_models.sh first."
+        log_error "Run 'autorun.sh setup' or export_models.sh first."
         exit 1
     fi
     log_info "Discovered checkpoints: ${VARIANTS[*]}"
@@ -156,6 +156,9 @@ build_engine() {
 
     mkdir -p "$engine_dir"
 
+    # max_prompt_embedding_table_size: Talker receives inputs_embeds from
+    # the Orchestrator, so we need prompt_embedding_table to pass them in.
+    # Size = max_input_len (prefill embeds occupy up to this many positions).
     local docker_cmd=(
         docker run --rm --gpus all
         -v "$EXPORTED_DIR/$variant:/mnt/model"
@@ -168,6 +171,9 @@ build_engine() {
             --max_batch_size "$MAX_BATCH_SIZE"
             --max_input_len "$MAX_INPUT_LEN"
             --max_seq_len "$MAX_SEQ_LEN"
+            --max_prompt_embedding_table_size "$MAX_INPUT_LEN"
+            --gather_context_logits
+            --gather_all_token_logits
             --paged_kv_cache disable
     )
 

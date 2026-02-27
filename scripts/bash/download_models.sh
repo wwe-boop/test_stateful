@@ -2,7 +2,7 @@
 # ===========================================================================
 #  download_models.sh — Standalone Qwen3-TTS model downloader
 #
-#  Can be used independently of autorun.sh to download or update models.
+#  Can be used independently of setup_env.sh / autorun.sh to download or update models.
 #  Interactively asks which model variant to download when not specified.
 #  Supports version pinning via model_versions.conf.
 #

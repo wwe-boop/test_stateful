@@ -1,0 +1,314 @@
+#!/bin/bash
+# ===========================================================================
+#  status.sh — Pipeline status detection for all three phases
+#
+#  Functions: detect_phase_a_status, detect_phase_b_status,
+#             detect_phase_c_status, detect_available_variants,
+#             print_status_summary, detect_resume_point
+#  Depends:   lib/logging.sh, lib/utils.sh
+#
+#  Used by autorun.sh to provide an interactive status dashboard and
+#  determine which pipeline stages still need to run.
+# ===========================================================================
+
+[[ -n "${_LIB_STATUS_LOADED:-}" ]] && return 0
+_LIB_STATUS_LOADED=1
+
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${_LIB_DIR}/logging.sh"
+
+# Status is communicated via stdout (echo), not exit codes.
+# All detect_* functions return 0 to stay compatible with set -e.
+
+# ---------------------------------------------------------------------------
+#  detect_phase_a_status <exported_dir> [variant]
+#
+#  Checks Phase A artifacts under exported_dir:
+#    - tokenizer/ with ONNX models (shared)
+#    - <variant>/ with ONNX + checkpoint + weights
+#
+#  Outputs one of: none | partial | complete
+# ---------------------------------------------------------------------------
+detect_phase_a_status() {
+    local exported_dir="$1"
+    local variant="${2:-}"
+
+    if [ ! -d "$exported_dir" ]; then
+        echo "none"
+        return 0
+    fi
+
+    local has_tokenizer=false
+    local has_variant=false
+    local has_checkpoint=false
+    local has_onnx=false
+
+    # Shared tokenizer models
+    if [ -f "$exported_dir/tokenizer/speech_tokenizer_encoder.onnx" ] \
+        && [ -f "$exported_dir/tokenizer/code2wav_decoder.onnx" ]; then
+        has_tokenizer=true
+    fi
+
+    # Variant-specific artifacts
+    if [ -n "$variant" ]; then
+        local vdir="$exported_dir/$variant"
+        if [ -d "$vdir" ]; then
+            has_variant=true
+            [ -d "$vdir/trtllm_checkpoint" ] && [ -f "$vdir/trtllm_checkpoint/config.json" ] && has_checkpoint=true
+            ls "$vdir"/*.onnx &>/dev/null 2>&1 && has_onnx=true
+        fi
+    else
+        # Auto-detect any variant
+        for vdir in "$exported_dir"/*/; do
+            local vname
+            vname=$(basename "$vdir")
+            [[ "$vname" == "tokenizer" ]] && continue
+            has_variant=true
+            [ -d "$vdir/trtllm_checkpoint" ] && [ -f "$vdir/trtllm_checkpoint/config.json" ] && has_checkpoint=true
+            ls "$vdir"/*.onnx &>/dev/null 2>&1 && has_onnx=true
+            break
+        done
+    fi
+
+    if $has_tokenizer && $has_variant && $has_checkpoint && $has_onnx; then
+        echo "complete"
+    elif $has_tokenizer || $has_variant; then
+        echo "partial"
+    else
+        echo "none"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  detect_phase_b_status <exported_dir> [variant]
+#
+#  Checks for compiled TRT-LLM engines.
+#  Outputs: none | complete
+# ---------------------------------------------------------------------------
+detect_phase_b_status() {
+    local exported_dir="$1"
+    local variant="${2:-}"
+
+    if [ ! -d "$exported_dir" ]; then
+        echo "none"
+        return 0
+    fi
+
+    local check_dirs=()
+    if [ -n "$variant" ]; then
+        check_dirs=("$exported_dir/$variant")
+    else
+        for vdir in "$exported_dir"/*/; do
+            local vname
+            vname=$(basename "$vdir")
+            [[ "$vname" == "tokenizer" ]] && continue
+            check_dirs+=("$vdir")
+        done
+    fi
+
+    for vdir in "${check_dirs[@]}"; do
+        local engine_dir="$vdir/trtllm_engine"
+        if [ -d "$engine_dir" ] && ls "$engine_dir"/*.engine &>/dev/null 2>&1; then
+            echo "complete"
+            return 0
+        fi
+    done
+
+    echo "none"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  detect_phase_c_status [container_name]
+#
+#  Checks if a Triton container is running + healthy.
+#  Outputs: none | running | healthy
+# ---------------------------------------------------------------------------
+detect_phase_c_status() {
+    local container_name="${1:-qwen3-tts-triton}"
+
+    if ! command -v docker &>/dev/null; then
+        echo "none"
+        return 0
+    fi
+
+    if ! docker ps -q --filter "name=$container_name" 2>/dev/null | grep -q .; then
+        echo "none"
+        return 0
+    fi
+
+    local http_port="${TRITON_HTTP_PORT:-8000}"
+    if curl -sf "http://localhost:${http_port}/v2/health/ready" &>/dev/null; then
+        echo "healthy"
+    else
+        echo "running"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  detect_available_variants <exported_dir> <models_dir>
+#
+#  Lists variants with their pipeline stage (downloaded / exported / engine / deployed).
+#  Output: one line per variant, format "variant:stage"
+#    stage = downloaded | exported | engine_ready
+# ---------------------------------------------------------------------------
+detect_available_variants() {
+    local exported_dir="$1"
+    local models_dir="$2"
+
+    # Exported variants (Phase A output)
+    if [ -d "$exported_dir" ]; then
+        for vdir in "$exported_dir"/*/; do
+            [ ! -d "$vdir" ] && continue
+            local vname
+            vname=$(basename "$vdir")
+            [[ "$vname" == "tokenizer" ]] && continue
+
+            if [ -d "$vdir/trtllm_engine" ] && ls "$vdir/trtllm_engine"/*.engine &>/dev/null 2>&1; then
+                echo "${vname}:engine_ready"
+            elif [ -d "$vdir/trtllm_checkpoint" ] || ls "$vdir"/*.onnx &>/dev/null 2>&1; then
+                echo "${vname}:exported"
+            fi
+        done
+    fi
+
+    # Downloaded-only variants (not yet exported)
+    if [ -d "$models_dir" ]; then
+        for mdir in "$models_dir"/*/; do
+            [ ! -d "$mdir" ] && continue
+            local mname
+            mname=$(basename "$mdir")
+
+            # Map model directory names back to variant keys
+            local vkey=""
+            case "$mname" in
+                Qwen3-TTS-12Hz-1.7B-Base)        vkey="base-1.7b" ;;
+                Qwen3-TTS-12Hz-1.7B-CustomVoice) vkey="custom-1.7b" ;;
+                Qwen3-TTS-12Hz-1.7B-VoiceDesign) vkey="design-1.7b" ;;
+                Qwen3-TTS-12Hz-0.6B-Base)        vkey="base-0.6b" ;;
+                Qwen3-TTS-12Hz-0.6B-CustomVoice) vkey="custom-0.6b" ;;
+            esac
+
+            [ -z "$vkey" ] && continue
+
+            # Only report if not already exported
+            if [ ! -d "$exported_dir/$vkey" ]; then
+                echo "${vkey}:downloaded"
+            fi
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
+#  _status_icon <status_string>
+#  Maps status to a display character.
+# ---------------------------------------------------------------------------
+_status_icon() {
+    case "$1" in
+        complete|healthy|engine_ready) echo -e "${_CLR_GREEN}OK${_CLR_RESET}" ;;
+        partial|running|exported)      echo -e "${_CLR_YELLOW}partial${_CLR_RESET}" ;;
+        downloaded)                    echo -e "${_CLR_YELLOW}downloaded${_CLR_RESET}" ;;
+        none)                          echo -e "${_CLR_RED}--${_CLR_RESET}" ;;
+        *)                             echo "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+#  print_status_summary <repo_root> [variant]
+#
+#  Prints a formatted status panel showing all three phase states,
+#  detected GPU info, and available variants.
+# ---------------------------------------------------------------------------
+print_status_summary() {
+    local repo_root="$1"
+    local variant="${2:-}"
+    local exported_dir="$repo_root/workspace/exported"
+    local models_dir="$repo_root/workspace/models"
+
+    # Detect phase status
+    local phase_a phase_b phase_c
+    phase_a=$(detect_phase_a_status "$exported_dir" "$variant")
+    phase_b=$(detect_phase_b_status "$exported_dir" "$variant")
+    phase_c=$(detect_phase_c_status)
+
+    local pa_icon pb_icon pc_icon
+    pa_icon=$(_status_icon "$phase_a")
+    pb_icon=$(_status_icon "$phase_b")
+    pc_icon=$(_status_icon "$phase_c")
+
+    # Detect GPU (best effort)
+    local gpu_info="(not detected)"
+    if command -v nvidia-smi &>/dev/null; then
+        gpu_info=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader,nounits 2>/dev/null \
+            | head -1 | sed 's/,/ (driver /' | sed 's/$/)/' ) || gpu_info="(detection failed)"
+    fi
+
+    # Detect Docker
+    local docker_info="not installed"
+    if command -v docker &>/dev/null; then
+        if docker info &>/dev/null 2>&1; then
+            docker_info="OK"
+        else
+            docker_info="installed (daemon not running)"
+        fi
+    fi
+
+    echo ""
+    echo -e "${_CLR_BLUE}╔══════════════════════════════════════════════════════════╗${_CLR_RESET}"
+    echo -e "${_CLR_BLUE}║       Qwen3-TTS Triton — Pipeline Status                ║${_CLR_RESET}"
+    echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  GPU:    $gpu_info"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Docker: $docker_info"
+    echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase A (setup + export):     $pa_icon"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase B (TRT-LLM engines):    $pb_icon"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C (Triton deployment):  $pc_icon"
+    echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
+
+    # List available variants
+    local variants
+    variants=$(detect_available_variants "$exported_dir" "$models_dir")
+
+    if [ -n "$variants" ]; then
+        echo -e "${_CLR_BLUE}║${_CLR_RESET}  Available variants:"
+        while IFS=: read -r vname vstage; do
+            local vicon
+            vicon=$(_status_icon "$vstage")
+            echo -e "${_CLR_BLUE}║${_CLR_RESET}    $vname  ($vicon)"
+        done <<< "$variants"
+    else
+        echo -e "${_CLR_BLUE}║${_CLR_RESET}  No variants found (run setup first)"
+    fi
+
+    echo -e "${_CLR_BLUE}╚══════════════════════════════════════════════════════════╝${_CLR_RESET}"
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
+#  detect_resume_point <repo_root> [variant]
+#
+#  Determines which phase to resume from based on current state.
+#  Outputs: setup | build | deploy | done
+# ---------------------------------------------------------------------------
+detect_resume_point() {
+    local repo_root="$1"
+    local variant="${2:-}"
+    local exported_dir="$repo_root/workspace/exported"
+
+    local phase_a phase_b phase_c
+    phase_a=$(detect_phase_a_status "$exported_dir" "$variant")
+    phase_b=$(detect_phase_b_status "$exported_dir" "$variant")
+    phase_c=$(detect_phase_c_status)
+
+    if [ "$phase_c" = "healthy" ]; then
+        echo "done"
+    elif [ "$phase_b" = "complete" ]; then
+        echo "deploy"
+    elif [ "$phase_a" = "complete" ]; then
+        echo "build"
+    else
+        echo "setup"
+    fi
+}

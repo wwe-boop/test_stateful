@@ -124,7 +124,7 @@ TaskType
   - 适合异构部署 (不同 GPU 跑不同变体)
 ```
 
-> **关键发现**: 三个变体的 Talker Backbone 和 Code Predictor 权重可能**不完全相同** (fine-tuning 结果)。Phase 1 先验证: 加载 Base 权重运行 CustomVoice 的 prefill，对比输出差异。若差异显著则必须分开部署。
+> **关键发现 (已验证)**: 三个变体的 Talker/CP Transformer 层权重高度相似 (cosine >0.994)，但 **codec embedding 差异显著** (cosine ~0.60)。由于 codec embedding 参与每步 decode 的输入构造，引擎**不可跨变体共享**，必须按单变体部署。详见 `workspace/exported/multi_variant_report.json`。
 
 ---
 
@@ -353,10 +353,10 @@ Phase 3: 收尾
 
 上游 LLM (中, 10 tok/s):
   text 偶尔跟不上 decode step:
-  step 5: 文本还没到 → 插入 tts_pad_embed (1-2 个, 可容忍)
-  step 6: "界" 到达 → 恢复正常消费
-  step 7: 文本又没到 → 插入 pad
-  → 如果 pad 连续超过阈值 → PAUSE decode, 等文本
+  step 5: 文本还没到 → 插入 tts_pad_embed (1 个, pad_tolerance=1)
+  step 6: 文本仍未到 → 连续第 2 个 pad → PAUSE, 冻结 KV cache
+  step 6+: "界" 到达 → buffer ≥ resume_threshold → 恢复 decode
+  → 频繁 PAUSE → 自动升级为 ADAPTIVE 模式 (增大启动缓冲)
 
 上游 LLM (慢, 3 tok/s):
   频繁 starvation → 自动提升流控等级:
@@ -364,9 +364,26 @@ Phase 3: 收尾
   → 仍然频繁 starvation → SENTENCE_LEVEL (降级, 输出警告)
 ```
 
-**`tts_pad_embed` 的容忍度**:
+**`tts_pad_embed` 的容忍度** (基于实验验证):
+
+> **Pad 容忍度实验** (`scripts/python/pad_tolerance_experiment.py`):
+> 原始 PyTorch 模型 (CustomVoice 1.7B)，句中插入 0/1/2/3/5 个 `tts_pad_token_id`，
+> 中/英文各两次重复，对比音频质量：
+>
+> | Pad 数 | 中文音频时长变化 | 英文音频时长变化 | 音质观感 |
+> |--------|-----------------|-----------------|---------|
+> | 0 (基线) | — | — | 正常 |
+> | 1 | +1.6% | +8% | 可接受，轻微节奏变化 |
+> | **2** | **+9.5%** | **-1% ~ +0%** | **已出现可感知的停顿/拖音** |
+> | 3 | +21% | +32% | 明显异常：时长膨胀、多余停顿 |
+> | 5 | +20% | +47% | 严重退化：长拖音、节奏崩坏 |
+>
+> **结论**: pad=2 已存在质量风险；`pad_tolerance` 应设为 **1**（最多容忍 1 个连续 pad）。
+
 - 模型训练时在多个场景使用 pad（codec tags 填充、ICL 对齐、non_streaming 全程 pad）
-- 短暂的句中 pad（1-3 个连续）造成轻微分布偏移，但不会导致灾难性失败
+- 但这些训练场景中 pad 出现在**结构化位置**（序列头尾/对齐区），而非句中任意位置
+- 句中插入 1 个 pad 仅相当于 "文本暂缺一步"，模型可从后续真实文本恢复
+- 句中连续 ≥2 个 pad 开始偏离训练分布，产生可感知的停顿/拖音
 - 超过容忍阈值时，PAUSE decode 保护音频质量（KV cache 不依赖 wall-clock 时间）
 
 ---
@@ -514,10 +531,10 @@ n_nodes = len(model_onnx.graph.node)
 4. **编译器限制**：极大的静态图可能触发 TRT 的内部限制（如最大 node 数、最大 tensor 数），导致编译失败。
 
 **验证清单** (Phase 1 优先执行):
-- [ ] ONNX 导出成功 + initializer 数量验证
-- [ ] `trtexec --onnx=code_predictor_unrolled.onnx` 编译成功
-- [ ] TRT engine 精度对比 (vs PyTorch FP32, 偏差 < 1e-3)
-- [ ] TRT engine 性能 benchmark (B=1, B=8)
+- [x] ONNX 导出成功 + initializer 数量验证 — 154 inits, 8851 nodes (权重共享正确)
+- [x] TRT engine 编译成功 — 510 MB, 126.9s (TRT 10.9.0, FP16, RTX 4090 D)
+- [x] TRT engine 精度对比 — 4/15 token argmax 差异 (FP16 边界敏感，预期行为)
+- [x] TRT engine 性能 benchmark — B=1: 5.08ms, B=8: 6.13ms
 
 ### 5.6 Fallback 方案: 单 Stage TRT 引擎 + Python 循环
 
@@ -964,8 +981,8 @@ class TTSSession:
 
     # 自适应流控
     start_threshold: int = 1       # TOKEN_LEVEL 下为 1 (立即启动)
-    resume_threshold: int = 1      # PAUSED 恢复阈值
-    pad_tolerance: int = 3         # 连续 pad 容忍上限
+    resume_threshold: int = 2      # PAUSED 恢复需 ≥2 token 缓冲 (避免恢复后立即再 PAUSE)
+    pad_tolerance: int = 1         # 连续 pad 容忍上限 (实验验证: pad≥2 已有音质退化)
     consecutive_pad_count: int = 0 # 当前连续 pad 计数
     starvation_count: int = 0      # 累计 starvation 次数 (PAUSE 触发)
     good_segment_count: int = 0    # 连续无 starvation 的 segment 数
@@ -984,32 +1001,36 @@ class TTSSession:
         return len(self.trailing_text_hidden) - self.text_consumed_count
 
     def escalate_mode(self):
-        """starvation 后提升流控等级"""
+        """starvation 后提升流控等级 (multiplicative increase)"""
         if self.flow_mode == FlowMode.TOKEN_LEVEL:
             self.flow_mode = FlowMode.ADAPTIVE
-            self.start_threshold = 3
-            self.resume_threshold = 2
+            self.start_threshold = 4      # 首次跳入: 缓冲 4 步再启动
+            self.resume_threshold = 4     # PAUSE 恢复也需 4 步缓冲
         elif self.flow_mode == FlowMode.ADAPTIVE:
-            self.start_threshold = min(self.start_threshold + 2, 20)
-            if self.start_threshold >= 15:
+            self.start_threshold = min(self.start_threshold + 3, 20)
+            self.resume_threshold = self.start_threshold
+            if self.start_threshold >= 12:
                 self.flow_mode = FlowMode.SENTENCE_LEVEL
                 log.warning(f"[{self.session_id}] LLM too slow, "
                             "degrading to sentence-level")
         self.good_segment_count = 0
 
     def try_deescalate_mode(self):
-        """连续良好后降低流控等级"""
+        """连续良好后降低流控等级 (additive decrease)"""
         self.good_segment_count += 1
         if self.good_segment_count < 5:
             return
         if self.flow_mode == FlowMode.SENTENCE_LEVEL:
             self.flow_mode = FlowMode.ADAPTIVE
-            self.start_threshold = 10
+            self.start_threshold = 8
+            self.resume_threshold = 8
         elif self.flow_mode == FlowMode.ADAPTIVE:
-            self.start_threshold = max(self.start_threshold - 1, 1)
-            if self.start_threshold <= 1:
+            self.start_threshold = max(self.start_threshold - 1, 2)
+            self.resume_threshold = self.start_threshold
+            if self.start_threshold <= 2:
                 self.flow_mode = FlowMode.TOKEN_LEVEL
-                self.resume_threshold = 1
+                self.start_threshold = 1
+                self.resume_threshold = 2   # TOKEN_LEVEL 恢复仍需 2 步缓冲
         self.good_segment_count = 0
 ```
 
@@ -1110,6 +1131,8 @@ async def generation_loop(scheduler: BatchScheduler):
             if s.flow_state != FlowState.PAUSED:
                 continue
             if s.buffer_available >= s.resume_threshold:
+                # resume_threshold ≥ 2: 确保恢复后至少有 2 步真实文本,
+                # 避免恢复后立即再次 starvation
                 s.flow_state = FlowState.GENERATING
                 s.consecutive_pad_count = 0
             elif s.pause_duration_ms > s.max_pause_ms:
@@ -1135,6 +1158,15 @@ async def generation_loop(scheduler: BatchScheduler):
                         codec_ids_1_31], dim=1)
 
         # ── 6. 构造下一步 input (自适应流控核心) ──
+        #
+        # pad_tolerance = 1 (实验验证: pad≥2 即产生音质退化)
+        #
+        # 决策树:
+        #   有文本 → 消费真实文本 (最佳路径)
+        #   文本用完 + text_complete → 安全 pad (文本确实结束了)
+        #   文本用完 + 未 complete + 首次 pad → 容忍 1 个 pad, 继续生成
+        #   文本用完 + 未 complete + 已 pad 过 → PAUSE, 冻结 KV cache
+        #
         still_active = []
         batch_next_embeds = []
         for i, session in enumerate(active):
@@ -1148,17 +1180,16 @@ async def generation_loop(scheduler: BatchScheduler):
                 session.consecutive_pad_count = 0
 
             elif session.text_complete:
-                # 文本全部到达且消费完 → 安全 pad
+                # 文本全部到达且消费完 → 安全 pad (不计入 consecutive_pad_count)
                 text_add = tts_pad_embed
-                session.consecutive_pad_count = 0
 
             elif session.consecutive_pad_count < session.pad_tolerance:
-                # 短暂缺失: 容忍少量 pad, 不中断生成
+                # 首次 pad: 容忍 1 个, 继续生成 (给上游一步的余量)
                 text_add = tts_pad_embed
                 session.consecutive_pad_count += 1
 
             else:
-                # 持续缺失: PAUSE, 保护音频质量
+                # 连续第 2 个 pad: PAUSE, 保护音频质量
                 session.flow_state = FlowState.PAUSED
                 session.pause_start_time = time.time()
                 session.starvation_count += 1
@@ -1347,26 +1378,39 @@ TTS 服务应**自适应上游 LLM 的速度**，而非假设特定的 LLM 能�
 
 ### 11.2 三级流控模式 (自动升降级)
 
+> **设计约束** (来自 pad 容忍度实验):
+> pad_tolerance=1 意味着只有 1 步的缓冲余量。对比旧设计 (pad_tolerance=3)，
+> PAUSE 触发会更频繁。因此 TOKEN→ADAPTIVE 的升级需要更灵敏，
+> ADAPTIVE 的 start_threshold 初始值更高，回升路径更谨慎。
+
 ```
                     ┌─────────────┐
         首次启动 ──▶│ TOKEN_LEVEL │  start_threshold = 1
                     │ (最低延迟)   │  首个 token 到达即启动
                     └──────┬──────┘
-                           │ starvation 发生
+                           │ 首次 starvation
                            ▼
                     ┌─────────────┐
-                    │  ADAPTIVE   │  start_threshold = 3..20 (AIMD)
-                    │ (Jitter Buf)│  缓冲后再启动, 减少 starvation
+                    │  ADAPTIVE   │  start_threshold = 4..20 (AIMD)
+                    │ (Jitter Buf)│  resume_threshold = start_threshold
                     └──────┬──────┘
-                           │ start_threshold >= 15 (反复 starvation)
+                           │ start_threshold >= 12 (反复 starvation)
                            ▼
                     ┌─────────────┐
                     │  SENTENCE   │  等完整句子到达
                     │ (降级+警告) │  ⚠️ log.warning("LLM too slow")
                     └─────────────┘
 
-        回升路径 (连续 5 个 segment 无 starvation):
-          SENTENCE → ADAPTIVE(threshold=10) → ... → TOKEN_LEVEL
+        回升路径 (连续 5 个 chunk 无 starvation):
+          SENTENCE → ADAPTIVE(threshold=8) → 逐步降低 → TOKEN_LEVEL
+
+升级时 start_threshold 跳变 (multiplicative increase):
+  TOKEN → ADAPTIVE: start_threshold = 4 (首次跳入缓冲模式)
+  ADAPTIVE 内再次 starvation: start_threshold = min(threshold + 3, 20)
+
+降级时 start_threshold 线性恢复 (additive decrease):
+  每个无 starvation 的 chunk: start_threshold = max(threshold - 1, 1)
+  threshold 降至 2 → 回到 TOKEN_LEVEL
 ```
 
 ### 11.3 每步文本消费决策
@@ -1376,34 +1420,49 @@ TTS 服务应**自适应上游 LLM 的速度**，而非假设特定的 LLM 能�
 
   ┌─ 有文本可消费?
   │   YES → 使用 trailing_text_hidden[step]
-  │          consecutive_pad_count = 0
+  │          consecutive_pad_count = 0           ← 重置 pad 计数
   │
   │   NO  → 文本已全部到达 (text_complete)?
-  │           YES → 安全使用 tts_pad_embed (文本确实结束了)
+  │           YES → 安全使用 tts_pad_embed        ← 文本确实结束了, 不计入 pad 计数
   │
-  │           NO  → 连续 pad 次数 < pad_tolerance (default: 3)?
+  │           NO  → consecutive_pad_count < 1?    ← pad_tolerance = 1
   │                   YES → 插入 tts_pad_embed, 继续生成
-  │                          consecutive_pad_count += 1
-  │                          (轻微质量损失, 但无延迟)
+  │                          consecutive_pad_count = 1
+  │                          (1 个 pad: 轻微影响, 可接受)
   │
-  │                   NO  → ⚠️ PAUSE decode
+  │                   NO  → ⚠️ PAUSE decode        ← 已用完 1 步容忍额度
   │                          冻结 KV cache, 等待文本
   │                          starvation_count += 1
-  │                          escalate_mode()  ← 提升流控等级
+  │                          escalate_mode()
   └
+
+对比旧设计 (pad_tolerance=3):
+  旧: 最多连续 3 个 pad → 第 4 步才 PAUSE
+  新: 最多连续 1 个 pad → 第 2 步即 PAUSE
+  代价: PAUSE 更频繁 (更多微停顿)
+  收益: 杜绝 pad≥2 导致的时长膨胀和拖音
 ```
 
-### 11.4 为什么短暂 pad 是安全的
+### 11.4 pad 安全性分析 (实验修正)
 
 ```
 模型训练中 tts_pad_embed 的使用场景:
-  1. ICL prompt 中 text_len < codec_len 时的对齐填充
-  2. codec tags 区域的文本位置填充
-  3. non_streaming_mode=True 时, 整个 decode 阶段的 text 信号
+  1. ICL prompt 中 text_len < codec_len 时的对齐填充 (结构化位置)
+  2. codec tags 区域的文本位置填充 (序列头部, 固定模式)
+  3. non_streaming_mode=True 时, 整个 decode 阶段全程 pad (特殊模式)
 
-→ 模型已经学会 "tts_pad_embed = 没有新的文本内容"
-→ 短暂出现 (1-3 个) 只是告诉模型 "文本暂时没到, 先继续"
-→ 长时间出现 (>3 个) 开始偏离训练分布 → PAUSE 保护
+关键区别: 训练场景中的 pad 出现在结构化/可预测位置,
+          而句中任意位置的 pad 是 OOD (out-of-distribution)
+
+实验结果 (pad_tolerance_experiment.py):
+  pad=1: 时长变化 +1.6%~+8%, 在采样噪声范围边缘, 勉强可接受
+  pad=2: 时长变化 -1%~+9.5%, 出现可感知的停顿/拖音 ← 已有风险
+  pad=3: 时长变化 +21%~+32%, 明显异常
+  pad=5: 时长变化 +20%~+47%, 严重退化
+
+→ pad_tolerance = 1: 允许 1 个 pad (告诉模型 "文本暂缺一步")
+→ 第 2 步 pad 时立即 PAUSE, 保护音频质量
+→ PAUSE 的听感是自然停顿 (KV cache 冻结, 恢复后无损)
 ```
 
 ### 11.5 PAUSE 的安全性
@@ -1419,49 +1478,65 @@ PAUSE 时:
 ### 11.6 不同 LLM 速度下的行为
 
 ```
-场景 A: 快速 LLM (40 tok/s, e.g. 小模型/低负载)
-  TTS 消费: 12.5 tok/s
+场景 A: 快速 LLM (≥25 tok/s, e.g. 小模型/低负载)
+  TTS 消费: 12.5 tok/s → LLM 供给 ≥2x 消费
   buffer 持续充裕 → TOKEN_LEVEL 全程
-  pad 插入: 0 次
-  首包延迟: prefill(~20ms) + 25步(102ms) + code2wav(15ms) ≈ 137ms
+  pad 插入: 0 次, PAUSE: 0 次
+  首包延迟: prefill(~20ms) + 10步(41ms) + code2wav(15ms) ≈ 76ms
 
-场景 B: 中速 LLM (10 tok/s, e.g. 中等模型)
-  buffer 偶尔不足 → 偶尔插入 1-2 个 pad
-  pad_tolerance 内自行恢复, 不触发 PAUSE
-  模式保持 TOKEN_LEVEL
-  首包延迟: ~137ms (无额外等待)
-  音频质量: 极轻微影响, 几乎不可感知
+场景 B: 中速 LLM (13~25 tok/s, e.g. 中等模型)
+  供给略超消费, 偶尔抖动导致 buffer 瞬空
+  pad 插入: 偶尔 1 个 (pad_tolerance=1 内恢复)
+  极少触发 PAUSE → 模式保持 TOKEN_LEVEL
+  首包延迟: ~76ms
+  音频质量: 极轻微影响, 基本不可感知
 
-场景 C: 慢速 LLM (5 tok/s, e.g. 大模型/高负载)
-  频繁触发 pad_tolerance → PAUSE
-  TOKEN_LEVEL → ADAPTIVE (start_threshold=3)
-  PAUSE 频率降低, 偶尔仍 PAUSE
-  → start_threshold 继续增大 (5, 7, ...)
-  首包延迟: ~200-400ms (含 buffer 等待)
+场景 C: 中慢 LLM (8~13 tok/s, e.g. 中大模型)
+  供给接近消费速率, 频繁触发 pad → PAUSE
+  TOKEN_LEVEL → ADAPTIVE (start_threshold=4)
+  PAUSE 频率降低 (缓冲 4 步后再启动)
+  偶尔仍 PAUSE → start_threshold 升至 7, 10...
+  首包延迟: ~100-200ms (含 buffer 等待)
+  音频质量: 基本无 pad (PAUSE 保护, 听感为自然停顿)
 
-场景 D: 极慢 LLM (3 tok/s, e.g. 超大模型/过载)
+场景 D: 慢速 LLM (5~8 tok/s, e.g. 大模型/高负载)
   ADAPTIVE 仍频繁 PAUSE
-  → start_threshold 升至 15 → SENTENCE_LEVEL
+  → start_threshold 升至 12 → SENTENCE_LEVEL
   ⚠️ WARNING: "LLM too slow, degrading to sentence-level"
   等完整句子到达后生成
-  首包延迟: ~2-3s (句级等待)
-  音频质量: 最好 (句内无 pad)
+  首包延迟: ~1-3s (句级等待)
+  音频质量: 最好 (句内 0 pad, 无 PAUSE)
 
-场景 E: LLM 速度恢复
-  连续 5 个 chunk 无 starvation
-  SENTENCE → ADAPTIVE → TOKEN_LEVEL (自动回升)
+场景 E: 极慢 LLM (<5 tok/s, e.g. 超大模型/过载)
+  即使 SENTENCE_LEVEL 也可能句内生成速度不够快
+  (极端: 每个 sentence 都需要多次 PAUSE)
+  → 告警升级, 建议上游降负载或切小模型
+
+场景 F: LLM 速度恢复
+  连续 5 个 chunk 无 starvation:
+    start_threshold -= 1 (每个 chunk)
+    threshold 降至 2 → 回到 TOKEN_LEVEL
+  SENTENCE → ADAPTIVE(threshold=8) → 逐步 → TOKEN_LEVEL
 ```
+
+> **pad_tolerance=1 的核心权衡**:
+> - pad=3 的旧设计: PAUSE 少、但存在音质退化风险（连续 2-3 个 pad 即可感知）
+> - pad=1 的新设计: PAUSE 多（约 2-3x），但每次 PAUSE 只是微停顿（~几十 ms），
+>   听感类似说话人在思考，远优于 pad 导致的时长膨胀/拖音
 
 ### 11.7 关键参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `pad_tolerance` | 3 | 连续 pad 上限, 超过则 PAUSE |
+| `pad_tolerance` | **1** | 连续 pad 上限, 超过则 PAUSE (实验验证: pad≥2 已有音质退化) |
 | `start_threshold` | 1 (TOKEN_LEVEL) | 启动所需最小 buffer |
-| `resume_threshold` | 1 (TOKEN_LEVEL) | PAUSED 恢复所需 buffer |
+| `resume_threshold` | **2** | PAUSED 恢复所需 buffer (≥2 避免恢复后立即再 PAUSE) |
 | `max_pause_ms` | 3000 ms | 最大暂停时间, 超时终止 |
-| `escalate_threshold` | 15 | start_threshold 达此值时降级为 SENTENCE |
+| `escalate_initial` | **4** | TOKEN→ADAPTIVE 首次升级时的 start_threshold |
+| `escalate_increment` | **3** | ADAPTIVE 内再次 starvation 时 threshold 增量 |
+| `escalate_threshold` | **12** | start_threshold 达此值时降级为 SENTENCE |
 | `deescalate_window` | 5 chunks | 连续良好后尝试降级 |
+| `deescalate_step` | 1 | 每个无 starvation 的 chunk, threshold 减少的步长 |
 | `sentence_delimiters` | `。！？；，、.!?;,` | SENTENCE 模式的拆分标点 |
 
 ### 11.8 经典算法溯源
@@ -1480,16 +1555,16 @@ PAUSE 时:
 TCP Reno                          我们的设计
 ───────────────────────────────────────────────
 cwnd (拥塞窗口)                    start_threshold (启动缓冲)
-丢包事件                           starvation 事件
-cwnd += 1/cwnd (additive increase) threshold -= 1 (降低缓冲)
-cwnd /= 2 (multiplicative decrease) threshold += 2 (增大缓冲)
+丢包事件                           starvation 事件 (连续 pad ≥ pad_tolerance)
+cwnd += 1/cwnd (additive increase) threshold -= 1 per chunk (降低缓冲)
+cwnd /= 2 (multiplicative decrease) threshold += 3 per starvation (增大缓冲)
 Slow Start → Cong.Avoidance → Timeout   TOKEN → ADAPTIVE → SENTENCE
 
 WebRTC NetEq                       我们的设计
 ───────────────────────────────────────────────
 RTP 包到达抖动                      text token 到达抖动
 NORMAL (正常播放)                   有 text, 正常消费
-EXPAND (时域拉伸)                   pad_tolerance 内, 插 tts_pad_embed
+EXPAND (时域拉伸, 仅 1 帧)         pad_tolerance=1, 插 1 个 tts_pad_embed
 PLC (包丢失隐藏)                    PAUSE, 冻结 KV cache 等待
 FADE_TO_SILENCE                    max_pause_ms 超时, 终止
 
@@ -1498,7 +1573,7 @@ Circuit Breaker                    我们的设计
 CLOSED (正常)                      TOKEN_LEVEL
 HALF-OPEN (探测)                   ADAPTIVE
 OPEN (熔断, 降级)                   SENTENCE_LEVEL (+ WARNING)
-成功率恢复 → CLOSED                 连续 5 segment 无 starvation → 回升
+成功率恢复 → CLOSED                 连续 5 chunk 无 starvation → 回升
 ```
 
 ### 11.9 进阶优化: Delay Manager (v2)
@@ -1540,9 +1615,9 @@ class DelayManager:
     @property
     def recommended_mode(self) -> FlowMode:
         target = self.target_buffer
-        if target <= 2:
+        if target <= 1:
             return FlowMode.TOKEN_LEVEL
-        elif target <= 15:
+        elif target <= 12:
             return FlowMode.ADAPTIVE
         else:
             return FlowMode.SENTENCE_LEVEL
@@ -1842,7 +1917,10 @@ Qwen3-TTS-Triton/
 │   │   ├── export_code2wav_onnx.py
 │   │   └── export_embeddings.py
 │   ├── bash/
-│   │   ├── build_engines.sh                # Phase B: docker run trtllm-build
+│   │   ├── autorun.sh                  # 智能入口 (串联 A→B→C, 子命令/交互)
+│   │   ├── setup_env.sh                # Phase A: 环境搭建 + 模型导出
+│   │   ├── build_engines.sh            # Phase B: docker run trtllm-build
+│   │   ├── build_triton.sh             # Phase C: Triton 部署
 │   └── test/
 │       ├── test_pipeline.py
 │       ├── test_streaming.py
@@ -1886,62 +1964,172 @@ Qwen3-TTS-Triton/
 
 ## 15. 实施路线图 (AI 辅助编程)
 
-### 构建流程 (两阶段)
+### 构建流程 (三阶段)
 
-构建拆分为 **Phase A (host)** 和 **Phase B (Docker 容器)** 两个阶段，解决 TRT-LLM 环境依赖问题：
+#### 15.0.1 问题背景
 
+`setup_env.sh` (Phase A) 在 host 裸机上通过 conda/venv 管理依赖，但 TRT-LLM engine 编译需要：
+
+- TRT-LLM 运行时（依赖链: TensorRT 10.x + cuDNN + NCCL + OpenMPI + CUDA toolkit）
+- 与目标部署 GPU 匹配的 CUDA 版本
+- `pip install tensorrt_llm` 会拉入特定版本的 PyTorch，极易破坏现有环境
+
+Host 上直接 `pip install tensorrt_llm` 不可行：版本绑定太紧、依赖链太重、容易破坏 PyTorch 环境。构建流程天然分为两个阶段，对环境的要求不同。
+
+#### 15.0.2 三阶段流程
+
+```mermaid
+flowchart LR
+    subgraph hostPhase [Phase A: Host / 轻量环境]
+        A1[下载模型权重] --> A2[PyTorch 加载模型]
+        A2 --> A3["ONNX 导出 (01-03, 05)"]
+        A2 --> A4["TRT-LLM checkpoint 导出 (04)"]
+        A2 --> A5["Embedding 权重 (06)"]
+    end
+
+    subgraph trtPhase ["Phase B: TRT-LLM 容器 (GPU)"]
+        B1["trtllm-build: checkpoint → engine"]
+        B2["Code Predictor: ONNX → TRT engine (Phase 2)"]
+    end
+
+    A3 --> deployReady
+    A4 --> B1
+    A5 --> deployReady
+    B1 --> deployReady
+    B2 --> deployReady
+
+    subgraph deployPhase [Phase C: Triton 部署容器]
+        deployReady[所有 engine/ONNX/权重]
+    end
 ```
-Phase A — autorun.sh (host, conda/venv):
-  PyTorch + qwen_tts + ONNX 工具
-  → ONNX 模型 + TRT-LLM checkpoints + Embedding 权重
 
-Phase B — build_engines.sh (docker run --gpus all, NGC TRT-LLM 容器):
-  trtllm-build + checkpoint 文件
-  → TRT-LLM engine (.engine)
-```
-
-- **Phase A** 不需要 TRT-LLM，只需要 PyTorch 环境即可完成所有权重提取和 checkpoint 转换
-- **Phase B** 不需要 PyTorch/qwen_tts，只在 NGC 容器内运行 `trtllm-build` CLI
-- 两阶段通过 `workspace/exported/` 目录传递中间产物
+- **Phase A** (`setup_env.sh`) 只需要 PyTorch + qwen_tts + ONNX 工具，不需要 TRT-LLM
+- **Phase B** (`build_engines.sh`) 只需要 TRT-LLM (trtllm-build CLI) + checkpoint 文件，不需要 PyTorch/qwen_tts
+- **Phase C** (`build_triton.sh`) 只需要 Triton + engine 文件，不需要任何构建工具
+- 三阶段通过 `workspace/exported/` 目录传递中间产物
+- `autorun.sh` 作为智能入口串联三阶段，支持子命令和交互式引导
 
 ```bash
-# Phase A: 环境搭建 + 模型导出 (host)
+# 一键全流程（交互式选择模型）
 bash scripts/bash/autorun.sh
 
-# Phase B: TRT-LLM engine 编译 (Docker 容器)
-bash scripts/bash/build_engines.sh
+# 一键全流程（指定模型）
+bash scripts/bash/autorun.sh base-1.7b
+
+# 分阶段执行
+bash scripts/bash/autorun.sh setup     # Phase A only
+bash scripts/bash/autorun.sh build     # Phase B only
+bash scripts/bash/autorun.sh deploy    # Phase C only
+
+# 查看流水线状态
+bash scripts/bash/autorun.sh status
+
+# 也可直接调用各阶段脚本
+bash scripts/bash/setup_env.sh         # Phase A
+bash scripts/bash/build_engines.sh     # Phase B
+bash scripts/bash/build_triton.sh run  # Phase C
 ```
 
 单独运行 `export_models.sh`、`download_models.sh` 或 `scripts/export/` 下的 Python 脚本时，需先手动激活虚拟环境：
 
 ```bash
-# conda/mamba 环境（autorun.sh 默认创建名为 qwen3-tts 的 conda 环境）
+# conda/mamba 环境（setup_env.sh 默认创建名为 qwen3-tts 的 conda 环境）
 conda activate qwen3-tts
 
-# 或 venv 环境（若 autorun.sh 回退使用了 python3 venv）
+# 或 venv 环境（若 setup_env.sh 回退使用了 python3 venv）
 source <venv-path>/bin/activate
+```
+
+#### 15.0.3 方案选型记录
+
+**选定方案: 拆分构建脚本 (方案 A)**
+
+`setup_env.sh` 做 Phase A（ONNX + checkpoint 导出），`build_engines.sh` 通过 `docker run` 调用 TRT-LLM 容器做 Phase B，`build_triton.sh` 组装并部署 Triton。`autorun.sh` 智能串联三阶段。
+
+| 维度 | 方案 A: 拆分构建 (选定) | 方案 B: 多阶段 Docker 构建 | 方案 C: 构建容器 |
+|------|------------------------|--------------------------|----------------|
+| 实现方式 | `setup_env.sh` (host) + `build_engines.sh` (docker) + `build_triton.sh` (deploy), 由 `autorun.sh` 串联 | 单 Dockerfile, Stage 1 编译 + Stage 2 复制产物 | `Dockerfile.build` 容器内运行 `setup_env.sh` |
+| 优点 | 改动最小，职责清晰，灵活 | 一条 `docker build` 全搞定 | 环境一致性好 |
+| 缺点 | 多步操作 (autorun.sh 已串联) | 构建镜像 ~15GB+，改参数需重建 | TRT-LLM 容器 ~15GB+，venv 逻辑冗余 |
+| 灵活性 | checkpoint 导出与 engine 编译解耦，改参数只需重跑 Phase B | 修改参数需重建整个镜像 | 模型权重需 volume mount |
+| CI/CD | `autorun.sh all` 一步串联，CI 友好 | 一步构建，CI 友好 | 适合批量环境 |
+
+选择方案 A 的核心理由：
+- checkpoint 导出和 engine 编译**完全解耦** — 改 batch size 等参数只需重跑 Phase B (~分钟级)
+- 可以用不同版本的 TRT-LLM 容器编译 engine，不影响 Phase A
+- Host 无需安装 TRT-LLM，避免破坏 PyTorch 环境
+
+#### 15.0.4 Phase B: build_engines.sh 核心逻辑
+
+```bash
+# NGC TRT-LLM 容器镜像编译 engine
+# workspace/ 通过 volume mount 传入传出
+docker run --rm --gpus all \
+    -v "${REPO_ROOT}/workspace:/workspace" \
+    nvcr.io/nvidia/tritonserver:xx.xx-trtllm-python-py3 \
+    trtllm-build \
+        --checkpoint_dir /workspace/exported/<variant>/trtllm_checkpoint \
+        --output_dir /workspace/exported/<variant>/trtllm_engine \
+        --gemm_plugin bfloat16 \
+        --gpt_attention_plugin bfloat16 \
+        --max_batch_size 8 \
+        --max_input_len 512 \
+        --max_seq_len 4096 \
+        --paged_kv_cache disable
+```
+
+**容器镜像策略**:
+
+NGC 官方不提供同时包含 TRT-LLM 和 ONNX Runtime backend 的镜像。本项目通过多阶段构建解决:
+
+| 阶段 | 镜像 | 用途 |
+|------|------|------|
+| Phase B (engine build) | `tritonserver:xx.xx-trtllm-python-py3` | `trtllm-build` 编译 engine (原始 NGC 镜像) |
+| Phase C (Triton deploy) | `qwen3-tts-triton-base:xx.xx` | Triton 推理服务 (组合镜像: trtllm + ORT) |
+
+组合镜像通过 `build_triton.sh build-image` 构建，从 `xx.xx-py3` 全功能镜像中提取
+`/opt/tritonserver/backends/onnxruntime` 复制到 trtllm 镜像。两个 NGC 镜像共享
+CUDA/Ubuntu base layers，增量下载约 3-5 GB，最终组合镜像仅比 trtllm 大 ~500 MB。
+
+`scripts/bash/lib/docker.sh` 实现 NGC 兼容矩阵，根据 NVIDIA 驱动版本自动选择最佳兼容镜像。Phase A (`setup_env.sh`) 预检驱动/Docker 并打印推荐镜像，及早发现环境问题。
+
+**产物传递路径**:
+```
+setup_env.sh (host)        →  workspace/exported/<variant>/trtllm_checkpoint/
+build_engines.sh (docker)  →  workspace/exported/<variant>/trtllm_engine/
+build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 ```
 
 ### Phase 1: 模型导出 + 基础验证 + 风险阻断 (2-3 天)
 
 > **关键路径**: 第 5 项 (CP TRT 编译验证) 是全项目最大风险点，需最优先执行。
 
-1. [ ] Speaker Encoder → ONNX
-2. [ ] Speech Tokenizer Encoder → ONNX
-3. [ ] Code2Wav Decoder → ONNX (含 chunked decode)
-4. [ ] Talker Backbone → TRT-LLM checkpoint (Phase A) + engine build via build_engines.sh (Phase B)
-5. [ ] **⚠️ Code Predictor 无 KV Cache 展开版 + ONNX 导出 + TRT 编译验证** (5.5 节验证清单)
-   - 若失败 → 立即切换 fallback: 单 stage ONNX + TRT (5.6 节)
-6. [ ] 单请求 Python 端到端验证 (PyTorch + ONNX)
-7. [ ] **pad 容忍度实验**: 原始 PyTorch 模型，句中插入 1/2/3/5 个 pad，A/B 对比音频质量
-8. [ ] **多任务 prefill 验证**: 分别用 Base/CustomVoice/VoiceDesign 权重走通 prefill 构建 (4.1 节)
+1. [x] Speaker Encoder → ONNX
+2. [x] Speech Tokenizer Encoder → ONNX
+3. [x] Code2Wav Decoder → ONNX (含 chunked decode)
+4. [x] Talker Backbone → TRT-LLM checkpoint (Phase A) + engine build via build_engines.sh (Phase B)
+5. [x] **⚠️ Code Predictor 无 KV Cache 展开版 + ONNX 导出 + TRT 编译验证** (5.5 节验证清单)
+   - Unrolled: 编译通过 (510 MB engine, 126.9s build), B=1 5.08ms / B=8 6.13ms, 少量 token argmax 差异(低精度预期行为)
+   - Single-stage: 编译通过 (151.5 MB), B=1 0.39ms / B=8 0.41ms, cosine similarity 高
+   - 结论: **Unrolled 方案可行，无需 fallback**
+6. [x] 单请求 Python 端到端验证 (PyTorch + ONNX)
+   - Stage A (Prefill 权重): text_embedding/text_projection/codec_embedding/codec_head/special_embeddings 全部 cosine=1.000000
+   - Stage B (Talker Backbone): PyTorch prefill+decode 基线建立
+   - Stage C (Code Predictor): PyTorch vs ONNX **15/15 tokens 完全匹配** (5 步 decode 循环 100% 匹配)
+   - Stage D (Code2Wav): ONNX decoder 可运行 (输出 shape 不同因采样率差异, 非精度问题)
+   - Stage E (Decode Loop): 5 步全流程 PyTorch vs ONNX codec tokens **完全一致**
+7. [x] **pad 容忍度实验**: 原始 PyTorch 模型，句中插入 1/2/3/5 个 pad，A/B 对比音频质量
+8. [x] **多任务 prefill 验证**: 分别用 Base/CustomVoice/VoiceDesign 权重走通 prefill 构建 (4.1 节)
    - 对比三种 task_type 的 prefill 输出与原始 PyTorch 的 cosine similarity
    - 验证三种变体的 Talker/CP 权重差异 (2.2.3 节: 是否可共享引擎)
+   - **0.6B (base vs custom)**: Talker avg=0.999935/min=0.999781, CP avg=0.999952/min=0.999888, Codec embedding=0.615
+   - **1.7B (custom vs design)**: Talker avg=0.994314/min=0.977611, CP avg=0.999297/min=0.998164, Codec embedding=0.604
+   - **结论: 引擎不可共享** — Talker/CP 权重 cosine 高但 codec embedding 差异大 (0.60), 必须分变体部署
 
 ### Phase 2: TensorRT / TRT-LLM 优化 (3-5 天)
 
 9. [ ] **Talker Backbone TRT-LLM 集成验证** (build_engines.sh 编译 engine + 精度对比, 6.0/6.2 节)
-10. [ ] Code Predictor ONNX → TRT (BF16, 验证权重共享)
+10. [ ] Code Predictor ONNX → TRT (BF16, 验证权重共享) — Phase 1 验证使用了 FP16 (bug), 已修正为 BF16, 需删除旧 .plan 重建
     - 或 fallback 方案的 single-stage TRT engine
 11. [ ] Codec Embedding Sum 优化 (3D gather, 2.1 节)
 12. [ ] 单请求 TRT 端到端验证 + BF16 长序列精度对比 (6.5 节)

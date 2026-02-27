@@ -112,16 +112,18 @@ def _extract_talker_weights(model) -> tuple[dict, dict]:
 #   model.norm.weight
 #   lm_head.weight
 #
-# TRT-LLM Qwen:
+# TRT-LLM Qwen (0.19.0):
 #   transformer.layers.{i}.attention.qkv.weight         (fused Q+K+V)
+#   transformer.layers.{i}.attention.qkv.bias           (zero — Qwen3 has no attn bias)
 #   transformer.layers.{i}.attention.dense.weight        (o_proj)
 #   transformer.layers.{i}.attention.q_norm.weight       (Qwen3 QK-Norm)
 #   transformer.layers.{i}.attention.k_norm.weight       (Qwen3 QK-Norm)
-#   transformer.layers.{i}.mlp.gate.weight               (gate_up fused)
+#   transformer.layers.{i}.mlp.gate.weight               (gate_proj, NOT fused)
+#   transformer.layers.{i}.mlp.fc.weight                 (up_proj)
 #   transformer.layers.{i}.mlp.proj.weight               (down_proj)
 #   transformer.layers.{i}.input_layernorm.weight
 #   transformer.layers.{i}.post_layernorm.weight
-#   transformer.vocab_embedding.weight                   (unused, we receive inputs_embeds)
+#   transformer.vocab_embedding.weight                   (placeholder, Talker uses inputs_embeds)
 #   transformer.ln_f.weight
 #   lm_head.weight
 
@@ -132,14 +134,23 @@ def _map_weights_to_trtllm(
 ) -> dict:
     """Map Talker HF weights to TRT-LLM checkpoint naming convention.
 
-    Fuses separate Q, K, V projections into a single QKV weight tensor
-    as required by TRT-LLM's optimized attention kernels.
+    TRT-LLM 0.19.0 Qwen3 expects per-layer:
+      attention.qkv.weight  — fused Q+K+V
+      attention.qkv.bias    — zero bias (Qwen3 has no attn bias, but TRT-LLM allocates it)
+      attention.dense.weight
+      mlp.gate.weight       — gate_proj (NOT fused with up)
+      mlp.fc.weight         — up_proj
+      mlp.proj.weight       — down_proj
+      input_layernorm.weight
+      post_layernorm.weight
+    Plus: transformer.vocab_embedding.weight, transformer.ln_f.weight, lm_head.weight
     """
     trtllm_state = OrderedDict()
     n_layers = config["num_hidden_layers"]
     num_heads = config["num_attention_heads"]
     num_kv_heads = config["num_key_value_heads"]
     head_dim = config["head_dim"]
+    hidden_size = config["hidden_size"]
 
     for i in range(n_layers):
         prefix_hf = f"model.layers.{i}"
@@ -151,6 +162,10 @@ def _map_weights_to_trtllm(
         v_w = hf_state[f"{prefix_hf}.self_attn.v_proj.weight"].to(dtype)
         qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
         trtllm_state[f"{prefix_trt}.attention.qkv.weight"] = qkv_w
+
+        # QKV bias — Qwen3 has no attention bias, but TRT-LLM expects the tensor
+        qkv_bias = torch.zeros(qkv_w.shape[0], dtype=dtype)
+        trtllm_state[f"{prefix_trt}.attention.qkv.bias"] = qkv_bias
 
         # O projection
         trtllm_state[f"{prefix_trt}.attention.dense.weight"] = (
@@ -165,11 +180,13 @@ def _map_weights_to_trtllm(
             hf_state[f"{prefix_hf}.self_attn.k_norm.weight"].to(dtype)
         )
 
-        # Fuse gate + up into single tensor for TRT-LLM SwiGLU
-        gate_w = hf_state[f"{prefix_hf}.mlp.gate_proj.weight"].to(dtype)
-        up_w = hf_state[f"{prefix_hf}.mlp.up_proj.weight"].to(dtype)
-        gate_up_w = torch.cat([gate_w, up_w], dim=0)
-        trtllm_state[f"{prefix_trt}.mlp.gate.weight"] = gate_up_w
+        # MLP: gate_proj → mlp.gate, up_proj → mlp.fc (separate, NOT fused)
+        trtllm_state[f"{prefix_trt}.mlp.gate.weight"] = (
+            hf_state[f"{prefix_hf}.mlp.gate_proj.weight"].to(dtype)
+        )
+        trtllm_state[f"{prefix_trt}.mlp.fc.weight"] = (
+            hf_state[f"{prefix_hf}.mlp.up_proj.weight"].to(dtype)
+        )
 
         # Down projection
         trtllm_state[f"{prefix_trt}.mlp.proj.weight"] = (
@@ -184,6 +201,12 @@ def _map_weights_to_trtllm(
             hf_state[f"{prefix_hf}.post_attention_layernorm.weight"].to(dtype)
         )
 
+    # Vocab embedding — Talker receives inputs_embeds so this is unused,
+    # but TRT-LLM model structure requires it
+    trtllm_state["transformer.vocab_embedding.weight"] = torch.zeros(
+        config["vocab_size"], hidden_size, dtype=dtype,
+    )
+
     # Final LayerNorm
     trtllm_state["transformer.ln_f.weight"] = (
         hf_state["model.norm.weight"].to(dtype)
@@ -195,6 +218,21 @@ def _map_weights_to_trtllm(
     )
 
     return trtllm_state
+
+
+def _convert_rope_scaling(rope_scaling: dict | None) -> dict | None:
+    """Convert HF rope_scaling to TRT-LLM format.
+
+    HF uses "type": "default" / "rope_type": "default" for standard RoPE
+    (no scaling), but TRT-LLM doesn't recognize "default" as a valid
+    RotaryScalingType. Return None to disable scaling in that case.
+    """
+    if rope_scaling is None:
+        return None
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type in (None, "default"):
+        return None
+    return {"type": rope_type}
 
 
 def _write_trtllm_checkpoint(
@@ -226,10 +264,11 @@ def _write_trtllm_checkpoint(
         "head_size": config["head_dim"],
         "hidden_act": config["hidden_act"],
         "max_position_embeddings": config["max_position_embeddings"],
+        "seq_length": config["max_position_embeddings"],
         "norm_epsilon": config["rms_norm_eps"],
         "position_embedding_type": "rope_gpt_neox",
         "rotary_base": config["rope_theta"],
-        "rotary_scaling": config.get("rope_scaling"),
+        "rotary_scaling": _convert_rope_scaling(config.get("rope_scaling")),
         "qwen_type": "qwen3",
         "qk_layernorm": True,
         "mapping": {

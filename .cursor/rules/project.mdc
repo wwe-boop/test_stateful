@@ -29,13 +29,15 @@ alwaysApply: true
 ## 三阶段构建
 
 ```
-Phase A — autorun.sh (host):     PyTorch + qwen_tts → ONNX 模型 + TRT-LLM checkpoints + .pt 权重
-Phase B — build_engines.sh (Docker):  NGC TRT-LLM 容器 → trtllm-build → .engine 文件
-Phase C — 部署镜像 (Triton):     engines + Orchestrator Python 后端 (无 PyTorch)
+autorun.sh                          — 智能入口 (串联 A→B→C, 子命令/交互式引导)
+Phase A — setup_env.sh (host):      PyTorch + qwen_tts → ONNX 模型 + TRT-LLM checkpoints + .pt 权重
+Phase B — build_engines.sh (Docker): NGC TRT-LLM 容器 → trtllm-build → .engine 文件
+Phase C — build_triton.sh (Triton):  engines + Orchestrator Python 后端 (无 PyTorch)
 ```
 
 - Phase A 不需要 TRT-LLM，只需 PyTorch + qwen_tts + ONNX 工具
-- Phase B 通过 `docker run --gpus all` 在 NGC 容器内运行 `trtllm-build`，不需要 PyTorch
+- Phase B 通过 `docker run --gpus all` 在 NGC `trtllm-python-py3` 容器内运行 `trtllm-build`，不需要 PyTorch
+- Phase C 使用组合镜像 `qwen3-tts-triton-base:xx.xx`（trtllm + ONNX Runtime backend），由 `build_triton.sh build-image` 构建
 - 容器镜像根据 NVIDIA 驱动版本自动选择最佳兼容版本（`lib/docker.sh` NGC 兼容矩阵）
 - Phase A 会预检驱动/Docker 并打印推荐镜像，及早发现环境问题
 - 两阶段通过 `workspace/exported/` 目录传递中间产物
@@ -48,8 +50,10 @@ Qwen3-TTS-Triton/
 ├── docs/architecture.md              ← 详细架构设计 (1650+ 行，核心参考文档)
 ├── scripts/
 │   ├── bash/
-│   │   ├── autorun.sh                ← Phase A: 一键构建环境 (9 步, host 端)
+│   │   ├── autorun.sh                ← 智能入口 (串联 A→B→C, 子命令/交互, 状态面板)
+│   │   ├── setup_env.sh              ← Phase A: 构建环境 (9 步, host 端)
 │   │   ├── build_engines.sh          ← Phase B: docker run trtllm-build (容器端)
+│   │   ├── build_triton.sh           ← Phase C: Triton 部署 (assemble/pull/run/build/stop)
 │   │   ├── download_models.sh        ← 独立模型下载脚本
 │   │   ├── export_models.sh          ← 独立模型导出脚本
 │   │   ├── tools.sh                  ← lib/ 聚合入口
@@ -61,7 +65,9 @@ Qwen3-TTS-Triton/
 │   │       ├── pip.sh                ← pip 安装 (PyTorch/qwen-tts/onnx)
 │   │       ├── mirrors.sh            ← 国内镜像配置 (TUNA)
 │   │       ├── network.sh            ← 下载 (ModelScope/HF/git clone)
-│   │       └── docker.sh             ← NGC 容器自动选择 (驱动检测/兼容矩阵/镜像拉取)
+│   │       ├── docker.sh             ← NGC 容器自动选择 (驱动检测/兼容矩阵/镜像拉取)
+│   │       ├── triton.sh             ← Triton model_repository 组装/容器管理
+│   │       └── status.sh             ← 三阶段流水线状态检测
 │   ├── export/                       ← 模型导出脚本
 │   │   ├── export_all.py             ← 总入口 (一键导出全部组件)
 │   │   ├── export_01_speech_tokenizer_encoder.py  ← Step 01 → ONNX

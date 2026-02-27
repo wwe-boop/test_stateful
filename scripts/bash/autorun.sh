@@ -1,32 +1,44 @@
 #!/bin/bash
 # ===========================================================================
-#  autorun.sh — One-command BUILD environment setup for Qwen3-TTS Triton
+#  autorun.sh — Intelligent launcher for Qwen3-TTS Triton pipeline
 #
-#  Sets up the environment needed to export model components to ONNX / TRT
-#  and prepare everything for the final Triton deployment image.
-#
-#  This is the BUILD phase — the final Triton image does NOT need PyTorch
-#  or the qwen-tts package; it only ships the exported engines.
-#
-#  Steps: prerequisites → submodule → workspace → mirrors → venv → deps
-#         → models → export deps → export
-#
-#  Engine build (TRT-LLM) is a separate step — run build_engines.sh after
-#  this script completes.  See docs/architecture.md for the two-phase flow.
+#  Smart entry point that orchestrates all three build phases:
+#    Phase A (setup):  Environment + model export    → setup_env.sh
+#    Phase B (build):  TRT-LLM engine compilation    → build_engines.sh
+#    Phase C (deploy): Triton server deployment       → build_triton.sh
 #
 #  Usage:
-#    bash scripts/bash/autorun.sh [workdir] [env_name] [python_version] [model_variant]
+#    bash scripts/bash/autorun.sh                    # interactive mode
+#    bash scripts/bash/autorun.sh base-1.7b          # full pipeline for variant
+#    bash scripts/bash/autorun.sh all [options]       # full pipeline (explicit)
+#    bash scripts/bash/autorun.sh setup [options]     # Phase A only
+#    bash scripts/bash/autorun.sh build [options]     # Phase B only
+#    bash scripts/bash/autorun.sh deploy [options]    # Phase C only
+#    bash scripts/bash/autorun.sh status              # show pipeline status
+#    bash scripts/bash/autorun.sh stop                # stop Triton server
 #
-#  Environment variables (override any positional arg):
-#    WORKDIR          workspace directory       (default: <repo>/workspace)
-#    ENV_NAME         Python env name           (default: qwen3-tts)
-#    PYTHON_VERSION   Python version            (default: 3.10)
-#    MODEL_VARIANT    Model variant to download (default: base-1.7b)
-#    MODEL_SOURCE     Download source           (auto | hf | modelscope)
-#    SKIP_MODELS      Set to 1 to skip model download
-#    SKIP_DEPS        Set to 1 to skip dependency installation
-#    SKIP_EXPORT      Set to 1 to skip ONNX model export
-#    CONFIGURE_MIRRORS  Mirror config (auto | china | skip)  (default: auto)
+#  Options:
+#    --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, ...)
+#    --yes, -y               Skip confirmations (non-interactive)
+#    --dry-run               Show what would be done
+#    -h, --help              Show full help
+#
+#    Phase A (forwarded to setup_env.sh):
+#      --python <ver>        Python version (default: 3.10)
+#      --env-name <name>     Virtual env name (default: qwen3-tts)
+#      --source <src>        Model source (auto|hf|modelscope)
+#      --skip-models         Skip model download
+#      --skip-deps           Skip dependency installation
+#      --skip-export         Skip model export
+#
+#    Phase B (forwarded to build_engines.sh):
+#      --max-batch-size <N>  TRT-LLM max batch (default: 8)
+#      --image <uri>         Override NGC container image
+#      --dtype <type>        Engine precision (default: bfloat16)
+#
+#    Phase C (forwarded to build_triton.sh):
+#      --grpc-port <port>    gRPC port (default: 8001)
+#      --http-port <port>    HTTP port (default: 8000)
 # ===========================================================================
 
 set -euo pipefail
@@ -35,250 +47,403 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 source "${SCRIPT_DIR}/tools.sh"
 
-WORKDIR="${WORKDIR:-${1:-${REPO_ROOT}/workspace}}"
-ENV_NAME="${ENV_NAME:-${2:-qwen3-tts}}"
-PYTHON_VERSION="${PYTHON_VERSION:-${3:-3.10}}"
-MODEL_VARIANT="${MODEL_VARIANT:-${4:-}}"
-MODEL_SOURCE="${MODEL_SOURCE:-auto}"
-SKIP_MODELS="${SKIP_MODELS:-0}"
-SKIP_DEPS="${SKIP_DEPS:-0}"
-SKIP_EXPORT="${SKIP_EXPORT:-0}"
+# ── Known model variant names (for auto-detection of positional args) ──
+_KNOWN_VARIANTS="base-1.7b custom-1.7b design-1.7b base-0.6b custom-0.6b all-1.7b all"
+_KNOWN_COMMANDS="all setup build deploy status stop help"
 
-SUBMODULE_PATH="third_party/Qwen3-TTS"
-MODEL_DIR="${WORKDIR}/models"
+_is_variant() { [[ " $_KNOWN_VARIANTS " == *" $1 "* ]]; }
+_is_command() { [[ " $_KNOWN_COMMANDS " == *" $1 "* ]]; }
 
-# ---- Banner ---------------------------------------------------------------
+# ── Defaults ──
+COMMAND=""
+VARIANT=""
+DRY_RUN=false
+YES_MODE=false
 
-show_banner() {
+# Phase A forwarding
+SETUP_ARGS=()
+PYTHON_VERSION=""
+ENV_NAME=""
+MODEL_SOURCE=""
+SKIP_MODELS=false
+SKIP_DEPS=false
+SKIP_EXPORT=false
+
+# Phase B forwarding
+BUILD_ARGS=()
+MAX_BATCH_SIZE=""
+BUILD_IMAGE=""
+ENGINE_DTYPE=""
+
+# Phase C forwarding
+DEPLOY_ARGS=()
+GRPC_PORT=""
+HTTP_PORT=""
+
+# ── Help ──
+
+usage() {
+    cat << 'EOF'
+Usage: autorun.sh [command] [model_variant] [options]
+
+Commands:
+  all               Full pipeline: setup → build → deploy (default)
+  setup             Phase A only (environment + model export)
+  build             Phase B only (TRT-LLM engine compilation)
+  deploy            Phase C only (Triton server deployment)
+  status            Show pipeline status
+  stop              Stop Triton server
+  help              Show this help
+
+If no command is given, launches interactive mode.
+If a model variant name is given without a command, runs the full pipeline.
+
+Options:
+  --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, design-1.7b,
+                          base-0.6b, custom-0.6b, all-1.7b, all)
+  --yes, -y               Skip confirmations (non-interactive)
+  --dry-run               Show what would be done without executing
+  -h, --help              Show this help
+
+Phase A options (forwarded to setup_env.sh):
+  --python <version>      Python version (default: 3.10)
+  --env-name <name>       Virtual env name (default: qwen3-tts)
+  --source <source>       Model download source (auto|hf|modelscope)
+  --skip-models           Skip model download
+  --skip-deps             Skip dependency installation
+  --skip-export           Skip model export
+
+Phase B options (forwarded to build_engines.sh):
+  --max-batch-size <N>    Max batch size (default: 8)
+  --image <uri>           Override NGC container image
+  --dtype <type>          Engine precision (default: bfloat16)
+
+Phase C options (forwarded to build_triton.sh):
+  --grpc-port <port>      gRPC port (default: 8001)
+  --http-port <port>      HTTP port (default: 8000)
+
+Examples:
+  autorun.sh                          # interactive guided setup
+  autorun.sh base-1.7b                # full pipeline for base-1.7b
+  autorun.sh all -m custom-1.7b       # full pipeline for custom-1.7b
+  autorun.sh setup --skip-export      # Phase A without export
+  autorun.sh build --dtype float16    # Phase B with fp16
+  autorun.sh deploy                   # Phase C (start Triton)
+  autorun.sh status                   # show pipeline status
+EOF
+}
+
+# ── Argument parsing ──
+# Handles: autorun.sh [command] [variant] [--options...]
+# Smart detection: first positional arg can be a command or variant name.
+
+parse_args() {
+    # First pass: detect command and variant from positional args
+    local positionals=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --variant|-m)       VARIANT="$2"; shift 2 ;;
+            --yes|-y)           YES_MODE=true; shift ;;
+            --dry-run)          DRY_RUN=true; shift ;;
+            --help|-h)          usage; exit 0 ;;
+
+            # Phase A
+            --python)           PYTHON_VERSION="$2"; shift 2 ;;
+            --env-name)         ENV_NAME="$2"; shift 2 ;;
+            --source)           MODEL_SOURCE="$2"; shift 2 ;;
+            --skip-models)      SKIP_MODELS=true; shift ;;
+            --skip-deps)        SKIP_DEPS=true; shift ;;
+            --skip-export)      SKIP_EXPORT=true; shift ;;
+
+            # Phase B
+            --max-batch-size)   MAX_BATCH_SIZE="$2"; shift 2 ;;
+            --image)            BUILD_IMAGE="$2"; shift 2 ;;
+            --dtype)            ENGINE_DTYPE="$2"; shift 2 ;;
+
+            # Phase C
+            --grpc-port)        GRPC_PORT="$2"; shift 2 ;;
+            --http-port)        HTTP_PORT="$2"; shift 2 ;;
+
+            -*)
+                log_error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+            *)
+                positionals+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Resolve positional arguments
+    for pos in "${positionals[@]}"; do
+        if [ -z "$COMMAND" ] && _is_command "$pos"; then
+            COMMAND="$pos"
+        elif [ -z "$VARIANT" ] && _is_variant "$pos"; then
+            VARIANT="$pos"
+            # Bare variant without command implies "all"
+            [ -z "$COMMAND" ] && COMMAND="all"
+        else
+            log_error "Unexpected argument: $pos"
+            usage
+            exit 1
+        fi
+    done
+}
+
+# ── Build forwarding arg arrays ──
+
+build_forward_args() {
+    # Phase A args
+    SETUP_ARGS=()
+    if [ -n "$VARIANT" ]; then
+        # Pass variant via env var (setup_env.sh reads MODEL_VARIANT)
+        export MODEL_VARIANT="$VARIANT"
+    fi
+    if [ -n "$PYTHON_VERSION" ]; then
+        SETUP_ARGS+=('' '' '')  # placeholder positional args
+        SETUP_ARGS[2]="$PYTHON_VERSION"
+    fi
+    if [ -n "$MODEL_SOURCE" ]; then
+        export MODEL_SOURCE="$MODEL_SOURCE"
+    fi
+    if $SKIP_MODELS; then export SKIP_MODELS=1; fi
+    if $SKIP_DEPS; then export SKIP_DEPS=1; fi
+    if $SKIP_EXPORT; then export SKIP_EXPORT=1; fi
+    if [ -n "$ENV_NAME" ]; then export ENV_NAME="$ENV_NAME"; fi
+
+    # Phase B args
+    BUILD_ARGS=()
+    if [ -n "$VARIANT" ]; then BUILD_ARGS+=(--variant "$VARIANT"); fi
+    if [ -n "$MAX_BATCH_SIZE" ]; then BUILD_ARGS+=(--max-batch-size "$MAX_BATCH_SIZE"); fi
+    if [ -n "$BUILD_IMAGE" ]; then BUILD_ARGS+=(--image "$BUILD_IMAGE"); fi
+    if [ -n "$ENGINE_DTYPE" ]; then BUILD_ARGS+=(--dtype "$ENGINE_DTYPE"); fi
+    if $DRY_RUN; then BUILD_ARGS+=(--dry-run); fi
+
+    # Phase C args
+    DEPLOY_ARGS=()
+    if [ -n "$VARIANT" ]; then DEPLOY_ARGS+=(--variant "$VARIANT"); fi
+    if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
+    if [ -n "$GRPC_PORT" ]; then
+        export TRITON_GRPC_PORT="$GRPC_PORT"
+    fi
+    if [ -n "$HTTP_PORT" ]; then
+        export TRITON_HTTP_PORT="$HTTP_PORT"
+    fi
+    if $DRY_RUN; then DEPLOY_ARGS+=(--dry-run); fi
+}
+
+# ── Phase runners ──
+
+run_phase_a() {
+    log_step "Phase A: Environment Setup & Model Export"
+    echo ""
+
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would run: bash setup_env.sh"
+        [ -n "$VARIANT" ] && log_info "  MODEL_VARIANT=$VARIANT"
+        return 0
+    fi
+
+    bash "${SCRIPT_DIR}/setup_env.sh" || {
+        log_error "Phase A failed."
+        log_info  "Fix the issue and re-run: bash scripts/bash/autorun.sh setup"
+        return 1
+    }
+}
+
+run_phase_b() {
+    log_step "Phase B: TRT-LLM Engine Build"
+    echo ""
+
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would run: bash build_engines.sh ${BUILD_ARGS[*]}"
+        return 0
+    fi
+
+    bash "${SCRIPT_DIR}/build_engines.sh" "${BUILD_ARGS[@]}" || {
+        log_error "Phase B failed."
+        log_info  "Fix the issue and re-run: bash scripts/bash/autorun.sh build"
+        return 1
+    }
+}
+
+run_phase_c() {
+    log_step "Phase C: Triton Deployment"
+    echo ""
+
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would run: bash build_triton.sh run ${DEPLOY_ARGS[*]}"
+        return 0
+    fi
+
+    bash "${SCRIPT_DIR}/build_triton.sh" run "${DEPLOY_ARGS[@]}" || {
+        log_error "Phase C failed."
+        log_info  "Fix the issue and re-run: bash scripts/bash/autorun.sh deploy"
+        return 1
+    }
+}
+
+# ── Command handlers ──
+
+cmd_all() {
+    show_run_banner "Full Pipeline" "A → B → C"
+
+    run_phase_a || exit 1
+    echo ""
+    run_phase_b || exit 1
+    echo ""
+    run_phase_c || exit 1
+
+    echo ""
+    echo -e "${_CLR_GREEN}All phases complete! Triton server is running.${_CLR_RESET}"
+    echo ""
+}
+
+cmd_setup() {
+    show_run_banner "Phase A" "Environment + Export"
+    run_phase_a || exit 1
+}
+
+cmd_build() {
+    show_run_banner "Phase B" "TRT-LLM Engines"
+    run_phase_b || exit 1
+}
+
+cmd_deploy() {
+    show_run_banner "Phase C" "Triton Deploy"
+    run_phase_c || exit 1
+}
+
+cmd_status() {
+    print_status_summary "$REPO_ROOT" "$VARIANT"
+}
+
+cmd_stop() {
+    local container="${CONTAINER_NAME:-qwen3-tts-triton}"
+    triton_stop "$container"
+}
+
+# ── Banner ──
+
+show_run_banner() {
+    local phase_name="$1"
+    local description="$2"
+
     echo ""
     echo -e "${_CLR_BLUE}╔══════════════════════════════════════════════════════════╗${_CLR_RESET}"
-    echo -e "${_CLR_BLUE}║     Qwen3-TTS Triton — Build Environment Setup         ║${_CLR_RESET}"
+    echo -e "${_CLR_BLUE}║     Qwen3-TTS Triton — ${phase_name}${_CLR_RESET}"
     echo -e "${_CLR_BLUE}╚══════════════════════════════════════════════════════════╝${_CLR_RESET}"
     echo ""
-    echo "  Workspace:       $WORKDIR"
-    echo "  Python env:      $ENV_NAME (Python $PYTHON_VERSION)"
-    echo "  Model variant:   $MODEL_VARIANT"
-    echo "  Model source:    $MODEL_SOURCE"
+    echo "  Mode:      $description"
+    [ -n "$VARIANT" ] && echo "  Variant:   $VARIANT"
+    $DRY_RUN && echo "  Dry run:   yes"
     echo ""
 }
 
-# ---- Step 1: Submodule ---------------------------------------------------
+# ── Interactive mode ──
 
-init_qwen3_tts() {
-    local abs_path="${REPO_ROOT}/${SUBMODULE_PATH}"
+interactive_mode() {
+    print_status_summary "$REPO_ROOT" ""
 
-    if [ -d "${abs_path}/.git" ] || [ -f "${abs_path}/.git" ]; then
-        log_info "Qwen3-TTS submodule already initialised, skipping"
-        return 0
+    # Determine where we are in the pipeline
+    local resume_point
+    resume_point=$(detect_resume_point "$REPO_ROOT" "")
+
+    echo "  What would you like to do?"
+    echo ""
+    echo "  [1] Full pipeline  (setup → build → deploy)"
+    echo "  [2] Setup environment  (Phase A)"
+    echo "  [3] Build engines  (Phase B)"
+    echo "  [4] Deploy Triton  (Phase C)"
+
+    if [ "$resume_point" != "setup" ] && [ "$resume_point" != "done" ]; then
+        echo "  [5] Resume from: $resume_point"
     fi
 
-    log_step "Initialising Qwen3-TTS submodule"
+    echo "  [6] Show detailed status"
+    echo "  [q] Quit"
+    echo ""
 
-    local ORIGINAL_URL="https://github.com/QwenLM/Qwen3-TTS.git"
-    local RESOLVED_URL
-    RESOLVED_URL=$(github_url "$ORIGINAL_URL") || return 1
-
-    if [ "$RESOLVED_URL" != "$ORIGINAL_URL" ]; then
-        log_info "Using mirror URL for submodule: $RESOLVED_URL"
-        git -C "$REPO_ROOT" config "submodule.${SUBMODULE_PATH}.url" "$RESOLVED_URL"
+    local choice
+    if [ ! -t 0 ]; then
+        log_info "Non-interactive mode, defaulting to full pipeline"
+        choice="1"
+    else
+        read -rp "  Enter choice [1-6/q]: " choice
     fi
 
-    GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
-        git -C "$REPO_ROOT" submodule update --init --depth 1 -- "$SUBMODULE_PATH" \
-        || { log_error "Failed to initialise Qwen3-TTS submodule"; return 1; }
+    # Ask for variant if not already set
+    if [[ "$choice" =~ ^[1-5]$ ]] && [ -z "$VARIANT" ]; then
+        echo ""
+        VARIANT=$(select_model_variant)
+        VARIANT="${VARIANT:-base-1.7b}"
+        export MODEL_VARIANT="$VARIANT"
+    fi
 
-    log_info "Qwen3-TTS submodule ready at: ${abs_path}"
+    build_forward_args
+
+    case "${choice:-1}" in
+        1) cmd_all ;;
+        2) cmd_setup ;;
+        3) cmd_build ;;
+        4) cmd_deploy ;;
+        5)
+            case "$resume_point" in
+                build)  cmd_build; echo ""; cmd_deploy ;;
+                deploy) cmd_deploy ;;
+                *)      cmd_all ;;
+            esac
+            ;;
+        6)
+            print_status_summary "$REPO_ROOT" "$VARIANT"
+            ;;
+        q|Q)
+            echo "  Bye."
+            exit 0
+            ;;
+        *)
+            log_error "Invalid choice: $choice"
+            exit 1
+            ;;
+    esac
 }
 
-# ---- Step 2: Symlink -----------------------------------------------------
+# ── Main ──
 
-link_into_workdir() {
-    local src="${REPO_ROOT}/${SUBMODULE_PATH}"
-    local dst="${WORKDIR}/Qwen3-TTS"
+main() {
+    parse_args "$@"
 
-    if [ -L "$dst" ]; then
-        log_info "Symlink already exists: $dst"
-        return 0
-    fi
-    if [ -e "$dst" ]; then
-        log_warn "$dst exists but is not a symlink, skipping"
-        return 0
+    # No command → interactive mode
+    if [ -z "$COMMAND" ]; then
+        interactive_mode
+        return
     fi
 
-    ln -s "$src" "$dst"
-    log_info "Linked: $dst -> $src"
-}
-
-# ---- Step 3: Dependencies ------------------------------------------------
-
-install_dependencies() {
-    if [ "$SKIP_DEPS" = "1" ]; then
-        log_info "SKIP_DEPS=1, skipping dependency installation"
-        return 0
-    fi
-
-    log_step "Installing dependencies..."
-
-    # setuptools>=82 removed pkg_resources, which modelscope still needs
-    python3 -m pip install --upgrade pip "setuptools<81" wheel -q \
-        || log_warn "pip/setuptools upgrade failed (non-fatal)"
-
-    # PyTorch with CUDA
-    install_torch_cuda
-
-    # flash-attn: fused attention kernels used by Qwen3-TTS Talker backbone
-    install_flash_attn \
-        || log_warn "flash-attn install failed (non-fatal, will fall back to manual attention)"
-
-    # modelscope CLI (official recommended download tool)
-    pip_install modelscope
-
-    # Qwen3-TTS: the model architecture (Qwen3TTSForConditionalGeneration) lives
-    # in this package — required by the export scripts to extract sub-modules
-    # (Talker, Code Predictor, etc.) and convert them to ONNX / TRT.
-    # NOT needed in the final Triton image.
-    install_qwen3_tts "${REPO_ROOT}/${SUBMODULE_PATH}"
-}
-
-# ---- Step 4: Model download ----------------------------------------------
-
-download_models() {
-    if [ "$SKIP_MODELS" = "1" ]; then
-        log_info "SKIP_MODELS=1, skipping model download"
-        return 0
-    fi
-
-    log_step "Downloading model weights (variant: $MODEL_VARIANT)..."
-    download_qwen3_tts_models "$MODEL_DIR" "$MODEL_VARIANT" "$MODEL_SOURCE"
-}
-
-# ---- Step 5: Export dependencies -----------------------------------------
-
-install_export_deps() {
-    log_step "Installing export dependencies ..."
-    install_onnx_export_deps
-    install_safetensors
-}
-
-# ---- Step 6: Model export ------------------------------------------------
-
-export_models() {
-    if [ "$SKIP_EXPORT" = "1" ]; then
-        log_info "SKIP_EXPORT=1, skipping model export"
-        return 0
-    fi
-    if [ "$SKIP_MODELS" = "1" ]; then
-        log_info "SKIP_MODELS=1, no models to export"
-        return 0
-    fi
-
-    log_step "Exporting models (ONNX / TRT-LLM checkpoints / PyTorch weights)..."
-
-    local export_dir="${REPO_ROOT}/scripts/export"
-    local export_args=()
-
-    if [ "$MODEL_VARIANT" != "all" ] && [ "$MODEL_VARIANT" != "all-1.7b" ]; then
-        export_args+=(--variant "$MODEL_VARIANT")
-    fi
-
-    cd "$export_dir"
-    python3 export_all.py "${export_args[@]}" \
-        || { log_error "Model export failed"; return 1; }
-
-    log_info "Models exported to: ${REPO_ROOT}/workspace/exported/"
-}
-
-# ---- Step 7: Validation --------------------------------------------------
-
-validate_setup() {
-    log_step "Validating setup..."
-
-    validate_python_env || return 1
-
-    # Check model directory
-    if [ "$SKIP_MODELS" != "1" ]; then
-        if [ -d "$MODEL_DIR" ] && [ "$(ls -A "$MODEL_DIR" 2>/dev/null)" ]; then
-            log_info "Model directory: $MODEL_DIR"
-            ls -1 "$MODEL_DIR"/
+    # Resolve variant interactively if needed for phases that require it
+    if [ -z "$VARIANT" ] && [[ "$COMMAND" =~ ^(all|setup)$ ]] && ! $YES_MODE; then
+        if [ -t 0 ]; then
+            VARIANT=$(select_model_variant)
+            VARIANT="${VARIANT:-base-1.7b}"
         else
-            log_warn "Model directory is empty: $MODEL_DIR"
+            VARIANT="base-1.7b"
         fi
     fi
 
-    # Check exported models
-    local exported_dir="${REPO_ROOT}/workspace/exported"
-    if [ -d "$exported_dir" ] && [ "$(ls -A "$exported_dir" 2>/dev/null)" ]; then
-        log_info "Exported models: $exported_dir"
-        find "$exported_dir" \( -name "*.onnx" -o -name "*.pt" -o -name "*.safetensors" \) 2>/dev/null \
-            | while read -r f; do
-                local size
-                size=$(du -h "$f" | cut -f1)
-                log_info "  ${f#$exported_dir/}  ($size)"
-            done
-        # TRT-LLM checkpoints (engine compiled separately by build_engines.sh)
-        find "$exported_dir" -path "*/trtllm_checkpoint/config.json" 2>/dev/null \
-            | while read -r f; do
-                log_info "  ${f#$exported_dir/}  (TRT-LLM checkpoint — run build_engines.sh to compile engine)"
-            done
-    fi
+    build_forward_args
+
+    case "$COMMAND" in
+        all)    cmd_all ;;
+        setup)  cmd_setup ;;
+        build)  cmd_build ;;
+        deploy) cmd_deploy ;;
+        status) cmd_status ;;
+        stop)   cmd_stop ;;
+        help)   usage ;;
+        *)      log_error "Unknown command: $COMMAND"; usage; exit 1 ;;
+    esac
 }
 
-# ---- Main -----------------------------------------------------------------
-
-main() {
-    # If model variant not explicitly specified and download is not skipped,
-    # ask the user which model(s) to download before proceeding.
-    if [ -z "$MODEL_VARIANT" ] && [ "$SKIP_MODELS" != "1" ]; then
-        MODEL_VARIANT=$(select_model_variant)
-    fi
-    MODEL_VARIANT="${MODEL_VARIANT:-base-1.7b}"
-
-    show_banner
-
-    log_step "[1/9] Checking prerequisites..."
-    check_prerequisites || exit 1
-
-    log_step "[2/9] Initialising Qwen3-TTS submodule..."
-    init_qwen3_tts
-
-    log_step "[3/9] Preparing workspace..."
-    ensure_workdir "$WORKDIR"
-    link_into_workdir
-
-    log_step "[4/9] Configuring package mirrors..."
-    configure_mirrors
-
-    log_step "[5/9] Setting up Python environment..."
-    ensure_venv "$ENV_NAME" "$PYTHON_VERSION"
-
-    log_step "[6/9] Installing dependencies..."
-    install_dependencies
-
-    log_step "[7/9] Downloading model weights..."
-    download_models
-
-    log_step "[8/9] Installing export dependencies ..."
-    install_export_deps
-
-    log_step "[9/9] Exporting models..."
-    export_models
-
-    echo ""
-    echo -e "${_CLR_BLUE}──────────────────────────────────────────────────${_CLR_RESET}"
-    validate_setup
-    echo -e "${_CLR_BLUE}──────────────────────────────────────────────────${_CLR_RESET}"
-    echo ""
-    echo -e "${_CLR_GREEN}Build complete!${_CLR_RESET}"
-    echo ""
-    echo "  Workspace:   $WORKDIR"
-    echo "  Models:      $MODEL_DIR"
-    echo "  Exported:    ${REPO_ROOT}/workspace/exported/"
-    echo "  Activate:    conda activate $ENV_NAME  (or source .venv/bin/activate)"
-    echo ""
-    echo "  Next steps:"
-    echo "    1. Build TRT-LLM engines:  bash scripts/bash/build_engines.sh  (auto-selects NGC container)"
-    echo "    2. Launch Triton:           tritonserver --model-repository model_repository/"
-    echo ""
-}
-
-main
+main "$@"

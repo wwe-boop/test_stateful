@@ -9,7 +9,7 @@
 #  after this script completes to compile TRT-LLM engines inside a container.
 #
 #  Prerequisites:
-#    Activate the Python virtual environment created by autorun.sh:
+#    Activate the Python virtual environment created by setup_env.sh:
 #      conda activate qwen3-tts    # or: source <venv-path>/bin/activate
 #
 #  Usage:
@@ -18,7 +18,7 @@
 #    bash scripts/bash/export_models.sh --dtype fp32            # fp32 precision
 #    bash scripts/bash/export_models.sh --device cpu            # force CPU
 #
-#  Can be called standalone or from autorun.sh (Step 9).
+#  Can be called standalone or from setup_env.sh (Step 9).
 #  Automatically installs missing export dependencies.
 #
 #  Output: workspace/exported/<variant>/
@@ -39,13 +39,13 @@ log_info "Arguments: $*"
 
 # Ensure core dependencies
 if ! python3 -c "import torch" 2>/dev/null; then
-    log_error "PyTorch not found. Run autorun.sh first or install manually."
+    log_error "PyTorch not found. Run 'autorun.sh setup' first or install manually."
     exit 1
 fi
 
 if ! python3 -c "import qwen_tts" 2>/dev/null; then
     log_error "qwen_tts package not found."
-    log_error "Run autorun.sh first or: pip install -e ${REPO_ROOT}/third_party/Qwen3-TTS"
+    log_error "Run 'autorun.sh setup' first or: pip install -e ${REPO_ROOT}/third_party/Qwen3-TTS"
     exit 1
 fi
 
