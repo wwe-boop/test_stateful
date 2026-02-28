@@ -29,7 +29,7 @@
 | **Text Embedder** | `Embedding(151936, 2048)` + `ResizeMLP(2048→1024)` | ~312M | PyTorch 权重 | 每请求 1 次 + 文本到达时 |
 | **Speaker Encoder** | ECAPA-TDNN, mel=128, enc_dim=1024 | ~6M | ONNX | 每请求 1 次 (仅 voice clone) |
 | **Speech Tokenizer Encoder** | MimiModel, 16 codebooks | ~26M | ONNX | 每请求 1 次 (仅 ICL 模式) |
-| **Talker Backbone** | Qwen3-style, 20L, h=1024, GQA(16h/2kv), head_dim=64 | ~180M | **TRT-LLM** | 每 decode step 1 次 (最热路径) |
+| **Talker Backbone** | Qwen3-style, 28L, h=1024/2048 (0.6B/1.7B), GQA(16h/8kv), head_dim=128 | ~180M–500M | **TRT-LLM** | 每 decode step 1 次 (最热路径) |
 | **Code Predictor** | Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128 + 15×embed + 15×lm_head | ~200M | **TensorRT (单引擎, 15 步展开)** | 每 decode step 1 次调用 |
 | **Code2Wav Decoder** | RVQ Dequant + Transformer(8L) + BigVGAN ConvNet | ~60M | ONNX | 每 chunk 1 次 |
 
@@ -604,7 +604,7 @@ async def code_predictor_fallback(engine, past_hidden, codec_token_0,
 
 Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 - 序列长度可达数千步，前缀重算代价不可忽略
-- KV Cache 内存极小：20L × 2KV heads × 64 dim，无需 PagedAttention
+- KV Cache 内存极小：28L × 8 KV heads × 128 dim，无需 PagedAttention
 
 ### 6.0 推理引擎选型
 
@@ -617,9 +617,9 @@ Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 | Prefill/Decode 分离 | 需手动实现 | **内置 chunked prefill + continuous decode** |
 | 开发成本 | 高（KV cache I/O wrapper + mask 构造 + profile 切换） | **低（定义模型配置即可）** |
 
-> **决策**: Talker Backbone **确定走 TRT-LLM**。其规格 (20L, GQA 16h/2kv, dim=1024, head_dim=64) 完全在 TRT-LLM 支持范围内。KV Cache、paged attention、continuous batching 均由 TRT-LLM 运行时原生管理。
+> **决策**: Talker Backbone **确定走 TRT-LLM**。实际 Qwen3-TTS Talker 为 28L、GQA 16h/8kv、head_dim=128（0.6B: h=1024，1.7B: h=2048），由 export_04 从模型 config 动态读取。KV Cache、paged attention、continuous batching 均由 TRT-LLM 运行时原生管理。
 >
-> **KV Cache I/O 风险 (纯 TRT 方案)**: KV cache 形状 `[20, 2, B, 2, S_max, 64]`，B=8, S_max=4096 时约 160MB BF16。作为 TRT 显式 I/O，每 decode step 的 device→device memcpy 约 0.16ms（HBM ~1TB/s），来回 0.32ms，占单步 8%。TRT-LLM 通过 in-place buffer 完全消除此开销。
+> **KV Cache I/O 风险 (纯 TRT 方案)**: KV cache 形状 `[28, 2, B, 8, S_max, 128]`，B=8, S_max=4096 时约 1.8GB BF16。作为 TRT 显式 I/O，每 decode step 的 device→device memcpy 约 0.16ms（HBM ~1TB/s），来回 0.32ms，占单步 8%。TRT-LLM 通过 in-place buffer 完全消除此开销。
 
 ### 6.1 导出封装 (纯 TRT fallback 方案)
 
@@ -627,15 +627,15 @@ Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 class TalkerBackboneWrapper(nn.Module):
     def __init__(self, talker_model, codec_head):
         super().__init__()
-        self.layers = talker_model.layers       # 20 层
+        self.layers = talker_model.layers       # 28 层
         self.norm = talker_model.norm
         self.rotary_emb = talker_model.rotary_emb
-        self.codec_head = codec_head            # Linear(1024, 3072)
+        self.codec_head = codec_head            # Linear(1024/2048, 3072)
 
     def forward(self, inputs_embeds, kv_cache, cache_position):
         """
-        inputs_embeds: [B, S, 1024]  (S=1 for decode, S>1 for prefill)
-        kv_cache:      [20, 2, B, 2, S_max, 64]  (预分配固定大小)
+        inputs_embeds: [B, S, H]  (S=1 for decode, S>1 for prefill; H=1024/2048)
+        kv_cache:      [28, 2, B, 8, S_max, 128]  (预分配固定大小)
         cache_position: [S]  (当前写入位置)
         """
         hidden = inputs_embeds
@@ -662,11 +662,11 @@ TRT-LLM 构建参数:
 - max_batch_size: 8
 - max_input_len: 512    (prefill)
 - max_seq_len: 4096     (含 KV cache)
-- num_layers: 20
-- hidden_size: 1024
+- num_layers: 28 (实际由 checkpoint 决定)
+- hidden_size: 1024 (0.6B) / 2048 (1.7B)
 - num_attention_heads: 16
-- num_key_value_heads: 2
-- head_size: 64
+- num_key_value_heads: 8
+- head_size: 128
 - use_gpt_attention_plugin: bfloat16  (启用优化 attention kernel)
 - paged_kv_cache: disable            (KV 总量极小, 无需 paged)
 - enable_chunked_prefill: true       (避免 prefill 阻塞 decode)
@@ -688,17 +688,17 @@ TRT-LLM 构建参数:
 
 ```python
 # Talker Backbone KV Cache: 预分配固定 slot
-# 20 layers, GQA(2 KV heads), head_dim=64
+# 28 layers, GQA(8 KV heads), head_dim=128
 talker_kv_cache = torch.zeros(
-    20,              # num_layers
+    28,              # num_layers
     2,               # K, V
     max_batch_size,  # e.g. 8
-    2,               # num_kv_heads
+    8,               # num_kv_heads
     max_seq_len,     # e.g. 4096
-    64,              # head_dim
+    128,             # head_dim
     dtype=torch.bfloat16, device="cuda"
 )
-# 显存占用: 20 × 2 × 8 × 2 × 4096 × 64 × 2B = 160MB
+# 显存占用: 28 × 2 × 8 × 8 × 4096 × 128 × 2B ≈ 1.8GB
 
 slot_seq_lengths = [0] * max_batch_size
 # Prefill: 写入 kv_cache[:, :, slot_id, :, 0:S, :]
@@ -1832,7 +1832,7 @@ message TTSError {
 
 | 组件 | 模式 | 耗时 | 说明 |
 |------|------|------|------|
-| **Talker Backbone** | Decode (B=1, S=1) | ~0.4ms | 20L, memory bandwidth bound |
+| **Talker Backbone** | Decode (B=1, S=1) | ~0.4ms | 28L, memory bandwidth bound |
 | **Talker Backbone** | Decode (B=8, S=1) | ~0.5ms | GEMV, 批量摊薄 launch |
 | **Code Predictor** | 15 步展开 (B=1) | ~2ms | 无 KV Cache, 单引擎 |
 | **Code Predictor** | 15 步展开 (B=8) | ~2ms | GEMM 效率高, 批量几乎不增耗时 |
@@ -2128,7 +2128,13 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 
 ### Phase 2: TensorRT / TRT-LLM 优化 (3-5 天)
 
-9. [ ] **Talker Backbone TRT-LLM 集成验证** (build_engines.sh 编译 engine + 精度对比, 6.0/6.2 节)
+9. [x] **Talker Backbone TRT-LLM 集成验证** (build_engines.sh 编译 engine + 精度对比, 6.0/6.2 节)
+   - 验证脚本: `scripts/bash/verify_talker_trtllm.sh`（Step 1: host 端 `verify_talker_trtllm_ref.py` 生成 .npz；Step 2: 容器内 `verify_talker_trtllm.py` 对比 engine 输出）
+   - NGC 26.01 (TRT-LLM 1.1.0) 下 engine 加载与 generate 跑通；prompt_embedding_table 传入 inputs_embeds，virtual token IDs = vocab_size..vocab_size+S-1
+   - **首轮发现 bug: export_04 中 MLP gate/fc 权重映射反了**（TRT-LLM Qwen 的 `mlp.gate` ← HF `up_proj`，`mlp.fc` ← HF `gate_proj`；我们写反了导致 SwiGLU 计算错误，prefill cosine 为负值）
+   - 修复后 design-1.7b 验证结果: **Prefill cosine=0.9996 (PASS)**，各位置 cosine 均 >0.999；top-10 token 排序与 PyTorch 完全一致
+   - codec_token_0: TRT 和 PT 的 context_logits argmax 均为 1486，但 generate() 由于 BF16 tie-break（token 1486 和 29 的 logit 并列 8.75）选了不同 token，后续 decode 因首 token 分歧而发散——此为 BF16 精度边界行为，实际部署中使用 sampling (temperature/top-p) 不受影响
+   - **需重新导出+编译其余 4 个变体** (base-0.6b/1.7b, custom-0.6b/1.7b)；`--paged_kv_cache disable` 保留（1.1.0 deprecated 但 `--kv_cache_type disabled` 语义不同——后者完全移除 KV cache）
 10. [ ] Code Predictor ONNX → TRT (BF16, 验证权重共享) — Phase 1 验证使用了 FP16 (bug), 已修正为 BF16, 需删除旧 .plan 重建
     - 或 fallback 方案的 single-stage TRT engine
 11. [ ] Codec Embedding Sum 优化 (3D gather, 2.1 节)

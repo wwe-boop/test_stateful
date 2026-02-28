@@ -112,14 +112,14 @@ def _extract_talker_weights(model) -> tuple[dict, dict]:
 #   model.norm.weight
 #   lm_head.weight
 #
-# TRT-LLM Qwen (0.19.0):
+# TRT-LLM Qwen (1.1.0+):
 #   transformer.layers.{i}.attention.qkv.weight         (fused Q+K+V)
 #   transformer.layers.{i}.attention.qkv.bias           (zero — Qwen3 has no attn bias)
 #   transformer.layers.{i}.attention.dense.weight        (o_proj)
-#   transformer.layers.{i}.attention.q_norm.weight       (Qwen3 QK-Norm)
-#   transformer.layers.{i}.attention.k_norm.weight       (Qwen3 QK-Norm)
-#   transformer.layers.{i}.mlp.gate.weight               (gate_proj, NOT fused)
-#   transformer.layers.{i}.mlp.fc.weight                 (up_proj)
+#   transformer.layers.{i}.attention.q_layernorm.weight  (Qwen3 QK-Norm)
+#   transformer.layers.{i}.attention.k_layernorm.weight  (Qwen3 QK-Norm)
+#   transformer.layers.{i}.mlp.gate.weight               (up_proj — TRT-LLM Qwen convention)
+#   transformer.layers.{i}.mlp.fc.weight                 (gate_proj — goes through silu)
 #   transformer.layers.{i}.mlp.proj.weight               (down_proj)
 #   transformer.layers.{i}.input_layernorm.weight
 #   transformer.layers.{i}.post_layernorm.weight
@@ -134,13 +134,15 @@ def _map_weights_to_trtllm(
 ) -> dict:
     """Map Talker HF weights to TRT-LLM checkpoint naming convention.
 
-    TRT-LLM 0.19.0 Qwen3 expects per-layer:
-      attention.qkv.weight  — fused Q+K+V
-      attention.qkv.bias    — zero bias (Qwen3 has no attn bias, but TRT-LLM allocates it)
+    TRT-LLM 1.1.0 Qwen3 expects per-layer:
+      attention.qkv.weight       — fused Q+K+V
+      attention.qkv.bias         — zero bias (Qwen3 has no attn bias, but TRT-LLM allocates it)
       attention.dense.weight
-      mlp.gate.weight       — gate_proj (NOT fused with up)
-      mlp.fc.weight         — up_proj
-      mlp.proj.weight       — down_proj
+      attention.q_layernorm.weight — QK-Norm
+      attention.k_layernorm.weight — QK-Norm
+      mlp.gate.weight             — up_proj (TRT-LLM Qwen: gate = linear multiplier)
+      mlp.fc.weight               — gate_proj (TRT-LLM Qwen: fc = through silu activation)
+      mlp.proj.weight             — down_proj
       input_layernorm.weight
       post_layernorm.weight
     Plus: transformer.vocab_embedding.weight, transformer.ln_f.weight, lm_head.weight
@@ -172,20 +174,22 @@ def _map_weights_to_trtllm(
             hf_state[f"{prefix_hf}.self_attn.o_proj.weight"].to(dtype)
         )
 
-        # QK-Norm (Qwen3 feature)
-        trtllm_state[f"{prefix_trt}.attention.q_norm.weight"] = (
+        # QK-Norm (Qwen3 feature — TRT-LLM 1.1.0 uses "q_layernorm"/"k_layernorm")
+        trtllm_state[f"{prefix_trt}.attention.q_layernorm.weight"] = (
             hf_state[f"{prefix_hf}.self_attn.q_norm.weight"].to(dtype)
         )
-        trtllm_state[f"{prefix_trt}.attention.k_norm.weight"] = (
+        trtllm_state[f"{prefix_trt}.attention.k_layernorm.weight"] = (
             hf_state[f"{prefix_hf}.self_attn.k_norm.weight"].to(dtype)
         )
 
-        # MLP: gate_proj → mlp.gate, up_proj → mlp.fc (separate, NOT fused)
+        # MLP: TRT-LLM Qwen convention (from convert.py key_list):
+        #   mlp.gate ← HF up_proj   (element-wise multiplier in SwiGLU)
+        #   mlp.fc   ← HF gate_proj (passed through silu activation)
         trtllm_state[f"{prefix_trt}.mlp.gate.weight"] = (
-            hf_state[f"{prefix_hf}.mlp.gate_proj.weight"].to(dtype)
+            hf_state[f"{prefix_hf}.mlp.up_proj.weight"].to(dtype)
         )
         trtllm_state[f"{prefix_trt}.mlp.fc.weight"] = (
-            hf_state[f"{prefix_hf}.mlp.up_proj.weight"].to(dtype)
+            hf_state[f"{prefix_hf}.mlp.gate_proj.weight"].to(dtype)
         )
 
         # Down projection

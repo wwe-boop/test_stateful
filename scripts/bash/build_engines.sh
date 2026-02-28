@@ -21,6 +21,7 @@
 #    bash scripts/bash/build_engines.sh --variant base-1.7b      # single variant
 #    bash scripts/bash/build_engines.sh --max-batch-size 4       # custom batch size
 #    bash scripts/bash/build_engines.sh --image <custom-image>   # override container
+#    bash scripts/bash/build_engines.sh --target-driver 575.57  # build for production driver
 #    bash scripts/bash/build_engines.sh --dry-run                # show docker command
 #    bash scripts/bash/build_engines.sh --pull-only              # pull image, don't build
 #
@@ -51,6 +52,7 @@ VARIANT=""
 DRY_RUN=false
 PULL_ONLY=false
 USER_IMAGE="${TRTLLM_IMAGE:-}"
+TARGET_DRIVER="${TARGET_DRIVER:-}"
 
 # ── Argument parsing ──
 while [[ $# -gt 0 ]]; do
@@ -61,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --max-input-len)  MAX_INPUT_LEN="$2"; shift 2 ;;
         --max-seq-len)    MAX_SEQ_LEN="$2"; shift 2 ;;
         --dtype)          ENGINE_DTYPE="$2"; shift 2 ;;
+        --target-driver)  TARGET_DRIVER="$2"; export TARGET_DRIVER; shift 2 ;;
         --dry-run)        DRY_RUN=true; shift ;;
         --pull-only)      PULL_ONLY=true; shift ;;
         --help|-h)
@@ -69,6 +72,8 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --variant <name>       Build for a specific model variant"
             echo "  --image <uri>          Override NGC container image (default: auto-detect)"
+            echo "  --target-driver <ver>  Target NVIDIA driver for NGC container selection"
+            echo "                         (e.g. 575.57 for production machines)"
             echo "  --max-batch-size N     Max batch size (default: 8)"
             echo "  --max-input-len N      Max input length for prefill (default: 512)"
             echo "  --max-seq-len N        Max sequence length incl. KV cache (default: 4096)"
@@ -93,6 +98,7 @@ if [ -n "$USER_IMAGE" ]; then
     log_info "Using user-specified image: $TRTLLM_IMAGE"
 else
     log_info "Auto-detecting best NGC container for this GPU driver ..."
+    _NGC_VERIFY_MANIFEST=1
     TRTLLM_IMAGE=$(resolve_ngc_image_info) \
         || { log_error "Cannot determine compatible container. Use --image to specify manually."; exit 1; }
 fi
@@ -124,7 +130,7 @@ discover_checkpoints() {
     echo "${found[@]}"
 }
 
-if [ -n "$VARIANT" ]; then
+if [[ -n "$VARIANT" && "$VARIANT" != all* ]]; then
     CKPT_DIR="$EXPORTED_DIR/$VARIANT/trtllm_checkpoint"
     if [ ! -f "$CKPT_DIR/config.json" ]; then
         log_error "TRT-LLM checkpoint not found: $CKPT_DIR"

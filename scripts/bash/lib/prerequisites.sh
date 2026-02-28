@@ -3,6 +3,7 @@
 #  prerequisites.sh — System prerequisites checking
 #
 #  Functions: check_prerequisites, ensure_git_lfs, detect_cuda_version,
+#             cuda_to_torch_tag, _flash_attn_compatible_tag,
 #             check_disk_space, check_gpu_memory, check_docker
 #  Depends:   lib/logging.sh, lib/utils.sh, lib/docker.sh
 # ===========================================================================
@@ -42,6 +43,7 @@ detect_cuda_version() {
 #  cuda_to_torch_tag <cuda_version>
 #  Maps a CUDA version to the PyTorch index URL tag (e.g. "12.4" → "cu124").
 #  Pins to the nearest PyTorch-supported CUDA build.
+#  See: https://download.pytorch.org/whl/
 # ---------------------------------------------------------------------------
 cuda_to_torch_tag() {
     local cuda_ver="$1"
@@ -54,11 +56,54 @@ cuda_to_torch_tag() {
     elif [ "$major" -eq 12 ]; then
         if   [ "$minor" -le 1 ]; then echo "cu121"
         elif [ "$minor" -le 4 ]; then echo "cu124"
-        else                          echo "cu126"
+        elif [ "$minor" -le 6 ]; then echo "cu126"
+        else                          echo "cu128"
         fi
+    elif [ "$major" -eq 13 ]; then
+        echo "cu130"
     else
         echo "cu${major}${minor}"
     fi
+}
+
+# ---------------------------------------------------------------------------
+#  flash-attn compatibility constants
+#  Update these when a new flash-attn release adds support for newer CUDA/torch.
+#  Wheel matrix: https://github.com/Dao-AILab/flash-attention/releases
+# ---------------------------------------------------------------------------
+_FLASH_ATTN_VERSION="2.8.3"
+_FLASH_ATTN_MAX_CUDA="12.8"
+
+# ---------------------------------------------------------------------------
+#  _flash_attn_compatible_tag <cuda_version>
+#  Given a system CUDA version, checks whether the PyTorch CUDA tag that
+#  cuda_to_torch_tag would select has a flash-attn pre-built wheel.
+#
+#  flash-attn 2.8.3 ships wheels for: cu118 cu121 cu122 cu124 cu126 cu128
+#  The max supported CUDA tag is cu128 (i.e. CUDA 12.8).
+#
+#  If the mapped tag is within range, echoes it and returns 0.
+#  If the mapped tag exceeds flash-attn's max, echoes the max compatible
+#  tag (cu128) as the downgrade candidate and returns 1.
+# ---------------------------------------------------------------------------
+_flash_attn_compatible_tag() {
+    local cuda_ver="$1"
+    local tag
+    tag=$(cuda_to_torch_tag "$cuda_ver")
+
+    local max_tag
+    max_tag=$(cuda_to_torch_tag "$_FLASH_ATTN_MAX_CUDA")
+
+    local tag_num max_num
+    tag_num=$(echo "$tag" | sed 's/^cu//')
+    max_num=$(echo "$max_tag" | sed 's/^cu//')
+
+    if [ "$tag_num" -le "$max_num" ]; then
+        echo "$tag"
+        return 0
+    fi
+    echo "$max_tag"
+    return 1
 }
 
 # ---------------------------------------------------------------------------

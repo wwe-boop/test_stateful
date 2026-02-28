@@ -62,7 +62,13 @@ def main():
     logger.info(f"Reference: seq_len={seq_len}, hidden={hidden_size}, vocab={vocab_size}")
     logger.info(f"Reference decode tokens: {ref_decode_tokens.tolist()}")
 
-    # Load TRT-LLM engine
+    # Load TRT-LLM engine (TRT-LLM 1.1.0+ supports QK-Norm for Qwen3)
+    try:
+        import tensorrt_llm
+        _ver = getattr(tensorrt_llm, "__version__", "unknown")
+        logger.info(f"TensorRT-LLM version: {_ver}")
+    except Exception:
+        pass
     logger.info(f"Loading TRT-LLM engine from {args.engine_dir} ...")
     t0 = time.time()
 
@@ -176,16 +182,7 @@ def main():
             decode_cosines.append(cos)
             logger.info(f"  decode step {i}: cosine={cos:.6f}")
 
-    # QK-Norm warning
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("  NOTE: TRT-LLM 0.19.0 QWen model ignores q_norm/k_norm weights")
-    logger.info("  (warned 'Provided but not required tensors'). This means")
-    logger.info("  precision WILL differ from PyTorch. The key metric is whether")
-    logger.info("  the deviation is bounded and output is still coherent.")
-    logger.info("=" * 60)
-
-    # Summary
+    # Summary (TRT-LLM 1.1.0+ uses QK-Norm for Qwen3; no "ignored tensors" warning)
     report = {
         "variant": str(Path(args.engine_dir).parent.name),
         "seq_len": seq_len,
@@ -196,7 +193,7 @@ def main():
         "prefill_cosine": prefill_cosine,
         "decode_cosines": decode_cosines,
         "gen_time_s": gen_time,
-        "qk_norm_missing": True,
+        "qk_norm_missing": False,
     }
 
     logger.info("")

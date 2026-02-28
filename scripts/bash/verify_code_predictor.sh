@@ -74,6 +74,7 @@ if [ -n "$USER_IMAGE" ]; then
     log_info "Using user-specified image: $TRTLLM_IMAGE"
 else
     log_info "Auto-detecting best NGC container ..."
+    _NGC_VERIFY_MANIFEST=1
     TRTLLM_IMAGE=$(resolve_ngc_image_info) \
         || { log_error "Cannot determine compatible container. Use --image to specify manually."; exit 1; }
 fi

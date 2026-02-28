@@ -19,9 +19,11 @@
 #  Environment variables (override any positional arg):
 #    WORKDIR          workspace directory       (default: <repo>/workspace)
 #    ENV_NAME         Python env name           (default: qwen3-tts)
-#    PYTHON_VERSION   Python version            (default: 3.10)
+#    PYTHON_VERSION   Python version            (default: from NGC matrix)
 #    MODEL_VARIANT    Model variant to download (default: base-1.7b)
 #    MODEL_SOURCE     Download source           (auto | hf | modelscope)
+#    TARGET_DRIVER    Target NVIDIA driver for NGC container selection
+#                     (e.g. 575.57 for production machines)
 #    SKIP_MODELS      Set to 1 to skip model download
 #    SKIP_DEPS        Set to 1 to skip dependency installation
 #    SKIP_EXPORT      Set to 1 to skip ONNX model export
@@ -36,7 +38,17 @@ source "${SCRIPT_DIR}/tools.sh"
 
 WORKDIR="${WORKDIR:-${1:-${REPO_ROOT}/workspace}}"
 ENV_NAME="${ENV_NAME:-${2:-qwen3-tts}}"
-PYTHON_VERSION="${PYTHON_VERSION:-${3:-3.10}}"
+
+# Python version: explicit env/arg > env_plan.json > NGC matrix > fallback 3.12
+_DEFAULT_PY_VER="${3:-}"
+if [ -z "$_DEFAULT_PY_VER" ]; then
+    _DEFAULT_PY_VER=$(resolve_ngc_python_version 2>/dev/null) || _DEFAULT_PY_VER="3.12"
+fi
+PYTHON_VERSION="${PYTHON_VERSION:-$_DEFAULT_PY_VER}"
+unset _DEFAULT_PY_VER
+
+PLAN_FILE="${WORKDIR}/env_plan.json"
+
 MODEL_VARIANT="${MODEL_VARIANT:-${4:-}}"
 MODEL_SOURCE="${MODEL_SOURCE:-auto}"
 SKIP_MODELS="${SKIP_MODELS:-0}"
@@ -122,12 +134,47 @@ install_dependencies() {
     python3 -m pip install --upgrade pip "setuptools<81" wheel -q \
         || log_warn "pip/setuptools upgrade failed (non-fatal)"
 
-    # PyTorch with CUDA
-    install_torch_cuda
+    # PyTorch with CUDA (use pre-resolved tag from env plan if available)
+    local _torch_tag=""
+    if [ -f "$PLAN_FILE" ]; then
+        _torch_tag=$(read_env_plan_val "$PLAN_FILE" "pytorch_cuda_tag") || true
+    fi
+    if [ -n "$_torch_tag" ]; then
+        install_torch_cuda "$_torch_tag"
+    else
+        install_torch_cuda
+    fi
 
-    # flash-attn: fused attention kernels used by Qwen3-TTS Talker backbone
-    install_flash_attn \
-        || log_warn "flash-attn install failed (non-fatal, will fall back to manual attention)"
+    # flash-attn: fused attention kernels used by Qwen3-TTS Talker backbone.
+    # The env_plan confirm stage already asked the user about flash-attn
+    # when CUDA exceeds the supported range.  Check the decision here:
+    #   - "skip"         -> user chose to skip flash-attn entirely
+    #   - "downgrade"    -> user chose to downgrade CUDA tag; PyTorch is now
+    #                       compatible, so install_flash_attn should succeed
+    #   - "source_build" -> user chose to build flash-attn from source
+    #   - (no decision)  -> CUDA was in range, try normally
+    local _fa_decision=""
+    if [ -f "$PLAN_FILE" ]; then
+        _fa_decision=$(awk '
+            /"user_decisions"/ { found=1 }
+            found && /"flash_attn_wheel_available"/ {
+                gsub(/.*"flash_attn_wheel_available"[[:space:]]*:[[:space:]]*"/, "")
+                gsub(/".*/, "")
+                print; exit
+            }
+        ' "$PLAN_FILE" 2>/dev/null) || true
+    fi
+
+    if [ "$_fa_decision" = "skip" ]; then
+        log_info "Skipping flash-attn (user decision: skip, will fall back to manual attention)"
+    elif [ "$_fa_decision" = "source_build" ]; then
+        log_step "Building flash-attn from source (user decision: source_build)..."
+        log_warn "This may take 10-30 min and requires ninja + CUDA toolkit"
+        python3 -m pip install flash-attn --no-build-isolation \
+            || log_warn "flash-attn source build failed (non-fatal, will fall back to manual attention)"
+    elif ! install_flash_attn; then
+        log_warn "flash-attn install failed (non-fatal, will fall back to manual attention)"
+    fi
 
     # modelscope CLI (official recommended download tool)
     pip_install modelscope
@@ -234,32 +281,48 @@ main() {
 
     show_banner
 
-    log_step "[1/9] Checking prerequisites..."
+    log_step "[1/10] Checking prerequisites..."
     check_prerequisites || exit 1
 
-    log_step "[2/9] Initialising Qwen3-TTS submodule..."
+    log_step "[2/10] Resolving environment version plan..."
+    local resolve_flags=""
+    [[ "${FORCE_RESOLVE:-}" = "1" ]] && resolve_flags="--force"
+    if resolve_env_plan "$PLAN_FILE" $resolve_flags; then
+        log_step "[3/10] Environment plan summary + confirmation..."
+        confirm_env_plan "$PLAN_FILE" || exit 1
+
+        # Override versions from plan
+        local plan_py plan_tag
+        plan_py=$(read_env_plan_val "$PLAN_FILE" "python") || true
+        plan_tag=$(read_env_plan_val "$PLAN_FILE" "pytorch_cuda_tag") || true
+        [ -n "$plan_py" ] && PYTHON_VERSION="$plan_py"
+        log_info "Using versions from plan: Python=$PYTHON_VERSION, PyTorch tag=${plan_tag:-auto}"
+    else
+        log_error "Environment plan resolution failed — see errors above"
+        exit 1
+    fi
+
+    log_step "[4/10] Initialising Qwen3-TTS submodule..."
     init_qwen3_tts
 
-    log_step "[3/9] Preparing workspace..."
+    log_step "[5/10] Preparing workspace..."
     ensure_workdir "$WORKDIR"
     link_into_workdir
 
-    log_step "[4/9] Configuring package mirrors..."
+    log_step "[6/10] Configuring package mirrors..."
     configure_mirrors
 
-    log_step "[5/9] Setting up Python environment..."
+    log_step "[7/10] Setting up Python environment..."
     ensure_venv "$ENV_NAME" "$PYTHON_VERSION"
 
-    log_step "[6/9] Installing dependencies..."
+    log_step "[8/10] Installing dependencies..."
     install_dependencies
 
-    log_step "[7/9] Downloading model weights..."
+    log_step "[9/10] Downloading model weights + export dependencies..."
     download_models
-
-    log_step "[8/9] Installing export dependencies ..."
     install_export_deps
 
-    log_step "[9/9] Exporting models..."
+    log_step "[10/10] Exporting models..."
     export_models
 
     echo ""

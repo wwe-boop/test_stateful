@@ -16,15 +16,17 @@
 #    bash scripts/bash/autorun.sh deploy [options]    # Phase C only
 #    bash scripts/bash/autorun.sh status              # show pipeline status
 #    bash scripts/bash/autorun.sh stop                # stop Triton server
+#    bash scripts/bash/autorun.sh update-matrix       # update NGC compat matrix
 #
 #  Options:
 #    --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, ...)
+#    --target-driver <ver>   Target NVIDIA driver for NGC container selection
 #    --yes, -y               Skip confirmations (non-interactive)
 #    --dry-run               Show what would be done
 #    -h, --help              Show full help
 #
 #    Phase A (forwarded to setup_env.sh):
-#      --python <ver>        Python version (default: 3.10)
+#      --python <ver>        Python version (default: from NGC matrix)
 #      --env-name <name>     Virtual env name (default: qwen3-tts)
 #      --source <src>        Model source (auto|hf|modelscope)
 #      --skip-models         Skip model download
@@ -49,7 +51,7 @@ source "${SCRIPT_DIR}/tools.sh"
 
 # ── Known model variant names (for auto-detection of positional args) ──
 _KNOWN_VARIANTS="base-1.7b custom-1.7b design-1.7b base-0.6b custom-0.6b all-1.7b all"
-_KNOWN_COMMANDS="all setup build deploy status stop help"
+_KNOWN_COMMANDS="all setup build deploy status stop update-matrix help"
 
 _is_variant() { [[ " $_KNOWN_VARIANTS " == *" $1 "* ]]; }
 _is_command() { [[ " $_KNOWN_COMMANDS " == *" $1 "* ]]; }
@@ -59,6 +61,7 @@ COMMAND=""
 VARIANT=""
 DRY_RUN=false
 YES_MODE=false
+TARGET_DRIVER="${TARGET_DRIVER:-}"
 
 # Phase A forwarding
 SETUP_ARGS=()
@@ -93,6 +96,7 @@ Commands:
   deploy            Phase C only (Triton server deployment)
   status            Show pipeline status
   stop              Stop Triton server
+  update-matrix     Update NGC compatibility matrix from NVIDIA website
   help              Show this help
 
 If no command is given, launches interactive mode.
@@ -101,12 +105,15 @@ If a model variant name is given without a command, runs the full pipeline.
 Options:
   --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, design-1.7b,
                           base-0.6b, custom-0.6b, all-1.7b, all)
+  --target-driver <ver>   Target NVIDIA driver version for NGC container
+                          selection (e.g. 575.57 for production machines).
+                          Overrides local driver detection.
   --yes, -y               Skip confirmations (non-interactive)
   --dry-run               Show what would be done without executing
   -h, --help              Show this help
 
 Phase A options (forwarded to setup_env.sh):
-  --python <version>      Python version (default: 3.10)
+  --python <version>      Python version (default: from NGC matrix)
   --env-name <name>       Virtual env name (default: qwen3-tts)
   --source <source>       Model download source (auto|hf|modelscope)
   --skip-models           Skip model download
@@ -128,8 +135,10 @@ Examples:
   autorun.sh all -m custom-1.7b       # full pipeline for custom-1.7b
   autorun.sh setup --skip-export      # Phase A without export
   autorun.sh build --dtype float16    # Phase B with fp16
+  autorun.sh build --target-driver 575.57   # build for production driver
   autorun.sh deploy                   # Phase C (start Triton)
   autorun.sh status                   # show pipeline status
+  autorun.sh update-matrix            # fetch latest NGC compat data
 EOF
 }
 
@@ -146,6 +155,7 @@ parse_args() {
             --variant|-m)       VARIANT="$2"; shift 2 ;;
             --yes|-y)           YES_MODE=true; shift ;;
             --dry-run)          DRY_RUN=true; shift ;;
+            --target-driver)    TARGET_DRIVER="$2"; shift 2 ;;
             --help|-h)          usage; exit 0 ;;
 
             # Phase A
@@ -196,6 +206,11 @@ parse_args() {
 # ── Build forwarding arg arrays ──
 
 build_forward_args() {
+    # Target driver override (propagated via env var to all phases)
+    if [ -n "$TARGET_DRIVER" ]; then
+        export TARGET_DRIVER
+    fi
+
     # Phase A args
     SETUP_ARGS=()
     if [ -n "$VARIANT" ]; then
@@ -214,9 +229,13 @@ build_forward_args() {
     if $SKIP_EXPORT; then export SKIP_EXPORT=1; fi
     if [ -n "$ENV_NAME" ]; then export ENV_NAME="$ENV_NAME"; fi
 
-    # Phase B args
+    # Phase B args — "all"/"all-1.7b" are meta-variants; omit --variant so
+    # build_engines.sh discovers all exported checkpoints automatically.
     BUILD_ARGS=()
-    if [ -n "$VARIANT" ]; then BUILD_ARGS+=(--variant "$VARIANT"); fi
+    if [ -n "$VARIANT" ] && [[ "$VARIANT" != all* ]]; then
+        BUILD_ARGS+=(--variant "$VARIANT")
+    fi
+    if [ -n "$TARGET_DRIVER" ]; then BUILD_ARGS+=(--target-driver "$TARGET_DRIVER"); fi
     if [ -n "$MAX_BATCH_SIZE" ]; then BUILD_ARGS+=(--max-batch-size "$MAX_BATCH_SIZE"); fi
     if [ -n "$BUILD_IMAGE" ]; then BUILD_ARGS+=(--image "$BUILD_IMAGE"); fi
     if [ -n "$ENGINE_DTYPE" ]; then BUILD_ARGS+=(--dtype "$ENGINE_DTYPE"); fi
@@ -224,7 +243,9 @@ build_forward_args() {
 
     # Phase C args
     DEPLOY_ARGS=()
-    if [ -n "$VARIANT" ]; then DEPLOY_ARGS+=(--variant "$VARIANT"); fi
+    if [ -n "$VARIANT" ] && [[ "$VARIANT" != all* ]]; then
+        DEPLOY_ARGS+=(--variant "$VARIANT")
+    fi
     if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
     if [ -n "$GRPC_PORT" ]; then
         export TRITON_GRPC_PORT="$GRPC_PORT"
@@ -326,6 +347,11 @@ cmd_stop() {
     triton_stop "$container"
 }
 
+cmd_update_matrix() {
+    source "${SCRIPT_DIR}/lib/ngc_updater.sh"
+    update_ngc_matrix "${SCRIPT_DIR}/ngc_matrix.conf"
+}
+
 # ── Banner ──
 
 show_run_banner() {
@@ -339,6 +365,7 @@ show_run_banner() {
     echo ""
     echo "  Mode:      $description"
     [ -n "$VARIANT" ] && echo "  Variant:   $VARIANT"
+    [ -n "$TARGET_DRIVER" ] && echo "  Target:    driver $TARGET_DRIVER (production override)"
     $DRY_RUN && echo "  Dry run:   yes"
     echo ""
 }
@@ -435,14 +462,15 @@ main() {
     build_forward_args
 
     case "$COMMAND" in
-        all)    cmd_all ;;
-        setup)  cmd_setup ;;
-        build)  cmd_build ;;
-        deploy) cmd_deploy ;;
-        status) cmd_status ;;
-        stop)   cmd_stop ;;
-        help)   usage ;;
-        *)      log_error "Unknown command: $COMMAND"; usage; exit 1 ;;
+        all)            cmd_all ;;
+        setup)          cmd_setup ;;
+        build)          cmd_build ;;
+        deploy)         cmd_deploy ;;
+        status)         cmd_status ;;
+        stop)           cmd_stop ;;
+        update-matrix)  cmd_update_matrix ;;
+        help)           usage ;;
+        *)              log_error "Unknown command: $COMMAND"; usage; exit 1 ;;
     esac
 }
 

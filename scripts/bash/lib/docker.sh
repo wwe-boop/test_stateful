@@ -4,13 +4,14 @@
 #
 #  Functions: detect_driver_version, resolve_ngc_image, ensure_ngc_image,
 #             check_docker_gpu_ready, print_container_recommendation,
-#             resolve_ngc_tag, build_combined_triton_image,
-#             ensure_combined_triton_image
+#             resolve_ngc_tag, resolve_ngc_python_version,
+#             resolve_ngc_entry, build_combined_triton_image,
+#             ensure_combined_triton_image, _check_ngc_manifest
 #  Depends:   lib/logging.sh, lib/utils.sh
 #
-#  NGC compatibility matrix sourced from:
-#  https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/
-#    docs/introduction/compatibility.html
+#  NGC compatibility matrix loaded from scripts/bash/ngc_matrix.conf
+#  (falls back to built-in defaults if the file is missing).
+#  Update via: bash scripts/bash/autorun.sh update-matrix
 #
 #  Container strategy:
 #    Phase B (engine build):  trtllm-python-py3  (unmodified NGC image)
@@ -29,28 +30,6 @@ _LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${_LIB_DIR}/logging.sh"
 source "${_LIB_DIR}/utils.sh"
 
-# NGC trtllm-python-py3 images: tag  min_driver  trtllm_version  cuda_version
-# Sorted newest-first so the first compatible match is the best.
-# Update this table when new NGC releases come out.
-_NGC_TRTLLM_MATRIX=(
-    "25.10  575.51  1.2.0   13.0"
-    "25.09  575.51  1.0.0   13.0"
-    "25.08  575.51  0.21.0  12.9"
-    "25.07  575.51  0.20.0  12.9"
-    "25.06  575.51  0.20.0  12.9"
-    "25.05  570.124 0.19.0  12.8"
-    "25.04  570.124 0.18.2  12.8"
-    "25.03  570.124 0.18.0  12.8"
-    "25.02  570.86  0.17.0  12.8"
-    "25.01  570.86  0.17.0  12.8"
-    "24.12  560.35  0.16.0  12.6"
-    "24.11  555.42  0.15.0  12.6"
-    "24.10  555.42  0.14.0  12.5"
-    "24.09  555.42  0.13.0  12.5"
-    "24.08  555.42  0.12.0  12.5"
-    "24.07  550.54  0.11.0  12.4"
-)
-
 # NGC image base and suffixes
 _NGC_TRITON_BASE="nvcr.io/nvidia/tritonserver"
 _NGC_TRTLLM_SUFFIX="-trtllm-python-py3"
@@ -58,6 +37,43 @@ _NGC_FULL_SUFFIX="-py3"
 
 # Combined image tag prefix (locally built: trtllm + onnxruntime backend)
 _COMBINED_IMAGE_NAME="qwen3-tts-triton-base"
+
+# Qwen3 project minimum requirements (QK-Norm needs TRT-LLM >= 1.0.0)
+_QWEN3_MIN_TRTLLM="1.0.0"
+_QWEN3_MIN_DRIVER="575.57"
+
+# ---------------------------------------------------------------------------
+#  _load_ngc_matrix
+#  Populates _NGC_TRTLLM_MATRIX from ngc_matrix.conf.
+#  Falls back to a minimal built-in default if the file is missing.
+#  Each entry: "tag  min_driver  trtllm_version  cuda_version  python_version  size_gb"
+# ---------------------------------------------------------------------------
+_NGC_TRTLLM_MATRIX=()
+
+_load_ngc_matrix() {
+    [[ ${#_NGC_TRTLLM_MATRIX[@]} -gt 0 ]] && return 0
+
+    local conf_path="${_LIB_DIR}/../ngc_matrix.conf"
+
+    if [ -f "$conf_path" ]; then
+        while IFS= read -r line; do
+            local stripped="${line##"${line%%[![:space:]]*}"}"
+            [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+            _NGC_TRTLLM_MATRIX+=("$stripped")
+        done < "$conf_path"
+    fi
+
+    if [ ${#_NGC_TRTLLM_MATRIX[@]} -eq 0 ]; then
+        log_warn "ngc_matrix.conf not found or empty — using built-in fallback"
+        _NGC_TRTLLM_MATRIX=(
+            "25.11  580.95  1.0.3  13.0  3.12  12.25"
+            "25.05  570.124 0.19.0 12.8  3.12  17.0"
+            "24.07  550.54  0.11.0 12.4  3.10  23.0"
+        )
+    fi
+}
+
+_load_ngc_matrix
 
 # ---------------------------------------------------------------------------
 #  detect_driver_version
@@ -104,33 +120,114 @@ _driver_ge() {
 }
 
 # ---------------------------------------------------------------------------
-#  resolve_ngc_image [driver_version]
-#  Selects the newest compatible NGC trtllm container tag for the given
-#  NVIDIA driver version.  If driver_version is omitted, auto-detects.
-#
-#  Echoes the full image URI (e.g. nvcr.io/nvidia/tritonserver:25.05-trtllm-python-py3)
-#  Returns 1 if no compatible image found.
+#  _version_ge <installed> <required>
+#  Semantic version comparison (major.minor.patch).  Returns 0 if installed
+#  >= required.  Missing components default to 0.
 # ---------------------------------------------------------------------------
-resolve_ngc_image() {
-    local driver_ver="${1:-}"
+_version_ge() {
+    local inst="$1" req="$2"
+    local i1 i2 i3 r1 r2 r3
+    IFS='.' read -r i1 i2 i3 <<< "$inst"
+    IFS='.' read -r r1 r2 r3 <<< "$req"
+    i1="${i1:-0}"; i2="${i2:-0}"; i3="${i3:-0}"
+    r1="${r1:-0}"; r2="${r2:-0}"; r3="${r3:-0}"
+
+    if   [ "$i1" -gt "$r1" ]; then return 0
+    elif [ "$i1" -lt "$r1" ]; then return 1
+    elif [ "$i2" -gt "$r2" ]; then return 0
+    elif [ "$i2" -lt "$r2" ]; then return 1
+    elif [ "$i3" -ge "$r3" ]; then return 0
+    fi
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+#  _check_ngc_manifest <image>
+#  Returns 0 if the Docker registry has a manifest for <image>, 1 otherwise.
+#  Used to skip matrix entries for containers not yet published.
+# ---------------------------------------------------------------------------
+_check_ngc_manifest() {
+    local image="$1"
+    docker manifest inspect "$image" > /dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+#  _resolve_best_entry [driver_version]
+#  Core resolver: finds the newest NGC matrix entry that satisfies both
+#  driver compatibility AND the project minimum TRT-LLM version.
+#
+#  When _NGC_VERIFY_MANIFEST=1, each candidate is checked against the
+#  Docker registry via _check_ngc_manifest.  Entries whose manifest is
+#  unavailable (not yet released) are skipped with a warning.
+#
+#  On success, echoes: "tag min_driver trtllm_version cuda_version python_version size_gb"
+#  On failure, prints targeted error messages and returns 1.
+# ---------------------------------------------------------------------------
+_resolve_best_entry() {
+    local driver_ver="${1:-${TARGET_DRIVER:-}}"
 
     if [ -z "$driver_ver" ]; then
         driver_ver=$(detect_driver_version) \
             || { log_error "Cannot detect NVIDIA driver version"; return 1; }
+    elif [ -n "${TARGET_DRIVER:-}" ] && [ -z "${1:-}" ]; then
+        log_info "Using target driver version: $driver_ver (override via TARGET_DRIVER)"
     fi
 
-    local tag min_drv trtllm_ver cuda_ver
+    local tag min_drv trtllm_ver cuda_ver py_ver size_gb
+    local best_driver_match=""
+
     for entry in "${_NGC_TRTLLM_MATRIX[@]}"; do
-        read -r tag min_drv trtllm_ver cuda_ver <<< "$entry"
+        read -r tag min_drv trtllm_ver cuda_ver py_ver size_gb <<< "$entry"
         if _driver_ge "$driver_ver" "$min_drv"; then
-            echo "${_NGC_TRITON_BASE}:${tag}${_NGC_TRTLLM_SUFFIX}"
-            return 0
+            if [ -z "$best_driver_match" ]; then
+                best_driver_match="$tag $min_drv $trtllm_ver $cuda_ver"
+            fi
+            if _version_ge "$trtllm_ver" "$_QWEN3_MIN_TRTLLM"; then
+                if [ "${_NGC_VERIFY_MANIFEST:-0}" = "1" ]; then
+                    local _img="${_NGC_TRITON_BASE}:${tag}${_NGC_TRTLLM_SUFFIX}"
+                    if docker image inspect "$_img" &>/dev/null; then
+                        : # image already local — skip remote manifest check
+                    elif ! _check_ngc_manifest "$_img"; then
+                        log_warn "NGC $tag not yet available on registry, trying next..."
+                        continue
+                    fi
+                fi
+                echo "$tag $min_drv $trtllm_ver $cuda_ver ${py_ver:-3.12} ${size_gb:--}"
+                return 0
+            fi
         fi
     done
 
-    log_error "Driver $driver_ver too old — oldest supported container (24.07) needs >= 550.54"
-    log_error "Update your NVIDIA driver: https://www.nvidia.com/drivers"
+    if [ -n "$best_driver_match" ]; then
+        local _bt _bd _bv _bc
+        read -r _bt _bd _bv _bc <<< "$best_driver_match"
+        log_error "Driver $driver_ver supports NGC $_bt (TRT-LLM $_bv), but Qwen3 requires TRT-LLM >= $_QWEN3_MIN_TRTLLM"
+        log_error "Qwen3 QK-Norm requires TRT-LLM >= $_QWEN3_MIN_TRTLLM (NGC 25.09+, driver >= $_QWEN3_MIN_DRIVER)"
+        log_error "Upgrade your NVIDIA driver to >= $_QWEN3_MIN_DRIVER: https://www.nvidia.com/drivers"
+    else
+        log_error "Driver $driver_ver too old — no compatible NGC container found"
+        log_error "Minimum driver for Qwen3: >= $_QWEN3_MIN_DRIVER"
+        log_error "Update your NVIDIA driver: https://www.nvidia.com/drivers"
+    fi
     return 1
+}
+
+# ---------------------------------------------------------------------------
+#  resolve_ngc_image [driver_version]
+#  Selects the newest compatible NGC trtllm container tag for the given
+#  NVIDIA driver version.  If driver_version is omitted, auto-detects.
+#  Rejects containers with TRT-LLM below the Qwen3 minimum.
+#
+#  Echoes the full image URI (e.g. nvcr.io/nvidia/tritonserver:25.09-trtllm-python-py3)
+#  Returns 1 if no compatible image found.
+# ---------------------------------------------------------------------------
+resolve_ngc_image() {
+    local entry
+    entry=$(_resolve_best_entry "$@") || return 1
+
+    local tag _rest
+    read -r tag _rest <<< "$entry"
+    echo "${_NGC_TRITON_BASE}:${tag}${_NGC_TRTLLM_SUFFIX}"
 }
 
 # ---------------------------------------------------------------------------
@@ -140,26 +237,18 @@ resolve_ngc_image() {
 #  Echoes the full image URI to stdout.
 # ---------------------------------------------------------------------------
 resolve_ngc_image_info() {
+    local entry
+    entry=$(_resolve_best_entry "$@") || return 1
+
+    local tag min_drv trtllm_ver cuda_ver py_ver size_gb
+    read -r tag min_drv trtllm_ver cuda_ver py_ver size_gb <<< "$entry"
+
     local driver_ver="${1:-}"
-
     if [ -z "$driver_ver" ]; then
-        driver_ver=$(detect_driver_version) \
-            || { log_error "Cannot detect NVIDIA driver version"; return 1; }
+        driver_ver=$(detect_driver_version 2>/dev/null) || true
     fi
-
-    local tag min_drv trtllm_ver cuda_ver
-    for entry in "${_NGC_TRTLLM_MATRIX[@]}"; do
-        read -r tag min_drv trtllm_ver cuda_ver <<< "$entry"
-        if _driver_ge "$driver_ver" "$min_drv"; then
-            log_info "Driver $driver_ver >= $min_drv → NGC tag $tag (TRT-LLM $trtllm_ver, CUDA $cuda_ver)"
-            echo "${_NGC_TRITON_BASE}:${tag}${_NGC_TRTLLM_SUFFIX}"
-            return 0
-        fi
-    done
-
-    log_error "Driver $driver_ver too old — oldest supported container (24.07) needs >= 550.54"
-    log_error "Update your NVIDIA driver: https://www.nvidia.com/drivers"
-    return 1
+    log_info "Driver ${driver_ver:-?} >= $min_drv → NGC tag $tag (TRT-LLM $trtllm_ver, CUDA $cuda_ver, Python ${py_ver:-?})"
+    echo "${_NGC_TRITON_BASE}:${tag}${_NGC_TRTLLM_SUFFIX}"
 }
 
 # ---------------------------------------------------------------------------
@@ -225,29 +314,42 @@ check_docker_gpu_ready() {
 
 # ---------------------------------------------------------------------------
 #  resolve_ngc_tag [driver_version]
-#  Like resolve_ngc_image but echoes only the NGC tag (e.g. "25.05"),
+#  Like resolve_ngc_image but echoes only the NGC tag (e.g. "25.09"),
 #  not the full image URI.  Used to construct image names for both
 #  trtllm and py3 variants.
 # ---------------------------------------------------------------------------
 resolve_ngc_tag() {
-    local driver_ver="${1:-}"
+    local entry
+    entry=$(_resolve_best_entry "$@") || return 1
 
-    if [ -z "$driver_ver" ]; then
-        driver_ver=$(detect_driver_version) \
-            || { log_error "Cannot detect NVIDIA driver version"; return 1; }
-    fi
+    local tag _rest
+    read -r tag _rest <<< "$entry"
+    echo "$tag"
+}
 
-    local tag min_drv trtllm_ver cuda_ver
-    for entry in "${_NGC_TRTLLM_MATRIX[@]}"; do
-        read -r tag min_drv trtllm_ver cuda_ver <<< "$entry"
-        if _driver_ge "$driver_ver" "$min_drv"; then
-            echo "$tag"
-            return 0
-        fi
-    done
+# ---------------------------------------------------------------------------
+#  resolve_ngc_entry [driver_version]
+#  Returns the full matrix entry (all 6 fields) for the best compatible
+#  NGC container.  Useful for callers that need python_version or size.
+#  Output: "tag  min_driver  trtllm_version  cuda_version  python_version  size_gb"
+# ---------------------------------------------------------------------------
+resolve_ngc_entry() {
+    _resolve_best_entry "$@"
+}
 
-    log_error "Driver $driver_ver too old — oldest supported container (24.07) needs >= 550.54"
-    return 1
+# ---------------------------------------------------------------------------
+#  resolve_ngc_python_version [driver_version]
+#  Returns the Python version used by the best compatible NGC container.
+#  Falls back to "3.12" if the field is missing.
+# ---------------------------------------------------------------------------
+resolve_ngc_python_version() {
+    local entry
+    entry=$(_resolve_best_entry "$@") || return 1
+
+    local tag min_drv trtllm_ver cuda_ver py_ver size_gb
+    read -r tag min_drv trtllm_ver cuda_ver py_ver size_gb <<< "$entry"
+
+    echo "${py_ver:-3.12}"
 }
 
 # ---------------------------------------------------------------------------
@@ -356,12 +458,15 @@ ensure_combined_triton_image() {
 # ---------------------------------------------------------------------------
 print_container_recommendation() {
     local driver_ver
-    if ! driver_ver=$(detect_driver_version); then
+    if [ -n "${TARGET_DRIVER:-}" ]; then
+        driver_ver="$TARGET_DRIVER"
+        log_info "Target driver (override): $driver_ver"
+    elif ! driver_ver=$(detect_driver_version); then
         log_warn "Cannot detect NVIDIA driver — skipping container recommendation"
         return 0
+    else
+        log_info "NVIDIA driver: $driver_ver"
     fi
-
-    log_info "NVIDIA driver: $driver_ver"
 
     local image
     if image=$(resolve_ngc_image_info "$driver_ver"); then
@@ -369,7 +474,7 @@ print_container_recommendation() {
         log_info "Triton deploy image (Phase C) will add ONNX Runtime backend automatically."
         log_info "Phase B: bash scripts/bash/build_engines.sh"
     else
-        log_warn "No compatible NGC TRT-LLM container for driver $driver_ver"
-        log_warn "Upgrade your NVIDIA driver to at least 550.54 for container support"
+        log_warn "No compatible NGC container for driver $driver_ver (Qwen3 needs TRT-LLM >= $_QWEN3_MIN_TRTLLM)"
+        log_warn "Upgrade your NVIDIA driver to >= $_QWEN3_MIN_DRIVER: https://www.nvidia.com/drivers"
     fi
 }

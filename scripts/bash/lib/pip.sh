@@ -46,13 +46,21 @@ pip_install_requirements() {
 }
 
 # ---------------------------------------------------------------------------
-#  install_torch_cuda [cuda_version]
+#  install_torch_cuda [cuda_tag_or_version]
 #  Installs PyTorch + torchaudio with the correct CUDA build.
-#  Auto-detects the CUDA version when not provided.
+#
+#  Argument can be:
+#    - A CUDA tag like "cu130", "cu128" (used directly as index URL suffix)
+#    - A CUDA version like "13.0", "12.8" (auto-converted via cuda_to_torch_tag)
+#    - Omitted: auto-detects CUDA version from the system
+#
+#  When called from setup_env.sh with an env_plan, the pre-resolved cuda_tag
+#  is passed in and the wheel index reachability has already been validated.
+#
 #  Skips if PyTorch with CUDA is already importable.
 # ---------------------------------------------------------------------------
 install_torch_cuda() {
-    local cuda_ver="${1:-}"
+    local arg="${1:-}"
 
     if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
         local existing
@@ -61,25 +69,28 @@ install_torch_cuda() {
         return 0
     fi
 
-    if [ -z "$cuda_ver" ]; then
+    local tag=""
+    if [[ "$arg" == cu* ]]; then
+        tag="$arg"
+    elif [ -n "$arg" ]; then
+        tag=$(cuda_to_torch_tag "$arg")
+    else
+        local cuda_ver
         cuda_ver=$(detect_cuda_version) || true
+        if [ -z "$cuda_ver" ]; then
+            log_warn "No CUDA detected — installing CPU-only PyTorch"
+            pip_install torch torchaudio
+            return $?
+        fi
+        tag=$(cuda_to_torch_tag "$cuda_ver")
     fi
 
-    if [ -z "$cuda_ver" ]; then
-        log_warn "No CUDA detected — installing CPU-only PyTorch"
-        pip_install torch torchaudio
-        return $?
-    fi
+    local whl_index="https://download.pytorch.org/whl/${tag}"
+    log_step "Installing PyTorch ($tag)..."
 
-    local tag
-    tag=$(cuda_to_torch_tag "$cuda_ver")
-    log_step "Installing PyTorch (CUDA $cuda_ver → $tag)..."
-
-    # --index-url overrides pip.conf; re-inject user's configured mirror
-    # as --extra-index-url so dependencies (nvidia-cudnn, sympy, etc.)
-    # can be fetched from the faster mirror
     local pip_args=(--upgrade torch torchaudio
-        --index-url "https://download.pytorch.org/whl/${tag}")
+        --only-binary=:all:
+        --index-url "$whl_index")
 
     local _cfg_index
     _cfg_index=$(python3 -m pip config get global.index-url 2>/dev/null) || true
@@ -89,7 +100,7 @@ install_torch_cuda() {
     fi
 
     python3 -m pip install "${pip_args[@]}" \
-        || { log_error "PyTorch install failed for $tag"; return 1; }
+        || { log_error "PyTorch install failed for $tag (no pre-built wheel available?)"; return 1; }
 
     if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
         local tv cr
@@ -98,7 +109,7 @@ install_torch_cuda() {
         log_info "PyTorch $tv installed (CUDA runtime: $cr)"
     else
         log_warn "PyTorch installed but torch.cuda.is_available() == False"
-        log_warn "Check that your NVIDIA driver is compatible with CUDA $cuda_ver"
+        log_warn "Check that your NVIDIA driver is compatible"
     fi
 }
 
@@ -107,7 +118,7 @@ install_torch_cuda() {
 #  Installs flash-attn with the correct pre-built wheel for the current
 #  PyTorch / CUDA / Python combination.  Downloads from GitHub releases
 #  via the project's mirror infrastructure (github_url).
-#  Falls back to source build if no pre-built wheel matches.
+#  Refuses to fall back to source build (10-30 min, often fails).
 # ---------------------------------------------------------------------------
 install_flash_attn() {
     if python3 -c "import flash_attn" 2>/dev/null; then
@@ -163,17 +174,24 @@ print(tv, cu, pv, abi)
        && [ -s "$tmp_wheel" ] \
        && python3 -c "import zipfile; zipfile.ZipFile('$tmp_wheel')" 2>/dev/null; then
         log_info "预编译 wheel 下载成功，安装中..."
-        python3 -m pip install "$tmp_wheel" \
-            && { rm -f "$tmp_wheel"; log_info "flash-attn ${fa_ver} installed"; return 0; }
-        log_warn "预编译 wheel 安装失败，尝试源码编译..."
+        if python3 -m pip install "$tmp_wheel"; then
+            rm -f "$tmp_wheel"
+            log_info "flash-attn ${fa_ver} installed"
+            return 0
+        fi
         rm -f "$tmp_wheel"
+        log_error "预编译 wheel 安装失败"
     else
         rm -f "$tmp_wheel"
-        log_warn "预编译 wheel 下载失败 ($wheel)，尝试源码编译..."
     fi
 
-    pip_install flash-attn --no-build-isolation \
-        || { log_warn "flash-attn source build failed (non-fatal)"; return 1; }
+    log_error "No pre-built flash-attn wheel for: torch=${torch_ver} cuda=${cuda_major} python=${py_ver} abi=${abi}"
+    log_error "Wheel filename: $wheel"
+    log_error "Source build disabled (unreliable, 10-30 min). Options:"
+    log_error "  1. Check flash-attn releases: https://github.com/Dao-AILab/flash-attention/releases"
+    log_error "  2. Adjust PyTorch/CUDA/Python versions to match an available wheel"
+    log_error "  3. Build manually: pip install flash-attn --no-build-isolation"
+    return 1
 }
 
 # ---------------------------------------------------------------------------

@@ -44,6 +44,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 source "${SCRIPT_DIR}/tools.sh"
 
+_NGC_VERIFY_MANIFEST=1
+
 # ── Defaults ──
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
