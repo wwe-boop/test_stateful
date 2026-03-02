@@ -23,7 +23,6 @@ source "${_LIB_DIR}/docker.sh"
 _TRITON_MODELS=(
     "speaker_encoder"
     "speech_tokenizer_encoder"
-    "talker_backbone"
     "code_predictor"
     "code2wav"
     "tts_orchestrator"
@@ -68,14 +67,12 @@ resolve_triton_deploy_image() {
 
 # ---------------------------------------------------------------------------
 #  _link_or_copy <src> <dst>
-#  Creates a symlink from dst → src.  Falls back to cp if symlinks fail
-#  (e.g. across filesystem boundaries).
+#  Copies src to dst.  Always uses cp (not symlinks) because the assembled
+#  model_repository is mounted into Docker containers where host-absolute
+#  symlinks would be dangling.
 # ---------------------------------------------------------------------------
 _link_or_copy() {
     local src="$1" dst="$2"
-    if ln -sf "$src" "$dst" 2>/dev/null; then
-        return 0
-    fi
     cp -a "$src" "$dst"
 }
 
@@ -87,7 +84,9 @@ _link_or_copy() {
 #    exported/<variant>/
 #    ├── speaker_encoder.onnx          → model_repo/speaker_encoder/1/model.onnx
 #    ├── code_predictor_*.onnx         → model_repo/code_predictor/1/model.onnx
-#    ├── trtllm_engine/                → model_repo/talker_backbone/1/
+#    ├── trtllm_engine/                → model_repo/tts_orchestrator/1/engine/ (legacy)
+#    ├── talker_context.engine         → model_repo/tts_orchestrator/1/engine/ (Pure TRT)
+#    ├── talker_decode_fused.engine    → model_repo/tts_orchestrator/1/engine/
 #    └── weights/                      → model_repo/tts_orchestrator/1/weights/
 #    exported/tokenizer/
 #    ├── speech_tokenizer_encoder.onnx → model_repo/speech_tokenizer_encoder/1/model.onnx
@@ -122,9 +121,7 @@ assemble_model_repo() {
     if [ -f "$spk_src" ]; then
         mkdir -p "$repo_dir/speaker_encoder/1"
         _link_or_copy "$spk_src" "$repo_dir/speaker_encoder/1/model.onnx"
-        _write_onnx_config "$repo_dir/speaker_encoder" "speaker_encoder" \
-            "mel_spectrogram:float:-1x-1x128" \
-            "speaker_embedding:float:-1x1024"
+        _write_onnx_minimal_config "$repo_dir/speaker_encoder" "speaker_encoder"
         log_info "  speaker_encoder: OK"
     else
         log_warn "  speaker_encoder: SKIPPED (not found — only needed for voice clone)"
@@ -135,9 +132,7 @@ assemble_model_repo() {
     if [ -f "$stoken_src" ]; then
         mkdir -p "$repo_dir/speech_tokenizer_encoder/1"
         _link_or_copy "$stoken_src" "$repo_dir/speech_tokenizer_encoder/1/model.onnx"
-        _write_onnx_config "$repo_dir/speech_tokenizer_encoder" "speech_tokenizer_encoder" \
-            "waveform:float:-1x1x-1" \
-            "audio_codes:int32:-1x16x-1"
+        _write_onnx_minimal_config "$repo_dir/speech_tokenizer_encoder" "speech_tokenizer_encoder"
         log_info "  speech_tokenizer_encoder: OK"
     else
         log_warn "  speech_tokenizer_encoder: SKIPPED (not found — only needed for ICL mode)"
@@ -148,26 +143,32 @@ assemble_model_repo() {
     if [ -f "$c2w_src" ]; then
         mkdir -p "$repo_dir/code2wav/1"
         _link_or_copy "$c2w_src" "$repo_dir/code2wav/1/model.onnx"
-        _write_onnx_config "$repo_dir/code2wav" "code2wav" \
-            "codes:int32:-1x16x-1,left_context:int32:-1x16x-1" \
-            "wav:float:-1x-1"
+        _write_onnx_minimal_config "$repo_dir/code2wav" "code2wav"
         log_info "  code2wav: OK"
     else
         log_error "  code2wav: MISSING (required)"
         return 1
     fi
 
-    # ── 4. Talker Backbone (TRT-LLM engine) ──
-    local engine_dir="$variant_dir/trtllm_engine"
-    if [ -d "$engine_dir" ] && ls "$engine_dir"/*.engine &>/dev/null 2>&1; then
-        mkdir -p "$repo_dir/talker_backbone/1"
-        for f in "$engine_dir"/*; do
-            _link_or_copy "$f" "$repo_dir/talker_backbone/1/$(basename "$f")"
-        done
-        _write_trtllm_config "$repo_dir/talker_backbone"
-        log_info "  talker_backbone: OK (TRT-LLM engine)"
+    # ── 4. Talker engines (Pure TRT or legacy TRT-LLM — loaded by orchestrator) ──
+    # Engine files go INSIDE tts_orchestrator/1/engine/
+    mkdir -p "$repo_dir/tts_orchestrator/1/engine"
+    local ctx_eng="$variant_dir/talker_context.engine"
+    local dec_eng="$variant_dir/talker_decode_fused.engine"
+    if [ -f "$ctx_eng" ] && [ -f "$dec_eng" ]; then
+        _link_or_copy "$ctx_eng" "$repo_dir/tts_orchestrator/1/engine/talker_context.engine"
+        _link_or_copy "$dec_eng" "$repo_dir/tts_orchestrator/1/engine/talker_decode_fused.engine"
+        log_info "  talker (Pure TRT): OK (context + decode_fused → tts_orchestrator/1/engine/)"
     else
-        log_warn "  talker_backbone: NOT READY (engine not built yet — run build_engines.sh)"
+        local engine_dir="$variant_dir/trtllm_engine"
+        if [ -d "$engine_dir" ] && ls "$engine_dir"/*.engine &>/dev/null 2>&1; then
+            for f in "$engine_dir"/*; do
+                _link_or_copy "$f" "$repo_dir/tts_orchestrator/1/engine/$(basename "$f")"
+            done
+            log_info "  talker (TRT-LLM): OK (engine → tts_orchestrator/1/engine/)"
+        else
+            log_warn "  talker: NOT READY (run build_engines.sh or build_engines.sh --pure-trt)"
+        fi
     fi
 
     # ── 5. Code Predictor (ONNX → TRT at Phase 2, ONNX for now) ──
@@ -181,9 +182,7 @@ assemble_model_repo() {
     if [ -n "$cp_src" ]; then
         mkdir -p "$repo_dir/code_predictor/1"
         _link_or_copy "$cp_src" "$repo_dir/code_predictor/1/model.onnx"
-        _write_onnx_config "$repo_dir/code_predictor" "code_predictor" \
-            "past_hidden:float:-1x1x1024,codec_token_0:int64:-1" \
-            "codec_tokens:int64:-1x15"
+        _write_onnx_minimal_config "$repo_dir/code_predictor" "code_predictor"
         log_info "  code_predictor: OK (ONNX)"
     else
         log_error "  code_predictor: MISSING (required)"
@@ -201,6 +200,50 @@ assemble_model_repo() {
     else
         log_warn "  tts_orchestrator/weights: MISSING (no embedding weights found)"
     fi
+
+    # Copy orchestrator Python source files
+    local orch_src_dir
+    orch_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    local orch_py_dir="$orch_src_dir/../model_repository/tts_orchestrator/1"
+    if [ -d "$orch_py_dir" ]; then
+        for pyf in model.py prefill_builder.py talker_runner.py; do
+            if [ -f "$orch_py_dir/$pyf" ]; then
+                cp "$orch_py_dir/$pyf" "$repo_dir/tts_orchestrator/1/$pyf"
+            fi
+        done
+        # codec_embedding_sum.py lives in scripts/python/
+        local ces="$orch_src_dir/../scripts/python/codec_embedding_sum.py"
+        if [ -f "$ces" ]; then
+            cp "$ces" "$repo_dir/tts_orchestrator/1/codec_embedding_sum.py"
+        fi
+        log_info "  tts_orchestrator/python: OK (copied model.py + helpers)"
+    else
+        log_warn "  tts_orchestrator/python: source dir not found, using stub"
+    fi
+
+    # Copy text tokenizer files for orchestrator
+    local model_base_dir
+    model_base_dir="$(cd "$(dirname "$exported_dir")" && pwd)/models"
+    local tok_dir=""
+    case "$variant" in
+        design-1.7b) tok_dir="$model_base_dir/Qwen3-TTS-12Hz-1.7B-VoiceDesign" ;;
+        custom-1.7b) tok_dir="$model_base_dir/Qwen3-TTS-12Hz-1.7B-CustomVoice" ;;
+        base-1.7b)   tok_dir="$model_base_dir/Qwen3-TTS-12Hz-1.7B-Base" ;;
+        custom-0.6b) tok_dir="$model_base_dir/Qwen3-TTS-12Hz-0.6B-CustomVoice" ;;
+        base-0.6b)   tok_dir="$model_base_dir/Qwen3-TTS-12Hz-0.6B-Base" ;;
+    esac
+    if [ -n "$tok_dir" ] && [ -d "$tok_dir" ]; then
+        mkdir -p "$repo_dir/tts_orchestrator/1/tokenizer"
+        for tf in tokenizer_config.json vocab.json merges.txt \
+                  config.json generation_config.json; do
+            [ -f "$tok_dir/$tf" ] && \
+                _link_or_copy "$tok_dir/$tf" "$repo_dir/tts_orchestrator/1/tokenizer/$tf"
+        done
+        log_info "  tts_orchestrator/tokenizer: OK"
+    else
+        log_warn "  tts_orchestrator/tokenizer: SKIPPED (model dir not found)"
+    fi
+
     _write_orchestrator_config "$repo_dir/tts_orchestrator" "$variant"
 
     echo ""
@@ -324,7 +367,8 @@ triton_run() {
     log_info "  Container:  $container_name"
     log_info "  Ports:      gRPC=$TRITON_GRPC_PORT HTTP=$TRITON_HTTP_PORT metrics=$TRITON_METRICS_PORT"
 
-    docker run -d --gpus all \
+    local gpu_device="${TRITON_GPU_DEVICE:-0}"
+    docker run -d --gpus "\"device=${gpu_device}\"" \
         --name "$container_name" \
         --shm-size=1g \
         --ulimit memlock=-1 \
@@ -392,6 +436,28 @@ triton_stop() {
 #  Config file generators (internal)
 # ===========================================================================
 
+# _write_onnx_minimal_config <model_dir> <model_name>
+# Generates a minimal config.pbtxt (backend + max_batch_size only).
+# With --strict-model-config=false, Triton auto-detects I/O from ONNX.
+_write_onnx_minimal_config() {
+    local model_dir="$1"
+    local model_name="$2"
+
+    cat > "$model_dir/config.pbtxt" << EOF
+name: "${model_name}"
+backend: "onnxruntime"
+max_batch_size: 0
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [ 0 ]
+  }
+]
+EOF
+}
+
 # _write_onnx_config <model_dir> <model_name> <inputs_spec> <outputs_spec>
 #
 # inputs_spec / outputs_spec: comma-separated "name:dtype:shape" entries
@@ -453,6 +519,7 @@ instance_group [
   {
     count: 1
     kind: KIND_GPU
+    gpus: [ 0 ]
   }
 ]
 EOF
@@ -492,6 +559,7 @@ instance_group [
   {
     count: 1
     kind: KIND_GPU
+    gpus: [ 0 ]
   }
 ]
 
@@ -545,6 +613,7 @@ instance_group [
   {
     count: 1
     kind: KIND_GPU
+    gpus: [ 0 ]
   }
 ]
 
@@ -552,50 +621,56 @@ parameters: {
   key: "model_variant"
   value: { string_value: "${variant}" }
 }
+parameters: {
+  key: "weights_dir"
+  value: { string_value: "/models/tts_orchestrator/1/weights" }
+}
+parameters: {
+  key: "engine_dir"
+  value: { string_value: "/models/tts_orchestrator/1/engine" }
+}
+parameters: {
+  key: "tokenizer_dir"
+  value: { string_value: "/models/tts_orchestrator/1/tokenizer" }
+}
+parameters: {
+  key: "max_decode_steps"
+  value: { string_value: "4096" }
+}
+parameters: {
+  key: "audio_chunk_frames"
+  value: { string_value: "25" }
+}
 EOF
 
-    # Stub model.py if not already present
+    # Stub model.py only if the real orchestrator was not copied
     local model_py="$model_dir/1/model.py"
     if [ ! -f "$model_py" ]; then
         cat > "$model_py" << 'PYEOF'
-"""
-TTS Orchestrator — Triton Python BLS Backend (stub)
-
-This stub will be replaced by the full orchestrator implementation in Phase 3.
-It currently loads successfully in Triton and responds with an empty audio chunk.
-"""
-
 import triton_python_backend_utils as pb_utils
 import numpy as np
 import json
 
-
 class TritonPythonModel:
     def initialize(self, args):
         self.model_config = json.loads(args["model_config"])
-        params = self.model_config.get("parameters", {})
-        self.variant = params.get("model_variant", {}).get("string_value", "unknown")
-        print(f"[TTS Orchestrator] Initialized with variant: {self.variant}")
+        print("[TTS Orchestrator] Stub initialized")
 
     def execute(self, requests):
         responses = []
         for request in requests:
             audio = np.zeros(1, dtype=np.float32)
             is_final = np.array([True], dtype=bool)
-
-            out_audio = pb_utils.Tensor("audio_chunk", audio)
-            out_final = pb_utils.Tensor("is_final", is_final)
-
             response = pb_utils.InferenceResponse(
-                output_tensors=[out_audio, out_final]
-            )
+                output_tensors=[pb_utils.Tensor("audio_chunk", audio),
+                                pb_utils.Tensor("is_final", is_final)])
             responses.append(response)
         return responses
 
     def finalize(self):
         print("[TTS Orchestrator] Finalized")
 PYEOF
-        log_info "  tts_orchestrator/model.py: stub created"
+        log_info "  tts_orchestrator/model.py: stub created (no source found)"
     fi
 }
 

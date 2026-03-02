@@ -2,7 +2,8 @@
 # ===========================================================================
 #  docker.sh — Docker / NGC container helpers
 #
-#  Functions: detect_driver_version, resolve_ngc_image, ensure_ngc_image,
+#  Functions: detect_driver_version, detect_gpu_compute_cap,
+#             resolve_ngc_image, ensure_ngc_image,
 #             check_docker_gpu_ready, print_container_recommendation,
 #             resolve_ngc_tag, resolve_ngc_python_version,
 #             resolve_ngc_entry, build_combined_triton_image,
@@ -91,6 +92,17 @@ detect_driver_version() {
         return 1
     fi
     echo "$driver_ver"
+}
+
+# ---------------------------------------------------------------------------
+#  detect_gpu_compute_cap
+#  Returns the compute capability of the first GPU (e.g. "8.0", "8.9").
+#  Returns 1 if nvidia-smi is unavailable or no GPU found.
+# ---------------------------------------------------------------------------
+detect_gpu_compute_cap() {
+    if ! command -v nvidia-smi &>/dev/null; then return 1; fi
+    nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+        | head -1 | tr -d ' '
 }
 
 # ---------------------------------------------------------------------------

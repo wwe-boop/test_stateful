@@ -10,6 +10,7 @@ Components exported:
   2. text_projection.pt   - ResizeMLP(text_hidden_size → hidden_size)
   3. codec_embeddings.pt  - Talker codec Embedding(vocab_size, hidden_size)
                             + Code Predictor codec embeddings (num_code_groups-1)
+  3b. codec_embeddings_3d.pt - Pre-stacked [16, vocab, hidden] for 3D gather+sum (§2.1)
   4. special_embeddings.pt - tts_pad_embed, tts_bos_embed, tts_eos_embed
   5. codec_head.pt         - Linear(hidden_size, vocab_size) for Talker logits
 
@@ -19,9 +20,17 @@ Applies to: ALL variants
 import argparse
 import json
 import logging
+import sys
 from pathlib import Path
 
 import torch
+
+# Allow importing from scripts/python (for CodecEmbeddingSum)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPTS = _REPO_ROOT / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+from python.codec_embedding_sum import CodecEmbeddingSum
 
 from utils import (
     setup_logging,
@@ -96,6 +105,16 @@ def export_embeddings(
         f"  codec_embeddings.pt: talker={n_talker/1e6:.1f}M + "
         f"code_predictor={n_cp/1e6:.1f}M params, saved to {path}"
     )
+
+    # 3b. Pre-stacked 3D codec embedding (for optimized gather+sum, §2.1)
+    stacked = CodecEmbeddingSum.stack_weights(
+        talker.model.codec_embedding.weight,
+        [emb.weight for emb in talker.code_predictor.model.codec_embedding],
+        dtype=dtype,
+    )
+    path_3d = out_dir / "codec_embeddings_3d.pt"
+    torch.save(stacked.cpu(), path_3d)
+    logger.info(f"  codec_embeddings_3d.pt: shape={tuple(stacked.shape)}, saved to {path_3d}")
 
     # 4. Special Embeddings (tts_pad, tts_bos, tts_eos) — computed in FP32, saved in target dtype
     with torch.no_grad():

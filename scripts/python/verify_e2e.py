@@ -33,8 +33,11 @@ import torch
 import torch.nn.functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "export"))
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "Qwen3-TTS"))
+
+from python.codec_embedding_sum import CodecEmbeddingSum, codec_sum_naive, benchmark as codec_sum_benchmark
 
 from utils import (
     setup_logging,
@@ -366,6 +369,15 @@ def verify_decode_loop(model, past_hidden_init, codec_token_0_init,
     codec_data = torch.load(weights_dir / "codec_embeddings.pt",
                             map_location=device, weights_only=True)
 
+    # Codec embedding sum: 3D gather (prefer exported 3d, else from model)
+    path_3d = weights_dir / "codec_embeddings_3d.pt"
+    if path_3d.exists():
+        stacked_3d = torch.load(path_3d, map_location=device, weights_only=True)
+        codec_emb_sum = CodecEmbeddingSum(stacked_3d.to(device=device))
+    else:
+        codec_emb_sum = CodecEmbeddingSum.from_model(model, dtype=torch.float32).to(device)
+    codec_emb_sum_verified = False
+
     # ONNX Code Predictor session
     onnx_path = str(exported_dir / variant / "code_predictor_unrolled.onnx")
     ort_sess = None
@@ -428,17 +440,22 @@ def verify_decode_loop(model, past_hidden_init, codec_token_0_init,
             match = sum(1 for a, b in zip(pt_tokens, onnx_tokens) if a == b)
             all_matches.append(match)
 
-        # Construct next step: codec_sum + tts_pad (no real text for simplicity)
+        # Construct next step: codec_sum + tts_pad (3D gather optimization)
         with torch.no_grad():
-            all_tokens = torch.tensor([full_codec_pt], device=device)
-            codec_sum = torch.zeros(1, 1, talker.config.hidden_size, device=device,
-                                    dtype=past_hidden.dtype)
-            for i in range(min(16, all_tokens.shape[1])):
-                if i == 0:
-                    codec_sum += talker.model.codec_embedding(all_tokens[:, i]).unsqueeze(1)
-                elif i - 1 < len(talker.code_predictor.model.codec_embedding):
-                    codec_sum += talker.code_predictor.model.codec_embedding[i-1](
-                        all_tokens[:, i]).unsqueeze(1)
+            all_tokens = torch.tensor([full_codec_pt], device=device, dtype=torch.long)
+            codec_sum = codec_emb_sum(all_tokens).unsqueeze(1).to(past_hidden.dtype)
+            if not codec_emb_sum_verified:
+                naive_sum = codec_sum_naive(
+                    talker.model.codec_embedding,
+                    list(talker.code_predictor.model.codec_embedding),
+                    all_tokens,
+                ).unsqueeze(1).to(past_hidden.dtype)
+                if torch.equal(codec_sum, naive_sum):
+                    logger.info("  Codec embedding sum: 3D gather bitwise identical to naive loop")
+                else:
+                    diff = (codec_sum.float() - naive_sum.float()).abs().max().item()
+                    logger.warning(f"  Codec embedding sum: 3D vs naive max_abs_diff={diff:.6f}")
+                codec_emb_sum_verified = True
 
             # Use tts_pad as text input (simplification for verification)
             pad_id = torch.tensor([[model.config.tts_pad_token_id]], device=device)
@@ -456,6 +473,24 @@ def verify_decode_loop(model, past_hidden_init, codec_token_0_init,
             kv = out.past_key_values
             logits = talker.codec_head(past_hidden)
             codec_token_0 = logits[:, -1, :].argmax(dim=-1)
+
+    # Codec embedding sum latency benchmark (3D gather vs naive)
+    try:
+        bm = codec_sum_benchmark(
+            codec_emb_sum,
+            naive_talker_embedding=talker.model.codec_embedding,
+            naive_cp_embeddings=list(talker.code_predictor.model.codec_embedding),
+            batch_size=1,
+            num_warmup=100,
+            num_repeat=1000,
+            device=device,
+        )
+        msg = f"  Codec sum latency: 3D gather={bm['opt_ms']:.3f}ms"
+        if bm.get("naive_ms") is not None:
+            msg += f", naive={bm['naive_ms']:.3f}ms, speedup={bm['speedup']:.2f}x"
+        logger.info(msg)
+    except Exception as e:
+        logger.info(f"  Codec sum benchmark skipped: {e}")
 
     # Summary
     if all_matches:
