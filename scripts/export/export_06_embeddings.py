@@ -2,14 +2,13 @@
 """
 [Step 06] Export Embedding weights for the TTS Orchestrator.
 
-These weights are loaded directly by the Orchestrator (Python BLS backend),
-NOT through Triton model scheduling. They stay in PyTorch format.
+Weights are loaded in-process by the Orchestrator (Python BLS); text embedding
+uses .pt weights only (no separate ONNX/TRT model).
 
 Components exported:
   1. text_embedding.pt    - Embedding(text_vocab_size, text_hidden_size), ~312M params
   2. text_projection.pt   - ResizeMLP(text_hidden_size → hidden_size)
-  3. codec_embeddings.pt  - Talker codec Embedding(vocab_size, hidden_size)
-                            + Code Predictor codec embeddings (num_code_groups-1)
+  3. codec_embeddings.pt  - Talker codec Embedding + Code Predictor codec embeddings
   3b. codec_embeddings_3d.pt - Pre-stacked [16, vocab, hidden] for 3D gather+sum (§2.1)
   4. special_embeddings.pt - tts_pad_embed, tts_bos_embed, tts_eos_embed
   5. codec_head.pt         - Linear(hidden_size, vocab_size) for Talker logits

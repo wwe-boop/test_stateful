@@ -1,10 +1,10 @@
 # Qwen3-TTS Triton 流式推理服务架构设计
 
-> **技术路线**: Triton Inference Server + TensorRT (/ TRT-LLM) + ONNX Runtime
+> **技术路线**: Triton Inference Server + TensorRT + ONNX Runtime
 >
 > **推理精度**: BF16 (BFloat16)。BF16 与 FP32 共享 8 位指数范围，彻底避免 FP16 在 RoPE / LayerNorm / Softmax 中的 overflow 风险，同时保持与 FP16 相同的显存占用和吞吐。
 >
-> **核心策略**: Talker Backbone → **TRT-LLM** (含 KV Cache，由 TRT-LLM 运行时管理)，Code Predictor → TRT (无 KV Cache，15 步循环展开为单引擎)，其余 → ONNX
+> **核心策略**: 统一双后端部署（纯 ONNX Runtime / 纯 TensorRT），BLS 推理流程完全一致，仅 backend 和模型文件格式不同。Talker Context 和 Talker Decode 均融合 Code Predictor + Codec Embedding Sum 为单模型，注册为独立 Triton 子模型，BLS 通过 `pb_utils.InferenceRequest` 调用并用 `dlpack` 零拷贝传递 KV Cache。
 
 ---
 
@@ -29,8 +29,8 @@
 | **Text Embedder** | `Embedding(151936, 2048)` + `ResizeMLP(2048→1024)` | ~312M | PyTorch 权重 | 每请求 1 次 + 文本到达时 |
 | **Speaker Encoder** | ECAPA-TDNN, mel=128, enc_dim=1024 | ~6M | ONNX | 每请求 1 次 (仅 voice clone) |
 | **Speech Tokenizer Encoder** | MimiModel, 16 codebooks | ~26M | ONNX | 每请求 1 次 (仅 ICL 模式) |
-| **Talker Backbone** | Qwen3-style, 28L, h=1024/2048 (0.6B/1.7B), GQA(16h/8kv), head_dim=128 | ~180M–500M | **TRT-LLM** | 每 decode step 1 次 (最热路径) |
-| **Code Predictor** | Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128 + 15×embed + 15×lm_head | ~200M | **TensorRT (单引擎, 15 步展开)** | 每 decode step 1 次调用 |
+| **Talker Backbone** | Qwen3-style, 28L, h=1024/2048 (0.6B/1.7B), GQA(16h/8kv), head_dim=128 | ~180M–500M | **Pure TRT (单引擎 Unified)** | Prefill + Decode 同一引擎，每请求 1 次 prefill + N 次 decode |
+| **Code Predictor** | Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128 + 15×embed + 15×lm_head | ~200M | **融合进 Fused Decode TRT** | 每 decode step 由融合引擎调用 |
 | **Code2Wav Decoder** | RVQ Dequant + Transformer(8L) + BigVGAN ConvNet | ~60M | ONNX | 每 chunk 1 次 |
 
 ### 2.1 Embedding 权重 (内置于 Orchestrator)
@@ -166,21 +166,32 @@ TaskType
 │  │  ┌───────────────────────────────────────────────┐   │  │
 │  │  │           Streaming Generation Loop            │   │  │
 │  │  │                                                │   │  │
-│  │  │  1. Talker Backbone (decode) → logits          │   │  │
-│  │  │  2. Sample → codec_token_0                     │   │  │
-│  │  │  3. Code Predictor (单次调用) → codec #1~#15   │   │  │
-│  │  │  4. Accumulate → Code2Wav (异步) → audio       │   │  │
-│  │  │  5. Construct next input → loop                │   │  │
+│  │  │  Prefill: context engine → hidden + logits     │   │  │
+│  │  │           + KV cache 填充                       │   │  │
+│  │  │  First step: standalone CP → full_codec        │   │  │
+│  │  │  Decode loop (fused engine):                   │   │  │
+│  │  │    Talker decode + CP + codec_sum → single call│   │  │
+│  │  │    → codec_sum, full_codec, logits             │   │  │
+│  │  │  Accumulate → Code2Wav (异步) → audio          │   │  │
 │  │  └───────────────────────────────────────────────┘   │  │
-│  └──┬────────┬────────┬────────┬────────┬───────────────┘  │
-│     │        │        │        │        │                   │
-│     ▼        ▼        ▼        ▼        ▼                   │
-│  ┌──────┐┌──────┐┌──────┐┌──────────┐┌──────────────────┐  │
-│  │ Text ││ Spk  ││Speech││ Talker   ││ Code Predictor   │  │
-│  │Embed ││ Enc  ││Token ││ Backbone ││ (TRT 单引擎      │  │
-│  │(Torch││(ONNX)││ Enc  ││(TRT-LLM) ││  15步展开,无KV)  │  │
-│  │ Wts) ││      ││(ONNX)││ +KVCache ││ (fallback:15调用)│  │
-│  └──────┘└──────┘└──────┘└──────────┘└──────────────────┘  │
+│  └──┬────────┬────────┬────────────────────────────────┘   │
+│     │        │        │                                     │
+│     ▼        ▼        ▼                                     │
+│  ┌──────┐┌──────┐┌──────┐                                  │
+│  │ Text ││ Spk  ││Speech│                                  │
+│  │Embed ││ Enc  ││Token │                                  │
+│  │(Torch││(ONNX)││ Enc  │                                  │
+│  │ Wts) ││      ││(ONNX)│                                  │
+│  └──────┘└──────┘└──────┘                                  │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │          Pure TRT Engines (自管理 KV Cache)           │  │
+│  │                                                      │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │ talker_unified (单引擎 prefill + decode)          │  │  │
+│  │  │ → codec_sum, full_codec, logits, present_kv_*     │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────┘  │
 │                                      ┌────────┐            │
 │                                      │Code2Wav│            │
 │                                      │ (ONNX) │            │
@@ -291,52 +302,57 @@ Phase 1: Prefill 构造 (按 task_type 分支)
    - 已到达的后续文本 → embed 后入队
    - 未到达的 → 后续动态追加 (token 级或句级, 取决于当前流控模式)
 
-2. Talker Backbone Forward (Prefill, TRT-LLM):
-   inputs_embeds [1, S_prefill, 1024]   ← S_prefill 因 task_type 而异
-   → hidden_states [1, S_prefill, 1024]
-   → logits [1, S_prefill, 3072]
-   → KV Cache 初始化
+2. Talker Context Engine Forward (Prefill, Pure TRT):
+   inputs_embeds [1, S_prefill, H]   ← S_prefill 因 task_type 而异; H=1024/2048
+   position_ids  [3, 1, S_prefill]   ← 3D multimodal RoPE
+   → last_hidden  [1, 1, H]          ← 最后位置的 hidden state
+   → last_logits  [1, 1, 3072]       ← 最后位置的 logits
+   → present_kv_*                     ← 所有层的 K/V cache 填充到预分配 buffer
 
-3. past_hidden = hidden_states[:, -1:, :]
+3. First Step (Context engine 不含 CP, 需单独调用):
+   codec_token_0 = argmax(last_logits)
+   Code Predictor (BLS) → codec_ids [1, 15]
+   full_codec = [codec_0, codec_ids]  → [1, 16]
+   codec_sum = CodecEmbeddingSum(full_codec) → [1, 1, H]
+   next_embed = codec_sum + text_add
 
 
-Phase 2: Decode Loop (流式)
-═══════════════════════════
+Phase 2: Decode Loop (流式, Fused Decode Engine)
+════════════════════════════════════════════════
 ┌──────────────────────────────────────────────────────┐
 │ while not EOS and step < max_tokens:                 │
 │                                                      │
-│   ① Sample codec_token_0 from logits (argmax/top-k)  │
+│   ① Fused Decode Engine 单次调用 (Pure TRT):          │
+│      输入: input_embeds [B,1,H] + position_id [3,B,1]│
+│           + past_kv_* (自管理 KV cache buffer)       │
+│      内部: Talker decode → CP 15步 → codec embed sum │
+│      输出:                                           │
+│        codec_sum  [B,1,H]   ← 下一步输入的 codec 部分│
+│        full_codec [B,16]    ← 16 个 codebook tokens  │
+│        logits     [B,1,3072]← Talker 输出 logits     │
+│        present_kv_* → 更新 KV cache buffer           │
 │                                                      │
-│   ② Code Predictor 单次调用 (TRT, 无 KV Cache):      │
-│      输入: past_hidden [B,1,1024], codec_token_0 [B] │
-│      内部: 15 stage 全量 prefill (循环展开)            │
-│      输出: codec_ids [B, 15]                         │
-│      全部 16 个 codebook: [codec_0, codec_ids]       │
+│   ② EOS 检查: logits argmax == codec_eos_id?          │
 │                                                      │
 │   ③ Accumulate → Code2Wav (每 25 frames):            │
 │      Code2Wav chunked_decode → audio chunk           │
 │      → 流式推送到客户端                               │
 │                                                      │
-│   ④ 构造下一步 inputs_embeds (自适应流控):              │
-│      codec_sum = Σ embed_i(codec_ids[i]) [B,1,1024]  │
+│   ④ 构造下一步 input (自适应流控):                      │
 │      text_add = 按流控策略选择:                        │
 │        有文本 → trailing_text_hidden[step]            │
 │        短暂缺失 → tts_pad_embed (容忍少量 pad)        │
 │        持续缺失 → PAUSE decode (冻结 KV cache)        │
-│      input = codec_sum + text_add                    │
+│      next_embed = codec_sum + text_add               │
 │                                                      │
-│   ⑤ Talker Backbone Forward (Decode, TRT-LLM):         │
-│      inputs_embeds [B, 1, 1024] → logits, KV update  │
-│      past_hidden = hidden_states                     │
-│                                                      │
-│   ⑥ step += 1                                        │
+│   ⑤ step += 1, position_id += 1                      │
 └──────────────────────────────────────────────────────┘
 
 
 Phase 3: 收尾
 ═════════════
 - Flush 剩余 codec tokens → Code2Wav → 最后一段音频
-- 释放 Talker KV Cache slot
+- 重置 TalkerRunner (清零 KV cache, _seq_len = 0)
 - 关闭 stream
 ```
 
@@ -601,111 +617,125 @@ async def code_predictor_fallback(engine, past_hidden, codec_token_0,
 
 ---
 
-## 6. Talker Backbone: TRT-LLM 部署 (含 KV Cache)
+## 6. Talker Backbone: Pure TRT 部署 (自管理 KV Cache + Fused Decode)
 
 Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 - 序列长度可达数千步，前缀重算代价不可忽略
-- KV Cache 内存极小：28L × 8 KV heads × 128 dim，无需 PagedAttention
+- KV Cache 内存极小：28L × 8 KV heads × 128 dim
 
-### 6.0 推理引擎选型
+### 6.0 部署方式
 
-| 维度 | 纯 TRT (手写 Wrapper) | **TRT-LLM (首选)** |
-|------|----------------------|---------------------|
-| KV Cache 管理 | 需自己实现 in-place I/O，显式 tensor 拷贝 | **内置 KV cache manager，零拷贝 in-place 更新** |
-| Attention Kernel | 标准 FMHA | **Flash Attention / XQA kernel (GQA 优化)** |
-| Batch 调度 | 需自己实现不同 seq_len 的 mask | **内置 inflight batching，原生支持不同 seq_len** |
-| CUDA Graphs | 需手动捕获 | **原生支持** |
-| Prefill/Decode 分离 | 需手动实现 | **内置 chunked prefill + continuous decode** |
-| 开发成本 | 高（KV cache I/O wrapper + mask 构造 + profile 切换） | **低（定义模型配置即可）** |
+Talker 使用**单引擎 talker_unified**（prefill 与 decode 合一），消除权重重复 (~1.6GB)。所有子模型（含 talker_unified、code2wav）注册为独立 Triton 模型，BLS 通过 `pb_utils.InferenceRequest` 统一调用：
 
-> **决策**: Talker Backbone **确定走 TRT-LLM**。实际 Qwen3-TTS Talker 为 28L、GQA 16h/8kv、head_dim=128（0.6B: h=1024，1.7B: h=2048），由 export_04 从模型 config 动态读取。KV Cache、paged attention、continuous batching 均由 TRT-LLM 运行时原生管理。
->
-> **KV Cache I/O 风险 (纯 TRT 方案)**: KV cache 形状 `[28, 2, B, 8, S_max, 128]`，B=8, S_max=4096 时约 1.8GB BF16。作为 TRT 显式 I/O，每 decode step 的 device→device memcpy 约 0.16ms（HBM ~1TB/s），来回 0.32ms，占单步 8%。TRT-LLM 通过 in-place buffer 完全消除此开销。
+| 部署模式 | 模型文件 | Triton backend | config.pbtxt |
+|---------|---------|---------------|-------------|
+| ONNX Runtime | `model.onnx` | `onnxruntime` | `_write_onnx_minimal_config()` |
+| TensorRT | `model.plan` | `tensorrt` | `_write_trt_minimal_config()` |
 
-### 6.1 导出封装 (纯 TRT fallback 方案)
+切换方式：`build_triton.sh assemble --engine-mode onnx|trt`，BLS `model.py` 代码无需任何修改。
+
+### 6.1 单引擎统一架构 (talker_unified)
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  talker_unified.engine (Prefill + Decode 合一，无权重重复)                  │
+│                                                                            │
+│  Inputs:                                                                   │
+│    input_embeds [B, S, H]     (S>1 prefill, S=1 decode)                   │
+│    position_ids [3, B, S]                                                  │
+│    past_kv_{i}_k [B, kv, S_past, hd]  (S_past=1 为 prefill dummy)          │
+│    past_kv_{i}_v [B, kv, S_past, hd]                                       │
+│                                                                            │
+│  Internals: 统一因果掩码 (row_idx + col_idx 算术)，UnifiedKVCache(cat past+new) │
+│    Talker 28L → norm + codec_head → argmax → CP 15步 → Codec Embedding Sum │
+│                                                                            │
+│  Outputs: codec_sum [B,1,H], full_codec [B,16], hidden, logits, present_kv_* │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 ONNX 导出
+
+#### 6.2.0 Unified 单引擎导出 (`export_04_talker_unified.py`，推荐)
+
+单 ONNX 同时支持 prefill (S>1, S_past=1 dummy) 与 decode (S=1, S_past>0)。统一因果掩码用纯算术构造，无分支；`UnifiedKVCache` 始终 `cat(past, new, dim=2)`。导出时用 S=8、S_past=4 的 dummy 做 trace，dynamic axes 覆盖 `seq`、`S_past`、`S_total`。
+
+#### 6.2.1 Context Engine 导出 (`export_04_talker_context.py`，已弃用)
 
 ```python
-class TalkerBackboneWrapper(nn.Module):
-    def __init__(self, talker_model, codec_head):
-        super().__init__()
-        self.layers = talker_model.layers       # 28 层
-        self.norm = talker_model.norm
-        self.rotary_emb = talker_model.rotary_emb
-        self.codec_head = codec_head            # Linear(1024/2048, 3072)
+class PrefillKVCache:
+    """Captures per-layer K/V during prefill (not a real cache, just a collector)."""
+    def __init__(self, num_layers: int): ...
+    def get_seq_length(self) -> int: return 0
+    def update(self, key_states, value_states, layer_idx, ...) -> Tuple:
+        self._cache[layer_idx] = (key_states, value_states)
+        return key_states, value_states
 
-    def forward(self, inputs_embeds, kv_cache, cache_position):
-        """
-        inputs_embeds: [B, S, H]  (S=1 for decode, S>1 for prefill; H=1024/2048)
-        kv_cache:      [28, 2, B, 8, S_max, 128]  (预分配固定大小)
-        cache_position: [S]  (当前写入位置)
-        """
-        hidden = inputs_embeds
-        position_ids = cache_position.unsqueeze(0).expand(3, -1, -1)
-        cos, sin = self.rotary_emb(hidden, position_ids)
-
-        for i, layer in enumerate(self.layers):
-            layer_kv = kv_cache[i]
-            hidden, layer_kv = layer(hidden, kv=layer_kv,
-                                     cos=cos, sin=sin,
-                                     cache_position=cache_position)
-            kv_cache[i] = layer_kv
-
-        hidden = self.norm(hidden)
-        logits = self.codec_head(hidden)
-        return hidden, logits, kv_cache
+class TalkerContextONNX(nn.Module):
+    """Wraps Talker layers + norm + codec_head for prefill ONNX export."""
+    def forward(self, input_embeds, position_ids):
+        # input_embeds: [B, S, H], position_ids: [3, B, S] (multimodal RoPE)
+        position_embeddings = self.rotary_emb(input_embeds, position_ids)
+        causal_mask = torch.triu(full((S,S), -inf), diagonal=1)
+        cache = PrefillKVCache(num_layers)
+        for layer in self.layers:
+            hidden = layer(hidden, mask, position_ids, cache, position_embeddings)
+        logits = self.codec_head(self.norm(hidden))
+        return (last_hidden, last_logits, *[cache.get_layer(i) for i in ...])
 ```
 
-### 6.2 TRT-LLM 配置 (首选方案)
-
-```
-TRT-LLM 构建参数:
-- dtype: bfloat16
-- max_batch_size: 8
-- max_input_len: 512    (prefill)
-- max_seq_len: 4096     (含 KV cache)
-- num_layers: 28 (实际由 checkpoint 决定)
-- hidden_size: 1024 (0.6B) / 2048 (1.7B)
-- num_attention_heads: 16
-- num_key_value_heads: 8
-- head_size: 128
-- use_gpt_attention_plugin: bfloat16  (启用优化 attention kernel)
-- paged_kv_cache: disable            (KV 总量极小, 无需 paged)
-- enable_chunked_prefill: true       (避免 prefill 阻塞 decode)
-- use_custom_all_reduce: disable     (单 GPU)
-```
-
-### 6.3 纯 TRT 优化配置 (fallback)
-
-```
-- BF16 精度
-- 多 optimization profile:
-    Profile 0 (Decode):  B=1~8, S=1       ← 最热路径
-    Profile 1 (Prefill): B=1~2, S=1~512
-- KV Cache: input/output binding 指向同一 GPU buffer (in-place update)
-  ⚠️ 必须确保 input/output KV cache 共享同一设备指针, 避免 160MB memcpy
-```
-
-### 6.4 KV Cache 管理
+#### 6.2.2 Fused Decode Engine 导出 (`export_05_talker_decode_fused.py`，已弃用)
 
 ```python
-# Talker Backbone KV Cache: 预分配固定 slot
-# 28 layers, GQA(8 KV heads), head_dim=128
-talker_kv_cache = torch.zeros(
-    28,              # num_layers
-    2,               # K, V
-    max_batch_size,  # e.g. 8
-    8,               # num_kv_heads
-    max_seq_len,     # e.g. 4096
-    128,             # head_dim
-    dtype=torch.bfloat16, device="cuda"
-)
-# 显存占用: 28 × 2 × 8 × 8 × 4096 × 128 × 2B ≈ 1.8GB
+class DecodeKVCache:
+    """Manages past + present KV for single-step decode."""
+    def update(self, key_states, value_states, layer_idx, ...):
+        full_k = torch.cat([past_k, key_states], dim=2)  # append along seq dim
+        full_v = torch.cat([past_v, value_states], dim=2)
+        return full_k, full_v
 
-slot_seq_lengths = [0] * max_batch_size
-# Prefill: 写入 kv_cache[:, :, slot_id, :, 0:S, :]
-# Decode:  写入 kv_cache[:, :, slot_id, :, S:S+1, :]
-# Release: slot_seq_lengths[slot_id] = 0
+class TalkerDecodeFusedONNX(nn.Module):
+    """Fuses: Talker decode step + Code Predictor (15 steps) + Codec Embedding Sum."""
+    def forward(self, input_embeds, position_ids, *past_key_values):
+        # 1. Talker decode (single token)
+        hidden, logits, present_kv = self.talker_decode(input_embeds, position_ids, *past_kv)
+        # 2. Code Predictor (15 steps unrolled, no KV cache)
+        codec_token_0 = logits[:, -1, :].argmax(dim=-1)
+        cp_tokens = self.cp(hidden, codec_token_0)         # [B, 15]
+        full_codec = cat([codec_token_0.unsqueeze(1), cp_tokens], dim=1)  # [B, 16]
+        # 3. Codec Embedding Sum (3D gather + sum)
+        codec_sum = self.codec_sum(full_codec).unsqueeze(1)  # [B, 1, H]
+        return (codec_sum, full_codec, hidden, logits, *present_kv)
 ```
+
+### 6.3 TRT 引擎编译 (`build_engines.sh`)
+
+单引擎编译，S_past min=1（prefill 时 BLS 传 dummy past_kv）：
+
+```bash
+trtexec --onnx=talker_unified.onnx --bf16 \
+  --minShapes=input_embeds:1x1x${H},position_ids:3x1x1,past_kv_0_k:1x${KV}x1x${HD},... \
+  --optShapes=input_embeds:1x1x${H},position_ids:3x1x1,past_kv_0_k:4x${KV}x64x${HD},... \
+  --maxShapes=input_embeds:${B}x512x${H},position_ids:3x${B}x512,past_kv_0_k:${B}x${KV}x${MAX_SEQ}x${HD},... \
+  --saveEngine=talker_unified.engine
+```
+
+模型维度 (`H`, `KV`, `num_layers`) 由 `_get_talker_dims()` 从 `weights/config.json` 或硬编码表获取。
+
+### 6.4 KV Cache 管理 (BLS)
+
+Talker 已从 Orchestrator 内置引擎改为独立 Triton 子模型。KV Cache 在 BLS Python 层用 `torch.Tensor` 管理，通过 `pb_utils.Tensor.from_dlpack("name", t.to_dlpack())` 实现 GPU 零拷贝传递：
+
+```python
+# Prefill: 调用 talker_unified，past_kv_tensors=None → BLS 传 dummy S_past=1
+codec_sum, full_codec, logits, kv_tensors = self._bls_talker(input_embeds, position_ids)
+
+# Decode loop: 同一模型，传入上一步 kv_tensors
+for step in range(max_steps):
+    codec_sum, full_codec, logits, kv_tensors = self._bls_talker(next_embed, pos, kv_tensors)
+    # kv_tensors 通过 dlpack 零拷贝传入/传出，无额外显存分配
+```
+
+KV 显存: 28L × 2 × 8(kv_heads) × max_seq × 128(head_dim) × 2B(bf16)。
 
 ### 6.5 BF16 精度说明
 
@@ -723,7 +753,7 @@ slot_seq_lengths = [0] * max_batch_size
 
 > BF16 的尾数精度略低于 FP16（7 位 vs 10 位），但对于 TTS 生成场景，指数范围的安全性远比尾数精度重要。实测中 BF16 与 FP32 的 logits KL 散度通常 <1e-4，可忽略。
 
-**验证**: 已通过 `verify_e2e_trt.sh` 实现：host 端生成 FP32 PyTorch 参考（e2e_trt_ref.npz），容器内 TRT-LLM + TRT CP 与参考对比；prefill logits cosine >0.999，decode token 因 BF16 边界存在差异属预期。长序列可指定 `--steps 1000` 做进一步对比。
+**验证**: 已通过 `verify_e2e_trt.sh` 实现：host 端生成 FP32 PyTorch 参考（e2e_trt_ref.npz），容器内 TRT + TRT CP 与参考对比；prefill logits cosine >0.999，decode token 因 BF16 边界存在差异属预期。长序列可指定 `--steps 1000` 做进一步对比。
 
 ---
 
@@ -770,16 +800,19 @@ model_repository/
 ├── tts_orchestrator/                    # BLS Python 后端 (Decoupled)
 │   ├── config.pbtxt                     # model_transaction_policy: decoupled
 │   └── 1/
-│       ├── model.py                     # 主控逻辑 + Generation Loop
-│       ├── session_manager.py           # 会话状态管理
-│       ├── batch_scheduler.py           # Batch 调度器
-│       ├── kv_cache_manager.py          # Talker KV Cache 管理
-│       ├── flow_controller.py           # 自适应流控 (TOKEN/ADAPTIVE/SENTENCE)
-│       └── weights/                     # Embedding 权重
+│       ├── model.py                     # 主控逻辑: prefill + decode loop + Code2Wav
+│       # talker 为独立 Triton 模型 (talker_unified)，由 BLS 调用
+│       ├── prefill_builder.py           # 4 种 task_type 的 prefill 构建
+│       ├── codec_embedding_sum.py       # 3D gather 优化的 codec embedding 求和
+│       ├── session_manager.py           # 会话状态管理 (Phase 3)
+│       ├── batch_scheduler.py           # Batch 调度器 (Phase 3)
+│       ├── flow_controller.py           # 自适应流控 (Phase 3)
+│       └── weights/                     # Embedding 权重 (.pt)
 │           ├── text_embedding.pt
 │           ├── text_projection.pt
-│           ├── codec_embeddings.pt      # Talker codec embeddings
-│           └── special_embeddings.pt    # tts_pad/bos/eos_embed
+│           ├── codec_embeddings_3d.pt   # 3D 合并查找表 [16, 3072, H]
+│           ├── special_embeddings.pt    # tts_pad/bos/eos_embed
+│           └── config.json             # 模型配置 (vocab, dims, special ids)
 │
 ├── speaker_encoder/                     # ONNX Runtime
 │   ├── config.pbtxt
@@ -789,26 +822,8 @@ model_repository/
 │   ├── config.pbtxt
 │   └── 1/model.onnx
 │
-├── talker_backbone/                     # TRT-LLM (KV Cache 由 TRT-LLM 运行时管理)
-│   ├── config.pbtxt                     # backend: tensorrtllm
-│   └── 1/
-│       ├── config.json                  # TRT-LLM checkpoint config
-│       └── *.engine                     # TRT-LLM engine(s)
-│   # TRT-LLM 管理:
-│   #   inputs_embeds:  [B, S, 1024]     (Orchestrator 构建后传入)
-│   #   KV Cache:       TRT-LLM 运行时内置管理 (零拷贝 in-place)
-│   # Outputs:
-│   #   hidden_states:  [B, S, 1024]
-│   #   logits:         [B, S, 3072]     (codec_head)
-│
-├── code_predictor/                      # TensorRT (无 KV Cache, 15 步展开)
-│   ├── config.pbtxt
-│   └── 1/model.plan
-│   # Inputs:
-│   #   past_hidden:    [B, 1, 1024]
-│   #   codec_token_0:  [B]
-│   # Outputs:
-│   #   codec_tokens:   [B, 15]
+├── talker_unified/                      # ONNX/TRT (prefill + decode 合一，单引擎)
+│   └── 1/model.onnx 或 model.plan
 │
 └── code2wav/                            # ONNX Runtime
     ├── config.pbtxt                     # dynamic batching enabled
@@ -816,6 +831,8 @@ model_repository/
     # Input:  codes [B, 16, T_chunk], left_ctx [B, 16, T_ctx]
     # Output: wav [B, T_chunk * 1920]
 ```
+
+> **注意**: talker_unified 为单 Triton 子模型，BLS 通过 `_bls_talker(input_embeds, position_ids, past_kv_tensors=None)` 调用；prefill 时 `past_kv_tensors=None` 传 dummy S_past=1，decode 时传入上一步的 KV；KV 经 dlpack 零拷贝传递。Code Predictor 已融合进统一引擎。
 
 ---
 
@@ -871,9 +888,9 @@ PAUSED/WAITING slot 仅占 KV cache 显存, 不占计算
 
 策略 B: 异步 Prefill (Phase 4 优化)
 ════════════════════════════════════
-使用 TRT-LLM 的 chunked prefill:
+使用 Context Engine 的 chunked prefill:
   - Prefill 拆为多个小 chunk (e.g. 64 tokens/chunk)
-  - 每个 chunk 在 decode step 间隙执行
+  - 每个 chunk 在 decode step 间隙执行, KV cache 分段填充
   - Decode 延迟增加极小 (~2ms/chunk)
   - 新请求的首包延迟略增, 但不阻塞现有生成
 
@@ -1093,6 +1110,8 @@ def parse_task_type(req: InitRequest) -> TaskType:
 
 ### 10.3 Generation Loop (伪代码)
 
+> **架构变更**: 原方案中 Talker Backbone 和 Code Predictor 作为独立模型分步调用。新方案中，decode loop 使用 **Fused Decode Engine**——单次 TRT 调用完成 Talker decode + CP 15步 + Codec Embedding Sum，直接返回 `codec_sum`、`full_codec` 和 `logits`。首步（context engine 后）仍需单独调用 CP。
+
 ```python
 async def generation_loop(scheduler: BatchScheduler):
     while scheduler.has_active_sessions():
@@ -1120,10 +1139,22 @@ async def generation_loop(scheduler: BatchScheduler):
                 ready = (contains_sentence_boundary(s.trailing_text_hidden)
                          or s.text_complete)
             if ready and not s.prefilled:
-                hidden, logits, kv = talker_backbone.forward(
-                    build_prefill_embeds(s), s.slot_id, mode="prefill")
-                s.past_hidden = hidden[:, -1:]
-                s.logits = logits[:, -1:]
+                # ── Prefill: Pure TRT context engine ──
+                prefill_embeds = build_prefill_embeds(s)
+                position_ids = build_3d_position_ids(prefill_embeds)
+                hidden, logits = talker.context(prefill_embeds, position_ids)
+                # KV cache 已填充到 TalkerRunner 内部 buffer
+
+                # ── First step: standalone CP (context engine 不含 CP) ──
+                codec_token_0 = logits[:, -1, :].argmax(dim=-1)
+                cp_tokens = bls_code_predictor(hidden, codec_token_0)
+                full_codec = cat([codec_token_0.unsqueeze(1), cp_tokens], dim=1)
+                s.codec_buffer.append(full_codec)
+                codec_sum = codec_embedding_sum(full_codec)
+
+                # next_embed for first decode step
+                text_add = consume_text(s)
+                s.next_embed = codec_sum + text_add
                 s.flow_state = FlowState.GENERATING
                 s.prefilled = True
 
@@ -1132,8 +1163,6 @@ async def generation_loop(scheduler: BatchScheduler):
             if s.flow_state != FlowState.PAUSED:
                 continue
             if s.buffer_available >= s.resume_threshold:
-                # resume_threshold ≥ 2: 确保恢复后至少有 2 步真实文本,
-                # 避免恢复后立即再次 starvation
                 s.flow_state = FlowState.GENERATING
                 s.consecutive_pad_count = 0
             elif s.pause_duration_ms > s.max_pause_ms:
@@ -1147,87 +1176,35 @@ async def generation_loop(scheduler: BatchScheduler):
             await asyncio.sleep(0.001)
             continue
 
-        # ── 4. Sample codec_token_0 ──
-        batch_logits = stack([s.logits for s in active])
-        codec_token_0 = sample(batch_logits)
+        # ── 4. Fused decode step (单次 TRT 调用) ──
+        # 融合引擎内部完成: Talker decode → CP 15步 → codec embed sum
+        for session in active:
+            position_id = build_position_id(session.generation_step)
+            codec_sum, full_codec, logits = talker.decode_step(
+                session.next_embed, position_id)
 
-        # ── 5. Code Predictor ──
-        batch_past_hidden = stack([s.past_hidden for s in active])
-        codec_ids_1_31 = code_predictor.forward(
-            batch_past_hidden, codec_token_0)
-        codec_ids = cat([codec_token_0.unsqueeze(1),
-                        codec_ids_1_31], dim=1)
+            session.codec_buffer.append(full_codec)
+            session.generation_step += 1
 
-        # ── 6. 构造下一步 input (自适应流控核心) ──
-        #
-        # pad_tolerance = 1 (实验验证: pad≥2 即产生音质退化)
-        #
-        # 决策树:
-        #   有文本 → 消费真实文本 (最佳路径)
-        #   文本用完 + text_complete → 安全 pad (文本确实结束了)
-        #   文本用完 + 未 complete + 首次 pad → 容忍 1 个 pad, 继续生成
-        #   文本用完 + 未 complete + 已 pad 过 → PAUSE, 冻结 KV cache
-        #
-        still_active = []
-        batch_next_embeds = []
-        for i, session in enumerate(active):
-            codec_sum = sum_codec_embeddings(codec_ids[i])
-            step = session.text_consumed_count
-
-            if step < len(session.trailing_text_hidden):
-                # 正常: 有文本可消费
-                text_add = session.trailing_text_hidden[step]
-                session.text_consumed_count += 1
-                session.consecutive_pad_count = 0
-
-            elif session.text_complete:
-                # 文本全部到达且消费完 → 安全 pad (不计入 consecutive_pad_count)
-                text_add = tts_pad_embed
-
-            elif session.consecutive_pad_count < session.pad_tolerance:
-                # 首次 pad: 容忍 1 个, 继续生成 (给上游一步的余量)
-                text_add = tts_pad_embed
-                session.consecutive_pad_count += 1
-
-            else:
-                # 连续第 2 个 pad: PAUSE, 保护音频质量
-                session.flow_state = FlowState.PAUSED
-                session.pause_start_time = time.time()
-                session.starvation_count += 1
-                session.consecutive_pad_count = 0
-                session.escalate_mode()
-                session.codec_buffer.append(codec_ids[i])
+            # ── 5. EOS 检查 ──
+            if logits[:, -1, :].argmax(dim=-1) == CODEC_EOS:
+                flush_remaining_audio(session)
+                session.flow_state = FlowState.DONE
+                talker.reset()
+                scheduler.release_slot(session.slot_id)
                 continue
 
-            still_active.append(session)
-            batch_next_embeds.append(codec_sum + text_add)
-
-        if not still_active:
-            continue
-
-        # ── 7. Talker decode step ──
-        batch_hidden, batch_logits = talker_backbone.forward(
-            stack(batch_next_embeds),
-            [s.slot_id for s in still_active],
-            mode="decode")
-
-        # ── 8. 更新状态 + 流式音频 ──
-        for i, session in enumerate(still_active):
-            session.past_hidden = batch_hidden[i:i+1, -1:]
-            session.logits = batch_logits[i:i+1, -1:]
-            session.generation_step += 1
-            session.codec_buffer.append(
-                codec_ids[active.index(session)])
-
+            # ── 6. 流式音频输出 ──
             if len(session.codec_buffer) >= session.audio_chunk_threshold:
                 audio = code2wav_chunked(session)
                 stream_audio_to_client(session, audio)
                 session.try_deescalate_mode()
 
-            if codec_ids[active.index(session), 0] == CODEC_EOS:
-                flush_remaining_audio(session)
-                session.flow_state = FlowState.DONE
-                scheduler.release_slot(session.slot_id)
+            # ── 7. 构造下一步 input (自适应流控) ──
+            text_add = consume_text_adaptive(session)
+            if text_add is None:  # PAUSE
+                continue
+            session.next_embed = codec_sum + text_add
 ```
 
 ### 10.4 Prefill 构建分支 (build_prefill_embeds)
@@ -1238,7 +1215,7 @@ async def generation_loop(scheduler: BatchScheduler):
 def build_prefill_embeds(s: TTSSession) -> torch.Tensor:
     """
     按 task_type 构建 prefill inputs_embeds.
-    返回: [1, S_prefill, 1024] — 直接传给 Talker Backbone TRT-LLM.
+    返回: [1, S_prefill, H] — 直接传给 Talker Context Engine (Pure TRT).
     """
     # ── 共通: role 段 (<|im_start|>assistant\n) ──
     role_embed = text_proj(text_embed(s.input_ids[:, :3]))  # [1, 3, 1024]
@@ -1318,7 +1295,7 @@ def build_prefill_embeds(s: TTSSession) -> torch.Tensor:
 > - Voice Clone (x_vec): ~8 tokens
 > - Voice Clone (ICL): 8 + T_ref + S_ref tokens (最长, 含参考音频)
 >
-> Talker TRT-LLM 的 prefill profile 需覆盖最大情况 (ICL 模式, S_prefill 可达 ~200+)
+> Talker Context Engine 的 max_seq_len profile 需覆盖最大情况 (ICL 模式, S_prefill 可达 ~200+)
 
 ### 10.5 错误隔离与 Session 保护
 
@@ -1829,49 +1806,47 @@ message TTSError {
 
 ## 13. 性能分析
 
-### 13.1 单步耗时分解 (TRT BF16, RTX 4090)
+### 13.1 单步耗时分解 (Pure TRT BF16, RTX 4090)
 
 | 组件 | 模式 | 耗时 | 说明 |
 |------|------|------|------|
-| **Talker Backbone** | Decode (B=1, S=1) | ~0.4ms | 28L, memory bandwidth bound |
-| **Talker Backbone** | Decode (B=8, S=1) | ~0.5ms | GEMV, 批量摊薄 launch |
-| **Code Predictor** | 15 步展开 (B=1) | ~2ms | 无 KV Cache, 单引擎 |
-| **Code Predictor** | 15 步展开 (B=8) | ~2ms | GEMM 效率高, 批量几乎不增耗时 |
-| **Code Predictor** | fallback 单stage×15 (B=1) | ~2.8ms | 15 次 launch 开销 ~0.75ms |
-| Codec Embedding Sum | 优化后 (3D gather) | ~0.05ms | 原朴素实现 ~0.3ms |
+| **Fused Decode Engine** | B=1, S=1 | **~2.5ms** | Talker decode + CP 15步 + codec sum, 单引擎单次调用 |
+| **Fused Decode Engine** | B=8, S=1 | **~2.7ms** | GEMM 效率高, 批量几乎不增耗时 |
 | Orchestrator 控制 | Python 状态机 + 调度 | ~0.1ms | GIL 约束下的控制面 |
-| **单步总计 (首选)** | B=1 | **~4.1ms** | CP 展开成功 |
-| **单步总计 (首选)** | B=8 | **~4.2ms** | 批量效率极高 |
-| **单步总计 (fallback)** | B=1 | **~3.5ms** | CP 单stage×15 |
+| **单步总计** | B=1 | **~2.6ms** | 融合引擎消除多次 launch + 中间 tensor 传输 |
+| **单步总计** | B=8 | **~2.8ms** | 批量效率极高 |
 | Code2Wav | 每 chunk (异步) | ~15ms | 独立 CUDA stream, 不阻塞 decode |
 
+> **融合引擎优势**: 相比分离调用方案（Talker ~0.4ms + CP ~2ms + codec sum ~0.05ms + Python 控制 ~0.1ms ≈ 2.55ms），融合引擎消除了 3 次 kernel launch 间隙和中间 tensor 的 device→host→device 往返，预期在实际推理中有额外 ~15% 的延迟收益。具体数字待实测验证。
+>
 > **Code2Wav 异步化**: Code2Wav 在独立 CUDA stream 执行，与 decode 循环 overlap。仅在推送音频时需同步检查完成状态，decode 循环无 15ms 峰值延迟。
 
 ### 13.2 端到端延迟
 
 ```
 TTS 纯计算首包 — 自适应首包优化 (10 frames, B=1):
-  Prefill:          ~20ms
-  10 decode steps:  10 × 4.1ms = 41ms
-  Code2Wav:         ~15ms
+  Prefill (context engine):    ~20ms
+  First step (standalone CP):  ~2ms
+  9 decode steps (fused):      9 × 2.6ms = 23.4ms
+  Code2Wav:                    ~15ms
   ─────────────────────────
-  TTS 部分首包:     ~76ms    ← 优化后 (原方案 25帧 = ~137ms)
+  TTS 部分首包:     ~60ms    ← 融合引擎优化后
 
 场景 A: 快速 LLM (40 tok/s) — TOKEN_LEVEL 模式
   第 1 个 token 到达 → 立即 prefill
   LLM 等待: ~25ms (首 token 延迟)
-  总首包: ~101ms  ← 最优 (优化前 ~162ms)
+  总首包: ~85ms  ← 最优
 
 场景 B: 中速 LLM (10 tok/s) — TOKEN_LEVEL 模式 (偶尔 pad)
   第 1 个 token 到达 → 立即 prefill
   LLM 等待: ~100ms (首 token 延迟)
   10 步中约 6 步插入 pad, 不触发 PAUSE
-  总首包: ~176ms (优化前 ~237ms)
+  总首包: ~160ms
 
 场景 C: 慢速 LLM (5 tok/s) — ADAPTIVE 模式
   等待 buffer >= start_threshold (e.g. 5 tokens)
   LLM 等待: ~1s
-  总首包: ~1.08s
+  总首包: ~1.06s
 
 场景 D: 极慢 LLM (3 tok/s) — SENTENCE_LEVEL 模式 (降级)
   等待完整句子 (e.g. 10 tokens)
@@ -1884,21 +1859,23 @@ TTS 纯计算首包 — 自适应首包优化 (10 frames, B=1):
 
 ```
 单 GPU (RTX 4090):
-  单步 ~4.2ms → ~238 codec steps/sec
+  单步 ~2.8ms (B=8) → ~357 codec steps/sec
   Codec rate: 12.5 Hz
-  最大并发用户: 238 / 12.5 ≈ 19 路 (理论上限)
-  留 50% 余量: ~8-10 路并发 (推荐 max_batch_size=8)
+  最大并发用户: 357 / 12.5 ≈ 28 路 (理论上限)
+  留 50% 余量: ~12-14 路并发 (推荐 max_batch_size=8, 留余量给 Code2Wav)
+
+注: 以上为融合引擎的估算值, 待实测验证。
 ```
 
 ### 13.4 与 vllm-omni 对比
 
 | 指标 | vllm-omni (现状) | 本方案 |
 |------|-----------------|--------|
-| 单步延迟 | ~20-23ms | **~4.1ms (5×)** |
+| 单步延迟 | ~20-23ms | **~2.6ms (8×)** |
 | GPU 利用率 | 10-20% (30W on 50系) | **80-90%** |
 | 批量支持 | max_batch=1 | max_batch=8+ |
 | 音频流式输出 | 不支持 | 自适应 chunk (首包 10帧, 后续 25帧) |
-| 首包延迟 (TTS部分) | ~500ms+ | **~76ms (首包优化后)** |
+| 首包延迟 (TTS部分) | ~500ms+ | **~60ms (融合引擎 + 首包优化)** |
 
 ---
 
@@ -1907,58 +1884,65 @@ TTS 纯计算首包 — 自适应首包优化 (10 frames, B=1):
 ```
 Qwen3-TTS-Triton/
 ├── docs/
-│   └── architecture.md
+│   └── architecture.md                 # 本文档
 │
 ├── scripts/
 │   ├── export/
-│   │   ├── export_talker_backbone.py          # TRT-LLM checkpoint (engine 由 build_engines.sh 编译)
-│   │   ├── export_code_predictor_trt.py    # 无 KV Cache 展开版
-│   │   ├── export_speaker_encoder_onnx.py
-│   │   ├── export_speech_tok_enc_onnx.py
-│   │   ├── export_code2wav_onnx.py
-│   │   └── export_embeddings.py
+│   │   ├── export_all.py               # 总入口 (一键导出全部组件)
+│   │   ├── export_01_speech_tokenizer_encoder.py  # → ONNX
+│   │   ├── export_02_code2wav_decoder.py          # → ONNX
+│   │   ├── export_03_speaker_encoder.py           # → ONNX (base only)
+│   │   ├── export_04_talker_unified.py              # → ONNX (单引擎 prefill+decode，推荐)
+│   │   ├── export_04_talker_context.py               # (deprecated) context 融合
+│   │   ├── export_05_talker_decode_fused.py        # (deprecated) decode 融合
+│   │   ├── export_06_embeddings.py                 # → .pt 权重 + config
+│   │   ├── export_code_predictor.py                # → 独立 CP 调试/验证 (不在主流程)
+│   │   └── utils.py                     # 共享工具 + CodePredictorUnrolled
 │   ├── bash/
 │   │   ├── autorun.sh                  # 智能入口 (串联 A→B→C, 子命令/交互)
 │   │   ├── setup_env.sh                # Phase A: 环境搭建 + 模型导出
-│   │   ├── build_engines.sh            # Phase B: docker run trtllm-build
+│   │   ├── build_engines.sh            # Phase B: trtexec 编译全部 ONNX → .engine
 │   │   ├── build_triton.sh             # Phase C: Triton 部署
-│   └── test/
-│       ├── test_pipeline.py
-│       ├── test_streaming.py
-│       └── test_batch.py
+│   │   └── lib/                        # 模块化函数库
+│   │       ├── triton.sh               # model_repository 组装 (含 Pure TRT engine 复制)
+│   │       └── ...
+│   └── python/
+│       ├── verify_trt_talker.py        # Pure TRT Talker 引擎验证
+│       ├── verify_e2e_trt.py           # TRT 端到端验证 (容器内)
+│       ├── verify_e2e_trt_ref.py       # FP32 参考生成 (host)
+│       ├── codec_embedding_sum.py      # CodecEmbeddingSum 模块
 │
 ├── model_repository/
-│   ├── tts_orchestrator/
+│   ├── tts_orchestrator/              # Python BLS 后端
 │   │   ├── config.pbtxt
 │   │   └── 1/
-│   │       ├── model.py
-│   │       ├── session_manager.py
-│   │       ├── batch_scheduler.py
-│   │       ├── kv_cache_manager.py
-│   │       └── flow_controller.py
-│   ├── speaker_encoder/
-│   ├── speech_tokenizer_encoder/
-│   ├── talker_backbone/
-│   ├── code_predictor/
-│   └── code2wav/
+│   │       ├── model.py               # 主控: BLS 入口 + prefill + decode loop
+│   │       ├── prefill_builder.py     # 4 种 task_type prefill 构建
+│   │       ├── codec_embedding_sum.py # 3D gather codec embedding
+│   │       ├── weights/               # text_embedding .pt 权重 + config.json
+│   │       └── tokenizer/             # text tokenizer 文件
+│   ├── speaker_encoder/               # model.onnx | model.plan (onnxruntime | tensorrt)
+│   ├── speech_tokenizer_encoder/      # model.onnx | model.plan
+│   ├── talker_unified/                # model.onnx | model.plan (prefill+decode 合一)
+│   └── code2wav/                      # model.onnx | model.plan
 │
-├── gateway/                            # TTS Gateway (gRPC ↔ Triton 桥接)
-│   ├── server.py                      # gRPC TTSService 实现
-│   ├── triton_bridge.py               # Triton decoupled model 调用封装
+├── gateway/                            # TTS Gateway (gRPC ↔ Triton 桥接, TODO)
 │   └── proto/
 │       └── tts_service.proto
 │
-├── client/
-│   ├── grpc_client.py
-│   ├── ws_client.py
-│   └── examples/
-│       └── streaming_demo.py
+├── client/                             # 客户端示例 (TODO)
 │
 ├── third_party/
-│   └── Qwen3-TTS/
+│   └── Qwen3-TTS/                      # 官方仓库 (git submodule)
 │
 └── workspace/
-    └── Qwen3-TTS/
+    ├── models/                         # 下载的模型权重 (gitignored)
+    └── exported/                       # 导出产物 (ONNX/engine/权重, gitignored)
+        └── <variant>/
+            ├── *.onnx                  # ONNX 模型
+            ├── talker_unified.engine   # Pure TRT 单引擎 (prefill + decode)
+            ├── *.pt                    # PyTorch 权重
+            └── *.engine                # trtexec 产出 (可选，--engine-mode trt 时使用)
 ```
 
 ---
@@ -1969,13 +1953,7 @@ Qwen3-TTS-Triton/
 
 #### 15.0.1 问题背景
 
-`setup_env.sh` (Phase A) 在 host 裸机上通过 conda/venv 管理依赖，但 TRT-LLM engine 编译需要：
-
-- TRT-LLM 运行时（依赖链: TensorRT 10.x + cuDNN + NCCL + OpenMPI + CUDA toolkit）
-- 与目标部署 GPU 匹配的 CUDA 版本
-- `pip install tensorrt_llm` 会拉入特定版本的 PyTorch，极易破坏现有环境
-
-Host 上直接 `pip install tensorrt_llm` 不可行：版本绑定太紧、依赖链太重、容易破坏 PyTorch 环境。构建流程天然分为两个阶段，对环境的要求不同。
+`setup_env.sh` (Phase A) 在 host 上通过 conda/venv 管理依赖，导出 ONNX 模型。TRT engine 编译需要 TensorRT 运行时（NGC 容器提供），host 无需安装 TensorRT。构建流程分两阶段，环境要求不同。
 
 #### 15.0.2 三阶段流程
 
@@ -1983,29 +1961,26 @@ Host 上直接 `pip install tensorrt_llm` 不可行：版本绑定太紧、依�
 flowchart LR
     subgraph hostPhase [Phase A: Host / 轻量环境]
         A1[下载模型权重] --> A2[PyTorch 加载模型]
-        A2 --> A3["ONNX 导出 (01-03, 05)"]
-        A2 --> A4["TRT-LLM checkpoint 导出 (04)"]
-        A2 --> A5["Embedding 权重 (06)"]
+        A2 --> A3["ONNX 导出 (01-03, 04a, 04b)"]
+        A2 --> A5["Embedding 权重 .pt (06)"]
     end
 
-    subgraph trtPhase ["Phase B: TRT-LLM 容器 (GPU)"]
-        B1["trtllm-build: checkpoint → engine"]
-        B2["Code Predictor: ONNX → TRT engine (Phase 2)"]
+    subgraph trtPhase ["Phase B: NGC 容器 (可选, GPU)"]
+        B1["trtexec: 全部 ONNX → .engine (bf16)"]
     end
 
     A3 --> deployReady
-    A4 --> B1
+    A3 --> B1
     A5 --> deployReady
     B1 --> deployReady
-    B2 --> deployReady
 
-    subgraph deployPhase [Phase C: Triton 部署容器]
-        deployReady[所有 engine/ONNX/权重]
+    subgraph deployPhase ["Phase C: Triton 部署 (xx.yy-py3)"]
+        deployReady["ONNX 模式: model.onnx + onnxruntime<br/>TRT 模式: model.plan + tensorrt"]
     end
 ```
 
-- **Phase A** (`setup_env.sh`) 只需要 PyTorch + qwen_tts + ONNX 工具，不需要 TRT-LLM
-- **Phase B** (`build_engines.sh`) 只需要 TRT-LLM (trtllm-build CLI) + checkpoint 文件，不需要 PyTorch/qwen_tts
+- **Phase A** (`setup_env.sh`) 只需要 PyTorch + qwen_tts + ONNX 工具
+- **Phase B** (`build_engines.sh`) 使用 `trtexec` 编译全部 ONNX → `.engine`（可选，仅 TRT 模式需要）
 - **Phase C** (`build_triton.sh`) 只需要 Triton + engine 文件，不需要任何构建工具
 - 三阶段通过 `workspace/exported/` 目录传递中间产物
 - `autorun.sh` 作为智能入口串联三阶段，支持子命令和交互式引导
@@ -2045,59 +2020,46 @@ source <venv-path>/bin/activate
 
 **选定方案: 拆分构建脚本 (方案 A)**
 
-`setup_env.sh` 做 Phase A（ONNX + checkpoint 导出），`build_engines.sh` 通过 `docker run` 调用 TRT-LLM 容器做 Phase B，`build_triton.sh` 组装并部署 Triton。`autorun.sh` 智能串联三阶段。
+`setup_env.sh` 做 Phase A（ONNX 导出 + .pt 权重），`build_engines.sh` 通过 `docker run` 调用 NGC 容器用 `trtexec` 做 Phase B，`build_triton.sh` 组装并部署 Triton。`autorun.sh` 智能串联三阶段。
 
-| 维度 | 方案 A: 拆分构建 (选定) | 方案 B: 多阶段 Docker 构建 | 方案 C: 构建容器 |
-|------|------------------------|--------------------------|----------------|
-| 实现方式 | `setup_env.sh` (host) + `build_engines.sh` (docker) + `build_triton.sh` (deploy), 由 `autorun.sh` 串联 | 单 Dockerfile, Stage 1 编译 + Stage 2 复制产物 | `Dockerfile.build` 容器内运行 `setup_env.sh` |
-| 优点 | 改动最小，职责清晰，灵活 | 一条 `docker build` 全搞定 | 环境一致性好 |
-| 缺点 | 多步操作 (autorun.sh 已串联) | 构建镜像 ~15GB+，改参数需重建 | TRT-LLM 容器 ~15GB+，venv 逻辑冗余 |
-| 灵活性 | checkpoint 导出与 engine 编译解耦，改参数只需重跑 Phase B | 修改参数需重建整个镜像 | 模型权重需 volume mount |
-| CI/CD | `autorun.sh all` 一步串联，CI 友好 | 一步构建，CI 友好 | 适合批量环境 |
-
-选择方案 A 的核心理由：
-- checkpoint 导出和 engine 编译**完全解耦** — 改 batch size 等参数只需重跑 Phase B (~分钟级)
-- 可以用不同版本的 TRT-LLM 容器编译 engine，不影响 Phase A
-- Host 无需安装 TRT-LLM，避免破坏 PyTorch 环境
+选择拆分构建的核心理由：
+- ONNX 导出与 engine 编译**完全解耦** — 改 batch size 等参数只需重跑 Phase B (~分钟级)
+- Host 无需安装 TensorRT，通过 NGC 容器提供编译环境
+- ONNX 模式可完全跳过 Phase B，直接部署
 
 #### 15.0.4 Phase B: build_engines.sh 核心逻辑
 
 ```bash
-# NGC TRT-LLM 容器镜像编译 engine
-# workspace/ 通过 volume mount 传入传出
+# TRT 引擎编译 (所有子模型)
+bash scripts/bash/build_engines.sh --variant design-1.7b
+
+# 编译命令示例 (workspace/ 通过 volume mount 传入传出):
 docker run --rm --gpus all \
     -v "${REPO_ROOT}/workspace:/workspace" \
-    nvcr.io/nvidia/tritonserver:xx.xx-trtllm-python-py3 \
-    trtllm-build \
-        --checkpoint_dir /workspace/exported/<variant>/trtllm_checkpoint \
-        --output_dir /workspace/exported/<variant>/trtllm_engine \
-        --gemm_plugin bfloat16 \
-        --gpt_attention_plugin bfloat16 \
-        --max_batch_size 8 \
-        --max_input_len 512 \
-        --max_seq_len 4096 \
-        --paged_kv_cache disable
+    nvcr.io/nvidia/tritonserver:xx.xx-py3 \
+    bash -c "
+        trtexec --onnx=/workspace/exported/<variant>/talker_unified.onnx --bf16 \
+            --minShapes=... --optShapes=... --maxShapes=... \
+            --saveEngine=/workspace/exported/<variant>/talker_unified.engine
+        # + speaker_encoder, speech_tokenizer_encoder, code2wav_decoder
+    "
 ```
 
 **容器镜像策略**:
 
-NGC 官方不提供同时包含 TRT-LLM 和 ONNX Runtime backend 的镜像。本项目通过多阶段构建解决:
+统一使用 `nvcr.io/nvidia/tritonserver:xx.yy-py3` 全功能镜像，Phase B 和 C 共用：
 
-| 阶段 | 镜像 | 用途 |
+| 阶段 | 用途 | 说明 |
 |------|------|------|
-| Phase B (engine build) | `tritonserver:xx.xx-trtllm-python-py3` | `trtllm-build` 编译 engine (原始 NGC 镜像) |
-| Phase C (Triton deploy) | `qwen3-tts-triton-base:xx.xx` | Triton 推理服务 (组合镜像: trtllm + ORT) |
+| Phase B (engine build) | `trtexec` 编译 ONNX → .engine | trtexec 位于 `/usr/src/tensorrt/bin/trtexec` |
+| Phase C (Triton deploy) | 推理服务 | onnxruntime + tensorrt + python backend |
 
-组合镜像通过 `build_triton.sh build-image` 构建，从 `xx.xx-py3` 全功能镜像中提取
-`/opt/tritonserver/backends/onnxruntime` 复制到 trtllm 镜像。两个 NGC 镜像共享
-CUDA/Ubuntu base layers，增量下载约 3-5 GB，最终组合镜像仅比 trtllm 大 ~500 MB。
-
-`scripts/bash/lib/docker.sh` 实现 NGC 兼容矩阵，根据 NVIDIA 驱动版本自动选择最佳兼容镜像。Phase A (`setup_env.sh`) 预检驱动/Docker 并打印推荐镜像，及早发现环境问题。
+`scripts/bash/lib/docker.sh` 实现 NGC 兼容矩阵，根据 NVIDIA 驱动版本自动选择最佳兼容镜像 tag。
 
 **产物传递路径**:
 ```
-setup_env.sh (host)        →  workspace/exported/<variant>/trtllm_checkpoint/
-build_engines.sh (docker)  →  workspace/exported/<variant>/trtllm_engine/
+setup_env.sh (host)        →  workspace/exported/<variant>/*.onnx, *.pt
+build_engines.sh (docker)  →  workspace/exported/<variant>/*.engine (可选, TRT 模式)
 build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 ```
 
@@ -2108,7 +2070,7 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 1. [x] Speaker Encoder → ONNX
 2. [x] Speech Tokenizer Encoder → ONNX
 3. [x] Code2Wav Decoder → ONNX (含 chunked decode)
-4. [x] Talker Backbone → TRT-LLM checkpoint (Phase A) + engine build via build_engines.sh (Phase B)
+4. [x] Talker Backbone → ONNX 导出 (04a context fused + 04b decode fused)
 5. [x] **⚠️ Code Predictor 无 KV Cache 展开版 + ONNX 导出 + TRT 编译验证** (5.5 节验证清单)
    - Unrolled: 编译通过 (510 MB engine, 126.9s build), B=1 5.08ms / B=8 6.13ms, 少量 token argmax 差异(低精度预期行为)
    - Single-stage: 编译通过 (151.5 MB), B=1 0.39ms / B=8 0.41ms, cosine similarity 高
@@ -2127,19 +2089,18 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
    - **1.7B (custom vs design)**: Talker avg=0.994314/min=0.977611, CP avg=0.999297/min=0.998164, Codec embedding=0.604
    - **结论: 引擎不可共享** — Talker/CP 权重 cosine 高但 codec embedding 差异大 (0.60), 必须分变体部署
 
-### Phase 2: TensorRT / TRT-LLM 优化 (3-5 天)
+### Phase 2: TensorRT 优化 (3-5 天)
 
-9. [x] **Talker Backbone TRT-LLM 集成验证** (build_engines.sh 编译 engine + 精度对比, 6.0/6.2 节)
-   - 验证脚本: `scripts/bash/verify_talker_trtllm.sh`（Step 1: host 端 `verify_talker_trtllm_ref.py` 生成 .npz；Step 2: 容器内 `verify_talker_trtllm.py` 对比 engine 输出）
-   - NGC 26.01 (TRT-LLM 1.1.0) 下 engine 加载与 generate 跑通；prompt_embedding_table 传入 inputs_embeds，virtual token IDs = vocab_size..vocab_size+S-1
-   - **首轮发现 bug: export_04 中 MLP gate/fc 权重映射反了**（TRT-LLM Qwen 的 `mlp.gate` ← HF `up_proj`，`mlp.fc` ← HF `gate_proj`；我们写反了导致 SwiGLU 计算错误，prefill cosine 为负值）
-   - 修复后 design-1.7b 验证结果: **Prefill cosine=0.9996 (PASS)**，各位置 cosine 均 >0.999；top-10 token 排序与 PyTorch 完全一致
-   - codec_token_0: TRT 和 PT 的 context_logits argmax 均为 1486，但 generate() 由于 BF16 tie-break（token 1486 和 29 的 logit 并列 8.75）选了不同 token，后续 decode 因首 token 分歧而发散——此为 BF16 精度边界行为，实际部署中使用 sampling (temperature/top-p) 不受影响
-   - **已重新导出+编译+验证其余 4 个变体** (base-0.6b/1.7b, custom-0.6b/1.7b)，prefill cosine 均 >0.998，验证 PASS；`--paged_kv_cache disable` 保留（1.1.0 deprecated 但 `--kv_cache_type disabled` 语义不同——后者完全移除 KV cache）
+9. [x] **Talker Backbone ONNX 导出 + trtexec 编译** (6.1/6.2/6.3 节)
+   - `export_04_talker_unified.py`: 单引擎 ONNX 导出 (prefill+decode)，统一因果掩码 + UnifiedKVCache
+   - `build_engines.sh`: `trtexec` 编译 talker_unified.onnx → talker_unified.engine，S_past min=1
+   - Talker 为 Triton 子模型 talker_unified，BLS 通过 _bls_talker() 调用，KV 经 dlpack 零拷贝传递
 10. [x] Code Predictor ONNX → TRT (BF16, 验证权重共享) — 5 个变体已用 BF16 重新编译；unrolled ~129–141s/变体，~438 MB (0.6B)/~508 MB (1.7B)；single-stage ~8–12s，~151 MB；精度 single-stage cosine >0.999，unrolled 部分 token 差异属预期
     - fallback single-stage TRT engine 已同时验证，均可选用
+    - CP 已融合进 context 和 fused decode 引擎，无需独立 CP Triton 模型
 11. [x] Codec Embedding Sum 优化 (3D gather, 2.1 节) — 已实现：`codec_embeddings_3d.pt` + `CodecEmbeddingSum` 模块；vocab 对齐（CP 2048→3072 零填充）；verify_e2e Stage E 已切 3D gather，实测 3D ~0.02ms vs naive ~0.17ms（约 7.7x）
-12. [x] 单请求 TRT 端到端验证 + BF16 长序列精度对比 (6.5 节) — 已实现：`verify_e2e_trt_ref.py`（host FP32 参考）+ `verify_e2e_trt.py`（容器内 TRT-LLM Talker + TRT CP）+ `verify_e2e_trt.sh` 两步编排。实测 design-1.7b（20 步）：prefill cosine 0.9996，Talker decode token 匹配率 ~15%（BF16 边界预期），CP 每步 15 token 平均匹配率 ~72%，整体 PASS；长序列可调 `--steps`（如 50/1000）验证
+    - Codec Embedding Sum 已融合进 context 和 fused decode 引擎
+12. [x] 单请求 TRT 端到端验证 + BF16 长序列精度对比 (6.5 节) — `verify_e2e_trt_ref.py`（host FP32 参考）+ `verify_e2e_trt.py`（Pure TRT talker_unified engine）+ `verify_e2e_trt.sh` 两步编排
 
 ### Phase 3: 流式 + Batch (1-1.5 周)
 
@@ -2170,7 +2131,7 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 | 风险 | 严重度 | 影响 | 缓解措施 |
 |------|--------|------|---------|
 | **CP 15步展开 TRT 编译** | **中高** | argmax→Gather 链路 + 75 层图规模，可能编译失败或耗时较长 | Phase 1 优先验证 (5.5 节); fallback: 单 stage TRT + 15 次调用 (5.6 节) |
-| Talker TRT-LLM 集成 | 中 | 模型配置映射 + 权重转换需适配 | TRT-LLM 原生支持 Qwen3 架构 (6.0 节); KV Cache 由 TRT-LLM 运行时管理 |
+| ~~Talker TRT-LLM 集成~~ | ~~中~~ | ~~已解决~~ | **已移除** — 统一使用 ONNX→trtexec + BLS KV Cache 管理 |
 | **Python GIL 控制面瓶颈** | **中高** | Orchestrator 每步 Python 开销可能达 0.5-1ms（朴素实现） | Codec embed sum 优化 (2.1 节); Phase 4 考虑 C++ backend (10.6 节) |
 | Code Predictor ONNX 权重膨胀 | 中 | torch.onnx.export 可能复制共享权重 | 导出后验证 initializer 数量; 必要时用 TRT API 直接构建 |
 | **Prefill 阻塞 Decode 循环** | **中** | 新请求 prefill (~20ms) 期间，现有 session decode 停滞 | 交错调度 (Phase 3); 异步/chunked prefill (Phase 4, 9.2 节) |
@@ -2178,12 +2139,12 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 | Code2Wav 分块边界伪影 | 低 | 分块合成产生不连续性 | 使用 left_context overlap (原始实现已支持) |
 | **Slot 耗尽** | **中** | 多 session 同时 PAUSE 时可用 slot 为零 | PAUSED 超时回收 + 强制驱逐最久 PAUSED session (9.3 节) |
 | **Pause 导致 Batch 碎片化** | 中 | 频繁 pause 使 batch size 波动 | AIMD 自适应阈值 + 动态 batch 重组 |
-| Attention mask 批量处理 | 中 | 不同 slot 的 seq_len 不同 | TRT-LLM 原生支持; 纯 TRT: max_seq_len mask + per-slot length |
+| Attention mask 批量处理 | 中 | 不同 slot 的 seq_len 不同 | Pure TRT: per-layer KV cache 按实际 seq_len 切片; causal mask 在 ONNX 导出时构造 |
 | BF16 精度验证 | **低** | BF16 尾数精度略低于 FP16（7 vs 10 位），需确认生成质量无退化 | 导出后做长序列精度对比 (6.5 节)；BF16 指数范围与 FP32 相同，overflow 风险已消除 |
 | 错误隔离 | 中 | 单 session 异常影响 batch 中其他 session | try-except 隔离 + 超时 slot 回收 (10.5 节) |
 | gRPC 协议集成 | 低中 | 自定义 proto 与 Triton 协议不兼容 | TTS Gateway 做协议桥接 (3.1 节); 或直接用 Triton 协议 |
 | **多变体权重差异** | **中** | 三变体 Talker/CP 权重不同, 无法共享单引擎实现多任务 | Phase 1 验证权重差异 (2.2.3 节); 单变体部署兜底 |
-| ICL 模式 prefill 过长 | 低中 | ICL 包含参考音频 codec (S_prefill~200+), 可能超 profile 范围 | Talker TRT-LLM max_input_len 设 512 (6.2 节) |
+| ICL 模式 prefill 过长 | 低中 | ICL 包含参考音频 codec (S_prefill~200+), 可能超 profile 范围 | Context Engine maxShapes 设 512 (6.3 节) |
 | Text Embedder 显存碎片 | 低 | ~624MB PyTorch 权重不在 Triton memory pool 内 | 显存预算显式计入 (2.1 节) |
 | Batch 内序列长度差异 | 低 | 不同请求 prefill 长度不同 | 分离 prefill/decode (9.2 节) |
 
@@ -2228,3 +2189,11 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 - Batch 效率更高 (GEMM vs GEMV)
 
 **Talker Backbone 保留 KV Cache**: 序列可达数千步, 前缀重算不可接受。
+
+### [历史] 为什么 Talker Backbone 从 TRT-LLM 转向 Pure TRT
+
+> 以下为历史决策记录。当前架构已完全移除 TRT-LLM，统一使用 ONNX 导出 + `trtexec` 编译。
+
+**问题**: TRT-LLM 内部插件维护有状态对象，通过 raw TRT API 调用时 segfault，无法实现 O(1) decode step。
+
+**解决方案**: 通过 ONNX 导出 + `trtexec` 编译，完全绕过 TRT-LLM。KV Cache 在 BLS Python 层通过 `dlpack` 零拷贝管理。Talker Context 和 Talker Decode Fused 均融合 Code Predictor + Codec Embedding Sum，注册为独立 Triton 子模型。

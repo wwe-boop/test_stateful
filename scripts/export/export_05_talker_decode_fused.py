@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-[Step 04b] Export Fused Talker Decode (1 step) + Code Predictor + Codec Sum to ONNX.
+[Step 05] Export Fused Talker Decode (1 step) + Code Predictor + Codec Sum to ONNX.
+
+Deprecated: Prefer export_04_talker_unified.py for single-engine deployment (no weight duplication).
 
 Single decode step: Talker 1-token forward (KV cache reuse) → argmax → CP 15-step
 → codec_sum. All in one ONNX for minimal GPU round-trips.
@@ -22,9 +24,7 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-# Allow importing CodePredictorUnrolled from same package
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from export_05_code_predictor import CodePredictorUnrolled
 
 from utils import (
     setup_logging,
@@ -38,6 +38,7 @@ from utils import (
     add_common_args,
     MODEL_VARIANTS,
     ONNX_EXPORT_DTYPE,
+    CodePredictorUnrolled,
 )
 
 logger = logging.getLogger("onnx_export")

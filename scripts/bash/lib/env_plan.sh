@@ -158,7 +158,7 @@ resolve_env_plan() {
 
     # ===== Phase 2: Derive versions (no network) =====
     local errors=() warnings=()
-    local ngc_tag="" ngc_min_drv="" ngc_trtllm="" ngc_cuda="" ngc_pyver="" ngc_size=""
+    local ngc_tag="" ngc_min_drv="" ngc_trt="" ngc_cuda="" ngc_pyver="" ngc_size=""
     local driver_status="ok" driver_msg=""
     local cuda_status="ok" cuda_msg=""
     local ngc_status="ok" ngc_msg=""
@@ -170,7 +170,7 @@ resolve_env_plan() {
         errors+=("$driver_msg")
     elif ! _driver_ge "$ngc_driver_ver" "$_QWEN3_MIN_DRIVER"; then
         driver_status="error"
-        driver_msg="Driver $ngc_driver_ver < $_QWEN3_MIN_DRIVER (Qwen3 needs TRT-LLM >= $_QWEN3_MIN_TRTLLM)"
+        driver_msg="Driver $ngc_driver_ver < $_QWEN3_MIN_DRIVER"
         errors+=("$driver_msg")
     else
         driver_msg="$ngc_driver_ver >= $_QWEN3_MIN_DRIVER"
@@ -190,11 +190,11 @@ resolve_env_plan() {
     if [ "$driver_status" = "ok" ]; then
         ngc_entry=$(_resolve_best_entry "$ngc_driver_ver" 2>/dev/null) || true
         if [ -n "$ngc_entry" ]; then
-            read -r ngc_tag ngc_min_drv ngc_trtllm ngc_cuda ngc_pyver ngc_size <<< "$ngc_entry"
-            ngc_msg="NGC $ngc_tag (TRT-LLM $ngc_trtllm, CUDA $ngc_cuda, Python $ngc_pyver)"
+            read -r ngc_tag ngc_min_drv ngc_trt ngc_cuda ngc_pyver ngc_size <<< "$ngc_entry"
+            ngc_msg="NGC $ngc_tag (CUDA $ngc_cuda, Python $ngc_pyver)"
         else
             ngc_status="error"
-            ngc_msg="No compatible NGC container for driver $driver_ver (need TRT-LLM >= $_QWEN3_MIN_TRTLLM)"
+            ngc_msg="No compatible NGC container for driver $driver_ver (need driver >= $_QWEN3_MIN_DRIVER)"
             errors+=("$ngc_msg")
         fi
     else
@@ -213,11 +213,10 @@ resolve_env_plan() {
         flash_cuda_tag=$(_flash_attn_compatible_tag "$cuda_ver") || flash_needs_downgrade=true
     fi
 
-    # 2f: NGC image URIs (trtllm + py3 share the same tag; py3 provides ORT backend)
-    local ngc_image="" ngc_ort_image=""
+    # 2f: NGC image URI (single image for both Phase B and C)
+    local ngc_image=""
     if [ -n "$ngc_tag" ]; then
-        ngc_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_TRTLLM_SUFFIX}"
-        ngc_ort_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}"
+        ngc_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_PY3_SUFFIX}"
     fi
 
     # ===== Phase 3: Verify feasibility (network, no installs) =====
@@ -347,10 +346,8 @@ CHECKS_EOF
     "flash_attn_version": "$_FLASH_ATTN_VERSION",
     "flash_attn_compatible_tag": "$flash_cuda_tag",
     "ngc_tag": "$ngc_tag",
-    "ngc_trtllm_version": "$ngc_trtllm",
     "ngc_cuda_version": "$ngc_cuda",
-    "ngc_image": "$ngc_image",
-    "ngc_ort_image": "$ngc_ort_image"
+    "ngc_image": "$ngc_image"
   },
   "checks": $checks_json,
   "warnings": $warnings_json,
@@ -416,7 +413,7 @@ print_env_plan() {
     local plan_file="$1"
     [ -f "$plan_file" ] || { log_error "Plan file not found: $plan_file"; return 1; }
 
-    local drv cuda gpu gpu_mem py tag ngc ngc_trtllm ngc_img ngc_ort_img
+    local drv cuda gpu gpu_mem py tag ngc ngc_img
     drv=$(_plan_get "$plan_file" "driver_version")
     cuda=$(_plan_get "$plan_file" "cuda_version")
     gpu=$(_plan_get "$plan_file" "gpu_name")
@@ -424,9 +421,7 @@ print_env_plan() {
     py=$(_plan_get "$plan_file" "python")
     tag=$(_plan_get "$plan_file" "pytorch_cuda_tag")
     ngc=$(_plan_get "$plan_file" "ngc_tag")
-    ngc_trtllm=$(_plan_get "$plan_file" "ngc_trtllm_version")
     ngc_img=$(_plan_get "$plan_file" "ngc_image")
-    ngc_ort_img=$(_plan_get "$plan_file" "ngc_ort_image")
 
     local gpu_gb=""
     if [ -n "$gpu_mem" ] && [ "$gpu_mem" != "0" ]; then
@@ -468,11 +463,10 @@ print_env_plan() {
             echo "    flash-attn: ${fa_ver}  (no wheel for ${sys_tag:-$tag})"
         fi
     fi
-    echo "    NGC:      ${ngc:-?}    (TRT-LLM ${ngc_trtllm:-?})"
+    echo "    NGC:      ${ngc:-?}"
     echo ""
-    echo "  Containers (same NGC tag, shared base layers):"
-    echo "    TRT-LLM:  ${ngc_img:-?}"
-    echo "    ORT:      ${ngc_ort_img:-?}"
+    echo "  Container (Phase B + C):"
+    echo "    Image:    ${ngc_img:-?}"
     echo ""
     echo "  Checks:"
 
@@ -482,7 +476,7 @@ print_env_plan() {
                   "CUDA detected"
                   "PyTorch wheel ($tag)"
                   "flash-attn wheel"
-                  "NGC container (TRT-LLM >= $_QWEN3_MIN_TRTLLM)"
+                  "NGC container (driver >= $_QWEN3_MIN_DRIVER)"
                   "Disk space")
 
     local i=0

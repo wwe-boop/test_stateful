@@ -3,15 +3,16 @@
 Master export script: exports all Qwen3-TTS components for Triton deployment.
 
 Runs the numbered export scripts (01-06) in order for all (or selected) variants.
+Dual-engine mode: pure ONNX Runtime and pure TensorRT (no TRT-LLM).
 
 Export pipeline:
-  01. Speech Tokenizer Encoder → ONNX  (shared, from tokenizer checkpoint)
-  02. Code2Wav Decoder → ONNX          (shared, from tokenizer checkpoint)
+  01. Speech Tokenizer Encoder → ONNX  (shared)
+  02. Code2Wav Decoder → ONNX          (shared)
   Per-variant:
     03. Speaker Encoder → ONNX         (base variants only)
-    04. Talker Backbone → TRT-LLM checkpoint  (engine build via build_engines.sh)
-    05. Code Predictor → ONNX          (unrolled + single-stage fallback)
-    06. Embedding weights → .pt        (for Orchestrator)
+    04. Talker Context Fused → ONNX    (prefill + CP + codec_sum)
+    05. Talker Decode Fused → ONNX     (decode step + CP + codec_sum)
+    06. Embedding weights → .pt        (for Orchestrator prefill; text_embedding in-process)
 
 Usage:
   python scripts/export/export_all.py                        # all variants, bf16, auto GPU
@@ -63,15 +64,8 @@ def main():
                         help="Skip shared tokenizer exports (steps 01-02)")
     parser.add_argument("--skip-talker", action="store_true",
                         help="Skip Talker Backbone export (step 04)")
-    parser.add_argument("--skip-code-predictor", action="store_true",
-                        help="Skip Code Predictor export (step 05)")
     parser.add_argument("--skip-embeddings", action="store_true",
                         help="Skip Embedding weights export (step 06)")
-    parser.add_argument("--code-predictor-mode", type=str, default="both",
-                        choices=["unrolled", "single_stage", "both"],
-                        help="Code Predictor export mode (default: both)")
-    parser.add_argument("--talker-onnx-baseline", action="store_true",
-                        help="Also export ONNX correctness baseline for Talker Backbone")
     args = parser.parse_args()
 
     device = resolve_device(args.device)
@@ -155,47 +149,23 @@ def main():
                 logger.error(f"[{variant}] Speaker Encoder failed: {e}", exc_info=True)
                 results[f"{variant}/speaker_encoder"] = ("FAILED", str(e))
 
-        # 04. Talker Backbone → TRT-LLM checkpoint
+        # 04. Talker Unified → ONNX (single engine for prefill + decode; replaces context + decode_fused)
         if not args.skip_talker:
             logger.info("=" * 60)
-            logger.info(f"Step 04/06: [{variant}] Talker Backbone → TRT-LLM checkpoint")
+            logger.info(f"Step 04/06: [{variant}] Talker Unified → ONNX")
             logger.info("=" * 60)
             try:
-                from export_04_talker_backbone import export_talker_backbone
-                talker_results = export_talker_backbone(
-                    variant, args.models_dir, args.output_dir, device, dtype,
-                    export_onnx_baseline=args.talker_onnx_baseline,
+                from export_04_talker_unified import export_talker_unified
+                out = export_talker_unified(
+                    variant, args.models_dir, args.output_dir, device,
                 )
-                ckpt_path = talker_results.get("checkpoint", "")
-                results[f"{variant}/talker_backbone"] = ("OK", f"checkpoint={ckpt_path}")
+                path = out.get("onnx", out) if isinstance(out, dict) else out
+                results[f"{variant}/talker_unified"] = ("OK", path)
             except Exception as e:
-                logger.error(f"[{variant}] Talker Backbone failed: {e}", exc_info=True)
-                results[f"{variant}/talker_backbone"] = ("FAILED", str(e))
+                logger.error(f"[{variant}] Talker Unified failed: {e}", exc_info=True)
+                results[f"{variant}/talker_unified"] = ("FAILED", str(e))
 
-        # 05. Code Predictor
-        if not args.skip_code_predictor:
-            logger.info("=" * 60)
-            logger.info(f"Step 05/06: [{variant}] Code Predictor → ONNX")
-            logger.info("=" * 60)
-            try:
-                from export_05_code_predictor import (
-                    export_code_predictor_unrolled,
-                    export_code_predictor_single_stage,
-                )
-                if args.code_predictor_mode in ("unrolled", "both"):
-                    path = export_code_predictor_unrolled(
-                        variant, args.models_dir, args.output_dir, device, dtype)
-                    results[f"{variant}/code_predictor_unrolled"] = ("OK", path)
-
-                if args.code_predictor_mode in ("single_stage", "both"):
-                    path = export_code_predictor_single_stage(
-                        variant, args.models_dir, args.output_dir, device, dtype)
-                    results[f"{variant}/code_predictor_single_stage"] = ("OK", path)
-            except Exception as e:
-                logger.error(f"[{variant}] Code Predictor failed: {e}", exc_info=True)
-                results[f"{variant}/code_predictor"] = ("FAILED", str(e))
-
-        # 06. Embedding weights
+        # 06. Embedding weights (.pt) for Orchestrator prefill
         if not args.skip_embeddings:
             logger.info("=" * 60)
             logger.info(f"Step 06/06: [{variant}] Embedding weights → .pt")

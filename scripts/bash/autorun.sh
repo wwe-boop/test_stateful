@@ -4,7 +4,7 @@
 #
 #  Smart entry point that orchestrates all three build phases:
 #    Phase A (setup):  Environment + model export    → setup_env.sh
-#    Phase B (build):  TRT-LLM engine compilation    → build_engines.sh
+#    Phase B (build):  TensorRT engine compilation    → build_engines.sh
 #    Phase C (deploy): Triton server deployment       → build_triton.sh
 #
 #  Usage:
@@ -34,7 +34,7 @@
 #      --skip-export         Skip model export
 #
 #    Phase B (forwarded to build_engines.sh):
-#      --max-batch-size <N>  TRT-LLM max batch (default: 8)
+#      --max-batch-size <N>  TRT max batch (default: 8)
 #      --image <uri>         Override NGC container image
 #      --dtype <type>        Engine precision (default: bfloat16)
 #
@@ -92,7 +92,7 @@ Usage: autorun.sh [command] [model_variant] [options]
 Commands:
   all               Full pipeline: setup → build → deploy (default)
   setup             Phase A only (environment + model export)
-  build             Phase B only (TRT-LLM engine compilation)
+  build             Phase B only (TensorRT engine compilation)
   deploy            Phase C only (Triton server deployment)
   status            Show pipeline status
   stop              Stop Triton server
@@ -276,7 +276,7 @@ run_phase_a() {
 }
 
 run_phase_b() {
-    log_step "Phase B: TRT-LLM Engine Build"
+    log_step "Phase B: TensorRT Engine Build (trtexec)"
     echo ""
 
     if $DRY_RUN; then
@@ -329,7 +329,7 @@ cmd_setup() {
 }
 
 cmd_build() {
-    show_run_banner "Phase B" "TRT-LLM Engines"
+    show_run_banner "Phase B" "TensorRT Engines"
     run_phase_b || exit 1
 }
 

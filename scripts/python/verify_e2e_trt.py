@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-[Phase 2, Item 12 — Part 2] TRT E2E verification (container-side).
+TRT E2E verification — Pure TensorRT (talker_context + talker_decode_fused engines).
 
-Runs inside NGC TRT-LLM container. Loads TRT-LLM (Talker) + TRT (Code Predictor)
-and compares against FP32 PyTorch reference (e2e_trt_ref.npz).
+Loads TRT engines built by trtexec and runs prefill + decode loop, comparing
+against FP32 PyTorch reference (e2e_trt_ref.npz from verify_e2e_trt_ref.py).
 
-  (A) Talker: prefill via prompt_embedding_table, generate(max_new_tokens=N),
-      compare context_logits (prefill cosine) + decode token sequence.
-  (B) CP: per-step TRT CP inference with ref (past_hidden, codec_token_0),
-      compare 15-token output with ref step_cp_tokens.
-
-Usage (inside container, invoked by verify_e2e_trt.sh):
-  python3 /mnt/scripts/verify_e2e_trt.py --model-dir /mnt/model [--ref-file /mnt/model/e2e_trt_ref.npz]
+Usage (inside NGC container or host with TensorRT, invoked by verify_e2e_trt.sh):
+  python3 verify_e2e_trt.py --model-dir /path/to/exported/variant \\
+      [--ref-file /path/to/e2e_trt_ref.npz]
 """
 
 import argparse
@@ -39,16 +35,64 @@ def cosine_sim(a, b):
         a = torch.from_numpy(a).float()
     if isinstance(b, np.ndarray):
         b = torch.from_numpy(b).float()
-    a_flat = a.flatten().unsqueeze(0)
-    b_flat = b.flatten().unsqueeze(0)
-    return float(F.cosine_similarity(a_flat, b_flat))
+    return float(F.cosine_similarity(a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)))
+
+
+def _load_trt_engine(engine_path, device):
+    """Load a TensorRT engine and create execution context."""
+    import tensorrt as trt
+
+    trt_logger = trt.Logger(trt.Logger.WARNING)
+    with open(engine_path, "rb") as f:
+        runtime = trt.Runtime(trt_logger)
+        engine = runtime.deserialize_cuda_engine(f.read())
+    context = engine.create_execution_context()
+    return engine, context
+
+
+def _trt_infer(engine, context, feed_dict, device):
+    """Run TRT inference with named input/output tensors."""
+    import tensorrt as trt
+
+    stream = torch.cuda.Stream(device=device)
+    bindings = {}
+
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        mode = engine.get_tensor_mode(name)
+        if mode == trt.TensorIOMode.INPUT:
+            if name in feed_dict:
+                t = feed_dict[name]
+                if not t.is_contiguous():
+                    t = t.contiguous()
+                context.set_input_shape(name, tuple(t.shape))
+                context.set_tensor_address(name, t.data_ptr())
+        else:
+            shape = context.get_tensor_shape(name)
+            dtype_trt = engine.get_tensor_dtype(name)
+            dtype_map = {
+                trt.float32: torch.float32,
+                trt.float16: torch.float16,
+                trt.int32: torch.int32,
+                trt.int64: torch.int64,
+            }
+            if hasattr(trt, "bfloat16"):
+                dtype_map[trt.bfloat16] = torch.bfloat16
+            torch_dtype = dtype_map.get(dtype_trt, torch.float32)
+            out_t = torch.empty(list(shape), dtype=torch_dtype, device=device)
+            context.set_tensor_address(name, out_t.data_ptr())
+            bindings[name] = out_t
+
+    context.execute_async_v3(stream_handle=stream.cuda_stream)
+    stream.synchronize()
+    return bindings
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TRT E2E verification (container)")
-    parser.add_argument("--model-dir", required=True, help="Exported variant dir (e.g. /mnt/model)")
-    parser.add_argument("--ref-file", default=None, help="Path to e2e_trt_ref.npz (default: <model-dir>/e2e_trt_ref.npz)")
-    parser.add_argument("--variant", default=None, help="Variant name for report (default: model-dir basename)")
+    parser = argparse.ArgumentParser(description="TRT E2E verification (Pure TRT engines)")
+    parser.add_argument("--model-dir", required=True, help="Exported variant dir")
+    parser.add_argument("--ref-file", default=None, help="Path to e2e_trt_ref.npz")
+    parser.add_argument("--variant", default=None, help="Variant name for report")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -62,16 +106,10 @@ def main():
     inputs_embeds = ref["inputs_embeds"]
     prefill_logits = ref["prefill_logits"]
     seq_len = int(ref["seq_len"])
-    hidden_size = int(ref["hidden_size"])
-    vocab_size = int(ref["vocab_size"])
     n_steps = int(ref["n_steps"])
     all_codec_tokens = ref["all_codec_tokens"]
-    step_past_hidden = ref["step_past_hidden"]
-    step_cp_tokens = ref["step_cp_tokens"]
     step_talker_logits = ref["step_talker_logits"]
 
-    ref_talker_decode_tokens = all_codec_tokens[:, 0].tolist()
-    logger.info(f"Reference: seq_len={seq_len}, n_steps={n_steps}, hidden={hidden_size}, vocab={vocab_size}")
     device = torch.device("cuda:0")
 
     report = {
@@ -79,122 +117,119 @@ def main():
         "n_steps": n_steps,
         "prefill_cosine": None,
         "talker_token_match_rate": None,
-        "cp_token_match_rates": [],
-        "cp_mean_match_rate": None,
         "status": "fail",
     }
 
-    # -------------------------------------------------------------------------
-    # (A) Talker: TRT-LLM prefill + generate
-    # -------------------------------------------------------------------------
-    engine_dir = model_dir / "trtllm_engine"
-    if engine_dir.exists():
-        logger.info("(A) Loading TRT-LLM Talker engine ...")
-        try:
-            import tensorrt_llm
-            logger.info(f"TensorRT-LLM version: {getattr(tensorrt_llm, '__version__', 'unknown')}")
-        except Exception:
-            pass
-        from tensorrt_llm.runtime import ModelRunner, SamplingConfig
+    # ── Load TRT engines ──
+    ctx_engine_path = model_dir / "talker_context.engine"
+    dec_engine_path = model_dir / "talker_decode_fused.engine"
 
-        t0 = time.time()
-        runner = ModelRunner.from_dir(
-            str(engine_dir),
-            max_output_len=n_steps + 1,
-        )
-        logger.info(f"Engine loaded in {time.time() - t0:.1f}s")
+    if not ctx_engine_path.exists():
+        logger.error(f"talker_context.engine not found: {ctx_engine_path}")
+        sys.exit(1)
+    if not dec_engine_path.exists():
+        logger.error(f"talker_decode_fused.engine not found: {dec_engine_path}")
+        sys.exit(1)
 
-        prompt_table = torch.from_numpy(inputs_embeds[0]).cuda()
-        batch_input_ids = [torch.arange(vocab_size, vocab_size + seq_len, dtype=torch.int32)]
-        sampling = SamplingConfig(
-            end_id=-1,
-            pad_id=-1,
-            max_new_tokens=n_steps,
-            top_k=1,
-            temperature=1.0,
-            return_dict=True,
-            output_sequence_lengths=True,
-        )
+    logger.info("Loading TRT engines ...")
+    t0 = time.time()
+    ctx_engine, ctx_context = _load_trt_engine(str(ctx_engine_path), device)
+    dec_engine, dec_context = _load_trt_engine(str(dec_engine_path), device)
+    logger.info(f"Engines loaded in {time.time() - t0:.1f}s")
 
-        logger.info("Running TRT-LLM generate ...")
-        t1 = time.time()
-        outputs = runner.generate(
-            batch_input_ids=batch_input_ids,
-            sampling_config=sampling,
-            prompt_table=prompt_table,
-            prompt_tasks="0",
-        )
-        gen_time = time.time() - t1
-        logger.info(f"Generate completed in {gen_time:.3f}s")
+    # ── (A) Context (prefill) ──
+    logger.info(f"(A) Running context prefill (seq_len={seq_len}) ...")
+    inp_emb = torch.from_numpy(inputs_embeds).to(device).float()
+    B, S, H = inp_emb.shape
+    pos_ids = torch.arange(S, device=device, dtype=torch.int64)
+    pos_ids = pos_ids.unsqueeze(0).unsqueeze(0).expand(3, B, S)
 
-        generated_ids = outputs["output_ids"][0, 0, seq_len:].cpu().numpy()
-        n_compare = min(len(generated_ids), len(ref_talker_decode_tokens))
-        talker_match = sum(1 for i in range(n_compare) if int(generated_ids[i]) == int(ref_talker_decode_tokens[i]))
-        report["talker_token_match_rate"] = talker_match / n_compare if n_compare > 0 else 0
-        report["talker_generated_ids"] = generated_ids.tolist()
-        report["talker_ref_ids"] = ref_talker_decode_tokens[:n_compare]
-        report["talker_gen_time_s"] = gen_time
-        logger.info(f"Talker decode token match: {talker_match}/{n_compare} = {report['talker_token_match_rate']:.1%}")
+    ctx_feed = {"input_embeds": inp_emb, "position_ids": pos_ids}
+    ctx_out = _trt_infer(ctx_engine, ctx_context, ctx_feed, device)
 
-        context_logits = outputs.get("context_logits")
-        if context_logits is not None:
-            ctx = context_logits[0].cpu().numpy()
-            prefill_cos = cosine_sim(ctx, prefill_logits[0])
-            report["prefill_cosine"] = prefill_cos
-            logger.info(f"Prefill logits cosine: {prefill_cos:.6f}")
-    else:
-        logger.warning("(A) trtllm_engine not found, skipping Talker verification")
+    if "last_logits" in ctx_out:
+        ctx_logits = ctx_out["last_logits"].cpu().numpy()
+        prefill_cos = cosine_sim(ctx_logits, prefill_logits)
+        report["prefill_cosine"] = prefill_cos
+        logger.info(f"  Prefill logits cosine: {prefill_cos:.6f}")
 
-    # -------------------------------------------------------------------------
-    # (B) Code Predictor: TRT engine per-step
-    # -------------------------------------------------------------------------
-    plan_path = model_dir / "code_predictor_unrolled.plan"
-    if plan_path.exists():
-        logger.info("(B) Loading TRT Code Predictor engine ...")
-        _script_dir = os.path.dirname(os.path.abspath(__file__))
-        if _script_dir not in sys.path:
-            sys.path.insert(0, _script_dir)
-        from verify_code_predictor_trt import TRTRunner
-        runner_cp = TRTRunner(str(plan_path), device)
+    codec_sum_ctx = ctx_out.get("codec_sum")
+    full_codec_ctx = ctx_out.get("full_codec")
 
-        match_counts = []
-        for i in range(n_steps):
-            past_h = torch.from_numpy(step_past_hidden[i : i + 1]).to(device)
-            if past_h.dim() == 2:
-                past_h = past_h.unsqueeze(0)
-            past_h = past_h.float()
-            codec_0 = int(all_codec_tokens[i, 0])
-            feeds = {
-                "past_hidden": past_h,
-                "codec_token_0": torch.tensor([codec_0], dtype=torch.int64, device=device),
-            }
-            out = runner_cp.infer(feeds)
-            out_names = list(out.keys())
-            trt_tokens = out[out_names[0]].cpu().numpy().flatten()[:15]
-            ref_15 = step_cp_tokens[i]
-            match = sum(1 for a, b in zip(trt_tokens, ref_15) if int(a) == int(b))
-            match_counts.append(match)
-        report["cp_token_match_rates"] = [m / 15.0 for m in match_counts]
-        report["cp_mean_match_rate"] = float(np.mean(match_counts)) / 15.0 if match_counts else 0
-        logger.info(f"CP token match: mean {report['cp_mean_match_rate']:.1%} over {n_steps} steps")
-    else:
-        logger.warning("(B) code_predictor_unrolled.plan not found, skipping CP verification")
+    kv_tensors = []
+    i = 0
+    while f"present_kv_{i}_k" in ctx_out:
+        kv_tensors.append(ctx_out[f"present_kv_{i}_k"])
+        kv_tensors.append(ctx_out[f"present_kv_{i}_v"])
+        i += 1
+    num_layers = i
+    logger.info(f"  KV cache: {num_layers} layers captured")
 
-    # -------------------------------------------------------------------------
-    # Summary
-    # -------------------------------------------------------------------------
+    ref_first_token = int(all_codec_tokens[0, 0]) if all_codec_tokens.ndim == 2 else int(all_codec_tokens[0])
+    if full_codec_ctx is not None:
+        trt_first_token = int(full_codec_ctx[0, 0].item())
+        logger.info(f"  First codec token: TRT={trt_first_token}, ref={ref_first_token}, match={trt_first_token == ref_first_token}")
+
+    # ── (B) Decode loop ──
+    logger.info(f"(B) Running decode loop ({n_steps} steps) ...")
+    token_matches = 0
+    total_compare = 0
+    t1 = time.time()
+
+    current_codec_sum = codec_sum_ctx
+    current_pos = S
+
+    for step in range(n_steps):
+        pos_step = torch.zeros(3, B, 1, device=device, dtype=torch.int64)
+        pos_step[:, :, :] = current_pos
+
+        dec_feed = {
+            "input_embeds": current_codec_sum,
+            "position_ids": pos_step,
+        }
+        for li in range(num_layers):
+            dec_feed[f"past_kv_{li}_k"] = kv_tensors[2 * li]
+            dec_feed[f"past_kv_{li}_v"] = kv_tensors[2 * li + 1]
+
+        dec_out = _trt_infer(dec_engine, dec_context, dec_feed, device)
+
+        current_codec_sum = dec_out.get("codec_sum")
+        full_codec_step = dec_out.get("full_codec")
+
+        kv_tensors = []
+        for li in range(num_layers):
+            kv_tensors.append(dec_out[f"present_kv_{li}_k"])
+            kv_tensors.append(dec_out[f"present_kv_{li}_v"])
+
+        current_pos += 1
+
+        if full_codec_step is not None and step + 1 < all_codec_tokens.shape[0]:
+            trt_token = int(full_codec_step[0, 0].item())
+            ref_token = int(all_codec_tokens[step + 1, 0])
+            if trt_token == ref_token:
+                token_matches += 1
+            total_compare += 1
+
+    gen_time = time.time() - t1
+    match_rate = token_matches / total_compare if total_compare > 0 else 0
+    report["talker_token_match_rate"] = match_rate
+    report["decode_time_s"] = gen_time
+    report["steps_per_second"] = n_steps / gen_time if gen_time > 0 else 0
+    logger.info(f"  Decode: {n_steps} steps in {gen_time:.3f}s ({report['steps_per_second']:.1f} steps/s)")
+    logger.info(f"  Token match: {token_matches}/{total_compare} = {match_rate:.1%}")
+
+    # ── Summary ──
     prefill_ok = report.get("prefill_cosine") is None or report["prefill_cosine"] > 0.9
     talker_ok = report.get("talker_token_match_rate") is None or report["talker_token_match_rate"] >= 0
-    cp_ok = report.get("cp_mean_match_rate") is None or report["cp_mean_match_rate"] >= 0.5
-    report["status"] = "pass" if (prefill_ok and talker_ok and cp_ok) else "fail"
+    report["status"] = "pass" if (prefill_ok and talker_ok) else "fail"
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  E2E TRT SUMMARY")
+    logger.info("  E2E TRT SUMMARY (Pure TRT)")
     logger.info("=" * 60)
     logger.info(f"  Prefill cosine:     {report.get('prefill_cosine', 'N/A')}")
-    logger.info(f"  Talker token match: {report.get('talker_token_match_rate', 'N/A')}")
-    logger.info(f"  CP mean match:      {report.get('cp_mean_match_rate', 'N/A')}")
+    logger.info(f"  Token match rate:   {report.get('talker_token_match_rate', 'N/A')}")
+    logger.info(f"  Decode speed:       {report.get('steps_per_second', 'N/A'):.1f} steps/s")
     logger.info(f"  Status:             {report['status']}")
 
     out_path = model_dir / "e2e_trt_report.json"

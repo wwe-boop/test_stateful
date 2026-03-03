@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-[Step 05] Export Code Predictor to ONNX (for TRT conversion).
+Standalone Code Predictor export & verification (optional, not in main pipeline).
+
+NOTE: In the main pipeline (export_all.py), Code Predictor is NOT exported
+independently. Its logic (CodePredictorUnrolled) is fused into:
+  - export_04_talker_context.py  (context prefill + CP + codec_sum)
+  - export_05_talker_decode_fused.py  (decode step + CP + codec_sum)
+
+The CodePredictorUnrolled class lives in utils.py and is imported here.
+
+This script exists for:
+  1. Standalone CP debugging / verification
+  2. Exporting a standalone CP ONNX for comparison / profiling
+  3. Single-stage fallback export (if the unrolled graph is too large for TRT)
 
 Component: Code Predictor
 Architecture: Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128
               + (num_code_groups-1) codec embeddings + lm_heads
 Input:  past_hidden [B, 1, 1024], codec_token_0 [B]
 Output: codec_tokens [B, num_code_groups-1]
-
-Two export strategies:
-  1. Unrolled (PRIMARY): All stages unrolled into a single static graph, no KV cache
-     - Single ONNX → single TRT engine → single call per decode step
-     - Risk: TRT compilation may fail for large graph (see architecture.md §5.5)
-
-  2. Single-stage (FALLBACK): one stage per call, driven by external Python loop
-     - N ONNX calls per decode step (N=num_code_groups-1), but each is simple and guaranteed to compile
-     - Extra launch overhead proportional to N
 
 Applies to: ALL variants
 """
@@ -40,91 +43,10 @@ from utils import (
     add_common_args,
     MODEL_VARIANTS,
     ONNX_EXPORT_DTYPE,
+    CodePredictorUnrolled,
 )
 
 logger = logging.getLogger("onnx_export")
-
-
-class CodePredictorUnrolled(nn.Module):
-    """All stages fully unrolled into a single forward pass, no KV Cache.
-
-    All stages share the same Transformer weights (num_code_groups-1 stages). Each stage:
-      1. Appends the new codec embedding to the sequence
-      2. Projects through small_to_mtp_projection
-      3. Full prefill through 5-layer Transformer
-      4. Takes last hidden → lm_head[stage] → argmax → next token
-
-    See architecture.md §5.4 for design rationale.
-    """
-
-    def __init__(self, code_predictor, talker_codec_embedding):
-        super().__init__()
-        self.transformer_layers = code_predictor.model.layers
-        self.norm = code_predictor.model.norm
-        self.rotary_emb = code_predictor.model.rotary_emb
-        self.projection = code_predictor.small_to_mtp_projection
-
-        self.codec_embeddings = code_predictor.model.codec_embedding
-        self.talker_codec_embedding = talker_codec_embedding
-        self.lm_heads = code_predictor.lm_head
-
-        self.num_stages = len(self.lm_heads)
-        self.hidden_size = code_predictor.config.hidden_size
-
-    def _transformer_forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, D = x.shape
-        device = x.device
-
-        position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-        position_embeddings = self.rotary_emb(x, position_ids)
-
-        causal_mask = torch.triu(
-            torch.full((S, S), float('-inf'), device=device, dtype=x.dtype),
-            diagonal=1,
-        )
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
-
-        hidden = x
-        for layer in self.transformer_layers:
-            layer_out = layer(
-                hidden,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_values=None,
-                output_attentions=False,
-                use_cache=False,
-                cache_position=torch.arange(S, device=device),
-                position_embeddings=position_embeddings,
-            )
-            hidden = layer_out[0]
-
-        return self.norm(hidden)
-
-    def forward(self, past_hidden: torch.Tensor, codec_token_0: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            past_hidden:   [B, 1, talker_hidden_size] - last hidden from Talker
-            codec_token_0: [B] - first codec token (sampled from Talker logits)
-        Returns:
-            codec_tokens:  [B, num_stages] - predicted codec tokens for codebooks 1..num_code_groups-1
-        """
-        embed_0 = self.talker_codec_embedding(codec_token_0).unsqueeze(1)
-        sequence = self.projection(torch.cat([past_hidden, embed_0], dim=1))
-
-        output_tokens = []
-        for stage in range(self.num_stages):
-            hidden = self._transformer_forward(sequence)
-            logits = self.lm_heads[stage](hidden[:, -1:, :])
-            token = logits.argmax(dim=-1).squeeze(-1)
-            output_tokens.append(token)
-
-            if stage < self.num_stages - 1:
-                next_embed = self.projection(
-                    self.codec_embeddings[stage](token).unsqueeze(1)
-                )
-                sequence = torch.cat([sequence, next_embed], dim=1)
-
-        return torch.stack(output_tokens, dim=1)
 
 
 class CodePredictorSingleStage(nn.Module):

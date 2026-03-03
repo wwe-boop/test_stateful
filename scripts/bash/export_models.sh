@@ -1,12 +1,12 @@
 #!/bin/bash
 # ===========================================================================
-#  export_models.sh — Export Qwen3-TTS models (ONNX + TRT-LLM checkpoints)
+#  export_models.sh — Export Qwen3-TTS models (ONNX + PyTorch weights)
 #
 #  Runs the Python export pipeline for all (or selected) model variants.
-#  Produces: ONNX models, TRT-LLM checkpoints, and embedding weights.
+#  Produces: ONNX models and embedding weights (.pt).
 #
-#  Engine compilation (trtllm-build) is NOT done here — run build_engines.sh
-#  after this script completes to compile TRT-LLM engines inside a container.
+#  TRT engine compilation (trtexec) is NOT done here — run build_engines.sh
+#  after this script completes to compile TRT engines inside an NGC container.
 #
 #  Prerequisites:
 #    Activate the Python virtual environment created by setup_env.sh:
@@ -58,4 +58,4 @@ cd "${EXPORT_DIR}"
 python3 export_all.py "$@"
 
 log_info "Export complete. Check workspace/exported/ for results."
-log_info "Next: run build_engines.sh to compile TRT-LLM engines."
+log_info "Next: run build_engines.sh to compile TRT engines (trtexec)."

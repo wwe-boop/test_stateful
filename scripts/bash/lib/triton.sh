@@ -19,11 +19,11 @@ source "${_LIB_DIR}/logging.sh"
 source "${_LIB_DIR}/utils.sh"
 source "${_LIB_DIR}/docker.sh"
 
-# Triton model repository layout expected by the orchestrator
+# Triton model repository layout (all sub-models + orchestrator)
 _TRITON_MODELS=(
     "speaker_encoder"
     "speech_tokenizer_encoder"
-    "code_predictor"
+    "talker_unified"
     "code2wav"
     "tts_orchestrator"
 )
@@ -35,34 +35,17 @@ TRITON_METRICS_PORT="${TRITON_METRICS_PORT:-8002}"
 
 # ---------------------------------------------------------------------------
 #  resolve_triton_deploy_image [driver_version]
-#  Returns the best Triton deployment image for Phase C.
-#
-#  Prefers the locally-built combined image (trtllm + onnxruntime backend).
-#  Falls back to the raw trtllm-python-py3 image if the combined image
-#  hasn't been built yet (ONNX models won't load without ORT backend).
-#
+#  Returns the Triton deployment image for Phase C.
+#  Uses the full py3 image (onnxruntime + tensorrt + python backends).
 #  Echoes the full image tag to stdout.
 # ---------------------------------------------------------------------------
 resolve_triton_deploy_image() {
     local ngc_tag
     ngc_tag=$(resolve_ngc_tag "$@") \
         || { log_error "Cannot determine NGC tag"; return 1; }
-
-    local combined_tag="${_COMBINED_IMAGE_NAME}:${ngc_tag}"
-
-    if docker image inspect "$combined_tag" &>/dev/null; then
-        log_info "Using combined image (TRT-LLM + ORT): $combined_tag"
-        echo "$combined_tag"
-        return 0
-    fi
-
-    log_warn "Combined image not found: $combined_tag"
-    log_warn "ONNX Runtime backend unavailable — ONNX models will fail to load."
-    log_warn "Build it: bash scripts/bash/build_triton.sh build-image"
-
-    local fallback="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_TRTLLM_SUFFIX}"
-    log_info "Falling back to: $fallback"
-    echo "$fallback"
+    local image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}"
+    log_info "Using Triton full image: $image"
+    echo "$image"
 }
 
 # ---------------------------------------------------------------------------
@@ -77,119 +60,103 @@ _link_or_copy() {
 }
 
 # ---------------------------------------------------------------------------
-#  assemble_model_repo <exported_dir> <variant> <model_repo_dir>
+#  assemble_model_repo <exported_dir> <variant> <model_repo_dir> [engine_mode]
 #
-#  Maps Phase A/B artifacts into Triton model_repository layout:
+#  engine_mode: trt (default) | onnx
+#  TRT mode:  copies .engine → model.plan, backend tensorrt
+#  ONNX mode: copies .onnx → model.onnx, backend onnxruntime
 #
-#    exported/<variant>/
-#    ├── speaker_encoder.onnx          → model_repo/speaker_encoder/1/model.onnx
-#    ├── code_predictor_*.onnx         → model_repo/code_predictor/1/model.onnx
-#    ├── trtllm_engine/                → model_repo/tts_orchestrator/1/engine/ (legacy)
-#    ├── talker_context.engine         → model_repo/tts_orchestrator/1/engine/ (Pure TRT)
-#    ├── talker_decode_fused.engine    → model_repo/tts_orchestrator/1/engine/
-#    └── weights/                      → model_repo/tts_orchestrator/1/weights/
-#    exported/tokenizer/
-#    ├── speech_tokenizer_encoder.onnx → model_repo/speech_tokenizer_encoder/1/model.onnx
-#    └── code2wav_decoder.onnx         → model_repo/code2wav/1/model.onnx
-#
-#  Generates stub config.pbtxt files for each model.
+#  Layout: speaker_encoder, speech_tokenizer_encoder, talker_unified,
+#  code2wav as independent models; tts_orchestrator = Python BLS.
 # ---------------------------------------------------------------------------
 assemble_model_repo() {
     local exported_dir="$1"
     local variant="$2"
     local repo_dir="$3"
+    local engine_mode="${4:-trt}"
 
     local variant_dir="$exported_dir/$variant"
     local tokenizer_dir="$exported_dir/tokenizer"
 
-    log_step "Assembling Triton model repository"
+    log_step "Assembling Triton model repository (engine_mode=$engine_mode)"
     log_info "  Variant:    $variant"
     log_info "  Source:     $variant_dir"
     log_info "  Repository: $repo_dir"
 
-    # Validate source directories
     if [ ! -d "$variant_dir" ]; then
         log_error "Variant directory not found: $variant_dir"
-        log_error "Run 'autorun.sh setup' / export_models.sh first (Phase A)."
+        log_error "Run Phase A first: autorun.sh setup or export_all.py"
         return 1
     fi
 
     mkdir -p "$repo_dir"
 
-    # ── 1. Speaker Encoder (ONNX) ──
-    local spk_src="$variant_dir/speaker_encoder.onnx"
-    if [ -f "$spk_src" ]; then
-        mkdir -p "$repo_dir/speaker_encoder/1"
-        _link_or_copy "$spk_src" "$repo_dir/speaker_encoder/1/model.onnx"
-        _write_onnx_minimal_config "$repo_dir/speaker_encoder" "speaker_encoder"
+    # Helper: copy model file and write config by engine_mode
+    _place_model() {
+        local name="$1"
+        local src="$2"
+        local model_dir="$repo_dir/$name/1"
+        mkdir -p "$model_dir"
+        if [ "$engine_mode" = "trt" ]; then
+            _link_or_copy "$src" "$model_dir/model.plan"
+            _write_trt_minimal_config "$repo_dir/$name" "$name"
+        else
+            _link_or_copy "$src" "$model_dir/model.onnx"
+            _write_onnx_minimal_config "$repo_dir/$name" "$name"
+        fi
+    }
+
+    # _resolve_model_src <base_path> selects .onnx or .engine based on engine_mode,
+    # verifying that the chosen file actually exists.
+    # Returns: 0 + prints path on success, 1 on not found.
+    _resolve_model_src() {
+        local base="$1"
+        local ext; [ "$engine_mode" = "trt" ] && ext=".engine" || ext=".onnx"
+        if [ -f "${base}${ext}" ]; then
+            echo "${base}${ext}"; return 0
+        fi
+        return 1
+    }
+
+    # ── 1. Speaker Encoder (optional — only needed for voice clone) ──
+    local spk_src
+    if spk_src="$(_resolve_model_src "$variant_dir/speaker_encoder")"; then
+        _place_model "speaker_encoder" "$spk_src"
         log_info "  speaker_encoder: OK"
     else
-        log_warn "  speaker_encoder: SKIPPED (not found — only needed for voice clone)"
+        log_warn "  speaker_encoder: SKIPPED (${engine_mode} file not found — only needed for voice clone)"
     fi
 
-    # ── 2. Speech Tokenizer Encoder (ONNX, shared across variants) ──
-    local stoken_src="$tokenizer_dir/speech_tokenizer_encoder.onnx"
-    if [ -f "$stoken_src" ]; then
-        mkdir -p "$repo_dir/speech_tokenizer_encoder/1"
-        _link_or_copy "$stoken_src" "$repo_dir/speech_tokenizer_encoder/1/model.onnx"
-        _write_onnx_minimal_config "$repo_dir/speech_tokenizer_encoder" "speech_tokenizer_encoder"
+    # ── 2. Speech Tokenizer Encoder (optional — only needed for ICL mode) ──
+    local stoken_src
+    if stoken_src="$(_resolve_model_src "$tokenizer_dir/speech_tokenizer_encoder")"; then
+        _place_model "speech_tokenizer_encoder" "$stoken_src"
         log_info "  speech_tokenizer_encoder: OK"
     else
-        log_warn "  speech_tokenizer_encoder: SKIPPED (not found — only needed for ICL mode)"
+        log_warn "  speech_tokenizer_encoder: SKIPPED (${engine_mode} file not found — only needed for ICL mode)"
     fi
 
-    # ── 3. Code2Wav Decoder (ONNX, shared across variants) ──
-    local c2w_src="$tokenizer_dir/code2wav_decoder.onnx"
-    if [ -f "$c2w_src" ]; then
-        mkdir -p "$repo_dir/code2wav/1"
-        _link_or_copy "$c2w_src" "$repo_dir/code2wav/1/model.onnx"
-        _write_onnx_minimal_config "$repo_dir/code2wav" "code2wav"
+    # ── 3. Talker Unified (required; single engine for prefill + decode) ──
+    local talker_src
+    if talker_src="$(_resolve_model_src "$variant_dir/talker_unified")"; then
+        _place_model "talker_unified" "$talker_src"
+        log_info "  talker_unified: OK"
+    else
+        log_error "  talker_unified: MISSING ${engine_mode} file (required). Run export_04_talker_unified.py + Phase B first."
+        return 1
+    fi
+
+    # ── 4. Code2Wav Decoder (required) ──
+    local c2w_src
+    if c2w_src="$(_resolve_model_src "$tokenizer_dir/code2wav_decoder")"; then
+        _place_model "code2wav" "$c2w_src"
         log_info "  code2wav: OK"
     else
-        log_error "  code2wav: MISSING (required)"
+        log_error "  code2wav: MISSING ${engine_mode} file (required). Run Phase A/B first."
         return 1
     fi
 
-    # ── 4. Talker engines (Pure TRT or legacy TRT-LLM — loaded by orchestrator) ──
-    # Engine files go INSIDE tts_orchestrator/1/engine/
-    mkdir -p "$repo_dir/tts_orchestrator/1/engine"
-    local ctx_eng="$variant_dir/talker_context.engine"
-    local dec_eng="$variant_dir/talker_decode_fused.engine"
-    if [ -f "$ctx_eng" ] && [ -f "$dec_eng" ]; then
-        _link_or_copy "$ctx_eng" "$repo_dir/tts_orchestrator/1/engine/talker_context.engine"
-        _link_or_copy "$dec_eng" "$repo_dir/tts_orchestrator/1/engine/talker_decode_fused.engine"
-        log_info "  talker (Pure TRT): OK (context + decode_fused → tts_orchestrator/1/engine/)"
-    else
-        local engine_dir="$variant_dir/trtllm_engine"
-        if [ -d "$engine_dir" ] && ls "$engine_dir"/*.engine &>/dev/null 2>&1; then
-            for f in "$engine_dir"/*; do
-                _link_or_copy "$f" "$repo_dir/tts_orchestrator/1/engine/$(basename "$f")"
-            done
-            log_info "  talker (TRT-LLM): OK (engine → tts_orchestrator/1/engine/)"
-        else
-            log_warn "  talker: NOT READY (run build_engines.sh or build_engines.sh --pure-trt)"
-        fi
-    fi
-
-    # ── 5. Code Predictor (ONNX → TRT at Phase 2, ONNX for now) ──
-    local cp_src=""
-    if [ -f "$variant_dir/code_predictor_unrolled.onnx" ]; then
-        cp_src="$variant_dir/code_predictor_unrolled.onnx"
-    elif [ -f "$variant_dir/code_predictor_single_stage.onnx" ]; then
-        cp_src="$variant_dir/code_predictor_single_stage.onnx"
-        log_warn "  code_predictor: using fallback single_stage ONNX"
-    fi
-    if [ -n "$cp_src" ]; then
-        mkdir -p "$repo_dir/code_predictor/1"
-        _link_or_copy "$cp_src" "$repo_dir/code_predictor/1/model.onnx"
-        _write_onnx_minimal_config "$repo_dir/code_predictor" "code_predictor"
-        log_info "  code_predictor: OK (ONNX)"
-    else
-        log_error "  code_predictor: MISSING (required)"
-        return 1
-    fi
-
-    # ── 6. TTS Orchestrator (Python BLS backend) ──
+    # ── 5. TTS Orchestrator (Python BLS backend) ──
     local weights_dir="$variant_dir/weights"
     mkdir -p "$repo_dir/tts_orchestrator/1/weights"
     if [ -d "$weights_dir" ]; then
@@ -201,18 +168,17 @@ assemble_model_repo() {
         log_warn "  tts_orchestrator/weights: MISSING (no embedding weights found)"
     fi
 
-    # Copy orchestrator Python source files
-    local orch_src_dir
-    orch_src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    local orch_py_dir="$orch_src_dir/../model_repository/tts_orchestrator/1"
+    # Copy orchestrator Python source files (paths relative to repo root)
+    local repo_root
+    repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
+    local orch_py_dir="$repo_root/model_repository/tts_orchestrator/1"
     if [ -d "$orch_py_dir" ]; then
-        for pyf in model.py prefill_builder.py talker_runner.py; do
+        for pyf in model.py prefill_builder.py; do
             if [ -f "$orch_py_dir/$pyf" ]; then
                 cp "$orch_py_dir/$pyf" "$repo_dir/tts_orchestrator/1/$pyf"
             fi
         done
-        # codec_embedding_sum.py lives in scripts/python/
-        local ces="$orch_src_dir/../scripts/python/codec_embedding_sum.py"
+        local ces="$repo_root/scripts/python/codec_embedding_sum.py"
         if [ -f "$ces" ]; then
             cp "$ces" "$repo_dir/tts_orchestrator/1/codec_embedding_sum.py"
         fi
@@ -458,6 +424,27 @@ instance_group [
 EOF
 }
 
+# _write_trt_minimal_config <model_dir> <model_name>
+# For TensorRT backend; model.plan must exist in <model_dir>/1/
+_write_trt_minimal_config() {
+    local model_dir="$1"
+    local model_name="$2"
+
+    cat > "$model_dir/config.pbtxt" << EOF
+name: "${model_name}"
+backend: "tensorrt"
+max_batch_size: 0
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [ 0 ]
+  }
+]
+EOF
+}
+
 # _write_onnx_config <model_dir> <model_name> <inputs_spec> <outputs_spec>
 #
 # inputs_spec / outputs_spec: comma-separated "name:dtype:shape" entries
@@ -624,10 +611,6 @@ parameters: {
 parameters: {
   key: "weights_dir"
   value: { string_value: "/models/tts_orchestrator/1/weights" }
-}
-parameters: {
-  key: "engine_dir"
-  value: { string_value: "/models/tts_orchestrator/1/engine" }
 }
 parameters: {
   key: "tokenizer_dir"

@@ -1,5 +1,5 @@
 """
-Shared utilities for ONNX export scripts.
+Shared utilities and reusable nn.Modules for ONNX export scripts.
 """
 
 import os
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 import torch
+import torch.nn as nn
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -239,12 +240,23 @@ def verify_onnx(onnx_path: str, test_inputs: Dict[str, np.ndarray],
         ref = torch_outputs.get(name)
         if ref is None:
             ref = list(torch_outputs.values())[i]
-        if not np.allclose(ort_outputs[i], ref, atol=atol, rtol=rtol):
-            max_diff = np.max(np.abs(ort_outputs[i] - ref))
+        ort_out = np.asarray(ort_outputs[i])
+        ref_has_nan = np.isnan(ref).any()
+        ort_has_nan = np.isnan(ort_out).any()
+        if ref_has_nan or ort_has_nan:
+            logger.warning(
+                f"  Output '{name}': ref_has_nan={ref_has_nan}, ort_has_nan={ort_has_nan}"
+            )
+            all_close = False
+            continue
+        if not np.allclose(ort_out, ref, atol=atol, rtol=rtol):
+            diff = np.abs(ort_out.astype(np.float64) - ref.astype(np.float64))
+            max_diff = np.max(diff)
             logger.warning(f"  Output '{name}': max_diff={max_diff:.6f} (atol={atol})")
             all_close = False
         else:
-            logger.info(f"  Output '{name}': OK (max_diff={np.max(np.abs(ort_outputs[i] - ref)):.6f})")
+            diff = np.abs(ort_out.astype(np.float64) - ref.astype(np.float64))
+            logger.info(f"  Output '{name}': OK (max_diff={np.max(diff):.6f})")
 
     return all_close
 
@@ -260,18 +272,46 @@ def has_model_weights(model_dir: Path) -> bool:
     return False
 
 
+def _remove_stale_data_file(onnx_path: str) -> None:
+    """Remove existing .data file to prevent onnx.save_model from appending to it."""
+    data_file = onnx_path + ".data"
+    if os.path.isfile(data_file):
+        os.remove(data_file)
+
+
 def _onnx_save_safe(onnx_model, onnx_path: str) -> None:
-    """Save ONNX model, auto-switching to external data when >2 GiB."""
+    """Save ONNX model, auto-switching to external data when >2 GiB.
+
+    Computes real weight size from in-memory raw_data (not ByteSize, which
+    under-counts when stale data_location=EXTERNAL flags are present).
+    """
     import onnx
 
     PROTO_LIMIT = 2 * 1024 * 1024 * 1024  # 2 GiB
-    model_size = onnx_model.ByteSize()
 
-    if model_size < PROTO_LIMIT:
+    total_weight_bytes = 0
+    for init in onnx_model.graph.initializer:
+        if init.raw_data:
+            total_weight_bytes += len(init.raw_data)
+        elif init.float_data:
+            total_weight_bytes += len(init.float_data) * 4
+        elif init.int32_data:
+            total_weight_bytes += len(init.int32_data) * 4
+        elif init.int64_data:
+            total_weight_bytes += len(init.int64_data) * 8
+
+    if total_weight_bytes < PROTO_LIMIT:
+        for init in onnx_model.graph.initializer:
+            if init.data_location == 1:
+                init.data_location = 0
         onnx.save(onnx_model, onnx_path)
     else:
-        logger.info(f"  Model size {model_size / (1024**3):.2f} GiB > 2 GiB, saving with external data")
+        logger.info(
+            f"  Weights {total_weight_bytes / (1024**3):.2f} GiB >= 2 GiB, "
+            f"saving with external data"
+        )
         ext_data_path = os.path.basename(onnx_path) + ".data"
+        _remove_stale_data_file(onnx_path)
         onnx.save_model(
             onnx_model, onnx_path,
             save_as_external_data=True,
@@ -279,6 +319,64 @@ def _onnx_save_safe(onnx_model, onnx_path: str) -> None:
             location=ext_data_path,
             size_threshold=1024,
         )
+
+
+def _consolidate_onnx_external_data(onnx_path: str) -> None:
+    """Consolidate per-tensor external data files into a single .data file.
+
+    torch.onnx.export saves large models (>2 GiB) with one file per tensor.
+    TensorRT prefers a single .data file.  This loads the model with all
+    external data in memory, re-saves with all_tensors_to_one_file=True,
+    then removes the per-tensor files.
+    """
+    import onnx
+
+    model = onnx.load(onnx_path, load_external_data=False)
+
+    ext_locations: set[str] = set()
+    for init in model.graph.initializer:
+        if init.data_location == 1:
+            for entry in init.external_data:
+                if entry.key == "location":
+                    ext_locations.add(entry.value)
+                    break
+
+    if not ext_locations:
+        del model
+        return
+
+    data_file = os.path.basename(onnx_path) + ".data"
+    if len(ext_locations) == 1 and data_file in ext_locations:
+        del model
+        return
+
+    logger.info(
+        f"  Consolidating {len(ext_locations)} per-tensor files → {data_file}"
+    )
+    del model
+
+    model = onnx.load(onnx_path, load_external_data=True)
+    _remove_stale_data_file(onnx_path)
+    onnx.save_model(
+        model,
+        onnx_path,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=data_file,
+        size_threshold=1024,
+    )
+    del model
+
+    base_dir = os.path.dirname(onnx_path) or "."
+    cleaned = 0
+    for loc in ext_locations:
+        if loc == data_file:
+            continue
+        filepath = os.path.join(base_dir, loc)
+        if os.path.isfile(filepath):
+            os.remove(filepath)
+            cleaned += 1
+    logger.info(f"  Cleaned up {cleaned} per-tensor files")
 
 
 def _onnx_check_safe(onnx_path: str) -> None:
@@ -296,24 +394,41 @@ def simplify_onnx(onnx_path: str) -> bool:
     """Run onnxsim to simplify the ONNX model in-place.
 
     Returns True on success, False if simplification failed (non-fatal).
+    Uses _onnx_save_safe which handles >2 GiB models with external data.
+
+    Skips models with external data (>2 GiB weights) because onnxsim 0.x
+    serializes the full model via protobuf (hard 2 GiB limit).  TensorRT
+    and ONNX Runtime apply their own graph optimizations at load time.
     """
+    ext_data = onnx_path + ".data"
+    if os.path.exists(ext_data):
+        ext_mb = os.path.getsize(ext_data) / (1024 * 1024)
+        logger.info(
+            f"Skipping onnxsim: model has {ext_mb:.0f} MB external data "
+            f"(exceeds protobuf 2 GiB serialize limit). "
+            f"TRT/ORT will optimize the graph at engine build time."
+        )
+        return False
+
     try:
         import onnx
         import onnxsim
 
         logger.info("Simplifying with onnxsim ...")
         onnx_model = onnx.load(onnx_path)
+        n_before = len(onnx_model.graph.node)
+
         simplified, ok = onnxsim.simplify(onnx_model)
-        if ok:
-            _onnx_save_safe(simplified, onnx_path)
-            logger.info(
-                f"  Simplified: {len(onnx_model.graph.node)} → "
-                f"{len(simplified.graph.node)} nodes"
-            )
-            return True
-        else:
+        del onnx_model
+        if not ok:
             logger.warning("  onnxsim returned check=False, keeping original")
             return False
+
+        n_after = len(simplified.graph.node)
+        logger.info(f"  Simplified: {n_before} → {n_after} nodes")
+
+        _onnx_save_safe(simplified, onnx_path)
+        return True
     except Exception as e:
         logger.warning(f"  onnxsim failed (non-fatal): {e}")
         return False
@@ -397,6 +512,50 @@ def export_onnx(
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     logger.info(f"Exporting to {onnx_path} (fp32 graph) ...")
 
+    # Break shared storage only when needed (e.g. fused QKV views of one buffer).
+    # Cloning every parameter can double external data size (~6GB -> ~12GB) when
+    # the exporter then writes each tensor; we only clone tensors that share
+    # storage with another so TRT gets correct per-tensor shapes.
+    def _storage_id(t):
+        return t.untyped_storage().data_ptr() if t.numel() > 0 else None
+
+    seen_storage = {}
+    for p in model.parameters():
+        sid = _storage_id(p.data)
+        if sid is not None:
+            seen_storage[sid] = seen_storage.get(sid, 0) + 1
+    for b in model.buffers():
+        sid = _storage_id(b.data)
+        if sid is not None:
+            seen_storage[sid] = seen_storage.get(sid, 0) + 1
+
+    for p in model.parameters():
+        sid = _storage_id(p.data)
+        if p.data.is_floating_point():
+            d = p.data.detach().float().contiguous()
+            if seen_storage.get(sid, 1) > 1:
+                d = d.clone()
+            p.data = d
+        else:
+            if seen_storage.get(sid, 1) > 1:
+                p.data = p.data.detach().contiguous().clone()
+            elif not p.data.is_contiguous():
+                p.data = p.data.detach().contiguous()
+    for b in model.buffers():
+        sid = _storage_id(b.data)
+        if b.data.is_floating_point():
+            d = b.data.detach().float().contiguous()
+            if seen_storage.get(sid, 1) > 1:
+                d = d.clone()
+            b.data = d
+        else:
+            if seen_storage.get(sid, 1) > 1:
+                b.data = b.data.detach().contiguous().clone()
+            elif not b.data.is_contiguous():
+                b.data = b.data.detach().contiguous()
+
+    _remove_stale_data_file(onnx_path)
+
     with _patch_vmap_mask():
         torch.onnx.export(
             model,
@@ -411,6 +570,10 @@ def export_onnx(
         )
 
     import onnx
+
+    # torch.onnx.export saves >2 GiB models with one file per tensor.
+    # Consolidate into a single .data file for TensorRT compatibility.
+    _consolidate_onnx_external_data(onnx_path)
 
     file_size = os.path.getsize(onnx_path)
 
@@ -432,4 +595,98 @@ def export_onnx(
         simplify_onnx(onnx_path)
 
     file_size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
-    logger.info(f"  File size: {file_size_mb:.1f} MB")
+    ext_data = onnx_path + ".data"
+    if os.path.exists(ext_data):
+        ext_mb = os.path.getsize(ext_data) / (1024 * 1024)
+        logger.info(f"  File size: {file_size_mb:.1f} MB + {ext_mb:.1f} MB external data")
+    else:
+        logger.info(f"  File size: {file_size_mb:.1f} MB")
+
+
+# ---------------------------------------------------------------------------
+#  Reusable nn.Modules for fused ONNX export (used by 04a, 04b, 05)
+# ---------------------------------------------------------------------------
+
+class CodePredictorUnrolled(nn.Module):
+    """All Code Predictor stages fully unrolled into a single forward pass (no KV Cache).
+
+    Used by export_04 (fused context), export_05 (fused decode), and
+    export_code_predictor (standalone CP export). Shared here so the dependency is explicit.
+
+    Each of the (num_code_groups-1) stages:
+      1. Appends the new codec embedding to the sequence
+      2. Projects through small_to_mtp_projection
+      3. Full prefill through 5-layer Transformer
+      4. Takes last hidden → lm_head[stage] → argmax → next token
+
+    See architecture.md §5.4 for design rationale.
+    """
+
+    def __init__(self, code_predictor, talker_codec_embedding):
+        super().__init__()
+        self.transformer_layers = code_predictor.model.layers
+        self.norm = code_predictor.model.norm
+        self.rotary_emb = code_predictor.model.rotary_emb
+        self.projection = code_predictor.small_to_mtp_projection
+
+        self.codec_embeddings = code_predictor.model.codec_embedding
+        self.talker_codec_embedding = talker_codec_embedding
+        self.lm_heads = code_predictor.lm_head
+
+        self.num_stages = len(self.lm_heads)
+        self.hidden_size = code_predictor.config.hidden_size
+
+    def _transformer_forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, D = x.shape
+        device = x.device
+
+        position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
+        position_embeddings = self.rotary_emb(x, position_ids)
+
+        causal_mask = torch.triu(
+            torch.full((S, S), float('-inf'), device=device, dtype=x.dtype),
+            diagonal=1,
+        )
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+
+        hidden = x
+        for layer in self.transformer_layers:
+            layer_out = layer(
+                hidden,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=False,
+                use_cache=False,
+                cache_position=torch.arange(S, device=device),
+                position_embeddings=position_embeddings,
+            )
+            hidden = layer_out[0]
+
+        return self.norm(hidden)
+
+    def forward(self, past_hidden: torch.Tensor, codec_token_0: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            past_hidden:   [B, 1, talker_hidden_size] - last hidden from Talker
+            codec_token_0: [B] - first codec token (sampled from Talker logits)
+        Returns:
+            codec_tokens:  [B, num_stages] - predicted codec tokens for codebooks 1..num_code_groups-1
+        """
+        embed_0 = self.talker_codec_embedding(codec_token_0).unsqueeze(1)
+        sequence = self.projection(torch.cat([past_hidden, embed_0], dim=1))
+
+        output_tokens = []
+        for stage in range(self.num_stages):
+            hidden = self._transformer_forward(sequence)
+            logits = self.lm_heads[stage](hidden[:, -1:, :])
+            token = logits.argmax(dim=-1).squeeze(-1)
+            output_tokens.append(token)
+
+            if stage < self.num_stages - 1:
+                next_embed = self.projection(
+                    self.codec_embeddings[stage](token).unsqueeze(1)
+                )
+                sequence = torch.cat([sequence, next_embed], dim=1)
+
+        return torch.stack(output_tokens, dim=1)

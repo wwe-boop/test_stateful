@@ -223,7 +223,7 @@ install_qwen3_tts() {
 
 # ---------------------------------------------------------------------------
 #  install_safetensors
-#  Installs safetensors — needed for writing TRT-LLM checkpoint files.
+#  Installs safetensors — needed for loading/saving model weight files.
 #  Idempotent, lightweight, no CUDA dependency.
 # ---------------------------------------------------------------------------
 install_safetensors() {

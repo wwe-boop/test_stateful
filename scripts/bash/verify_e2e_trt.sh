@@ -1,14 +1,14 @@
 #!/bin/bash
 # ===========================================================================
-#  verify_e2e_trt.sh — TRT E2E verification + BF16 long-sequence precision (Phase 2, Item 12)
+#  verify_e2e_trt.sh — TRT E2E verification (talker_context + talker_decode_fused)
 #
 #  Two-step flow:
-#    1. Host: Generate FP32 PyTorch reference (verify_e2e_trt_ref.py) → e2e_trt_ref.npz
-#    2. Container: Run TRT-LLM + TRT CP vs reference (verify_e2e_trt.py) → e2e_trt_report.json
+#    1. Host: Generate PyTorch reference (verify_e2e_trt_ref.py) → e2e_trt_ref.npz
+#    2. Container: Run TRT engines vs reference (verify_e2e_trt.py) → e2e_trt_report.json
 #
 #  Prerequisites:
-#    - TRT-LLM engine at workspace/exported/<variant>/trtllm_engine/
-#    - Code Predictor .plan at workspace/exported/<variant>/code_predictor_unrolled.plan
+#    - TRT engines: workspace/exported/<variant>/talker_context.engine,
+#      talker_decode_fused.engine (from build_engines.sh)
 #    - For step 1: conda env qwen3-tts; workspace/exported/<variant>/weights/
 #    - Docker with NVIDIA Container Toolkit
 #
@@ -31,7 +31,7 @@ VARIANT=""
 N_STEPS=50
 SKIP_REF=false
 DRY_RUN=false
-USER_IMAGE="${TRTLLM_IMAGE:-}"
+USER_IMAGE="${NGC_IMAGE:-}"
 GPU_DEVICES="all"
 
 while [[ $# -gt 0 ]]; do
@@ -68,12 +68,8 @@ if [ ! -d "$VARIANT_DIR" ]; then
     log_error "Variant dir not found: $VARIANT_DIR"
     exit 1
 fi
-if [ ! -f "$VARIANT_DIR/trtllm_engine/rank0.engine" ] && [ ! -f "$VARIANT_DIR/trtllm_engine/config.json" ]; then
-    log_error "TRT-LLM engine not found: $VARIANT_DIR/trtllm_engine/. Run build_engines.sh first."
-    exit 1
-fi
-if [ ! -f "$VARIANT_DIR/code_predictor_unrolled.plan" ]; then
-    log_error "Code Predictor engine not found: $VARIANT_DIR/code_predictor_unrolled.plan. Run verify_code_predictor.sh first."
+if [ ! -f "$VARIANT_DIR/talker_context.engine" ] || [ ! -f "$VARIANT_DIR/talker_decode_fused.engine" ]; then
+    log_error "TRT engines not found: $VARIANT_DIR/talker_context.engine and talker_decode_fused.engine. Run build_engines.sh first."
     exit 1
 fi
 
@@ -112,7 +108,7 @@ run_container_verify() {
         docker run --rm --gpus "$GPU_DEVICES"
         -v "$VARIANT_DIR:/mnt/model"
         -v "$SCRIPTS_PY:/mnt/scripts:ro"
-        "$TRTLLM_IMAGE"
+        "$NGC_IMAGE"
         bash -c "pip install -q onnxruntime 2>/dev/null; python3 /mnt/scripts/verify_e2e_trt.py --model-dir /mnt/model --ref-file /mnt/model/e2e_trt_ref.npz --variant $VARIANT"
     )
     if $DRY_RUN; then
@@ -139,18 +135,18 @@ else
 fi
 
 if [ -n "$USER_IMAGE" ]; then
-    TRTLLM_IMAGE="$USER_IMAGE"
-    log_info "Using image: $TRTLLM_IMAGE"
+    NGC_IMAGE="$USER_IMAGE"
+    log_info "Using image: $NGC_IMAGE"
 else
     log_info "Auto-detecting NGC container ..."
     _NGC_VERIFY_MANIFEST=1
-    TRTLLM_IMAGE=$(resolve_ngc_image_info) \
+    NGC_IMAGE=$(resolve_ngc_image_info) \
         || { log_error "Cannot determine container. Use --image to specify."; exit 1; }
 fi
 
 if ! $SKIP_REF || ! $DRY_RUN; then
     check_docker_gpu_ready || exit 1
-    ensure_ngc_image "$TRTLLM_IMAGE" || exit 1
+    ensure_ngc_image "$NGC_IMAGE" || exit 1
 fi
 
 if run_ref_gen && run_container_verify; then

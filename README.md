@@ -1,6 +1,6 @@
 # Qwen3-TTS Triton
 
-High-performance streaming TTS inference service built on **Triton Inference Server**.
+*Qwen3-TTS In The Wild: High-performance streaming TTS inference service built on **Triton Inference Server & TensorRT**.*
 
 Takes the [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) model, splits it into 6 independent components, exports them as ONNX / TRT-LLM / TensorRT engines, and serves them through Triton with streaming audio output.
 

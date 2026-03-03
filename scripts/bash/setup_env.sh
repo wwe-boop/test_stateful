@@ -218,7 +218,7 @@ export_models() {
         return 0
     fi
 
-    log_step "Exporting models (ONNX / TRT-LLM checkpoints / PyTorch weights)..."
+    log_step "Exporting models (ONNX / PyTorch weights)..."
 
     local export_dir="${REPO_ROOT}/scripts/export"
     local export_args=()
@@ -261,10 +261,10 @@ validate_setup() {
                 size=$(du -h "$f" | cut -f1)
                 log_info "  ${f#$exported_dir/}  ($size)"
             done
-        # TRT-LLM checkpoints (engine compiled separately by build_engines.sh)
-        find "$exported_dir" -path "*/trtllm_checkpoint/config.json" 2>/dev/null \
+        # Weights directories (used by orchestrator at runtime)
+        find "$exported_dir" -path "*/weights/config.json" 2>/dev/null \
             | while read -r f; do
-                log_info "  ${f#$exported_dir/}  (TRT-LLM checkpoint — run build_engines.sh to compile engine)"
+                log_info "  ${f#$exported_dir/}  (embedding weights for orchestrator)"
             done
     fi
 }
@@ -338,9 +338,9 @@ main() {
     echo "  Activate:    conda activate $ENV_NAME  (or source .venv/bin/activate)"
     echo ""
     echo "  Next steps:"
-    echo "    1. Build TRT-LLM engines:  bash scripts/bash/build_engines.sh  (auto-selects NGC container)"
-    echo "    2. Deploy Triton:           bash scripts/bash/build_triton.sh run"
-    echo "    3. Or run full pipeline:    bash scripts/bash/autorun.sh all"
+    echo "    1. Build TRT engines:      bash scripts/bash/build_engines.sh  (trtexec, NGC container)"
+    echo "    2. Deploy Triton:          bash scripts/bash/build_triton.sh run"
+    echo "    3. Or run full pipeline:   bash scripts/bash/autorun.sh all"
     echo ""
 }
 

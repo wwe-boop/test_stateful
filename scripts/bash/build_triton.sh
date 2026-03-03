@@ -7,27 +7,21 @@
 #
 #  Modes of operation:
 #    1. assemble    — Build model_repository/ from workspace/exported/
-#    2. build-image — Build combined base image (trtllm + onnxruntime backend)
-#    3. pull        — Pull the NGC Triton container image(s)
-#    4. run         — Assemble + build-image + run Triton server
-#    5. build       — Build a self-contained Docker image with baked-in models
-#    6. stop        — Stop a running Triton container
+#    2. pull        — Pull the NGC Triton container image
+#    3. run         — Assemble + run Triton server (uses full py3 image)
+#    4. build       — Build a self-contained Docker image with baked-in models
+#    5. stop        — Stop a running Triton container
 #
 #  Prerequisites:
-#    - Phase A completed: workspace/exported/<variant>/ with ONNX + weights
-#    - Phase B completed: workspace/exported/<variant>/trtllm_engine/ (optional)
-#    - Docker with NVIDIA Container Toolkit
+#    - Phase A: workspace/exported/<variant>/ with ONNX + weights
+#    - Phase B (optional): .engine files for --engine-mode trt
 #
 #  Usage:
-#    bash scripts/bash/build_triton.sh assemble                     # assemble model repo
-#    bash scripts/bash/build_triton.sh assemble --variant base-1.7b # specific variant
-#    bash scripts/bash/build_triton.sh build-image                  # build combined base image
-#    bash scripts/bash/build_triton.sh pull                         # pull NGC images
-#    bash scripts/bash/build_triton.sh run                          # assemble + build-image + run
-#    bash scripts/bash/build_triton.sh run --variant custom-1.7b    # run specific variant
-#    bash scripts/bash/build_triton.sh build --tag my-tts:latest    # build self-contained image
-#    bash scripts/bash/build_triton.sh stop                         # stop running server
-#    bash scripts/bash/build_triton.sh --generate-dockerfile        # generate Dockerfile.triton
+#    bash scripts/bash/build_triton.sh assemble                          # assemble (ONNX)
+#    bash scripts/bash/build_triton.sh assemble --engine-mode trt         # use TensorRT engines
+#    bash scripts/bash/build_triton.sh run --engine-mode onnx|trt
+#    bash scripts/bash/build_triton.sh stop
+#    bash scripts/bash/build_triton.sh --generate-dockerfile
 #
 #  Environment variables:
 #    TRITON_IMAGE          Docker image override (default: auto from driver)
@@ -51,6 +45,7 @@ EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen3-tts-triton}"
 VARIANT=""
+ENGINE_MODE="${ENGINE_MODE:-trt}"
 USER_IMAGE="${TRITON_IMAGE:-}"
 BUILD_TAG=""
 HEALTH_TIMEOUT=120
@@ -63,15 +58,15 @@ Usage: build_triton.sh <command> [options]
 
 Commands:
   assemble               Assemble model_repository/ from exported artifacts
-  build-image            Build combined base image (trtllm + onnxruntime backend)
-  pull                   Pull the NGC Triton container image(s)
-  run                    Assemble + build-image + start Triton server
+  pull                   Pull the NGC Triton container image
+  run                    Assemble (if needed) + start Triton server
   build                  Build a self-contained deployment Docker image
   stop                   Stop the running Triton container
   status                 Show container status and health
 
 Options:
   --variant <name>       Target model variant (default: auto-discover first)
+  --engine-mode onnx|trt Use ONNX or TensorRT engines (default: trt)
   --image <uri>          Override NGC container image
   --repo-dir <path>      Override model_repository output path
   --container <name>     Container name (default: qwen3-tts-triton)
@@ -94,18 +89,12 @@ generate_dockerfile() {
 # ===========================================================================
 #  Dockerfile.triton — Self-contained Qwen3-TTS Triton deployment image
 #
-#  Uses the combined base image (trtllm + onnxruntime backend) built by:
-#    bash scripts/bash/build_triton.sh build-image
-#
-#  Build:
-#    bash scripts/bash/build_triton.sh build --tag qwen3-tts-triton:latest
-#
-#  Run:
-#    docker run --gpus all -p 8000:8000 -p 8001:8001 -p 8002:8002 \
-#      qwen3-tts-triton:latest
+#  Base: NVIDIA Triton full py3 image (onnxruntime + tensorrt + python).
+#  Build: bash scripts/bash/build_triton.sh build --tag qwen3-tts-triton:latest
+#  Run:   docker run --gpus all -p 8000:8000 -p 8001:8001 -p 8002:8002 <tag>
 # ===========================================================================
 
-ARG BASE_IMAGE=qwen3-tts-triton-base:25.05
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:25.05-py3
 FROM ${BASE_IMAGE}
 
 LABEL maintainer="Qwen3-TTS-Triton"
@@ -157,6 +146,7 @@ shift
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant)        VARIANT="$2"; shift 2 ;;
+        --engine-mode)    ENGINE_MODE="$2"; shift 2 ;;
         --image)          USER_IMAGE="$2"; shift 2 ;;
         --repo-dir)       MODEL_REPO_DIR="$2"; shift 2 ;;
         --container)      CONTAINER_NAME="$2"; shift 2 ;;
@@ -206,10 +196,11 @@ cmd_assemble() {
         log_info "[DRY RUN] Would assemble model repo:"
         log_info "  Source:  $EXPORTED_DIR/$VARIANT"
         log_info "  Target:  $MODEL_REPO_DIR"
+        log_info "  Engine:  $ENGINE_MODE"
         return 0
     fi
 
-    assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" \
+    assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
         || { log_error "Assembly failed"; exit 1; }
 
     echo ""
@@ -226,53 +217,19 @@ cmd_assemble() {
     return $status
 }
 
-cmd_build_image() {
-    log_step "Phase C: Build combined Triton image (TRT-LLM + ONNX Runtime)"
-
-    check_docker_gpu_ready || exit 1
-
-    if $DRY_RUN; then
-        local ngc_tag
-        ngc_tag=$(resolve_ngc_tag) || exit 1
-        log_info "[DRY RUN] Would build combined image:"
-        log_info "  Base:   ${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_TRTLLM_SUFFIX}"
-        log_info "  + ORT:  ${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}"
-        log_info "  Tag:    ${_COMBINED_IMAGE_NAME}:${ngc_tag}"
-        return 0
-    fi
-
-    local combined_tag
-    combined_tag=$(build_combined_triton_image) \
-        || { log_error "Failed to build combined image"; exit 1; }
-
-    echo ""
-    log_info "Combined image ready: $combined_tag"
-    log_info "Backends: TRT-LLM + ONNX Runtime + Python"
-    log_info ""
-    log_info "Next: bash scripts/bash/build_triton.sh run"
-}
-
 cmd_pull() {
     check_docker_gpu_ready || exit 1
 
+    check_docker_gpu_ready || exit 1
+
     if $DRY_RUN; then
-        local ngc_tag
-        ngc_tag=$(resolve_ngc_tag) || exit 1
-        log_info "[DRY RUN] Would pull:"
-        log_info "  ${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_TRTLLM_SUFFIX}"
-        log_info "  ${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}"
+        log_info "[DRY RUN] Would pull Triton full image (py3)"
         return 0
     fi
 
-    local ngc_tag
-    ngc_tag=$(resolve_ngc_tag) || exit 1
-
-    log_info "Pulling NGC images for combined build ..."
-    ensure_ngc_image "${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_TRTLLM_SUFFIX}" || exit 1
-    ensure_ngc_image "${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}" || exit 1
-
-    log_info "Images ready. Build combined image:"
-    log_info "  bash scripts/bash/build_triton.sh build-image"
+    TRITON_IMAGE=$(resolve_triton_deploy_image) || exit 1
+    ensure_ngc_image "$TRITON_IMAGE" || exit 1
+    log_info "Image ready: $TRITON_IMAGE"
 }
 
 cmd_run() {
@@ -280,8 +237,8 @@ cmd_run() {
 
     # Assemble if needed
     if [ ! -d "$MODEL_REPO_DIR" ] || [ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]; then
-        log_info "Model repository not found, assembling ..."
-        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" \
+        log_info "Model repository not found, assembling (engine_mode=$ENGINE_MODE) ..."
+        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
             || { log_error "Assembly failed"; exit 1; }
     else
         log_info "Using existing model repository: $MODEL_REPO_DIR"
@@ -291,10 +248,9 @@ cmd_run() {
 
     check_docker_gpu_ready || exit 1
 
-    # Build combined image if user didn't specify --image
     if [ -z "$USER_IMAGE" ]; then
-        TRITON_IMAGE=$(ensure_combined_triton_image) \
-            || { log_error "Failed to prepare combined image"; exit 1; }
+        TRITON_IMAGE=$(resolve_triton_deploy_image) \
+            || { log_error "Failed to resolve Triton image"; exit 1; }
     else
         TRITON_IMAGE="$USER_IMAGE"
         log_info "Using user-specified image: $TRITON_IMAGE"
@@ -346,18 +302,16 @@ cmd_build() {
 
     check_docker_gpu_ready || exit 1
 
-    # Ensure combined base image exists
     if [ -z "$USER_IMAGE" ]; then
-        TRITON_IMAGE=$(ensure_combined_triton_image) \
-            || { log_error "Failed to prepare combined base image"; exit 1; }
+        TRITON_IMAGE=$(resolve_triton_deploy_image) \
+            || { log_error "Failed to resolve Triton image"; exit 1; }
     else
         TRITON_IMAGE="$USER_IMAGE"
     fi
 
-    # Ensure model repo exists
     if [ ! -d "$MODEL_REPO_DIR" ] || [ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]; then
         resolve_variant
-        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" \
+        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
             || { log_error "Assembly failed"; exit 1; }
     fi
     validate_model_repo "$MODEL_REPO_DIR" || exit 1
@@ -408,7 +362,6 @@ cmd_status() {
 # ── Main dispatch ──
 case "$COMMAND" in
     assemble)    cmd_assemble ;;
-    build-image) cmd_build_image ;;
     pull)        cmd_pull ;;
     run)         cmd_run ;;
     build)       cmd_build ;;

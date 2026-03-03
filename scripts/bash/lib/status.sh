@@ -40,7 +40,7 @@ detect_phase_a_status() {
 
     local has_tokenizer=false
     local has_variant=false
-    local has_checkpoint=false
+    local has_weights=false
     local has_onnx=false
 
     # Shared tokenizer models
@@ -54,7 +54,7 @@ detect_phase_a_status() {
         local vdir="$exported_dir/$variant"
         if [ -d "$vdir" ]; then
             has_variant=true
-            [ -d "$vdir/trtllm_checkpoint" ] && [ -f "$vdir/trtllm_checkpoint/config.json" ] && has_checkpoint=true
+            [ -d "$vdir/weights" ] && has_weights=true
             ls "$vdir"/*.onnx &>/dev/null 2>&1 && has_onnx=true
         fi
     else
@@ -64,13 +64,13 @@ detect_phase_a_status() {
             vname=$(basename "$vdir")
             [[ "$vname" == "tokenizer" ]] && continue
             has_variant=true
-            [ -d "$vdir/trtllm_checkpoint" ] && [ -f "$vdir/trtllm_checkpoint/config.json" ] && has_checkpoint=true
+            [ -d "$vdir/weights" ] && has_weights=true
             ls "$vdir"/*.onnx &>/dev/null 2>&1 && has_onnx=true
             break
         done
     fi
 
-    if $has_tokenizer && $has_variant && $has_checkpoint && $has_onnx; then
+    if $has_tokenizer && $has_variant && $has_weights && $has_onnx; then
         echo "complete"
     elif $has_tokenizer || $has_variant; then
         echo "partial"
@@ -83,7 +83,7 @@ detect_phase_a_status() {
 # ---------------------------------------------------------------------------
 #  detect_phase_b_status <exported_dir> [variant]
 #
-#  Checks for compiled TRT-LLM engines.
+#  Checks for compiled TensorRT engines (.engine files alongside ONNX).
 #  Outputs: none | complete
 # ---------------------------------------------------------------------------
 detect_phase_b_status() {
@@ -108,8 +108,7 @@ detect_phase_b_status() {
     fi
 
     for vdir in "${check_dirs[@]}"; do
-        local engine_dir="$vdir/trtllm_engine"
-        if [ -d "$engine_dir" ] && ls "$engine_dir"/*.engine &>/dev/null 2>&1; then
+        if [ -f "$vdir/talker_context.engine" ] && [ -f "$vdir/talker_decode_fused.engine" ]; then
             echo "complete"
             return 0
         fi
@@ -166,9 +165,9 @@ detect_available_variants() {
             vname=$(basename "$vdir")
             [[ "$vname" == "tokenizer" ]] && continue
 
-            if [ -d "$vdir/trtllm_engine" ] && ls "$vdir/trtllm_engine"/*.engine &>/dev/null 2>&1; then
+            if [ -f "$vdir/talker_context.engine" ] && [ -f "$vdir/talker_decode_fused.engine" ]; then
                 echo "${vname}:engine_ready"
-            elif [ -d "$vdir/trtllm_checkpoint" ] || ls "$vdir"/*.onnx &>/dev/null 2>&1; then
+            elif ls "$vdir"/*.onnx &>/dev/null 2>&1; then
                 echo "${vname}:exported"
             fi
         done
@@ -263,7 +262,7 @@ print_status_summary() {
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Docker: $docker_info"
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase A (setup + export):     $pa_icon"
-    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase B (TRT-LLM engines):    $pb_icon"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase B (TRT engines):        $pb_icon"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C (Triton deployment):  $pc_icon"
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
 
