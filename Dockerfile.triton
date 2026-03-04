@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.01-py3
+FROM ${BASE_IMAGE}
+
+RUN pip install --no-cache-dir \
+    -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
+    --trusted-host mirrors.bfsu.edu.cn \
+    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    torch \
+    tokenizers \
+    scipy \
+    soundfile \
+    && python3 -c "\
+import torch, tokenizers; \
+print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
+print(f'tokenizers {tokenizers.__version__}')"

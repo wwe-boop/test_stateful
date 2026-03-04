@@ -6,8 +6,8 @@
 #             resolve_ngc_image, ensure_ngc_image,
 #             check_docker_gpu_ready, print_container_recommendation,
 #             resolve_ngc_tag, resolve_ngc_python_version,
-#             resolve_ngc_entry, build_combined_triton_image,
-#             ensure_combined_triton_image, _check_ngc_manifest
+#             resolve_ngc_entry, build_triton_deploy_image,
+#             _check_ngc_manifest
 #  Depends:   lib/logging.sh, lib/utils.sh
 #
 #  NGC compatibility matrix loaded from scripts/bash/ngc_matrix.conf
@@ -17,9 +17,10 @@
 #  Container strategy (unified):
 #    Phase B + C: nvcr.io/nvidia/tritonserver:xx.yy-py3
 #      - Phase B: trtexec at /usr/src/tensorrt/bin/trtexec (from libnvinfer-bin)
-#      - Phase C: Triton server with onnxruntime + tensorrt + python backends
+#      - Phase C: Triton server with tensorrt + onnxruntime + python backends
+#                 + torch/tokenizers/scipy/soundfile (installed via Dockerfile.triton)
 #
-#  Single image, no custom build required.
+#  Deploy image: qwen3-tts-triton:xx.yy (built from -py3 + pip deps)
 # ===========================================================================
 
 [[ -n "${_LIB_DOCKER_LOADED:-}" ]] && return 0
@@ -33,9 +34,8 @@ source "${_LIB_DIR}/utils.sh"
 _NGC_TRITON_BASE="nvcr.io/nvidia/tritonserver"
 _NGC_PY3_SUFFIX="-py3"
 
-# Legacy suffix (only used by deprecated build_combined_triton_image)
-_NGC_TRTLLM_SUFFIX="-trtllm-python-py3"
-_COMBINED_IMAGE_NAME="qwen3-tts-triton-base"
+# Deploy image name (built from -py3 + torch/tokenizers)
+_DEPLOY_IMAGE_NAME="qwen3-tts-triton"
 
 # Minimum driver for NGC images with TensorRT 10+ and CUDA 12.4+
 _QWEN3_MIN_DRIVER="550.54"
@@ -344,10 +344,12 @@ resolve_ngc_python_version() {
 }
 
 # ---------------------------------------------------------------------------
-#  build_combined_triton_image [ngc_tag]
-#  DEPRECATED: Phase C uses full Triton py3 image. Use resolve_triton_deploy_image().
+#  build_triton_deploy_image [ngc_tag]
+#  Builds the Phase C deploy image: -py3 base + torch + tokenizers.
+#  Uses Dockerfile.triton at the repo root.
+#  Echoes the built image tag to stdout.
 # ---------------------------------------------------------------------------
-build_combined_triton_image() {
+build_triton_deploy_image() {
     local ngc_tag="${1:-}"
 
     if [ -z "$ngc_tag" ]; then
@@ -355,64 +357,62 @@ build_combined_triton_image() {
             || { log_error "Cannot determine NGC tag"; return 1; }
     fi
 
-    local trtllm_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_TRTLLM_SUFFIX}"
-    local full_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}"
-    local combined_tag="${_COMBINED_IMAGE_NAME}:${ngc_tag}"
+    local base_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_PY3_SUFFIX}"
+    local deploy_tag="${_DEPLOY_IMAGE_NAME}:${ngc_tag}"
 
-    # Already built?
-    if docker image inspect "$combined_tag" &>/dev/null; then
-        log_info "Combined image already exists: $combined_tag"
-        echo "$combined_tag"
+    if docker image inspect "$deploy_tag" &>/dev/null; then
+        log_info "Deploy image already exists: $deploy_tag"
+        echo "$deploy_tag"
         return 0
     fi
 
-    log_step "Building combined Triton image (TRT-LLM + ONNX Runtime)"
-    log_info "  TRT-LLM base: $trtllm_image"
-    log_info "  ORT source:   $full_image"
-    log_info "  Output tag:   $combined_tag"
+    log_step "Building Triton deploy image"
+    log_info "  Base:   $base_image"
+    log_info "  Output: $deploy_tag"
 
-    # Pull source images
-    ensure_ngc_image "$trtllm_image" || return 1
+    ensure_ngc_image "$base_image" || return 1
 
-    log_info "Pulling py3 image for ONNX Runtime backend (shared layers = fast) ..."
-    ensure_ngc_image "$full_image" || return 1
+    local repo_root
+    repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
+    local dockerfile="$repo_root/Dockerfile.triton"
 
-    # Build via inline Dockerfile (empty context dir to avoid sending workspace)
-    log_info "Extracting ONNX Runtime backend into combined image ..."
+    if [ ! -f "$dockerfile" ]; then
+        log_error "Dockerfile.triton not found at $dockerfile"
+        return 1
+    fi
 
     local build_ctx
     build_ctx=$(mktemp -d)
 
-    if ! docker build -t "$combined_tag" -f - "$build_ctx" <<DOCKERFILE
-FROM ${full_image} AS ort_source
-FROM ${trtllm_image}
-COPY --from=ort_source /opt/tritonserver/backends/onnxruntime /opt/tritonserver/backends/onnxruntime
-DOCKERFILE
-    then
+    if ! docker build \
+        --build-arg "BASE_IMAGE=$base_image" \
+        -t "$deploy_tag" \
+        -f "$dockerfile" \
+        "$build_ctx"; then
         rm -rf "$build_ctx"
-        log_error "Failed to build combined image"
+        log_error "Failed to build deploy image"
         return 1
     fi
     rm -rf "$build_ctx"
 
     local size
-    size=$(docker image inspect "$combined_tag" --format '{{.Size}}' 2>/dev/null)
+    size=$(docker image inspect "$deploy_tag" --format '{{.Size}}' 2>/dev/null)
     if [ -n "$size" ]; then
         local size_gb
         size_gb=$(awk -v s="$size" 'BEGIN {printf "%.1f", s/1073741824}')
-        log_info "Combined image ready: $combined_tag (${size_gb} GB)"
+        log_info "Deploy image ready: $deploy_tag (${size_gb} GB)"
     else
-        log_info "Combined image ready: $combined_tag"
+        log_info "Deploy image ready: $deploy_tag"
     fi
 
-    echo "$combined_tag"
+    echo "$deploy_tag"
 }
 
 # ---------------------------------------------------------------------------
-#  ensure_combined_triton_image [ngc_tag]
-#  DEPRECATED: Use resolve_triton_deploy_image() + ensure_ngc_image() instead.
+#  ensure_triton_deploy_image [ngc_tag]
+#  Returns the deploy image tag, building it if necessary.
 # ---------------------------------------------------------------------------
-ensure_combined_triton_image() {
+ensure_triton_deploy_image() {
     local ngc_tag="${1:-}"
 
     if [ -z "$ngc_tag" ]; then
@@ -420,15 +420,15 @@ ensure_combined_triton_image() {
             || { log_error "Cannot determine NGC tag"; return 1; }
     fi
 
-    local combined_tag="${_COMBINED_IMAGE_NAME}:${ngc_tag}"
+    local deploy_tag="${_DEPLOY_IMAGE_NAME}:${ngc_tag}"
 
-    if docker image inspect "$combined_tag" &>/dev/null; then
-        log_info "Combined image already exists: $combined_tag"
-        echo "$combined_tag"
+    if docker image inspect "$deploy_tag" &>/dev/null; then
+        log_info "Deploy image already exists: $deploy_tag"
+        echo "$deploy_tag"
         return 0
     fi
 
-    build_combined_triton_image "$ngc_tag"
+    build_triton_deploy_image "$ngc_tag"
 }
 
 # ---------------------------------------------------------------------------

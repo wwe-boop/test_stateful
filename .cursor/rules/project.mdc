@@ -13,7 +13,7 @@ alwaysApply: true
 
 - **推理引擎**: Triton Inference Server + ONNX Runtime 或 TensorRT（二选一，统一 BLS）
 - **精度**: BF16
-- **核心策略**: 全部组件先导出 ONNX；部署时选择 engine-mode：onnx（model.onnx + onnxruntime）或 trt（model.plan + tensorrt）。Talker 拆为 talker_context（prefill + CP + codec_sum 融合）与 talker_decode_fused（decode + CP + codec_sum 融合），KV Cache 由 BLS 通过 dlpack 在 GPU 间传递。
+- **核心策略**: 全部组件先导出 ONNX；部署时选择 engine-mode：onnx（model.onnx + onnxruntime）或 trt（model.plan + tensorrt）。Talker 为 **talker_unified** 单引擎（prefill + decode 合一，含 CP + codec_sum 融合），KV Cache 由 BLS 通过 dlpack 在 GPU 间传递。
 
 ## 模型组件 (Triton model_repository)
 
@@ -22,20 +22,19 @@ alwaysApply: true
 | Text Embedder (~312M) | .pt 权重，Orchestrator 进程内 | 每请求 1 次 |
 | Speaker Encoder (~6M) | ONNX/TRT 子模型 | 每请求 1 次 (voice clone) |
 | Speech Tokenizer Encoder (~26M) | ONNX/TRT 子模型 | 每请求 1 次 (ICL) |
-| talker_context (prefill+CP+sum) | ONNX/TRT 子模型 | 每请求 1 次 |
-| talker_decode_fused (decode+CP+sum) | ONNX/TRT 子模型 | 每 decode step |
+| talker_unified (prefill+decode+CP+sum) | ONNX/TRT 子模型 | 每请求 1 次 prefill + 每 decode step |
 | code2wav | ONNX/TRT 子模型 | 每 chunk |
 | tts_orchestrator | Python BLS | 编排上述子模型 |
 
 ## 三阶段构建
 
 ```
-Phase A — export (host):  PyTorch + qwen_tts → ONNX（04 context 融合、05 decode 融合）+ .pt 权重
-Phase B — build_engines.sh (可选):  trtexec 将 ONNX 编译为 .engine（所有子模型）
+Phase A — export (host):  PyTorch + qwen_tts → ONNX（04 talker_unified 融合）+ .pt 权重
+Phase B — build_engines.sh (可选):  trtexec 将 ONNX 编译为 .engine（含 talker_unified.engine）
 Phase C — build_triton.sh:  assemble（--engine-mode trt|onnx）+ run
 ```
 
-- Phase A：`export_all.py` 产出 04/05 ONNX 与 06 的 .pt
+- Phase A：`export_all.py` 产出 04 talker_unified ONNX 与 06 的 .pt
 - Phase B + C 共用 `tritonserver:xx.yy-py3`（trtexec 在 `/usr/src/tensorrt/bin/trtexec`）
 - 单独运行导出脚本前需激活环境：`conda activate qwen3-tts`（或 venv）
 
@@ -69,8 +68,7 @@ Qwen3-TTS-Triton/
 │   │   ├── export_01_speech_tokenizer_encoder.py  ← Step 01 → ONNX
 │   │   ├── export_02_code2wav_decoder.py          ← Step 02 → ONNX
 │   │   ├── export_03_speaker_encoder.py           ← Step 03 → ONNX (base only)
-│   │   ├── export_04_talker_context.py             ← Step 04 → ONNX (context 融合 CP+codec_sum)
-│   │   ├── export_05_talker_decode_fused.py        ← Step 05 → ONNX (decode 融合 CP+codec_sum)
+│   │   ├── export_04_talker_unified.py             ← Step 04 → ONNX (talker prefill+decode 融合)
 │   │   ├── export_06_embeddings.py                 ← Step 06 → .pt 权重 + config
 │   │   ├── export_code_predictor.py                ← 独立 CP 调试/验证 (不在主流程)
 │   │   └── utils.py                  ← 共享工具 + CodePredictorUnrolled
@@ -100,7 +98,7 @@ Qwen3-TTS-Triton/
 
 ## 实施阶段
 
-- **Phase 1** (当前): 导出 ONNX (04a/04b 融合) + 可选 trtexec 编译 + Triton 双后端部署 + BLS 统一编排
+- **Phase 1** (当前): 导出 ONNX (talker_unified 单引擎) + 可选 trtexec 编译 + Triton 双后端部署 + BLS 统一编排
 - Phase 2: 流式 + Batch (Orchestrator / Session / Flow Control)
 - Phase 3: 优化 + 生产化 (监控, 压测)
 

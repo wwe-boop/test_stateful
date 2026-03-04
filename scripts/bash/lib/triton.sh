@@ -36,15 +36,26 @@ TRITON_METRICS_PORT="${TRITON_METRICS_PORT:-8002}"
 # ---------------------------------------------------------------------------
 #  resolve_triton_deploy_image [driver_version]
 #  Returns the Triton deployment image for Phase C.
-#  Uses the full py3 image (onnxruntime + tensorrt + python backends).
+#  Uses the deploy image (py3 + torch/tokenizers) built by
+#  build_triton_deploy_image().  Falls back to raw -py3 if deploy
+#  image is not yet built.
 #  Echoes the full image tag to stdout.
 # ---------------------------------------------------------------------------
 resolve_triton_deploy_image() {
     local ngc_tag
     ngc_tag=$(resolve_ngc_tag "$@") \
         || { log_error "Cannot determine NGC tag"; return 1; }
-    local image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_FULL_SUFFIX}"
-    log_info "Using Triton full image: $image"
+
+    local deploy_tag="${_DEPLOY_IMAGE_NAME}:${ngc_tag}"
+    if docker image inspect "$deploy_tag" &>/dev/null; then
+        log_info "Using Triton deploy image: $deploy_tag"
+        echo "$deploy_tag"
+        return 0
+    fi
+
+    local image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_PY3_SUFFIX}"
+    log_warn "Deploy image not found ($deploy_tag), falling back to: $image"
+    log_warn "Build it first: bash scripts/bash/build_triton.sh build-image"
     echo "$image"
 }
 
@@ -102,6 +113,12 @@ assemble_model_repo() {
             _write_trt_minimal_config "$repo_dir/$name" "$name"
         else
             _link_or_copy "$src" "$model_dir/model.onnx"
+            # Copy ONNX external data file if present (large models use .onnx.data).
+            # Keep the original filename because the ONNX proto references it internally.
+            if [ -f "${src}.data" ]; then
+                _link_or_copy "${src}.data" "$model_dir/$(basename "${src}.data")"
+                log_info "    + copied external data: $(basename "${src}.data")"
+            fi
             _write_onnx_minimal_config "$repo_dir/$name" "$name"
         fi
     }
@@ -136,10 +153,28 @@ assemble_model_repo() {
         log_warn "  speech_tokenizer_encoder: SKIPPED (${engine_mode} file not found — only needed for ICL mode)"
     fi
 
+    # ── 2b. Text/Codec Embedders (optional — orchestrator uses in-process torch; skip unless BLS fallback needed) ──
+    local te_src ce_src
+    if te_src="$(_resolve_model_src "$variant_dir/text_embedder")"; then
+        _place_model "text_embedder" "$te_src"
+        log_info "  text_embedder: OK (BLS fallback)"
+    else
+        log_info "  text_embedder: SKIPPED (embedding in-process in orchestrator)"
+    fi
+    if ce_src="$(_resolve_model_src "$variant_dir/codec_embedder")"; then
+        _place_model "codec_embedder" "$ce_src"
+        log_info "  codec_embedder: OK (BLS fallback)"
+    else
+        log_info "  codec_embedder: SKIPPED (embedding in-process in orchestrator)"
+    fi
+
     # ── 3. Talker Unified (required; single engine for prefill + decode) ──
     local talker_src
     if talker_src="$(_resolve_model_src "$variant_dir/talker_unified")"; then
         _place_model "talker_unified" "$talker_src"
+        if [ "$engine_mode" = "trt" ]; then
+            _write_talker_unified_bf16_config "$repo_dir/talker_unified" "$variant_dir"
+        fi
         log_info "  talker_unified: OK"
     else
         log_error "  talker_unified: MISSING ${engine_mode} file (required). Run export_04_talker_unified.py + Phase B first."
@@ -173,7 +208,7 @@ assemble_model_repo() {
     repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
     local orch_py_dir="$repo_root/model_repository/tts_orchestrator/1"
     if [ -d "$orch_py_dir" ]; then
-        for pyf in model.py prefill_builder.py; do
+        for pyf in model.py prefill_builder.py audio_utils.py lightweight_tokenizer.py; do
             if [ -f "$orch_py_dir/$pyf" ]; then
                 cp "$orch_py_dir/$pyf" "$repo_dir/tts_orchestrator/1/$pyf"
             fi
@@ -200,7 +235,7 @@ assemble_model_repo() {
     esac
     if [ -n "$tok_dir" ] && [ -d "$tok_dir" ]; then
         mkdir -p "$repo_dir/tts_orchestrator/1/tokenizer"
-        for tf in tokenizer_config.json vocab.json merges.txt \
+        for tf in tokenizer.json tokenizer_config.json vocab.json merges.txt \
                   config.json generation_config.json; do
             [ -f "$tok_dir/$tf" ] && \
                 _link_or_copy "$tok_dir/$tf" "$repo_dir/tts_orchestrator/1/tokenizer/$tf"
@@ -445,6 +480,80 @@ instance_group [
 EOF
 }
 
+# _write_talker_unified_bf16_config <model_dir> <variant_dir>
+# Full config for talker_unified TRT engine (BF16 I/O, 58 inputs, 60 outputs).
+# Reads dimensions from <variant_dir>/weights/config.json.
+_write_talker_unified_bf16_config() {
+    local model_dir="$1"
+    local variant_dir="$2"
+    local cfg="$variant_dir/weights/config.json"
+    local H=2048 KV_HEADS=8 HEAD_DIM=128 NUM_LAYERS=28 V=3072
+    if [ -f "$cfg" ]; then
+        H=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_hidden_size', 2048))")
+        KV_HEADS=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_num_kv_heads', 8))")
+        NUM_LAYERS=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_num_layers', 28))")
+        V=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_vocab_size', 3072))")
+        HEAD_DIM=$(( H / 16 ))
+    fi
+    local config_file="$model_dir/config.pbtxt"
+    cat > "$config_file" << EOF
+name: "talker_unified"
+backend: "tensorrt"
+max_batch_size: 0
+
+input [
+  { name: "input_embeds"  data_type: TYPE_BF16  dims: [ -1, -1, $H ] }
+]
+input [
+  { name: "position_ids"  data_type: TYPE_INT64  dims: [ 3, -1, -1 ] }
+]
+EOF
+    local i=0
+    while [ "$i" -lt "$NUM_LAYERS" ]; do
+        cat >> "$config_file" << EOF
+input [
+  { name: "past_kv_${i}_k"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+]
+input [
+  { name: "past_kv_${i}_v"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+]
+EOF
+        i=$((i + 1))
+    done
+    cat >> "$config_file" << EOF
+output [
+  { name: "codec_sum"  data_type: TYPE_BF16  dims: [ -1, 1, $H ] }
+]
+output [
+  { name: "full_codec"  data_type: TYPE_INT64  dims: [ -1, 16 ] }
+]
+output [
+  { name: "hidden"  data_type: TYPE_BF16  dims: [ -1, -1, $H ] }
+]
+output [
+  { name: "logits"  data_type: TYPE_BF16  dims: [ -1, -1, $V ] }
+]
+EOF
+    i=0
+    while [ "$i" -lt "$NUM_LAYERS" ]; do
+        cat >> "$config_file" << EOF
+output [
+  { name: "present_kv_${i}_k"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+]
+output [
+  { name: "present_kv_${i}_v"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+]
+EOF
+        i=$((i + 1))
+    done
+    cat >> "$config_file" << EOF
+instance_group [
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+EOF
+    log_info "    + talker_unified config.pbtxt (BF16 I/O, ${NUM_LAYERS} layers)"
+}
+
 # _write_onnx_config <model_dir> <model_name> <inputs_spec> <outputs_spec>
 #
 # inputs_spec / outputs_spec: comma-separated "name:dtype:shape" entries
@@ -623,6 +732,10 @@ parameters: {
 parameters: {
   key: "audio_chunk_frames"
   value: { string_value: "25" }
+}
+parameters: {
+  key: "first_chunk_frames"
+  value: { string_value: "10" }
 }
 EOF
 

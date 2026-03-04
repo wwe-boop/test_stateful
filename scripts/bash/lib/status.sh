@@ -108,7 +108,7 @@ detect_phase_b_status() {
     fi
 
     for vdir in "${check_dirs[@]}"; do
-        if [ -f "$vdir/talker_context.engine" ] && [ -f "$vdir/talker_decode_fused.engine" ]; then
+        if [ -f "$vdir/talker_unified.engine" ]; then
             echo "complete"
             return 0
         fi
@@ -165,7 +165,7 @@ detect_available_variants() {
             vname=$(basename "$vdir")
             [[ "$vname" == "tokenizer" ]] && continue
 
-            if [ -f "$vdir/talker_context.engine" ] && [ -f "$vdir/talker_decode_fused.engine" ]; then
+            if [ -f "$vdir/talker_unified.engine" ]; then
                 echo "${vname}:engine_ready"
             elif ls "$vdir"/*.onnx &>/dev/null 2>&1; then
                 echo "${vname}:exported"

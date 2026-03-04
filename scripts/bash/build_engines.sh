@@ -7,7 +7,8 @@
 #  (tritonserver:xx.yy-py3, trtexec at /usr/src/tensorrt/bin/trtexec).
 #
 #  Builds: talker_unified.engine (single engine for prefill+decode, per variant),
-#  plus speaker_encoder.engine, speech_tokenizer_encoder.engine, code2wav_decoder.engine
+#  plus text_embedder.engine, codec_embedder.engine, speaker_encoder.engine,
+#  speech_tokenizer_encoder.engine, code2wav_decoder.engine
 #  (shared or per-variant as per Phase A layout).
 #
 #  Prerequisites:
@@ -24,9 +25,9 @@
 #
 #  Environment variables:
 #    NGC_IMAGE        Docker image override (default: auto-detect from driver)
-#    MAX_BATCH_SIZE   Max batch (default: 8)
+#    MAX_BATCH_SIZE   Max batch (default: 16)
 #    MAX_INPUT_LEN    Prefill len (default: 512)
-#    MAX_SEQ_LEN      Total seq len (default: 4096)
+#    MAX_SEQ_LEN      Total seq len (default: 1024)
 #    ENGINE_DTYPE     bfloat16|float16 (default: bfloat16)
 #
 #  Output: workspace/exported/<variant>/*.engine, workspace/exported/tokenizer/*.engine
@@ -41,10 +42,10 @@ source "${SCRIPT_DIR}/tools.sh"
 # trtexec path inside NGC tritonserver image
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 
-# ── Engine build defaults (matching architecture.md §6.2) ──
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-8}"
+# ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=1024, batch=16) ──
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-16}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-512}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
 ENGINE_DTYPE="${ENGINE_DTYPE:-bfloat16}"
 
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
@@ -133,7 +134,17 @@ build_talker_unified_trt() {
         i=$((i + 1))
     done
 
-    log_info "Building talker_unified.engine (trtexec) ..."
+    # BF16 I/O formats: input_embeds=bf16, position_ids=int64, all KV=bf16 (58 inputs, 60 outputs)
+    local io_in="bf16:chw,int64:chw"
+    local io_out="bf16:chw,int64:chw,bf16:chw,bf16:chw"
+    i=0
+    while [ "$i" -lt "$NUM_LAYERS" ]; do
+        io_in="$io_in,bf16:chw,bf16:chw"
+        io_out="$io_out,bf16:chw,bf16:chw"
+        i=$((i + 1))
+    done
+
+    log_info "Building talker_unified.engine (trtexec, BF16 I/O) ..."
     local unif_cmd=(
         docker run --rm --gpus all
         -v "$variant_dir:/mnt/model"
@@ -145,6 +156,8 @@ build_talker_unified_trt() {
         --minShapes="$unif_min"
         --optShapes="$unif_opt"
         --maxShapes="$unif_max"
+        --inputIOFormats="$io_in"
+        --outputIOFormats="$io_out"
     )
     if ! "${unif_cmd[@]}"; then
         log_error "trtexec talker_unified engine failed for $variant"
@@ -155,14 +168,62 @@ build_talker_unified_trt() {
     return 0
 }
 
-# Build peripheral TRT engines (speaker_encoder, speech_tokenizer_encoder, code2wav_decoder)
+# Build peripheral TRT engines (text_embedder, codec_embedder, speaker_encoder, speech_tokenizer_encoder, code2wav_decoder)
 build_peripheral_engines() {
     if $DRY_RUN; then
-        log_info "[DRY RUN] Would run trtexec for speaker_encoder, speech_tokenizer_encoder, code2wav_decoder"
+        log_info "[DRY RUN] Would run trtexec for text_embedder, codec_embedder, speaker_encoder, speech_tokenizer_encoder, code2wav_decoder"
         return 0
     fi
     local image="$1"
     local failed=0
+
+    # Text embedder: per-variant (Embedding + ResizeMLP, required for lightweight deploy)
+    for vdir in "$EXPORTED_DIR"/*/; do
+        [ -d "$vdir" ] || continue
+        local onnx="${vdir}text_embedder.onnx"
+        [ -f "$onnx" ] || continue
+        local variant_name
+        variant_name=$(basename "$vdir")
+        log_info "Building text_embedder.engine for $variant_name ..."
+        local te_cmd=(
+            docker run --rm --gpus all -v "$vdir:/mnt/model" "$image"
+            $TRTEXEC --onnx=/mnt/model/text_embedder.onnx
+            --saveEngine=/mnt/model/text_embedder.engine
+            --bf16
+            --minShapes=token_ids:1x1
+            --optShapes=token_ids:1x64
+            --maxShapes=token_ids:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}
+            --memPoolSize=workspace:4096
+        )
+        if [ -f "${onnx}.data" ]; then
+            log_info "  (has external data file)"
+        fi
+        if ! "${te_cmd[@]}"; then
+            log_error "text_embedder trtexec failed for $variant_name"
+            failed=$((failed + 1))
+        fi
+    done
+
+    # Codec embedder: per-variant (Embedding lookup, required for lightweight deploy)
+    for vdir in "$EXPORTED_DIR"/*/; do
+        [ -d "$vdir" ] || continue
+        local onnx="${vdir}codec_embedder.onnx"
+        [ -f "$onnx" ] || continue
+        local variant_name
+        variant_name=$(basename "$vdir")
+        log_info "Building codec_embedder.engine for $variant_name ..."
+        if ! docker run --rm --gpus all -v "$vdir:/mnt/model" "$image" \
+            $TRTEXEC --onnx=/mnt/model/codec_embedder.onnx \
+            --saveEngine=/mnt/model/codec_embedder.engine \
+            --bf16 \
+            --minShapes=codec_ids:1x1 \
+            --optShapes=codec_ids:1x8 \
+            --maxShapes=codec_ids:${MAX_BATCH_SIZE}x64 \
+            --memPoolSize=workspace:1024; then
+            log_error "codec_embedder trtexec failed for $variant_name"
+            failed=$((failed + 1))
+        fi
+    done
 
     # Speaker encoder: per-variant, only if ONNX exists (base variants)
     for vdir in "$EXPORTED_DIR"/*/; do
