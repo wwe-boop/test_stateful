@@ -121,11 +121,12 @@ build_talker_unified_trt() {
 
     # Single engine: min/opt/max for input_embeds, position_ids, and all past_kv_{i}_k/v
     # All tensors sharing the "batch" dim must have the same batch value per profile.
+    # ONNX export shape: input_embeds [B,S,H], position_ids [B,3,S] (dim1=3 is the three token-type streams)
     # min: batch=1, S=1, S_past=1 (dummy); opt: batch=1, S=1, S_past=128 (decode hot path); max: batch=B, S=512, S_past=4096
     local OPT_BATCH=1 OPT_S_PAST=128
-    local unif_min="input_embeds:1x1x${H},position_ids:3x1x1"
-    local unif_opt="input_embeds:${OPT_BATCH}x1x${H},position_ids:3x${OPT_BATCH}x1"
-    local unif_max="input_embeds:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}x${H},position_ids:3x${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}"
+    local unif_min="input_embeds:1x1x${H},position_ids:1x3x1"
+    local unif_opt="input_embeds:${OPT_BATCH}x1x${H},position_ids:${OPT_BATCH}x3x1"
+    local unif_max="input_embeds:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}x${H},position_ids:${MAX_BATCH_SIZE}x3x${MAX_INPUT_LEN}"
     local i=0
     while [ "$i" -lt "$NUM_LAYERS" ]; do
         unif_min="$unif_min,past_kv_${i}_k:1x${KV_HEADS}x1x${HEAD_DIM},past_kv_${i}_v:1x${KV_HEADS}x1x${HEAD_DIM}"
@@ -266,16 +267,37 @@ build_peripheral_engines() {
         log_info "speech_tokenizer_encoder.onnx not found, skipping"
     fi
 
-    # Code2Wav decoder (shared)
+    # Code2Wav decoder (stateful streaming, chunk_T=4 fixed; 39 inputs, 38 outputs)
     if [ -f "$TOKENIZER_DIR/code2wav_decoder.onnx" ]; then
-        log_info "Building code2wav_decoder.engine ..."
+        log_info "Building code2wav_decoder.engine (streaming, chunk_T=4) ..."
+        C2W_BATCH="${MAX_BATCH_SIZE:-8}"
+        # Dynamic: codes (batch), cache_position fixed [4], past_kv_* (batch + past_len 0..72), conv/transconv states (batch)
+        C2W_MIN="codes:1x16x4,cache_position:4"
+        C2W_OPT="codes:1x16x4,cache_position:4"
+        C2W_MAX="codes:${C2W_BATCH}x16x4,cache_position:4"
+        for i in 0 1 2 3 4 5 6 7; do
+            C2W_MIN="${C2W_MIN},past_kv_${i}_k:1x16x0x64,past_kv_${i}_v:1x16x0x64"
+            C2W_OPT="${C2W_OPT},past_kv_${i}_k:1x16x4x64,past_kv_${i}_v:1x16x4x64"
+            C2W_MAX="${C2W_MAX},past_kv_${i}_k:${C2W_BATCH}x16x72x64,past_kv_${i}_v:${C2W_BATCH}x16x72x64"
+        done
+        # Conv/transconv states: batch dynamic, fixed time dims (from plan)
+        for name in conv_state_0:1x512x2 conv_state_1:1x1024x6 conv_state_2:1x1024x6 conv_state_3:1x1024x6 \
+            conv_state_4:1x768x6 conv_state_5:1x768x18 conv_state_6:1x768x54 conv_state_7:1x384x6 conv_state_8:1x384x18 conv_state_9:1x384x54 \
+            conv_state_10:1x192x6 conv_state_11:1x192x18 conv_state_12:1x192x54 conv_state_13:1x96x6 conv_state_14:1x96x18 conv_state_15:1x96x54 conv_state_16:1x96x6 \
+            transconv_overlap_0:1x768x8 transconv_overlap_1:1x384x5 transconv_overlap_2:1x192x4 transconv_overlap_3:1x96x3; do
+            n="${name%%:*}"
+            s="${name#*:}"
+            C2W_MIN="${C2W_MIN},${n}:${s}"
+            C2W_OPT="${C2W_OPT},${n}:${s}"
+            C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
+        done
         if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/code2wav_decoder.onnx \
             --saveEngine=/mnt/model/code2wav_decoder.engine \
             --bf16 \
-            --minShapes=codes:1x16x1 \
-            --optShapes=codes:1x16x50 \
-            --maxShapes=codes:${MAX_BATCH_SIZE}x16x500 \
+            --minShapes="$C2W_MIN" \
+            --optShapes="$C2W_OPT" \
+            --maxShapes="$C2W_MAX" \
             --memPoolSize=workspace:4096; then
             log_error "code2wav_decoder trtexec failed"
             failed=$((failed + 1))

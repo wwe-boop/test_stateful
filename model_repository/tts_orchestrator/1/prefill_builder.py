@@ -1,11 +1,17 @@
 """
 PrefillBuilder: construct inputs_embeds for Talker Backbone prefill.
 
+Rewritten to exactly match the official model.generate() logic (L2086-2232):
+  - Correct text format: <|im_start|>assistant\\n{text}<|im_end|>\\n<|im_start|>assistant\\n
+  - Correct tag tokens: [nothink, think_bos, think_eos] (not pad/bos/pad)
+  - non_streaming_mode=True for VoiceDesign: ALL text folded into prefill
+  - Streaming mode for other task types: first text in prefill, rest as trailing
+
 Supports 4 task types (architecture.md §10.4):
-  - VOICE_DESIGN:     role + instruct + tag + bos + first_text
-  - CUSTOM_VOICE:     role + instruct + tag + spk(codec) + bos + first_text
-  - VOICE_CLONE_XVEC: role + tag + spk_embed + bos + first_text
-  - VOICE_CLONE_ICL:  role + tag + spk_embed + bos + ICL(ref) + first_text
+  - VOICE_DESIGN:     role + instruct + tag + pad + bos + text(all) + pad+bos  [non_streaming]
+  - CUSTOM_VOICE:     role + instruct + tag + spk(codec) + pad + bos + text    [streaming]
+  - VOICE_CLONE_XVEC: role + tag + spk_embed + pad + bos + text               [streaming]
+  - VOICE_CLONE_ICL:  role + tag + spk_embed + pad + bos + ICL(ref) + text     [streaming]
 
 In-process torch: text/codec embeddings via loaded .pt weights on GPU (BF16).
 All tensor ops use torch; no BLS for embedders. Tokenizer remains lightweight (tokenizers lib).
@@ -74,6 +80,10 @@ class EmbeddingWeights:
         self.codec_eos_id = self.config["codec_eos_token_id"]
         self.codec_bos_id = self.config["codec_bos_id"]
         self.codec_pad_id = self.config["codec_pad_id"]
+        self.codec_nothink_id = self.config.get("codec_nothink_id", 2155)
+        self.codec_think_bos_id = self.config.get("codec_think_bos_id", 2156)
+        self.codec_think_eos_id = self.config.get("codec_think_eos_id", 2157)
+        self.codec_think_id = self.config.get("codec_think_id", 2154)
         self.codec_language_id = self.config.get("codec_language_id", {})
         self.spk_id_map = self.config.get("spk_id", {})
 
@@ -104,7 +114,6 @@ class EmbeddingWeights:
                 f"text_projection.pt not found in {weights_dir}. Run export_06_embeddings.py."
             )
         text_proj_sd = torch.load(text_proj_path, map_location=self.device, weights_only=True)
-        # linear_fc1: [intermediate, input], linear_fc2: [output, intermediate]
         in_size = text_proj_sd["linear_fc1.weight"].shape[1]
         mid_size = text_proj_sd["linear_fc1.weight"].shape[0]
         out_size = text_proj_sd["linear_fc2.weight"].shape[0]
@@ -170,11 +179,17 @@ class EmbeddingWeights:
             return self.codec_embedding(codec_ids)
 
 
+OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+
 class PrefillBuilder:
     """
     Build prefill inputs_embeds for different task types.
 
-    Uses EmbeddingWeights.text_embed/codec_embed (in-process torch); all tensor ops are torch.
+    Exactly replicates model.generate() L2086-2232 logic:
+    - Text format: OFFICIAL_ASSISTANT_FMT (with trailing \\n<|im_start|>assistant\\n)
+    - Tag tokens: [nothink/think, think_bos, [language_id,] think_eos] + [pad, bos]
+    - non_streaming_mode: VoiceDesign folds all text into prefill
     """
 
     def __init__(self, weights: EmbeddingWeights, tokenizer: Any):
@@ -202,9 +217,10 @@ class PrefillBuilder:
         """
         w = self.w
         device = w.device
+        non_streaming_mode = (task_type == TaskType.VOICE_DESIGN)
 
-        # Tokenize: tokenizer returns numpy [1, S]
-        assistant_text = f"<|im_start|>assistant\n{text}<|im_end|>"
+        # Tokenize with official format (includes trailing \n<|im_start|>assistant\n)
+        assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=text)
         input_ids_np = self.tokenizer(assistant_text, return_tensors="pt")["input_ids"]
         if isinstance(input_ids_np, np.ndarray):
             pass
@@ -214,38 +230,29 @@ class PrefillBuilder:
             input_ids_np = input_ids_np.reshape(1, -1)
         input_ids = torch.as_tensor(input_ids_np, device=device, dtype=torch.int64)
 
-        # Role embed: first 3 tokens
+        # Role embed: first 3 tokens (<|im_start|> assistant \n)
         role_embed = w.text_embed(input_ids[:, :3])
 
-        # Tag: think/language codec tokens
-        if language == "auto":
+        # Tag: codec_prefill_list (matches official L2108-2123)
+        # No language specified: [nothink, think_bos, think_eos]
+        # With language: [think, think_bos, language_id, think_eos]
+        if language == "auto" or language is None:
             tag_ids = torch.tensor(
-                [[w.codec_pad_id, w.codec_bos_id, w.codec_pad_id]],
-                device=device,
-                dtype=torch.int64,
+                [[w.codec_nothink_id, w.codec_think_bos_id, w.codec_think_eos_id]],
+                device=device, dtype=torch.int64,
             )
         else:
-            lang_id = w.codec_language_id.get(language, w.codec_pad_id)
+            lang_id = w.codec_language_id.get(language.lower(), w.codec_pad_id)
             tag_ids = torch.tensor(
-                [[w.codec_pad_id, w.codec_bos_id, lang_id, w.codec_pad_id]],
-                device=device,
-                dtype=torch.int64,
+                [[w.codec_think_id, w.codec_think_bos_id, lang_id, w.codec_think_eos_id]],
+                device=device, dtype=torch.int64,
             )
-        tag_codec_embed = w.codec_embed(tag_ids)
-        bos_codec_embed = w.codec_embed(
-            torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)
-        )
+        codec_input_embedding_0 = w.codec_embed(tag_ids)
 
-        # Instruct embed (for CUSTOM_VOICE / VOICE_DESIGN)
-        instruct_embed = None
-        if instruct and task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN):
-            instruct_ids_np = self.tokenizer(instruct, return_tensors="pt")["input_ids"]
-            if not isinstance(instruct_ids_np, np.ndarray):
-                instruct_ids_np = np.asarray(instruct_ids_np, dtype=np.int64)
-            if instruct_ids_np.ndim == 1:
-                instruct_ids_np = instruct_ids_np.reshape(1, -1)
-            instruct_ids = torch.as_tensor(instruct_ids_np, device=device, dtype=torch.int64)
-            instruct_embed = w.text_embed(instruct_ids)
+        # codec_input_embedding_1: [pad, bos] (official L2124-2129)
+        codec_input_embedding_1 = w.codec_embed(
+            torch.tensor([[w.codec_pad_id, w.codec_bos_id]], device=device, dtype=torch.int64)
+        )
 
         # Speaker embed
         speaker_embed = None
@@ -259,39 +266,53 @@ class PrefillBuilder:
             if spk_embedding is not None:
                 speaker_embed = spk_embedding.reshape(1, 1, -1)
 
-        # Codec layer: tag + [speaker] + bos
+        # Concat: tag + [speaker] + [pad, bos] (official L2130-2139)
         if speaker_embed is not None:
-            codec_layer = torch.cat(
-                [tag_codec_embed, speaker_embed, bos_codec_embed], dim=1
+            codec_input_embedding = torch.cat(
+                [codec_input_embedding_0, speaker_embed, codec_input_embedding_1], dim=1
             )
         else:
-            codec_layer = torch.cat([tag_codec_embed, bos_codec_embed], dim=1)
+            codec_input_embedding = torch.cat(
+                [codec_input_embedding_0, codec_input_embedding_1], dim=1
+            )
 
-        # Text layer: pad alignment + tts_bos
-        n_codec = codec_layer.shape[1]
-        pad_count = max(n_codec - 2, 0)
+        # Text layer: pad alignment + tts_bos (official L2146-2152)
+        # _talker_input_embed = cat(tts_pad * (n-2), tts_bos) + codec_input_embedding[:, :-1]
+        n_codec = codec_input_embedding.shape[1]
         text_layer = torch.cat(
             [
-                w.tts_pad_embed.expand(1, pad_count, w.hidden_size),
+                w.tts_pad_embed.expand(1, n_codec - 2, w.hidden_size),
                 w.tts_bos_embed,
             ],
             dim=1,
         )
-        dual_track = text_layer + codec_layer[:, :-1]
+        dual_track = text_layer + codec_input_embedding[:, :-1]
+
+        # Instruct embed (for CUSTOM_VOICE / VOICE_DESIGN, goes between role and dual_track)
+        instruct_embed = None
+        if instruct and task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN):
+            instruct_ids_np = self.tokenizer(instruct, return_tensors="pt")["input_ids"]
+            if not isinstance(instruct_ids_np, np.ndarray):
+                instruct_ids_np = np.asarray(instruct_ids_np, dtype=np.int64)
+            if instruct_ids_np.ndim == 1:
+                instruct_ids_np = instruct_ids_np.reshape(1, -1)
+            instruct_ids = torch.as_tensor(instruct_ids_np, device=device, dtype=torch.int64)
+            instruct_embed = w.text_embed(instruct_ids)
 
         if instruct_embed is not None:
-            base_prefill = torch.cat([role_embed, instruct_embed, dual_track], dim=1)
+            talker_input_embed = torch.cat([role_embed, instruct_embed, dual_track], dim=1)
         else:
-            base_prefill = torch.cat([role_embed, dual_track], dim=1)
+            talker_input_embed = torch.cat([role_embed, dual_track], dim=1)
 
-        # First text token
+        # First text token + codec_bos (official L2156-2162)
         if input_ids.shape[1] > 3:
             first_text_embed = w.text_embed(input_ids[:, 3:4])
         else:
             first_text_embed = w.tts_pad_embed
-        first_text_with_bos = first_text_embed + codec_layer[:, -1:]
+        first_text_with_bos = first_text_embed + codec_input_embedding[:, -1:]
+        talker_input_embed = torch.cat([talker_input_embed, first_text_with_bos], dim=1)
 
-        # ICL (voice_clone_icl)
+        # ICL path (voice_clone_icl) — unchanged from original
         if (
             task_type == TaskType.VOICE_CLONE_ICL
             and ref_codes is not None
@@ -303,23 +324,22 @@ class PrefillBuilder:
             codec_sum_vec = w.codec_embeddings_3d[
                 g_idx, ref_codes, :
             ].sum(dim=(0, 1), keepdim=True)
-            codec_embed_icl = torch.cat([bos_codec_embed, codec_sum_vec], dim=1)
+            codec_embed_icl = torch.cat(
+                [w.codec_embed(torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)),
+                 codec_sum_vec], dim=1
+            )
             if ref_text and ref_text.strip():
-                ref_assistant = f"<|im_start|>assistant\n{ref_text.strip()}<|im_end|>"
-                ref_ids_np = self.tokenizer(ref_assistant, return_tensors="pt")[
-                    "input_ids"
-                ]
+                ref_assistant = OFFICIAL_ASSISTANT_FMT.format(text=ref_text.strip())
+                ref_ids_np = self.tokenizer(ref_assistant, return_tensors="pt")["input_ids"]
                 if not isinstance(ref_ids_np, np.ndarray):
                     ref_ids_np = np.asarray(ref_ids_np, dtype=np.int64)
                 if ref_ids_np.ndim == 1:
                     ref_ids_np = ref_ids_np.reshape(1, -1)
                 ref_ids = torch.as_tensor(ref_ids_np, device=device, dtype=torch.int64)
-                ref_id = ref_ids[:, 3:-2] if ref_ids.shape[1] > 5 else ref_ids[:, :0]
+                ref_id = ref_ids[:, 3:-5] if ref_ids.shape[1] > 8 else ref_ids[:, :0]
             else:
                 ref_id = input_ids[:, :0]
-            text_id = (
-                input_ids[:, 3:-5] if input_ids.shape[1] > 8 else input_ids[:, 3:4]
-            )
+            text_id = input_ids[:, 3:-5] if input_ids.shape[1] > 8 else input_ids[:, 3:4]
             text_embed_icl = w.text_embed(torch.cat([ref_id, text_id], dim=1))
             text_embed_icl = torch.cat([text_embed_icl, w.tts_eos_embed], dim=1)
             text_lens = text_embed_icl.shape[1]
@@ -336,21 +356,56 @@ class PrefillBuilder:
                     text_embed_icl = torch.cat([text_embed_icl] + pads, dim=1)
                 icl_embed = text_embed_icl + codec_embed_icl
                 trailing = [w.tts_pad_embed]
-            prefill = torch.cat(
-                [base_prefill, first_text_with_bos, icl_embed], dim=1
+            prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
+
+        elif non_streaming_mode:
+            # Official L2203-2227: fold ALL text into prefill
+            # Drop the first_text_with_bos we just appended (it gets rebuilt below)
+            talker_input_embed = talker_input_embed[:, :-1]
+
+            # All text tokens (excluding role[:3] and tail[-5:])
+            text_part = input_ids[:, 3:-5]
+            n_text = text_part.shape[1]
+            text_embed = torch.cat(
+                [w.text_embed(text_part), w.tts_eos_embed],
+                dim=1,
             )
+            # Corresponding codec_pad tokens (one per text token + eos)
+            codec_pad_ids = torch.full(
+                (1, n_text + 1), w.codec_pad_id,
+                device=device, dtype=torch.int64,
+            )
+            codec_pad_embed = w.codec_embed(codec_pad_ids)
+            # Append: text+codec_pad interleaved, then tts_pad+codec_bos
+            prefill = torch.cat(
+                [
+                    talker_input_embed,
+                    text_embed + codec_pad_embed,
+                    w.tts_pad_embed + w.codec_embed(
+                        torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)
+                    ),
+                ],
+                dim=1,
+            )
+            trailing = [w.tts_pad_embed.clone()]
+
         else:
-            prefill = torch.cat([base_prefill, first_text_with_bos], dim=1)
-            trailing = []
-            if input_ids.shape[1] > 4:
-                end_idx = max(4, input_ids.shape[1] - 5)
-                for i in range(4, end_idx):
-                    t_embed = w.text_embed(input_ids[:, i : i + 1])
-                    trailing.append(t_embed)
-            trailing.append(w.tts_eos_embed)
+            # Streaming mode (official L2228-2232)
+            prefill = talker_input_embed
+            mid = input_ids[:, 4:-5] if input_ids.shape[1] > 9 else input_ids[:, :0]
+            if mid.shape[1] > 0:
+                mid_embed = w.text_embed(mid)
+                trailing_text_hidden = torch.cat([mid_embed, w.tts_eos_embed], dim=1)
+            else:
+                trailing_text_hidden = w.tts_eos_embed
+            n_trailing = trailing_text_hidden.shape[1]
+            trailing = [
+                trailing_text_hidden[:, i : i + 1, :].clone()
+                for i in range(n_trailing)
+            ]
 
         logger.info(
-            f"Prefill built: task={task_type.value}, "
+            f"Prefill built: task={task_type.value}, non_streaming={non_streaming_mode}, "
             f"shape={tuple(prefill.shape)}, trailing={len(trailing)}"
         )
         return prefill, trailing

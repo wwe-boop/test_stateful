@@ -2,15 +2,14 @@
 """
 [Step 02] Export Code2Wav Decoder to ONNX.
 
-Component: Code2Wav Decoder
+Component: Code2Wav Decoder (stateful streaming, chunk_T=4)
 Architecture: RVQ Dequant + Transformer(8L, sliding window) + BigVGAN ConvNet
-Input:  codes [B, num_quantizers(16), T_codes]
-Output: wav [B, T_codes * 1920]
-Engine: ONNX Runtime
-Usage: Called once per chunk (async, overlapped with decode loop)
+Input:  codes [B, 16, 4], cache_position [4], 37 state tensors
+Output: wav [B, 7680], 37 updated state tensors
+Engine: ONNX Runtime / TensorRT
+Usage: Incremental decode per 4 codec frames; states kept on GPU for batching.
 
 The decoder is shared across all model variants (comes from the tokenizer checkpoint).
-Supports chunked decoding with left_context overlap for seamless audio.
 """
 
 import argparse
@@ -32,29 +31,17 @@ from utils import (
     ONNX_EXPORT_DTYPE,
 )
 
+from code2wav_streaming import (
+    Code2WavStreamingWrapper,
+    create_initial_states,
+    get_initial_state_shapes,
+    NUM_KV,
+    NUM_CONV,
+    NUM_TRANSCONV,
+    CHUNK_T,
+)
+
 logger = logging.getLogger("onnx_export")
-
-
-class Code2WavDecoderWrapper(torch.nn.Module):
-    """Wraps the Qwen3TTSTokenizerV2Decoder for clean ONNX export.
-
-    Directly calls the decoder forward which takes codes [B, Q, T]
-    and returns wav [B, 1, T_audio].
-    """
-
-    def __init__(self, decoder):
-        super().__init__()
-        self.decoder = decoder
-
-    def forward(self, codes: torch.LongTensor) -> torch.Tensor:
-        """
-        Args:
-            codes: [B, num_quantizers, T_codes] - codec tokens (int64)
-        Returns:
-            wav: [B, T_audio] - audio waveform, clamped to [-1, 1]
-        """
-        wav = self.decoder(codes)
-        return wav.squeeze(1)
 
 
 def export_code2wav_decoder(
@@ -70,44 +57,73 @@ def export_code2wav_decoder(
     tokenizer_model = load_speech_tokenizer(tokenizer_path, device=device, dtype=torch.float32)
 
     decoder = tokenizer_model.decoder.to(device).eval()
-    wrapper = Code2WavDecoderWrapper(decoder).to(device).eval()
+    wrapper = Code2WavStreamingWrapper(decoder).to(device).eval()
 
     B = 1
-    num_quantizers = 16
-    T_codes = 25
-    dummy_codes = torch.randint(0, 2048, (B, num_quantizers, T_codes), device=device)
+    dummy_codes = torch.randint(0, 2048, (B, 16, CHUNK_T), device=device, dtype=torch.long)
+    cache_position = torch.arange(CHUNK_T, device=device, dtype=torch.long)
+    state_tensors = create_initial_states(decoder, device, torch.float32, batch_size=B)
 
     with torch.no_grad():
-        ref_output = wrapper(dummy_codes)
+        out = wrapper(dummy_codes, cache_position, *state_tensors)
 
-    logger.info(f"Decoder output shape: {ref_output.shape}")
+    wav_ref = out[0]
+    logger.info(f"Streaming decoder output wav shape: {wav_ref.shape} (expected [1, 7680])")
 
+    input_names = ["codes", "cache_position"]
+    output_names = ["wav"]
+    for name, _ in get_initial_state_shapes(decoder, batch_size=B, past_kv_len=0):
+        input_names.append(name)
+    for i in range(8):
+        output_names.append(f"present_kv_{i}_k")
+        output_names.append(f"present_kv_{i}_v")
+    for i in range(NUM_CONV):
+        output_names.append(f"new_conv_state_{i}")
+    for i in range(NUM_TRANSCONV):
+        output_names.append(f"new_transconv_overlap_{i}")
+
+    dynamic_axes = {
+        "codes": {0: "batch"},
+        "cache_position": {},
+        "wav": {0: "batch"},
+    }
+    for i in range(8):
+        dynamic_axes[f"past_kv_{i}_k"] = {0: "batch", 2: "past_len"}
+        dynamic_axes[f"past_kv_{i}_v"] = {0: "batch", 2: "past_len"}
+        dynamic_axes[f"present_kv_{i}_k"] = {0: "batch", 2: "total_len"}
+        dynamic_axes[f"present_kv_{i}_v"] = {0: "batch", 2: "total_len"}
+
+    dummy_inputs = (dummy_codes, cache_position, *state_tensors)
     onnx_path = str(out_dir / "code2wav_decoder.onnx")
     export_onnx(
         model=wrapper,
-        dummy_inputs=(dummy_codes,),
-        input_names=["codes"],
-        output_names=["wav"],
-        dynamic_axes={
-            "codes": {0: "batch", 2: "time"},
-            "wav": {0: "batch", 1: "audio_length"},
-        },
+        dummy_inputs=dummy_inputs,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
         onnx_path=onnx_path,
+        opset_version=18,
+        simplify=True,
+        do_constant_folding=False,
     )
 
     cpu_codes = dummy_codes.cpu()
+    cpu_cache_pos = cache_position.cpu()
+    cpu_states = [s.cpu() for s in state_tensors]
     cpu_wrapper = wrapper.cpu().eval()
     with torch.no_grad():
-        cpu_ref = cpu_wrapper(cpu_codes)
+        cpu_out = cpu_wrapper(cpu_codes, cpu_cache_pos, *cpu_states)
     wrapper.to(device)
 
-    test_inputs = {"codes": to_numpy(cpu_codes)}
-    torch_outputs = {"wav": to_numpy(cpu_ref)}
+    test_inputs = {"codes": to_numpy(cpu_codes), "cache_position": to_numpy(cpu_cache_pos)}
+    for i, t in enumerate(cpu_states):
+        test_inputs[input_names[2 + i]] = to_numpy(t)
+    torch_outputs = {output_names[i]: to_numpy(cpu_out[i]) for i in range(len(output_names))}
     ok = verify_onnx(onnx_path, test_inputs, torch_outputs, atol=1e-3)
     if ok:
-        logger.info("Code2Wav Decoder ONNX verification PASSED")
+        logger.info("Code2Wav Streaming ONNX verification PASSED")
     else:
-        logger.warning("Code2Wav Decoder ONNX verification FAILED")
+        logger.warning("Code2Wav Streaming ONNX verification had differences")
 
     del tokenizer_model
     if device != "cpu":

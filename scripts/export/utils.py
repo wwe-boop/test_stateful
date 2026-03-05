@@ -201,6 +201,50 @@ def load_tts_model(
     return model
 
 
+def _patch_decoder_rotary_from_weights(decoder) -> None:
+    """When decoder_config was None at load, RoPE inv_freq is loaded from checkpoint and can have
+    a different head_dim than the built attention layers. Rebuild rotary_emb.inv_freq so
+    cos/sin have shape [..., head_dim] matching the attention layer's query_states."""
+    if not hasattr(decoder, "pre_transformer") or not hasattr(decoder.pre_transformer, "layers"):
+        return
+    layers = decoder.pre_transformer.layers
+    if not layers:
+        return
+    attn = getattr(layers[0], "self_attn", None)
+    if attn is None:
+        return
+    cfg = getattr(decoder, "config", None)
+    if cfg is None:
+        return
+    head_dim = getattr(attn, "head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
+    setattr(cfg, "head_dim", head_dim)
+    rotary = getattr(decoder.pre_transformer, "rotary_emb", None)
+    if rotary is None or not hasattr(rotary, "inv_freq"):
+        return
+    # inv_freq length must be head_dim/2 (forward does cat(freqs, freqs) -> cos/sin last dim = head_dim)
+    current_len = rotary.inv_freq.shape[0]
+    expected_len = head_dim // 2
+    # Always rebuild so cos/sin match the attention layer's query (handles checkpoint vs build mismatch)
+    rope_theta = float(getattr(cfg, "rope_theta", 10000.0))
+    device = rotary.inv_freq.device
+    inv_freq = 1.0 / (
+        rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )
+    rotary.register_buffer("inv_freq", inv_freq, persistent=False)
+    if hasattr(rotary, "attention_scaling"):
+        scaling = getattr(rotary, "attention_scaling", None)
+        if scaling is not None and isinstance(scaling, torch.Tensor):
+            pass  # keep existing
+        else:
+            rotary.attention_scaling = 1.0
+    logger.info(
+        "Patched decoder rotary_emb.inv_freq: head_dim=%s (inv_freq len %s -> %s)",
+        head_dim, current_len, expected_len,
+    )
+
+
 def load_speech_tokenizer(tokenizer_path: Path, device: str = "cpu", dtype: torch.dtype = torch.float32):
     """Load the speech tokenizer (encoder + decoder) from the tokenizer checkpoint."""
     from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Model
@@ -217,6 +261,9 @@ def load_speech_tokenizer(tokenizer_path: Path, device: str = "cpu", dtype: torc
         local_files_only=True,
         trust_remote_code=True,
     )
+    # When config had decoder_config=None, default config can mismatch checkpoint; fix RoPE head_dim
+    if hasattr(model, "decoder"):
+        _patch_decoder_rotary_from_weights(model.decoder)
     model.eval()
     return model
 
@@ -499,6 +546,7 @@ def export_onnx(
     onnx_path: str,
     opset_version: int = 18,
     simplify: bool = True,
+    do_constant_folding: bool = True,
 ) -> None:
     """Export a PyTorch module to ONNX, then validate and optionally simplify.
 
@@ -565,7 +613,7 @@ def export_onnx(
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=opset_version,
-            do_constant_folding=True,
+            do_constant_folding=do_constant_folding,
             dynamo=False,
         )
 

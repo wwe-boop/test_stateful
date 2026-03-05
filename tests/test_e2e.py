@@ -123,6 +123,7 @@ def test_e2e_voice_design(client):
     full = np.concatenate(chunks)
     assert full.size >= 1
     assert first_sec is not None
+    print(f"\n[E2E T3.1a] voice_design first_chunk_s={first_sec:.3f} total_s={total:.3f} samples={full.size}")
     # T3.4: first chunk latency < 200ms (relaxed for CI)
     assert first_sec < 30.0, f"First chunk too slow: {first_sec:.2f}s"
 
@@ -211,5 +212,9 @@ def test_e2e_first_chunk_latency(client):
     assert err is None
     assert len(chunks) >= 1
     assert first_sec is not None
-    # Log for manual review; assertion is relaxed for CI
-    assert first_sec < 15.0, f"First chunk latency {first_sec*1000:.0f}ms (target < 200ms in prod)"
+    # Log metrics for E2E report; assertion relaxed for CI
+    first_ms = first_sec * 1000
+    total_ms = total_sec * 1000
+    samples = sum(c.size for c in chunks)
+    print(f"\n[E2E T3.4] first_chunk_latency_ms={first_ms:.0f} total_ms={total_ms:.0f} chunks={len(chunks)} samples={samples}")
+    assert first_sec < 15.0, f"First chunk latency {first_ms:.0f}ms (target < 200ms in prod)"

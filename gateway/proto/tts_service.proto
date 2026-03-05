@@ -1,0 +1,67 @@
+// TTS Gateway — custom gRPC protocol (architecture 12.3).
+// Bridge: client TTSService <-> Triton Inference Server (tts_orchestrator).
+syntax = "proto3";
+
+package tts.v1;
+
+option java_multiple_files = true;
+
+service TTSService {
+  rpc StreamingSynthesize(stream TTSRequest) returns (stream TTSResponse);
+}
+
+message TTSRequest {
+  oneof request {
+    InitRequest init = 1;
+    TextChunk text = 2;
+    TextComplete complete = 3;
+  }
+}
+
+// Unified init — fill fields per task_type (architecture 12.3 table).
+message InitRequest {
+  string task_type = 1;   // "voice_clone" | "custom_voice" | "voice_design"
+  string language = 2;     // "chinese" | "english" | ... | "auto"
+  bytes ref_audio = 3;     // Voice clone: reference audio (PCM/WAV)
+  string ref_text = 4;      // Voice clone ICL: reference text
+  bool x_vector_only = 5;  // Voice clone: true = speaker only, false = ICL
+  string speaker = 6;      // CustomVoice: preset name ("Chelsie" | "Ethan" | ...)
+  string instruct = 7;     // CustomVoice / VoiceDesign: instruction text
+  SamplingParams sampling = 10;
+}
+
+message SamplingParams {
+  float temperature = 1;
+  int32 top_k = 2;
+  float top_p = 3;
+  float repetition_penalty = 4;
+  int32 max_new_tokens = 5;
+  bool do_sample = 6;
+  float subtalker_temperature = 7;
+  int32 subtalker_top_k = 8;
+  float subtalker_top_p = 9;
+}
+
+message TextChunk {
+  string text = 1;
+}
+
+message TextComplete {}
+
+message TTSResponse {
+  oneof response {
+    AudioChunk audio = 1;
+    TTSError error = 2;
+  }
+}
+
+message AudioChunk {
+  bytes pcm_data = 1;   // PCM16 LE, mono, 24000 Hz
+  int32 sample_rate = 2;
+  bool is_final = 3;
+}
+
+message TTSError {
+  int32 code = 1;
+  string message = 2;
+}

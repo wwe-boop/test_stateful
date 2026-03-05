@@ -9,6 +9,11 @@ Unified pipeline (same BLS for ONNX and TensorRT backends):
   5. Code2Wav (BLS) for chunked audio
 
 Talker path uses torch + DLPack zero-copy (BF16 I/O); KV cache never leaves GPU.
+
+Error isolation (10.5): per-request try/except; OOM and timeout handled; client disconnect
+checked via response_sender.is_cancelled() in the decode loop.
+
+Phase 3 multi-session: see session_manager.py (SessionManager, BatchScheduler, FlowState).
 """
 
 import json
@@ -35,6 +40,21 @@ _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _MODEL_DIR not in sys.path:
     sys.path.insert(0, _MODEL_DIR)
 
+# Stateful code2wav: chunk_T=4 fixed; 37 state tensor shapes (batch=1, past_kv_len=0).
+# Order matches code2wav_streaming.get_initial_state_shapes (16 KV + 17 conv + 4 transconv).
+_CODE2WAV_STATE_SHAPES = [
+    (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64),
+    (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64),
+    (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64),
+    (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64),
+    (1, 512, 2), (1, 1024, 6), (1, 1024, 6), (1, 1024, 6),
+    (1, 768, 6), (1, 768, 18), (1, 768, 54), (1, 384, 6), (1, 384, 18), (1, 384, 54),
+    (1, 192, 6), (1, 192, 18), (1, 192, 54), (1, 96, 6), (1, 96, 18), (1, 96, 54), (1, 96, 6),
+    (1, 768, 8), (1, 384, 5), (1, 192, 4), (1, 96, 3),
+]
+CODE2WAV_CHUNK_T = 4
+SAMPLES_PER_CODEC_FRAME = 1920
+
 
 class TritonPythonModel:
 
@@ -56,10 +76,13 @@ class TritonPythonModel:
         self.device = torch.device("cuda", self.device_id)
         self.max_steps = int(params.get("max_decode_steps", {}).get(
             "string_value", "2000"))
+        # Stateful code2wav: fixed chunk_T=4; legacy params kept for config compatibility
         self.audio_chunk_threshold = int(params.get("audio_chunk_frames", {}).get(
             "string_value", "25"))
         self.first_chunk_frames = int(params.get("first_chunk_frames", {}).get(
-            "string_value", "10"))
+            "string_value", "4"))
+        self.request_timeout_sec = float(params.get("request_timeout_sec", {}).get(
+            "string_value", "120"))
 
         from prefill_builder import EmbeddingWeights, PrefillBuilder, parse_task_type
         self._parse_task_type = parse_task_type
@@ -86,13 +109,37 @@ class TritonPythonModel:
         logger.info("Tokenizer loaded (lightweight: tokenizers only)")
 
         self.prefill_builder = PrefillBuilder(self.weights, self.tokenizer)
-        logger.info(f"[TTS Orchestrator] Initialized: variant={self.variant}, num_layers={self.num_layers}")
+
+        # Detect talker_unified backend: TRT (BF16) vs ONNX (FP32)
+        # position_ids is always [B, 3, S] for both backends (engine rebuilt with correct axis order)
+        repo_root = Path(_MODEL_DIR).resolve().parent.parent
+        talker_config = repo_root / "talker_unified" / "config.pbtxt"
+        self._talker_backend = "onnxruntime"
+        if talker_config.exists():
+            raw = talker_config.read_text()
+            if "backend: \"tensorrt\"" in raw or 'backend: "tensorrt"' in raw:
+                self._talker_backend = "tensorrt"
+        self._talker_dtype = torch.bfloat16 if self._talker_backend == "tensorrt" else torch.float32
+        # Code2wav: same backend/dtype as talker (streaming model chunk_T=4, 39 inputs, 38 outputs)
+        code2wav_config = repo_root / "code2wav" / "config.pbtxt"
+        self._code2wav_dtype = torch.float32
+        if code2wav_config.exists():
+            raw = code2wav_config.read_text()
+            if "backend: \"tensorrt\"" in raw or 'backend: "tensorrt"' in raw:
+                self._code2wav_dtype = torch.bfloat16
+        logger.info(
+            f"[TTS Orchestrator] Initialized: variant={self.variant}, num_layers={self.num_layers}, "
+            f"talker_backend={self._talker_backend}, code2wav_dtype={self._code2wav_dtype}"
+        )
 
     def execute(self, requests):
         for request in requests:
             response_sender = request.get_response_sender()
             try:
                 self._handle_request(request, response_sender)
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error(f"Request failed (OOM): {e}")
+                self._send_error(response_sender, "out_of_memory: GPU OOM")
             except Exception as e:
                 logger.error(f"Request failed: {e}")
                 logger.error(traceback.format_exc())
@@ -167,8 +214,15 @@ class TritonPythonModel:
             raise RuntimeError(f"Prefill build failed: {e}") from e
 
         B, S, H = inputs_embeds.shape
+        # TRT engine often built with max S_past=1024; cap prefill to avoid shape error
+        max_prefill_len = 1024
+        if S > max_prefill_len:
+            logger.warning("Prefill length %d exceeds engine max %d, truncating", S, max_prefill_len)
+            inputs_embeds = inputs_embeds[:, :max_prefill_len, :].contiguous()
+            S = max_prefill_len
+        request_start = time.monotonic()
         position_ids_1d = torch.arange(S, device=self.device, dtype=torch.int64)
-        position_ids = position_ids_1d.reshape(1, 1, -1).expand(3, B, S)
+        position_ids = position_ids_1d.reshape(1, 1, -1).expand(B, 3, S)
 
         # Prefill: unified talker (past_kv dummy S_past=1)
         t0 = time.perf_counter()
@@ -177,59 +231,68 @@ class TritonPythonModel:
         )
         logger.debug(f"talker prefill: {(time.perf_counter() - t0) * 1000:.1f}ms")
         codec_eos_id = self.weights.codec_eos_id
-        codec_buffer = [full_codec]
+        codec_frame_buffer = []  # list of [1, 16] full_codec tensors
+        code2wav_states = self._create_code2wav_initial_states()
+        frame_index = 0
         text_idx = 0
-        first_chunk_sent = False
 
-        if int(logits[:, -1, :].argmax(dim=-1).item()) == codec_eos_id:
+        # EOS check: use FP32 argmax to avoid BF16 precision issues (Phase 0)
+        if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
             logger.info("EOS at step 0")
             self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
             return
 
-        chunk_threshold = self.first_chunk_frames if not first_chunk_sent else self.audio_chunk_threshold
-        if len(codec_buffer) >= chunk_threshold:
-            audio = self._bls_code2wav(codec_buffer)
-            self._send_audio_chunk(response_sender, audio, is_final=False)
-            codec_buffer = []
-            first_chunk_sent = True
+        # Push first codec frame (stateful code2wav: decode in chunks of 4)
+        codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
 
         next_embed = (codec_sum + trailing_text[text_idx]).to(torch.bfloat16)
         text_idx += 1
-        position_id = torch.full((3, B, 1), S, device=self.device, dtype=torch.int64)
+        position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
 
+        # KV length guard: engine MAX_SEQ_LEN=1024; stop before overflow (Phase 0)
+        max_kv_len = 1024 - 32
         for step in range(1, self.max_steps):
+            if S + step > max_kv_len:
+                logger.warning(
+                    "KV cache approaching limit (%s + %s > %s), forcing EOS",
+                    S, step, max_kv_len,
+                )
+                break
             if response_sender.is_cancelled():
                 logger.info("Client disconnected, stopping generation")
                 break
+            if (time.monotonic() - request_start) > self.request_timeout_sec:
+                logger.warning("Request timeout, stopping generation")
+                self._send_error(response_sender, "request_timeout")
+                return
 
             t0 = time.perf_counter()
             codec_sum, full_codec, logits, kv_tensors = self._bls_talker(
                 next_embed, position_id, kv_tensors
             )
             logger.debug(f"talker step {step}: {(time.perf_counter() - t0) * 1000:.1f}ms")
-            codec_buffer.append(full_codec)
+            codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
 
-            if int(logits[:, -1, :].argmax(dim=-1).item()) == codec_eos_id:
+            # EOS check: use FP32 argmax to avoid BF16 precision issues (Phase 0)
+            if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
                 logger.info(f"EOS at step {step}")
                 break
 
-            chunk_threshold = self.first_chunk_frames if not first_chunk_sent else self.audio_chunk_threshold
-            if len(codec_buffer) >= chunk_threshold:
-                audio = self._bls_code2wav(codec_buffer)
-                self._send_audio_chunk(response_sender, audio, is_final=False)
-                codec_buffer = []
-                first_chunk_sent = True
+            # Stateful code2wav: flush full chunks of 4 frames
+            code2wav_states, frame_index = self._flush_code2wav_buffer(
+                response_sender, codec_frame_buffer, code2wav_states, frame_index, is_final=False
+            )
 
             text_add = trailing_text[text_idx] if text_idx < len(trailing_text) else self._tts_pad_embed_torch
             text_idx += 1
             next_embed = (codec_sum + text_add).to(torch.bfloat16)
-            position_id = torch.full((3, B, 1), S + step, device=self.device, dtype=torch.int64)
+            position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
 
-        if codec_buffer:
-            audio = self._bls_code2wav(codec_buffer)
-            self._send_audio_chunk(response_sender, audio, is_final=True)
-        else:
-            self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+        # Final flush: decode remaining full chunks and any partial chunk (pad to 4)
+        _, _ = self._flush_code2wav_buffer(
+            response_sender, codec_frame_buffer, code2wav_states, frame_index, is_final=True
+        )
+        self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
 
         logger.info("Generation complete")
 
@@ -239,9 +302,9 @@ class TritonPythonModel:
         position_ids: torch.Tensor,
         past_kv_tensors: list = None,
     ):
-        """Unified BLS call to talker_unified (BF16 I/O). past_kv_tensors=None → prefill (dummy S_past=1). Zero-copy via DLPack."""
-        # Inputs: GPU zero-copy via from_dlpack
-        inp_emb = input_embeds.contiguous()
+        """Unified BLS call to talker_unified. past_kv_tensors=None → prefill (dummy S_past=1). Zero-copy via DLPack."""
+        # TRT: BF16; ONNX: FP32 (set in initialize from talker_unified config.pbtxt)
+        inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
         inputs = [
             pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
@@ -252,18 +315,18 @@ class TritonPythonModel:
             for i in range(self.num_layers):
                 dummy_k = torch.zeros(
                     B, self.kv_heads, 1, self.head_dim,
-                    dtype=torch.bfloat16, device=self.device,
+                    dtype=self._talker_dtype, device=self.device,
                 )
                 dummy_v = torch.zeros(
                     B, self.kv_heads, 1, self.head_dim,
-                    dtype=torch.bfloat16, device=self.device,
+                    dtype=self._talker_dtype, device=self.device,
                 )
                 inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", dummy_k))
                 inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", dummy_v))
         else:
             for i in range(self.num_layers):
-                k = past_kv_tensors[2 * i].contiguous()
-                v = past_kv_tensors[2 * i + 1].contiguous()
+                k = past_kv_tensors[2 * i].contiguous().to(self._talker_dtype)
+                v = past_kv_tensors[2 * i + 1].contiguous().to(self._talker_dtype)
                 inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", k))
                 inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", v))
 
@@ -284,10 +347,19 @@ class TritonPythonModel:
         codec_sum = self._tensor_from_response_torch(response, "codec_sum")
         full_codec = self._tensor_from_response_torch(response, "full_codec")
         logits = self._tensor_from_response_torch(response, "logits")
+        # TRT engine may return (3,1,H)/(3,16)/(3,1,V); slice to (1,...) for downstream
+        if self._talker_backend == "tensorrt" and codec_sum.shape[0] == 3:
+            codec_sum = codec_sum[:1]
+            full_codec = full_codec[:1]
+            logits = logits[:1]
         kv_tensors = []
         for i in range(self.num_layers):
-            kv_tensors.append(self._tensor_from_response_torch(response, f"present_kv_{i}_k"))
-            kv_tensors.append(self._tensor_from_response_torch(response, f"present_kv_{i}_v"))
+            k = self._tensor_from_response_torch(response, f"present_kv_{i}_k")
+            v = self._tensor_from_response_torch(response, f"present_kv_{i}_v")
+            if self._talker_backend == "tensorrt" and k.shape[0] == 3:
+                k, v = k[:1], v[:1]
+            kv_tensors.append(k)
+            kv_tensors.append(v)
 
         return codec_sum, full_codec, logits, kv_tensors
 
@@ -348,29 +420,122 @@ class TritonPythonModel:
         codes = self._tensor_from_response_torch(response, "audio_codes")
         return codes.squeeze(0).T
 
-    def _bls_code2wav(self, codec_buffer: list) -> np.ndarray:
-        """codec_buffer: list of torch [B, 16] int64 (full_codec from talker)."""
-        stacked = torch.cat(codec_buffer, dim=0)
-        codes = stacked.T.unsqueeze(0).cpu().numpy().astype(np.int64)
+    def _full_codec_to_frame(self, full_codec: torch.Tensor) -> torch.Tensor:
+        """Ensure full_codec from talker is [1, 16] for buffer."""
+        t = full_codec.contiguous()
+        if t.dim() == 3:
+            t = t.squeeze(0)
+        if t.dim() == 2 and t.shape[0] != 1:
+            t = t.unsqueeze(0)
+        return t.to(self.device)
 
-        inputs = [pb_utils.Tensor("codes", codes)]
+    def _create_code2wav_initial_states(self):
+        """Create 37 zero state tensors for stateful code2wav (GPU, correct dtype)."""
+        return [
+            torch.zeros(shape, device=self.device, dtype=self._code2wav_dtype)
+            for shape in _CODE2WAV_STATE_SHAPES
+        ]
+
+    def _flush_code2wav_buffer(
+        self,
+        response_sender,
+        codec_frame_buffer: list,
+        code2wav_states: list,
+        frame_index: int,
+        is_final: bool,
+    ):
+        """Decode full chunks of 4 frames; if is_final, pad and decode remaining 1–3 frames. Mutates codec_frame_buffer. Returns (updated_states, updated_frame_index)."""
+        while len(codec_frame_buffer) >= CODE2WAV_CHUNK_T:
+            frames = codec_frame_buffer[:CODE2WAV_CHUNK_T]
+            del codec_frame_buffer[:CODE2WAV_CHUNK_T]
+            codes = torch.stack(frames, dim=-1)
+            if codes.dim() == 2:
+                codes = codes.unsqueeze(0)
+            codes = codes.contiguous()
+            cache_position = torch.arange(
+                frame_index, frame_index + CODE2WAV_CHUNK_T, device=self.device, dtype=torch.int64
+            )
+            wav_np, code2wav_states = self._bls_code2wav_streaming(codes, cache_position, code2wav_states)
+            self._send_audio_chunk(response_sender, wav_np, is_final=False)
+            frame_index += CODE2WAV_CHUNK_T
+
+        if is_final and len(codec_frame_buffer) > 0:
+            n = len(codec_frame_buffer)
+            codec_pad_id = self.weights.codec_pad_id
+            pad_frames = [
+                torch.full((1, 16), codec_pad_id, device=self.device, dtype=torch.int64)
+                for _ in range(CODE2WAV_CHUNK_T - n)
+            ]
+            frames = codec_frame_buffer + pad_frames
+            del codec_frame_buffer[:]
+            codes = torch.stack(frames, dim=-1)
+            if codes.dim() == 2:
+                codes = codes.unsqueeze(0)
+            codes = codes.contiguous()
+            cache_position = torch.arange(
+                frame_index, frame_index + CODE2WAV_CHUNK_T, device=self.device, dtype=torch.int64
+            )
+            wav_np, _ = self._bls_code2wav_streaming(codes, cache_position, code2wav_states)
+            valid_samples = n * SAMPLES_PER_CODEC_FRAME
+            self._send_audio_chunk(
+                response_sender, wav_np[:valid_samples].astype(np.float32), is_final=False
+            )
+        return code2wav_states, frame_index
+
+    def _bls_code2wav_streaming(
+        self,
+        codes: torch.Tensor,
+        cache_position: torch.Tensor,
+        state_tensors: list,
+    ) -> tuple:
+        """Stateful code2wav: codes [1, 16, 4], cache_position [4], 37 states -> wav [7680], 37 new states. Uses DLPack for GPU tensors."""
+        codes = codes.to(torch.int64)
+        inputs = [
+            pb_utils.Tensor.from_dlpack("codes", codes),
+            pb_utils.Tensor.from_dlpack("cache_position", cache_position),
+        ]
+        state_input_names = []
+        for i in range(8):
+            state_input_names.append(f"past_kv_{i}_k")
+            state_input_names.append(f"past_kv_{i}_v")
+        for i in range(17):
+            state_input_names.append(f"conv_state_{i}")
+        for i in range(4):
+            state_input_names.append(f"transconv_overlap_{i}")
+        for i, t in enumerate(state_tensors):
+            inputs.append(
+                pb_utils.Tensor.from_dlpack(state_input_names[i], t.contiguous().to(self._code2wav_dtype))
+            )
+
+        out_names = ["wav"]
+        for i in range(8):
+            out_names.append(f"present_kv_{i}_k")
+            out_names.append(f"present_kv_{i}_v")
+        for i in range(17):
+            out_names.append(f"new_conv_state_{i}")
+        for i in range(4):
+            out_names.append(f"new_transconv_overlap_{i}")
+
         request = pb_utils.InferenceRequest(
             model_name="code2wav",
             inputs=inputs,
-            requested_output_names=["wav"],
+            requested_output_names=out_names,
         )
         response = request.exec()
         if response.has_error():
-            raise RuntimeError(f"Code2Wav BLS error: {response.error().message()}")
+            raise RuntimeError(f"code2wav BLS error: {response.error().message()}")
 
-        wav = pb_utils.get_output_tensor_by_name(response, "wav")
-        if wav.is_cpu():
-            return wav.as_numpy().flatten()
-        try:
-            wav_t = torch.from_dlpack(wav)
-            return wav_t.cpu().numpy().flatten()
-        except (AttributeError, TypeError):
-            return np.array(wav.as_numpy(), dtype=np.float32).flatten()
+        wav_t = self._tensor_from_response_torch(response, "wav")
+        wav_np = wav_t.cpu().float().numpy().flatten()
+        new_states = []
+        for i in range(8):
+            new_states.append(self._tensor_from_response_torch(response, f"present_kv_{i}_k"))
+            new_states.append(self._tensor_from_response_torch(response, f"present_kv_{i}_v"))
+        for i in range(17):
+            new_states.append(self._tensor_from_response_torch(response, f"new_conv_state_{i}"))
+        for i in range(4):
+            new_states.append(self._tensor_from_response_torch(response, f"new_transconv_overlap_{i}"))
+        return wav_np, new_states
 
     def _send_audio_chunk(self, response_sender, audio: np.ndarray, is_final: bool = False):
         audio_tensor = pb_utils.Tensor("audio_chunk", audio.astype(np.float32))

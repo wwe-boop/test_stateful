@@ -181,11 +181,12 @@ assemble_model_repo() {
         return 1
     fi
 
-    # ── 4. Code2Wav Decoder (required) ──
+    # ── 4. Code2Wav Decoder (required; stateful streaming chunk_T=4) ──
     local c2w_src
     if c2w_src="$(_resolve_model_src "$tokenizer_dir/code2wav_decoder")"; then
         _place_model "code2wav" "$c2w_src"
-        log_info "  code2wav: OK"
+        _write_code2wav_streaming_config "$repo_dir/code2wav" "$engine_mode"
+        log_info "  code2wav: OK (streaming chunk_T=4)"
     else
         log_error "  code2wav: MISSING ${engine_mode} file (required). Run Phase A/B first."
         return 1
@@ -208,7 +209,7 @@ assemble_model_repo() {
     repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
     local orch_py_dir="$repo_root/model_repository/tts_orchestrator/1"
     if [ -d "$orch_py_dir" ]; then
-        for pyf in model.py prefill_builder.py audio_utils.py lightweight_tokenizer.py; do
+        for pyf in model.py prefill_builder.py audio_utils.py lightweight_tokenizer.py session_manager.py; do
             if [ -f "$orch_py_dir/$pyf" ]; then
                 cp "$orch_py_dir/$pyf" "$repo_dir/tts_orchestrator/1/$pyf"
             fi
@@ -482,6 +483,8 @@ EOF
 
 # _write_talker_unified_bf16_config <model_dir> <variant_dir>
 # Full config for talker_unified TRT engine (BF16 I/O, 58 inputs, 60 outputs).
+# Uses explicit min dims (1,1,1) for dynamic axes so Triton TRT backend can bind;
+# engine was built with min/opt/max profiles, runtime shapes within profile are valid.
 # Reads dimensions from <variant_dir>/weights/config.json.
 _write_talker_unified_bf16_config() {
     local model_dir="$1"
@@ -496,6 +499,8 @@ _write_talker_unified_bf16_config() {
         HEAD_DIM=$(( H / 16 ))
     fi
     local config_file="$model_dir/config.pbtxt"
+    # ONNX export: input_embeds [B,S,H], position_ids [B,3,S], past_kv [B,KV,Spast,HD]
+    # Use -1 for dynamic batch and seq dims; dim1=3 in position_ids is fixed.
     cat > "$config_file" << EOF
 name: "talker_unified"
 backend: "tensorrt"
@@ -505,7 +510,7 @@ input [
   { name: "input_embeds"  data_type: TYPE_BF16  dims: [ -1, -1, $H ] }
 ]
 input [
-  { name: "position_ids"  data_type: TYPE_INT64  dims: [ 3, -1, -1 ] }
+  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1 ] }
 ]
 EOF
     local i=0
@@ -520,6 +525,7 @@ input [
 EOF
         i=$((i + 1))
     done
+    # Outputs: batch dim is dynamic (-1), seq dim is dynamic where applicable.
     cat >> "$config_file" << EOF
 output [
   { name: "codec_sum"  data_type: TYPE_BF16  dims: [ -1, 1, $H ] }
@@ -551,7 +557,109 @@ instance_group [
   { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
 ]
 EOF
-    log_info "    + talker_unified config.pbtxt (BF16 I/O, ${NUM_LAYERS} layers)"
+    log_info "    + talker_unified config.pbtxt (BF16 I/O, ${NUM_LAYERS} layers, min-shape for TRT load)"
+}
+
+# _write_code2wav_streaming_config <model_dir> <engine_mode>
+# Stateful code2wav: 39 inputs (codes, cache_position, 16 KV, 17 conv states, 4 transconv overlaps),
+# 38 outputs (wav, 16 present_kv, 17 new_conv_state, 4 new_transconv_overlap). chunk_T=4 fixed.
+_write_code2wav_streaming_config() {
+    local model_dir="$1"
+    local engine_mode="$2"
+    local backend="onnxruntime"
+    local float_type="TYPE_FP32"
+    [ "$engine_mode" = "trt" ] && backend="tensorrt" && float_type="TYPE_BF16"
+
+    local config_file="$model_dir/config.pbtxt"
+    cat > "$config_file" << EOF
+name: "code2wav"
+backend: "${backend}"
+max_batch_size: 0
+
+input [
+  { name: "codes"  data_type: TYPE_INT64  dims: [ -1, 16, 4 ] }
+]
+input [
+  { name: "cache_position"  data_type: TYPE_INT64  dims: [ 4 ] }
+]
+EOF
+    local i
+    for i in 0 1 2 3 4 5 6 7; do
+        cat >> "$config_file" << EOF
+input [
+  { name: "past_kv_${i}_k"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
+]
+input [
+  { name: "past_kv_${i}_v"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
+]
+EOF
+    done
+    # Conv states: 0 [B,512,2]; 1,2,3 [B,1024,6]; 4-6 [B,768,6|18|54]; 7-9 [B,384,...]; 10-12 [B,192,...]; 13-15 [B,96,...]; 16 [B,96,6]
+    local conv_specs="conv_state_0:-1:512:2 conv_state_1:-1:1024:6 conv_state_2:-1:1024:6 conv_state_3:-1:1024:6"
+    conv_specs="$conv_specs conv_state_4:-1:768:6 conv_state_5:-1:768:18 conv_state_6:-1:768:54"
+    conv_specs="$conv_specs conv_state_7:-1:384:6 conv_state_8:-1:384:18 conv_state_9:-1:384:54"
+    conv_specs="$conv_specs conv_state_10:-1:192:6 conv_state_11:-1:192:18 conv_state_12:-1:192:54"
+    conv_specs="$conv_specs conv_state_13:-1:96:6 conv_state_14:-1:96:18 conv_state_15:-1:96:54 conv_state_16:-1:96:6"
+    for spec in $conv_specs; do
+        local name="${spec%%:*}" rest="${spec#*:}"
+        local dims="${rest//:/, }"
+        cat >> "$config_file" << EOF
+input [
+  { name: "${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
+]
+EOF
+    done
+    local tc_specs="transconv_overlap_0:-1:768:8 transconv_overlap_1:-1:384:5 transconv_overlap_2:-1:192:4 transconv_overlap_3:-1:96:3"
+    for spec in $tc_specs; do
+        local name="${spec%%:*}" rest="${spec#*:}"
+        local dims="${rest//:/, }"
+        cat >> "$config_file" << EOF
+input [
+  { name: "${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
+]
+EOF
+    done
+    # Outputs
+    cat >> "$config_file" << EOF
+output [
+  { name: "wav"  data_type: ${float_type}  dims: [ -1, 7680 ] }
+]
+EOF
+    for i in 0 1 2 3 4 5 6 7; do
+        cat >> "$config_file" << EOF
+output [
+  { name: "present_kv_${i}_k"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
+]
+output [
+  { name: "present_kv_${i}_v"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
+]
+EOF
+    done
+    for spec in $conv_specs; do
+        local name="${spec%%:*}" rest="${spec#*:}"
+        local dims="${rest//:/, }"
+        local out_name="new_${name}"
+        cat >> "$config_file" << EOF
+output [
+  { name: "${out_name}"  data_type: ${float_type}  dims: [ ${dims} ] }
+]
+EOF
+    done
+    for spec in $tc_specs; do
+        local name="${spec%%:*}" rest="${spec#*:}"
+        local dims="${rest//:/, }"
+        cat >> "$config_file" << EOF
+output [
+  { name: "new_${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
+]
+EOF
+    done
+    cat >> "$config_file" << EOF
+instance_group [
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+EOF
+    log_info "    + code2wav config.pbtxt (streaming chunk_T=4, 39 inputs, 38 outputs)"
 }
 
 # _write_onnx_config <model_dir> <model_name> <inputs_spec> <outputs_spec>
@@ -735,7 +843,7 @@ parameters: {
 }
 parameters: {
   key: "first_chunk_frames"
-  value: { string_value: "10" }
+  value: { string_value: "4" }
 }
 EOF
 

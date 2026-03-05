@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-TRT E2E verification — Pure TensorRT (talker_context + talker_decode_fused engines).
+TRT E2E verification — Single talker_unified engine (prefill + decode).
 
-Loads TRT engines built by trtexec and runs prefill + decode loop, comparing
+Loads talker_unified.engine built by trtexec, runs prefill + decode loop, comparing
 against FP32 PyTorch reference (e2e_trt_ref.npz from verify_e2e_trt_ref.py).
 
-Usage (inside NGC container or host with TensorRT, invoked by verify_e2e_trt.sh):
-  python3 verify_e2e_trt.py --model-dir /path/to/exported/variant \\
-      [--ref-file /path/to/e2e_trt_ref.npz]
+Usage (inside NGC container or host with TensorRT):
+  python3 verify_e2e_trt.py --model-dir /path/to/exported/variant [--ref-file /path/to/e2e_trt_ref.npz]
 """
 
 import argparse
@@ -35,7 +34,11 @@ def cosine_sim(a, b):
         a = torch.from_numpy(a).float()
     if isinstance(b, np.ndarray):
         b = torch.from_numpy(b).float()
-    return float(F.cosine_similarity(a.flatten().unsqueeze(0), b.flatten().unsqueeze(0)))
+    a_flat = a.flatten().float()
+    b_flat = b.flatten().float()
+    if a_flat.numel() == 0:
+        return 1.0
+    return float(F.cosine_similarity(a_flat.unsqueeze(0), b_flat.unsqueeze(0)))
 
 
 def _load_trt_engine(engine_path, device):
@@ -88,149 +91,241 @@ def _trt_infer(engine, context, feed_dict, device):
     return bindings
 
 
+def _load_talker_dims(model_dir: Path):
+    """Load H, num_kv_heads, head_dim, num_layers from weights config or ref."""
+    cfg_path = model_dir / "weights" / "config.json"
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            c = json.load(f)
+        H = int(c.get("talker_hidden_size", 2048))
+        n_heads = int(c.get("talker_num_heads", 16))
+        num_kv_heads = int(c.get("talker_num_kv_heads", 8))
+        num_layers = int(c.get("talker_num_layers", 28))
+        head_dim = H // n_heads
+        return H, num_kv_heads, head_dim, num_layers
+    return 2048, 8, 128, 28
+
+
 def main():
-    parser = argparse.ArgumentParser(description="TRT E2E verification (Pure TRT engines)")
+    parser = argparse.ArgumentParser(
+        description="TRT E2E verification (talker_unified.engine)"
+    )
     parser.add_argument("--model-dir", required=True, help="Exported variant dir")
     parser.add_argument("--ref-file", default=None, help="Path to e2e_trt_ref.npz")
     parser.add_argument("--variant", default=None, help="Variant name for report")
+    parser.add_argument("--steps", type=int, default=None, help="Max decode steps (default: use ref n_steps)")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
     variant_name = args.variant or model_dir.name
     ref_file = args.ref_file or str(model_dir / "e2e_trt_ref.npz")
     if not os.path.exists(ref_file):
-        logger.error(f"Reference file not found: {ref_file}. Run verify_e2e_trt_ref.py on host first.")
+        logger.error(
+            f"Reference file not found: {ref_file}. Run verify_e2e_trt_ref.py on host first."
+        )
         sys.exit(1)
 
     ref = np.load(ref_file)
     inputs_embeds = ref["inputs_embeds"]
     prefill_logits = ref["prefill_logits"]
+    pad_embed_ref = ref["pad_embed"] if "pad_embed" in ref else None
     seq_len = int(ref["seq_len"])
-    n_steps = int(ref["n_steps"])
+    n_steps = int(ref["n_steps"]) if args.steps is None else min(int(ref["n_steps"]), args.steps)
     all_codec_tokens = ref["all_codec_tokens"]
+    step_output_codec_token_0_ref = (
+        ref["step_output_codec_token_0"]
+        if "step_output_codec_token_0" in ref
+        else all_codec_tokens[:, 0]
+    )
     step_talker_logits = ref["step_talker_logits"]
+    codec_eos_id = int(ref["codec_eos_id"]) if "codec_eos_id" in ref else 4198
+    ref_eos_step = int(ref["eos_step"]) if "eos_step" in ref else -1
 
     device = torch.device("cuda:0")
+    H, num_kv_heads, head_dim, num_layers = _load_talker_dims(model_dir)
 
     report = {
         "variant": variant_name,
         "n_steps": n_steps,
-        "prefill_cosine": None,
-        "talker_token_match_rate": None,
+        "prefill_logits_cosine": None,
+        "step_logits_cosines": [],
+        "codec_token_0_match_rate": None,
+        "full_codec_match_rate": None,
+        "ref_eos_step": ref_eos_step,
+        "trt_eos_step": None,
         "status": "fail",
     }
 
-    # ── Load TRT engines ──
-    ctx_engine_path = model_dir / "talker_context.engine"
-    dec_engine_path = model_dir / "talker_decode_fused.engine"
-
-    if not ctx_engine_path.exists():
-        logger.error(f"talker_context.engine not found: {ctx_engine_path}")
-        sys.exit(1)
-    if not dec_engine_path.exists():
-        logger.error(f"talker_decode_fused.engine not found: {dec_engine_path}")
+    # Load single unified engine
+    engine_path = model_dir / "talker_unified.engine"
+    if not engine_path.exists():
+        logger.error(f"talker_unified.engine not found: {engine_path}")
         sys.exit(1)
 
-    logger.info("Loading TRT engines ...")
+    logger.info("Loading talker_unified.engine ...")
     t0 = time.time()
-    ctx_engine, ctx_context = _load_trt_engine(str(ctx_engine_path), device)
-    dec_engine, dec_context = _load_trt_engine(str(dec_engine_path), device)
-    logger.info(f"Engines loaded in {time.time() - t0:.1f}s")
+    engine, context = _load_trt_engine(str(engine_path), device)
+    logger.info(f"Engine loaded in {time.time() - t0:.1f}s")
 
-    # ── (A) Context (prefill) ──
-    logger.info(f"(A) Running context prefill (seq_len={seq_len}) ...")
-    inp_emb = torch.from_numpy(inputs_embeds).to(device).float()
-    B, S, H = inp_emb.shape
-    pos_ids = torch.arange(S, device=device, dtype=torch.int64)
-    pos_ids = pos_ids.unsqueeze(0).unsqueeze(0).expand(3, B, S)
+    # Prefill: input_embeds [1, S, H], position_ids [3, 1, S], dummy past_kv [1, kv, 1, hd]
+    S = seq_len
+    B = 1
+    inp_emb = torch.from_numpy(inputs_embeds).to(device=device, dtype=torch.bfloat16)
+    if inp_emb.shape[1] != S or inp_emb.shape[2] != H:
+        logger.warning(
+            f"Ref inputs_embeds shape {inp_emb.shape} vs expected (1, {S}, {H}); trimming/padding"
+        )
+        inp_emb = inp_emb[:, :S, :].contiguous()
+        if inp_emb.shape[2] != H:
+            logger.error("Ref hidden size does not match engine H")
+            sys.exit(1)
+    position_ids_prefill = torch.arange(1, S + 1, device=device, dtype=torch.int64)
+    position_ids_prefill = position_ids_prefill.unsqueeze(0).unsqueeze(0).expand(3, B, S)
 
-    ctx_feed = {"input_embeds": inp_emb, "position_ids": pos_ids}
-    ctx_out = _trt_infer(ctx_engine, ctx_context, ctx_feed, device)
+    feed = {
+        "input_embeds": inp_emb,
+        "position_ids": position_ids_prefill,
+    }
+    for i in range(num_layers):
+        feed[f"past_kv_{i}_k"] = torch.zeros(
+            1, num_kv_heads, 1, head_dim, device=device, dtype=torch.bfloat16
+        )
+        feed[f"past_kv_{i}_v"] = torch.zeros(
+            1, num_kv_heads, 1, head_dim, device=device, dtype=torch.bfloat16
+        )
 
-    if "last_logits" in ctx_out:
-        ctx_logits = ctx_out["last_logits"].cpu().numpy()
-        prefill_cos = cosine_sim(ctx_logits, prefill_logits)
-        report["prefill_cosine"] = prefill_cos
-        logger.info(f"  Prefill logits cosine: {prefill_cos:.6f}")
+    logger.info(f"(A) Prefill: seq_len={S} ...")
+    out = _trt_infer(engine, context, feed, device)
 
-    codec_sum_ctx = ctx_out.get("codec_sum")
-    full_codec_ctx = ctx_out.get("full_codec")
+    logits = out["logits"]
+    if logits.dtype == torch.bfloat16:
+        logits_f = logits.float()
+    else:
+        logits_f = logits.float()
+    prefill_logits_ref = np.asarray(prefill_logits, dtype=np.float32)
+    if prefill_logits_ref.ndim == 3:
+        prefill_logits_ref = prefill_logits_ref[:, -1, :]
+    prefill_cos = cosine_sim(logits_f.cpu().numpy(), prefill_logits_ref)
+    report["prefill_logits_cosine"] = prefill_cos
+    logger.info(f"  Prefill logits cosine: {prefill_cos:.6f}")
 
+    codec_sum = out["codec_sum"]
+    full_codec = out["full_codec"]
     kv_tensors = []
-    i = 0
-    while f"present_kv_{i}_k" in ctx_out:
-        kv_tensors.append(ctx_out[f"present_kv_{i}_k"])
-        kv_tensors.append(ctx_out[f"present_kv_{i}_v"])
-        i += 1
-    num_layers = i
-    logger.info(f"  KV cache: {num_layers} layers captured")
+    for i in range(num_layers):
+        kv_tensors.append(out[f"present_kv_{i}_k"])
+        kv_tensors.append(out[f"present_kv_{i}_v"])
 
-    ref_first_token = int(all_codec_tokens[0, 0]) if all_codec_tokens.ndim == 2 else int(all_codec_tokens[0])
-    if full_codec_ctx is not None:
-        trt_first_token = int(full_codec_ctx[0, 0].item())
-        logger.info(f"  First codec token: TRT={trt_first_token}, ref={ref_first_token}, match={trt_first_token == ref_first_token}")
+    ref_first = int(all_codec_tokens[0, 0]) if all_codec_tokens.ndim == 2 else int(all_codec_tokens[0])
+    trt_first = int(full_codec[0, 0].item())
+    logger.info(f"  First codec token: TRT={trt_first}, ref={ref_first}, match={trt_first == ref_first}")
 
-    # ── (B) Decode loop ──
-    logger.info(f"(B) Running decode loop ({n_steps} steps) ...")
+    # Decode loop
+    logger.info(f"(B) Decode loop ({n_steps} steps) ...")
     token_matches = 0
-    total_compare = 0
+    full_codec_matches = 0
+    step_cosines = []
+    trt_eos_step = -1
     t1 = time.time()
 
-    current_codec_sum = codec_sum_ctx
+    # Next decode input = codec_sum + pad_embed (match ref)
+    current_codec_sum = codec_sum
+    if pad_embed_ref is not None:
+        pad_embed = torch.from_numpy(np.asarray(pad_embed_ref, dtype=np.float32)).to(device=device)
+        if pad_embed.dim() == 2:
+            pad_embed = pad_embed.unsqueeze(1)
+        current_codec_sum = (current_codec_sum.float() + pad_embed).to(codec_sum.dtype)
     current_pos = S
 
     for step in range(n_steps):
-        pos_step = torch.zeros(3, B, 1, device=device, dtype=torch.int64)
-        pos_step[:, :, :] = current_pos
-
+        pos_step = torch.full(
+            (3, B, 1), current_pos, device=device, dtype=torch.int64
+        )
         dec_feed = {
             "input_embeds": current_codec_sum,
             "position_ids": pos_step,
         }
-        for li in range(num_layers):
-            dec_feed[f"past_kv_{li}_k"] = kv_tensors[2 * li]
-            dec_feed[f"past_kv_{li}_v"] = kv_tensors[2 * li + 1]
+        for i in range(num_layers):
+            dec_feed[f"past_kv_{i}_k"] = kv_tensors[2 * i]
+            dec_feed[f"past_kv_{i}_v"] = kv_tensors[2 * i + 1]
 
-        dec_out = _trt_infer(dec_engine, dec_context, dec_feed, device)
+        dec_out = _trt_infer(engine, context, dec_feed, device)
 
-        current_codec_sum = dec_out.get("codec_sum")
-        full_codec_step = dec_out.get("full_codec")
+        codec_sum_step = dec_out["codec_sum"]
+        if pad_embed_ref is not None:
+            current_codec_sum = (codec_sum_step.float() + pad_embed).to(codec_sum_step.dtype)
+        else:
+            current_codec_sum = codec_sum_step
+        full_codec_step = dec_out["full_codec"]
+        step_logits = dec_out["logits"]
+        if step_logits.dtype == torch.bfloat16:
+            step_logits_f = step_logits.float()
+        else:
+            step_logits_f = step_logits.float()
 
         kv_tensors = []
-        for li in range(num_layers):
-            kv_tensors.append(dec_out[f"present_kv_{li}_k"])
-            kv_tensors.append(dec_out[f"present_kv_{li}_v"])
+        for i in range(num_layers):
+            kv_tensors.append(dec_out[f"present_kv_{i}_k"])
+            kv_tensors.append(dec_out[f"present_kv_{i}_v"])
 
         current_pos += 1
 
-        if full_codec_step is not None and step + 1 < all_codec_tokens.shape[0]:
-            trt_token = int(full_codec_step[0, 0].item())
-            ref_token = int(all_codec_tokens[step + 1, 0])
-            if trt_token == ref_token:
-                token_matches += 1
-            total_compare += 1
+        ref_step_logits = step_talker_logits[step]
+        if ref_step_logits.ndim == 3:
+            ref_step_logits = ref_step_logits[:, -1, :]
+        cos_s = cosine_sim(step_logits_f.cpu().numpy(), ref_step_logits)
+        step_cosines.append(cos_s)
+
+        trt_token_0 = int(full_codec_step[0, 0].item())
+        ref_token_0 = int(step_output_codec_token_0_ref[step])
+        if trt_token_0 == ref_token_0:
+            token_matches += 1
+        ref_full = all_codec_tokens[step]
+        trt_full = full_codec_step[0].cpu().numpy().astype(np.int64)
+        if trt_full.shape[0] >= ref_full.shape[0] and np.all(trt_full[: ref_full.shape[0]] == ref_full):
+            full_codec_matches += 1
+        if trt_eos_step < 0 and trt_token_0 == codec_eos_id:
+            trt_eos_step = step
+
+        if (step + 1) % 50 == 0 or step == 0:
+            logger.info(
+                f"  step {step}: token_0 TRT={trt_token_0} ref={ref_token_0} match={trt_token_0 == ref_token_0} cos={cos_s:.4f}"
+            )
 
     gen_time = time.time() - t1
+    total_compare = n_steps
     match_rate = token_matches / total_compare if total_compare > 0 else 0
-    report["talker_token_match_rate"] = match_rate
+    full_match_rate = full_codec_matches / total_compare if total_compare > 0 else 0
+    report["codec_token_0_match_rate"] = match_rate
+    report["full_codec_match_rate"] = full_match_rate
+    report["step_logits_cosines"] = step_cosines
+    report["trt_eos_step"] = trt_eos_step
     report["decode_time_s"] = gen_time
     report["steps_per_second"] = n_steps / gen_time if gen_time > 0 else 0
-    logger.info(f"  Decode: {n_steps} steps in {gen_time:.3f}s ({report['steps_per_second']:.1f} steps/s)")
-    logger.info(f"  Token match: {token_matches}/{total_compare} = {match_rate:.1%}")
 
-    # ── Summary ──
-    prefill_ok = report.get("prefill_cosine") is None or report["prefill_cosine"] > 0.9
-    talker_ok = report.get("talker_token_match_rate") is None or report["talker_token_match_rate"] >= 0
-    report["status"] = "pass" if (prefill_ok and talker_ok) else "fail"
+    logger.info(
+        f"  Decode: {n_steps} steps in {gen_time:.3f}s ({report['steps_per_second']:.1f} steps/s)"
+    )
+    logger.info(f"  codec_token_0 match: {token_matches}/{total_compare} = {match_rate:.1%}")
+    logger.info(f"  full_codec match: {full_codec_matches}/{total_compare} = {full_match_rate:.1%}")
+    logger.info(f"  EOS: ref_step={ref_eos_step}, trt_step={trt_eos_step}")
+
+    min_cos = min(step_cosines) if step_cosines else 0
+    prefill_ok = report["prefill_logits_cosine"] is None or report["prefill_logits_cosine"] > 0.9
+    token_ok = report["codec_token_0_match_rate"] is not None and report["codec_token_0_match_rate"] >= 0
+    report["status"] = "pass" if (prefill_ok and token_ok) else "fail"
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  E2E TRT SUMMARY (Pure TRT)")
+    logger.info("  E2E TRT SUMMARY (talker_unified)")
     logger.info("=" * 60)
-    logger.info(f"  Prefill cosine:     {report.get('prefill_cosine', 'N/A')}")
-    logger.info(f"  Token match rate:   {report.get('talker_token_match_rate', 'N/A')}")
-    logger.info(f"  Decode speed:       {report.get('steps_per_second', 'N/A'):.1f} steps/s")
-    logger.info(f"  Status:             {report['status']}")
+    logger.info(f"  Prefill logits cosine: {report.get('prefill_logits_cosine', 'N/A')}")
+    logger.info(f"  codec_token_0 match rate: {report.get('codec_token_0_match_rate', 'N/A')}")
+    logger.info(f"  full_codec match rate: {report.get('full_codec_match_rate', 'N/A')}")
+    logger.info(f"  Min step logits cosine: {min_cos:.4f}")
+    logger.info(f"  EOS ref_step / trt_step: {ref_eos_step} / {trt_eos_step}")
+    logger.info(f"  Decode speed: {report.get('steps_per_second', 'N/A'):.1f} steps/s")
+    logger.info(f"  Status: {report['status']}")
 
     out_path = model_dir / "e2e_trt_report.json"
     with open(out_path, "w") as f:

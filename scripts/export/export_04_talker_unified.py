@@ -103,6 +103,9 @@ class TalkerUnifiedONNX(nn.Module):
         device = input_embeds.device
         dtype = input_embeds.dtype
         n = self.num_layers
+        # Accept (B, 3, S) from Triton (batch at dim 0) and convert to (3, B, S) for RoPE
+        if position_ids.dim() == 3 and position_ids.size(0) != 3:
+            position_ids = position_ids.permute(1, 0, 2)  # (B, 3, S) -> (3, B, S)
         past_list = [
             (past_key_values[2 * i], past_key_values[2 * i + 1])
             for i in range(n)
@@ -224,8 +227,9 @@ def _export_talker_unified_onnx(
     # Trace with S>1 and S_past>0 to cover both prefill- and decode-like paths.
     B, S, S_past = 1, 8, 4
     dummy_embeds = torch.randn(B, S, hidden_size, device=device, dtype=ONNX_EXPORT_DTYPE)
+    # Export with (B, 3, S) so Triton batch dim matches input_embeds
     position_ids = torch.arange(S_past, S_past + S, device=device, dtype=torch.long)
-    position_ids = position_ids.unsqueeze(0).unsqueeze(0).expand(3, B, S)
+    position_ids = position_ids.unsqueeze(0).unsqueeze(0).expand(B, 3, S)
 
     past_list = []
     for _ in range(num_layers):
@@ -266,7 +270,7 @@ def _export_talker_unified_onnx(
 
     dynamic_axes = {
         "input_embeds": {0: "batch", 1: "seq"},
-        "position_ids": {0: "three", 1: "batch", 2: "seq"},
+        "position_ids": {0: "batch", 1: "three", 2: "seq"},
         "codec_sum": {0: "batch"},
         "full_codec": {0: "batch"},
         "hidden": {0: "batch", 1: "seq"},
