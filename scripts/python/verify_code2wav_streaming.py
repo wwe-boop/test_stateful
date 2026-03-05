@@ -151,6 +151,13 @@ def compare_wav(
     return ok
 
 
+def _trim_at_eos(codes: np.ndarray, eos_step: int) -> np.ndarray:
+    """Trim codec sequence to frames before EOS (exclude EOS frame)."""
+    if eos_step >= 0:
+        return codes[:eos_step]
+    return codes
+
+
 def get_codes_from_tts(
     model_path: Path,
     text: str,
@@ -158,7 +165,9 @@ def get_codes_from_tts(
     device: torch.device,
     variant: str = "design-1.7b",
 ) -> tuple:
-    """Run manual decode loop to get codec sequence [T, 16]. Returns (codes np.ndarray, sample_rate)."""
+    """Run manual decode loop to get codec sequence [T, 16].
+    Returns (codes np.ndarray, sample_rate, eos_step, gold_wav_np_or_None).
+    gold_wav is decoded by the TTS model's own speech_tokenizer as ground truth."""
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel as TTSModelWrapper
     from verify_prototype_parity import run_manual_decode_loop
     from official_prefill import build_prefill_like_official
@@ -171,8 +180,9 @@ def get_codes_from_tts(
     non_streaming = "design" in variant.lower()
     codec_eos_id = int(model.config.talker_config.codec_eos_token_id)
 
-    # Tokenize like prototype
-    tok_out = processor(text=text, return_tensors="pt")
+    # Must wrap text with assistant format, matching official generate_voice_design / generate_custom_voice
+    formatted_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+    tok_out = processor(text=formatted_text, return_tensors="pt")
     input_ids = tok_out["input_ids"].to(device=device, dtype=torch.long)
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
@@ -186,11 +196,29 @@ def get_codes_from_tts(
         pad_embed = model.talker.text_projection(
             model.talker.model.text_embedding(pad_id)
         )
-    codes_manual, _, _ = run_manual_decode_loop(
+    codes_manual, _, eos_step = run_manual_decode_loop(
         model, prefill_embeds, trailing_list, pad_embed,
         max_steps, codec_eos_id, device,
     )
-    return codes_manual, 24000
+
+    # Produce gold-standard WAV using the TTS model's own speech_tokenizer
+    gold_wav_np = None
+    speech_tok = getattr(model, "speech_tokenizer", None)
+    if speech_tok is None:
+        speech_tok = getattr(wrapper, "speech_tokenizer", None)
+    if speech_tok is not None:
+        trimmed = codes_manual[:eos_step] if eos_step >= 0 else codes_manual
+        trimmed = np.clip(trimmed, 0, 2047).astype(np.int64)
+        codes_for_dec = torch.from_numpy(trimmed).long().to(device)
+        try:
+            wavs_gold, sr_gold = speech_tok.decode([{"audio_codes": codes_for_dec}])
+            gold_wav_np = wavs_gold[0] if isinstance(wavs_gold[0], np.ndarray) else wavs_gold[0].cpu().numpy()
+            logger.info("Gold decode (TTS model's speech_tokenizer): %d samples (%.2f s)",
+                        len(gold_wav_np), len(gold_wav_np) / sr_gold)
+        except Exception as e:
+            logger.warning("Gold decode failed: %s", e)
+
+    return codes_manual, 24000, eos_step, gold_wav_np
 
 
 def main():
@@ -252,11 +280,19 @@ def main():
             logger.error("No weights for variant %s at %s", args.variant, model_path)
             sys.exit(1)
         logger.info("E2E: getting codes from TTS (variant=%s, max_steps=%s) ...", args.variant, args.max_steps)
-        codes_np, sr = get_codes_from_tts(
+        codes_np, sr, eos_step, gold_wav_np = get_codes_from_tts(
             model_path, args.text, args.max_steps, device, args.variant
         )
+        # Trim at EOS so we only decode real speech frames (post-EOS steps produce noise)
+        codes_np = _trim_at_eos(codes_np, eos_step)
+        if codes_np.size == 0:
+            logger.error("No frames after trim (eos_step=%s). Increase --max-steps or check TTS.", eos_step)
+            sys.exit(1)
         T = codes_np.shape[0]
-        logger.info("Got codes shape %s (%d frames)", codes_np.shape, T)
+        logger.info("Got codes shape %s (%d frames after trim at EOS step %s)", codes_np.shape, T, eos_step)
+        # Clamp to valid codebook indices [0, codebook_size-1] as in generate_audio_compare
+        codebook_size = 2048
+        codes_np = np.clip(codes_np, 0, codebook_size - 1).astype(np.int64)
         codes_t = torch.from_numpy(codes_np).long().to(device)
         if codes_t.dim() == 2:
             codes_t = codes_t.unsqueeze(0).permute(0, 2, 1)
@@ -306,15 +342,32 @@ def main():
                     f.setframerate(sr)
                     f.writeframes(wav_int16.tobytes())
 
+        # Diagnostic: audio statistics
+        logger.info("wav_ref stats: min=%.4f max=%.4f mean=%.6f std=%.6f",
+                     wav_ref_np.min(), wav_ref_np.max(), wav_ref_np.mean(), wav_ref_np.std())
+
         _write_wav(out_dir / "code2wav_ref_one_shot.wav", wav_ref_np, 24000)
         _write_wav(out_dir / "code2wav_streaming.wav", wav_stream_np, 24000)
         logger.info("Saved code2wav_ref_one_shot.wav and code2wav_streaming.wav in %s", out_dir)
-        # Also decode with prototype tokenizer.decode() for listening comparison
-        wavs_proto, sr_proto = tokenizer_model.decode([{"audio_codes": codes_t.permute(0, 2, 1)}])
-        wav_proto_np = wavs_proto[0] if isinstance(wavs_proto[0], np.ndarray) else wavs_proto[0].cpu().numpy()
+
+        # Gold reference from TTS model's own speech_tokenizer (known-good decode path)
+        if gold_wav_np is not None:
+            _write_wav(out_dir / "code2wav_gold_tts_tokenizer.wav", gold_wav_np, 24000)
+            logger.info("Saved code2wav_gold_tts_tokenizer.wav (TTS model's own speech_tokenizer)")
+            logger.info("gold_wav stats: min=%.4f max=%.4f mean=%.6f std=%.6f",
+                         gold_wav_np.min(), gold_wav_np.max(), gold_wav_np.mean(), gold_wav_np.std())
+            min_len = min(len(wav_ref_np), len(gold_wav_np))
+            diff = np.abs(wav_ref_np[:min_len].astype(np.float64) - gold_wav_np[:min_len].astype(np.float64))
+            logger.info("one-shot vs gold: max_diff=%.4e mean_diff=%.4e (len ref=%d gold=%d)",
+                         diff.max(), diff.mean(), len(wav_ref_np), len(gold_wav_np))
+
+        # Also decode with prototype tokenizer_model.decode() for comparison
+        out = tokenizer_model.decode(codes_t.permute(0, 2, 1), return_dict=False)
+        wavs_proto = out[0]
+        sr_proto = getattr(tokenizer_model, "output_sample_rate", 24000)
+        wav_proto_np = wavs_proto[0] if isinstance(wavs_proto[0], np.ndarray) else wavs_proto[0].detach().cpu().numpy()
         _write_wav(out_dir / "code2wav_prototype_decode.wav", wav_proto_np, int(sr_proto))
-        logger.info("Saved code2wav_prototype_decode.wav (prototype tokenizer.decode)")
-        # Compare prototype decode vs one-shot (they may differ slightly due to chunked_decode context)
+        logger.info("Saved code2wav_prototype_decode.wav (tokenizer_model.decode)")
         compare_wav(wav_ref_np, wav_proto_np[: wav_ref_np.shape[0]], "prototype_decode")
 
     logger.info("Done. Streaming vs one-shot: %s", "PASS" if ok else "FAIL")
