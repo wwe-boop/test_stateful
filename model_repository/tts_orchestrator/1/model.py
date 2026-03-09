@@ -4,7 +4,7 @@ TTS Orchestrator — Triton Python BLS Backend.
 Unified pipeline (same BLS for ONNX and TensorRT backends):
   1. Session init (Speaker Encoder / Speech Tokenizer via BLS)
   2. Prefill construction (in-process torch embedding; no BLS for embedders)
-  3. BLS talker_unified: prefill (past_kv dummy S_past=1) → codec_sum, full_codec, logits, KV
+  3. BLS talker_unified: prefill (past_kv empty S_past=0) → codec_sum, full_codec, logits, KV
   4. Decode loop: BLS talker_unified(next_embed, position_id, KV) → codec_sum, full_codec, logits, updated KV
   5. Code2Wav (BLS) for chunked audio
 
@@ -55,6 +55,11 @@ _CODE2WAV_STATE_SHAPES = [
 CODE2WAV_CHUNK_T = 4
 SAMPLES_PER_CODEC_FRAME = 1920
 
+_MODEL_TYPE_ALLOWED_TASKS = {
+    "base": {"voice_clone_icl", "voice_clone_xvec"},
+    "custom_voice": {"custom_voice"},
+    "voice_design": {"voice_design"},
+}
 
 class TritonPythonModel:
 
@@ -89,6 +94,7 @@ class TritonPythonModel:
 
         logger.info(f"Loading weights from {weights_dir} ...")
         self.weights = EmbeddingWeights(weights_dir, device_id=self.device_id)
+        self._tts_model_type = self.weights.config.get("tts_model_type", "unknown")
         self.num_layers = int(self.weights.config.get("talker_num_layers", 28))
         self.kv_heads = int(self.weights.config.get("talker_num_kv_heads", 8))
         talker_h = int(self.weights.config.get("talker_hidden_size", 2048))
@@ -156,9 +162,18 @@ class TritonPythonModel:
         if not (text or "").strip():
             raise ValueError("Request field 'text' is required and must be non-empty")
         try:
-            self._parse_task_type(task_type_str, req.get("x_vector_only", False))
+            task_type = self._parse_task_type(task_type_str, req.get("x_vector_only", False))
         except ValueError as e:
             raise ValueError(f"Invalid task_type or parameters: {e}") from e
+            
+        allowed = _MODEL_TYPE_ALLOWED_TASKS.get(self._tts_model_type, set())
+        if task_type.value not in allowed:
+            raise ValueError(
+                f"This instance (variant={self.variant}, type={self._tts_model_type}) "
+                f"does not support task_type '{task_type.value}'. "
+                f"Supported: {sorted(allowed)}"
+            )
+            
         if task_type_str and task_type_str.startswith("voice_clone"):
             ref_audio = req.get("ref_audio")
             if not ref_audio or not (ref_audio if isinstance(ref_audio, str) else "").strip():
@@ -168,6 +183,22 @@ class TritonPythonModel:
         req_tensor = pb_utils.get_input_tensor_by_name(request, "request")
         req_json = req_tensor.as_numpy()[0].decode("utf-8")
         req = json.loads(req_json)
+
+        if req.get("action") == "capabilities":
+            caps = {
+                "variant": self.variant,
+                "tts_model_type": self._tts_model_type,
+                "tts_model_size": self.weights.config.get("tts_model_size"),
+                "supported_task_types": sorted(
+                    _MODEL_TYPE_ALLOWED_TASKS.get(self._tts_model_type, set())
+                ),
+                "supported_languages": sorted(self.weights.codec_language_id.keys()),
+                "supported_speakers": sorted(self.weights.spk_id_map.keys()),
+                "max_decode_steps": self.max_steps,
+                "engine_backend": self._talker_backend,
+            }
+            self._send_capabilities(response_sender, caps)
+            return
 
         self._validate_request(req)
 
@@ -224,7 +255,7 @@ class TritonPythonModel:
         position_ids_1d = torch.arange(S, device=self.device, dtype=torch.int64)
         position_ids = position_ids_1d.reshape(1, 1, -1).expand(B, 3, S)
 
-        # Prefill: unified talker (past_kv dummy S_past=1)
+        # Prefill: unified talker (past_kv empty S_past=0)
         t0 = time.perf_counter()
         codec_sum, full_codec, logits, kv_tensors = self._bls_talker(
             inputs_embeds, position_ids
@@ -302,7 +333,7 @@ class TritonPythonModel:
         position_ids: torch.Tensor,
         past_kv_tensors: list = None,
     ):
-        """Unified BLS call to talker_unified. past_kv_tensors=None → prefill (dummy S_past=1). Zero-copy via DLPack."""
+        """Unified BLS call to talker_unified. past_kv_tensors=None → prefill (empty S_past=0). Zero-copy via DLPack."""
         # TRT: BF16; ONNX: FP32 (set in initialize from talker_unified config.pbtxt)
         inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
@@ -313,16 +344,16 @@ class TritonPythonModel:
         if past_kv_tensors is None:
             B = input_embeds.shape[0]
             for i in range(self.num_layers):
-                dummy_k = torch.zeros(
-                    B, self.kv_heads, 1, self.head_dim,
+                empty_k = torch.empty(
+                    B, self.kv_heads, 0, self.head_dim,
                     dtype=self._talker_dtype, device=self.device,
                 )
-                dummy_v = torch.zeros(
-                    B, self.kv_heads, 1, self.head_dim,
+                empty_v = torch.empty(
+                    B, self.kv_heads, 0, self.head_dim,
                     dtype=self._talker_dtype, device=self.device,
                 )
-                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", dummy_k))
-                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", dummy_v))
+                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", empty_k))
+                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", empty_v))
         else:
             for i in range(self.num_layers):
                 k = past_kv_tensors[2 * i].contiguous().to(self._talker_dtype)
@@ -543,6 +574,25 @@ class TritonPythonModel:
         response = pb_utils.InferenceResponse(
             output_tensors=[audio_tensor, final_tensor])
         response_sender.send(response)
+
+    def _send_capabilities(self, response_sender, caps: dict):
+        caps_json = json.dumps(caps)
+        # We must return audio_chunk (TYPE_FP32) and is_final (TYPE_BOOL) as defined in config.pbtxt
+        # We can embed the JSON string in an error message, or we can add a new output tensor.
+        # Since we cannot easily change the output signature dynamically, we will return it as an error message
+        # with a special prefix, or we can just return it as a TritonError.
+        # A cleaner way is to return it as a TritonError so the client can parse it.
+        response = pb_utils.InferenceResponse(
+            output_tensors=[
+                pb_utils.Tensor("audio_chunk", np.zeros(1, dtype=np.float32)),
+                pb_utils.Tensor("is_final", np.array([True], dtype=bool)),
+            ],
+            error=pb_utils.TritonError(f"CAPABILITIES:{caps_json}"),
+        )
+        try:
+            response_sender.send(response)
+        except Exception:
+            pass
 
     def _send_error(self, response_sender, error_msg: str):
         audio = np.zeros(1, dtype=np.float32)

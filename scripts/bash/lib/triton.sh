@@ -153,21 +153,6 @@ assemble_model_repo() {
         log_warn "  speech_tokenizer_encoder: SKIPPED (${engine_mode} file not found — only needed for ICL mode)"
     fi
 
-    # ── 2b. Text/Codec Embedders (optional — orchestrator uses in-process torch; skip unless BLS fallback needed) ──
-    local te_src ce_src
-    if te_src="$(_resolve_model_src "$variant_dir/text_embedder")"; then
-        _place_model "text_embedder" "$te_src"
-        log_info "  text_embedder: OK (BLS fallback)"
-    else
-        log_info "  text_embedder: SKIPPED (embedding in-process in orchestrator)"
-    fi
-    if ce_src="$(_resolve_model_src "$variant_dir/codec_embedder")"; then
-        _place_model "codec_embedder" "$ce_src"
-        log_info "  codec_embedder: OK (BLS fallback)"
-    else
-        log_info "  codec_embedder: SKIPPED (embedding in-process in orchestrator)"
-    fi
-
     # ── 3. Talker Unified (required; single engine for prefill + decode) ──
     local talker_src
     if talker_src="$(_resolve_model_src "$variant_dir/talker_unified")"; then
@@ -182,13 +167,29 @@ assemble_model_repo() {
     fi
 
     # ── 4. Code2Wav Decoder (required; stateful streaming chunk_T=4) ──
+    # Force ONNX backend for code2wav: TRT auto-complete cannot handle the mixed
+    # batching (cache_position has no batch dim while all other tensors do).
+    # TODO: once export adds batch dim to cache_position, remove this override.
+    local c2w_engine_mode="$engine_mode"
+    if [ "$engine_mode" = "trt" ] && [ -f "$tokenizer_dir/code2wav_decoder.onnx" ]; then
+        c2w_engine_mode="onnx"
+        log_info "  code2wav: using ONNX backend (TRT has mixed-batch conflict on cache_position)"
+    fi
     local c2w_src
-    if c2w_src="$(_resolve_model_src "$tokenizer_dir/code2wav_decoder")"; then
-        _place_model "code2wav" "$c2w_src"
-        _write_code2wav_streaming_config "$repo_dir/code2wav" "$engine_mode"
+    local c2w_ext; [ "$c2w_engine_mode" = "trt" ] && c2w_ext=".engine" || c2w_ext=".onnx"
+    if [ -f "$tokenizer_dir/code2wav_decoder${c2w_ext}" ]; then
+        c2w_src="$tokenizer_dir/code2wav_decoder${c2w_ext}"
+        local c2w_model_dir="$repo_dir/code2wav/1"
+        mkdir -p "$c2w_model_dir"
+        if [ "$c2w_engine_mode" = "trt" ]; then
+            _link_or_copy "$c2w_src" "$c2w_model_dir/model.plan"
+        else
+            _link_or_copy "$c2w_src" "$c2w_model_dir/model.onnx"
+        fi
+        _write_code2wav_streaming_config "$repo_dir/code2wav" "$c2w_engine_mode"
         log_info "  code2wav: OK (streaming chunk_T=4)"
     else
-        log_error "  code2wav: MISSING ${engine_mode} file (required). Run Phase A/B first."
+        log_error "  code2wav: MISSING ${c2w_engine_mode} file (required). Run Phase A/B first."
         return 1
     fi
 
@@ -356,6 +357,17 @@ triton_run() {
 
     repo_dir="$(cd "$repo_dir" && pwd)"
 
+    # If container name is default, try to append variant name to it
+    if [ "$container_name" = "qwen3-tts-triton" ]; then
+        local config_file="$repo_dir/tts_orchestrator/config.pbtxt"
+        if [ -f "$config_file" ]; then
+            local var_val=$(grep -A 1 'key: "model_variant"' "$config_file" | grep 'string_value' | cut -d'"' -f2 || true)
+            if [ -n "$var_val" ]; then
+                container_name="qwen3-tts-triton-${var_val}"
+            fi
+        fi
+    fi
+
     # Stop existing container if running
     if docker ps -q --filter "name=$container_name" | grep -q .; then
         log_warn "Stopping existing container: $container_name"
@@ -370,10 +382,23 @@ triton_run() {
     log_info "  Ports:      gRPC=$TRITON_GRPC_PORT HTTP=$TRITON_HTTP_PORT metrics=$TRITON_METRICS_PORT"
 
     local gpu_device="${TRITON_GPU_DEVICE:-0}"
+    local variant_label=""
+    local type_label=""
+    
+    # Try to extract variant from config.pbtxt if available
+    local config_file="$repo_dir/tts_orchestrator/config.pbtxt"
+    if [ -f "$config_file" ]; then
+        local var_val=$(grep -A 1 'key: "model_variant"' "$config_file" | grep 'string_value' | cut -d'"' -f2 || true)
+        local type_val=$(grep -A 1 'key: "tts_model_type"' "$config_file" | grep 'string_value' | cut -d'"' -f2 || true)
+        if [ -n "$var_val" ]; then variant_label="--label tts.variant=${var_val}"; fi
+        if [ -n "$type_val" ]; then type_label="--label tts.model_type=${type_val}"; fi
+    fi
+
     docker run -d --gpus "\"device=${gpu_device}\"" \
         --name "$container_name" \
         --shm-size=1g \
         --ulimit memlock=-1 \
+        $variant_label $type_label \
         -p "${TRITON_HTTP_PORT}:8000" \
         -p "${TRITON_GRPC_PORT}:8001" \
         -p "${TRITON_METRICS_PORT}:8002" \
@@ -567,25 +592,41 @@ _write_code2wav_streaming_config() {
     local model_dir="$1"
     local engine_mode="$2"
     local backend="onnxruntime"
-    local float_type="TYPE_FP32"
-    [ "$engine_mode" = "trt" ] && backend="tensorrt" && float_type="TYPE_BF16"
+    [ "$engine_mode" = "trt" ] && backend="tensorrt"
 
     local config_file="$model_dir/config.pbtxt"
-    cat > "$config_file" << EOF
+
+    if [ "$engine_mode" = "onnx" ]; then
+        # ONNX mode: minimal config — let ORT auto-complete shapes from the model.
+        # The streaming code2wav ONNX has mixed dynamic/fixed dims that are hard to
+        # hand-write correctly; ORT reads them from the graph.
+        cat > "$config_file" << EOF
 name: "code2wav"
-backend: "${backend}"
+backend: "onnxruntime"
+max_batch_size: 0
+
+instance_group [
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+EOF
+    else
+        # TRT mode: explicit shapes (engine profiles define valid ranges).
+        local float_type="TYPE_BF16"
+        cat > "$config_file" << EOF
+name: "code2wav"
+backend: "tensorrt"
 max_batch_size: 0
 
 input [
   { name: "codes"  data_type: TYPE_INT64  dims: [ -1, 16, 4 ] }
 ]
 input [
-  { name: "cache_position"  data_type: TYPE_INT64  dims: [ 4 ] }
+  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 4 ] }
 ]
 EOF
-    local i
-    for i in 0 1 2 3 4 5 6 7; do
-        cat >> "$config_file" << EOF
+        local i
+        for i in 0 1 2 3 4 5 6 7; do
+            cat >> "$config_file" << EOF
 input [
   { name: "past_kv_${i}_k"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
 ]
@@ -593,40 +634,38 @@ input [
   { name: "past_kv_${i}_v"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
 ]
 EOF
-    done
-    # Conv states: 0 [B,512,2]; 1,2,3 [B,1024,6]; 4-6 [B,768,6|18|54]; 7-9 [B,384,...]; 10-12 [B,192,...]; 13-15 [B,96,...]; 16 [B,96,6]
-    local conv_specs="conv_state_0:-1:512:2 conv_state_1:-1:1024:6 conv_state_2:-1:1024:6 conv_state_3:-1:1024:6"
-    conv_specs="$conv_specs conv_state_4:-1:768:6 conv_state_5:-1:768:18 conv_state_6:-1:768:54"
-    conv_specs="$conv_specs conv_state_7:-1:384:6 conv_state_8:-1:384:18 conv_state_9:-1:384:54"
-    conv_specs="$conv_specs conv_state_10:-1:192:6 conv_state_11:-1:192:18 conv_state_12:-1:192:54"
-    conv_specs="$conv_specs conv_state_13:-1:96:6 conv_state_14:-1:96:18 conv_state_15:-1:96:54 conv_state_16:-1:96:6"
-    for spec in $conv_specs; do
-        local name="${spec%%:*}" rest="${spec#*:}"
-        local dims="${rest//:/, }"
-        cat >> "$config_file" << EOF
+        done
+        local conv_specs="conv_state_0:-1:512:2 conv_state_1:-1:1024:6 conv_state_2:-1:1024:6 conv_state_3:-1:1024:6"
+        conv_specs="$conv_specs conv_state_4:-1:768:6 conv_state_5:-1:768:18 conv_state_6:-1:768:54"
+        conv_specs="$conv_specs conv_state_7:-1:384:6 conv_state_8:-1:384:18 conv_state_9:-1:384:54"
+        conv_specs="$conv_specs conv_state_10:-1:192:6 conv_state_11:-1:192:18 conv_state_12:-1:192:54"
+        conv_specs="$conv_specs conv_state_13:-1:96:6 conv_state_14:-1:96:18 conv_state_15:-1:96:54 conv_state_16:-1:96:6"
+        for spec in $conv_specs; do
+            local name="${spec%%:*}" rest="${spec#*:}"
+            local dims="${rest//:/, }"
+            cat >> "$config_file" << EOF
 input [
   { name: "${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
 ]
 EOF
-    done
-    local tc_specs="transconv_overlap_0:-1:768:8 transconv_overlap_1:-1:384:5 transconv_overlap_2:-1:192:4 transconv_overlap_3:-1:96:3"
-    for spec in $tc_specs; do
-        local name="${spec%%:*}" rest="${spec#*:}"
-        local dims="${rest//:/, }"
-        cat >> "$config_file" << EOF
+        done
+        local tc_specs="transconv_overlap_0:-1:768:8 transconv_overlap_1:-1:384:5 transconv_overlap_2:-1:192:4 transconv_overlap_3:-1:96:3"
+        for spec in $tc_specs; do
+            local name="${spec%%:*}" rest="${spec#*:}"
+            local dims="${rest//:/, }"
+            cat >> "$config_file" << EOF
 input [
   { name: "${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
 ]
 EOF
-    done
-    # Outputs
-    cat >> "$config_file" << EOF
+        done
+        cat >> "$config_file" << EOF
 output [
-  { name: "wav"  data_type: ${float_type}  dims: [ -1, 7680 ] }
+  { name: "wav"  data_type: ${float_type}  dims: [ -1, 1, 7680 ] }
 ]
 EOF
-    for i in 0 1 2 3 4 5 6 7; do
-        cat >> "$config_file" << EOF
+        for i in 0 1 2 3 4 5 6 7; do
+            cat >> "$config_file" << EOF
 output [
   { name: "present_kv_${i}_k"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
 ]
@@ -634,31 +673,31 @@ output [
   { name: "present_kv_${i}_v"  data_type: ${float_type}  dims: [ -1, 16, -1, 64 ] }
 ]
 EOF
-    done
-    for spec in $conv_specs; do
-        local name="${spec%%:*}" rest="${spec#*:}"
-        local dims="${rest//:/, }"
-        local out_name="new_${name}"
-        cat >> "$config_file" << EOF
-output [
-  { name: "${out_name}"  data_type: ${float_type}  dims: [ ${dims} ] }
-]
-EOF
-    done
-    for spec in $tc_specs; do
-        local name="${spec%%:*}" rest="${spec#*:}"
-        local dims="${rest//:/, }"
-        cat >> "$config_file" << EOF
+        done
+        for spec in $conv_specs; do
+            local name="${spec%%:*}" rest="${spec#*:}"
+            local dims="${rest//:/, }"
+            cat >> "$config_file" << EOF
 output [
   { name: "new_${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
 ]
 EOF
-    done
-    cat >> "$config_file" << EOF
+        done
+        for spec in $tc_specs; do
+            local name="${spec%%:*}" rest="${spec#*:}"
+            local dims="${rest//:/, }"
+            cat >> "$config_file" << EOF
+output [
+  { name: "new_${name}"  data_type: ${float_type}  dims: [ ${dims} ] }
+]
+EOF
+        done
+        cat >> "$config_file" << EOF
 instance_group [
   { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
 ]
 EOF
+    fi
     log_info "    + code2wav config.pbtxt (streaming chunk_T=4, 39 inputs, 38 outputs)"
 }
 
@@ -783,6 +822,14 @@ _write_orchestrator_config() {
     local model_dir="$1"
     local variant="$2"
 
+    local tts_model_type="unknown"
+    local supported_tasks="unknown"
+    case "$variant" in
+        base-*)   tts_model_type="base";         supported_tasks="voice_clone_icl,voice_clone_xvec" ;;
+        custom-*) tts_model_type="custom_voice"; supported_tasks="custom_voice" ;;
+        design-*) tts_model_type="voice_design"; supported_tasks="voice_design" ;;
+    esac
+
     cat > "$model_dir/config.pbtxt" << EOF
 name: "tts_orchestrator"
 backend: "python"
@@ -824,6 +871,14 @@ instance_group [
 parameters: {
   key: "model_variant"
   value: { string_value: "${variant}" }
+}
+parameters: {
+  key: "tts_model_type"
+  value: { string_value: "${tts_model_type}" }
+}
+parameters: {
+  key: "supported_task_types"
+  value: { string_value: "${supported_tasks}" }
 }
 parameters: {
   key: "weights_dir"
