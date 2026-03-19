@@ -688,7 +688,8 @@ _apply_flash_attn_downgrade() {
 
 # ---------------------------------------------------------------------------
 #  _write_decision <plan_file> <check_name> <decision>
-#  Appends user decision to the plan JSON's user_decisions block.
+#  Sets or updates user decision in the plan JSON's user_decisions block.
+#  If the key already exists, only its value is updated (no duplicate keys).
 # ---------------------------------------------------------------------------
 _write_decision() {
     local file="$1" check="$2" decision="$3"
@@ -696,8 +697,13 @@ _write_decision() {
     if grep -q '"user_decisions": {}' "$file"; then
         sed -i 's/"user_decisions": {}/"user_decisions": { "'"$check"'": "'"$decision"'" }/' "$file"
     elif grep -q '"user_decisions":' "$file"; then
-        # Add to existing decisions (before closing brace)
-        sed -i '/"user_decisions":/,/}/ s/}$/, "'"$check"'": "'"$decision"'" }/' "$file"
+        # If this check key already exists, update its value only (avoid duplicate keys)
+        if awk '/"user_decisions":/,/}/' "$file" | grep -q '"'"$check"'":'; then
+            sed -i '/"user_decisions":/,/}/ s/"'"$check"'": "[^"]*"/"'"$check"'": "'"$decision"'"/' "$file"
+        else
+            # Add new key before closing brace
+            sed -i '/"user_decisions":/,/}/ s/}$/, "'"$check"'": "'"$decision"'" }/' "$file"
+        fi
     fi
     log_info "Decision recorded: $check = $decision"
 }

@@ -235,13 +235,44 @@ cmd_pull() {
 cmd_run() {
     resolve_variant
 
-    # Assemble if needed
+    # Assemble if needed, or re-assemble if source engines are newer than assembled files
+    local need_assemble=false
     if [ ! -d "$MODEL_REPO_DIR" ] || [ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]; then
-        log_info "Model repository not found, assembling (engine_mode=$ENGINE_MODE) ..."
+        need_assemble=true
+        log_info "Model repository not found, will assemble (engine_mode=$ENGINE_MODE) ..."
+    else
+        local stale=false
+        local ext; [ "$ENGINE_MODE" = "trt" ] && ext="engine" || ext="onnx"
+        for src_engine in "$EXPORTED_DIR/$VARIANT"/*."$ext" "$EXPORTED_DIR/tokenizer"/*."$ext"; do
+            [ -f "$src_engine" ] || continue
+            local base_name
+            base_name=$(basename "$src_engine" ".$ext")
+            local repo_name="$base_name"
+            [ "$repo_name" = "code2wav_decoder" ] && repo_name="code2wav"
+            local target; [ "$ENGINE_MODE" = "trt" ] && target="model.plan" || target="model.onnx"
+            local dst="$MODEL_REPO_DIR/$repo_name/1/$target"
+            if [ ! -f "$dst" ] || [ ! -s "$dst" ] || [ "$src_engine" -nt "$dst" ]; then
+                stale=true
+                break
+            fi
+        done
+        # Also re-assemble when orchestrator Python source (e.g. model.py) is newer
+        local orch_src="$REPO_ROOT/model_repository/tts_orchestrator/1/model.py"
+        local orch_dst="$MODEL_REPO_DIR/tts_orchestrator/1/model.py"
+        if [ -f "$orch_src" ] && [ -f "$orch_dst" ] && [ "$orch_src" -nt "$orch_dst" ]; then
+            stale=true
+            log_warn "Orchestrator Python source (model.py) is newer than assembled copy"
+        fi
+        if $stale; then
+            need_assemble=true
+            log_warn "Model repository is stale (source engines or orchestrator newer), re-assembling ..."
+        else
+            log_info "Using existing model repository: $MODEL_REPO_DIR"
+        fi
+    fi
+    if $need_assemble; then
         assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
             || { log_error "Assembly failed"; exit 1; }
-    else
-        log_info "Using existing model repository: $MODEL_REPO_DIR"
     fi
 
     validate_model_repo "$MODEL_REPO_DIR" || exit 1

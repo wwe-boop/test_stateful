@@ -36,7 +36,7 @@
 #    Phase B (forwarded to build_engines.sh):
 #      --max-batch-size <N>  TRT max batch (default: 8)
 #      --image <uri>         Override NGC container image
-#      --dtype <type>        Engine precision (default: bfloat16)
+#      --dtype <type>        Engine precision: bf16|fp16|fp32 (default: bf16)
 #
 #    Phase C (forwarded to build_triton.sh):
 #      --grpc-port <port>    gRPC port (default: 8001)
@@ -123,7 +123,8 @@ Phase A options (forwarded to setup_env.sh):
 Phase B options (forwarded to build_engines.sh):
   --max-batch-size <N>    Max batch size (default: 8)
   --image <uri>           Override NGC container image
-  --dtype <type>          Engine precision (default: bfloat16)
+  --dtype <type>          Engine precision: bf16|fp16|fp32 (default: bf16)
+                          Use fp32 if Triton reports dtype mismatch (e.g. TYPE_FP32 vs TYPE_BF16).
 
 Phase C options (forwarded to build_triton.sh):
   --grpc-port <port>      gRPC port (default: 8001)
@@ -134,7 +135,9 @@ Examples:
   autorun.sh base-1.7b                # full pipeline for base-1.7b
   autorun.sh all -m custom-1.7b       # full pipeline for custom-1.7b
   autorun.sh setup --skip-export      # Phase A without export
-  autorun.sh build --dtype float16    # Phase B with fp16
+  autorun.sh custom-1.7b --dtype fp32 # Full pipeline, FP32 engines (fixes dtype mismatch)
+  autorun.sh build -m custom-1.7b --dtype fp32    # Phase B with fp32
+  autorun.sh build -m custom-1.7b --dtype fp16    # Phase B with fp16
   autorun.sh build --target-driver 575.57   # build for production driver
   autorun.sh deploy                   # Phase C (start Triton)
   autorun.sh status                   # show pipeline status
@@ -259,7 +262,7 @@ build_forward_args() {
 # ── Phase runners ──
 
 run_phase_a() {
-    log_step "Phase A: Environment Setup & Model Export"
+    log_step "阶段 A: 环境配置与模型导出"
     echo ""
 
     if $DRY_RUN; then
@@ -269,14 +272,14 @@ run_phase_a() {
     fi
 
     bash "${SCRIPT_DIR}/setup_env.sh" || {
-        log_error "Phase A failed."
-        log_info  "Fix the issue and re-run: bash scripts/bash/autorun.sh setup"
+        log_error "Phase A 失败。"
+        log_info  "请修正问题后重新执行: bash scripts/bash/autorun.sh setup"
         return 1
     }
 }
 
 run_phase_b() {
-    log_step "Phase B: TensorRT Engine Build (trtexec)"
+    log_step "阶段 B: TensorRT 引擎编译 (trtexec)"
     echo ""
 
     if $DRY_RUN; then
@@ -285,14 +288,14 @@ run_phase_b() {
     fi
 
     bash "${SCRIPT_DIR}/build_engines.sh" "${BUILD_ARGS[@]}" || {
-        log_error "Phase B failed."
-        log_info  "Fix the issue and re-run: bash scripts/bash/autorun.sh build"
+        log_error "Phase B 失败。"
+        log_info  "请修正问题后重新执行: bash scripts/bash/autorun.sh build"
         return 1
     }
 }
 
 run_phase_c() {
-    log_step "Phase C: Triton Deployment"
+    log_step "阶段 C: Triton 部署"
     echo ""
 
     if $DRY_RUN; then
@@ -301,8 +304,8 @@ run_phase_c() {
     fi
 
     bash "${SCRIPT_DIR}/build_triton.sh" run "${DEPLOY_ARGS[@]}" || {
-        log_error "Phase C failed."
-        log_info  "Fix the issue and re-run: bash scripts/bash/autorun.sh deploy"
+        log_error "Phase C 失败。"
+        log_info  "请修正问题后重新执行: bash scripts/bash/autorun.sh deploy"
         return 1
     }
 }
@@ -310,7 +313,7 @@ run_phase_c() {
 # ── Command handlers ──
 
 cmd_all() {
-    show_run_banner "Full Pipeline" "A → B → C"
+    show_run_banner "完整流程" "A → B → C"
 
     run_phase_a || exit 1
     echo ""
@@ -319,22 +322,22 @@ cmd_all() {
     run_phase_c || exit 1
 
     echo ""
-    echo -e "${_CLR_GREEN}All phases complete! Triton server is running.${_CLR_RESET}"
+    echo -e "${_CLR_GREEN}全部阶段完成！Triton 服务已运行。${_CLR_RESET}"
     echo ""
 }
 
 cmd_setup() {
-    show_run_banner "Phase A" "Environment + Export"
+    show_run_banner "阶段 A" "环境 + 导出"
     run_phase_a || exit 1
 }
 
 cmd_build() {
-    show_run_banner "Phase B" "TensorRT Engines"
+    show_run_banner "阶段 B" "TensorRT 引擎"
     run_phase_b || exit 1
 }
 
 cmd_deploy() {
-    show_run_banner "Phase C" "Triton Deploy"
+    show_run_banner "阶段 C" "Triton 部署"
     run_phase_c || exit 1
 }
 
@@ -363,10 +366,11 @@ show_run_banner() {
     echo -e "${_CLR_BLUE}║     Qwen3-TTS Triton — ${phase_name}${_CLR_RESET}"
     echo -e "${_CLR_BLUE}╚══════════════════════════════════════════════════════════╝${_CLR_RESET}"
     echo ""
-    echo "  Mode:      $description"
-    [ -n "$VARIANT" ] && echo "  Variant:   $VARIANT"
-    [ -n "$TARGET_DRIVER" ] && echo "  Target:    driver $TARGET_DRIVER (production override)"
-    $DRY_RUN && echo "  Dry run:   yes"
+    echo "  模式:      $description"
+    [ -n "$VARIANT" ] && echo "  变体:      $VARIANT"
+    [ -n "$ENGINE_DTYPE" ] && echo "  精度:      $ENGINE_DTYPE"
+    [ -n "$TARGET_DRIVER" ] && echo "  目标驱动:  $TARGET_DRIVER"
+    $DRY_RUN && echo "  预演:      是"
     echo ""
 }
 
@@ -379,27 +383,28 @@ interactive_mode() {
     local resume_point
     resume_point=$(detect_resume_point "$REPO_ROOT" "")
 
-    echo "  What would you like to do?"
+    echo "  要执行什么操作？"
     echo ""
-    echo "  [1] Full pipeline  (setup → build → deploy)"
-    echo "  [2] Setup environment  (Phase A)"
-    echo "  [3] Build engines  (Phase B)"
-    echo "  [4] Deploy Triton  (Phase C)"
+    echo "  [1] 完整流程  (setup → build → deploy)"
+    echo "  [2] 环境配置  (阶段 A)"
+    echo "  [3] 构建引擎  (阶段 B)"
+    echo "  [4] 部署 Triton  (阶段 C)"
 
     if [ "$resume_point" != "setup" ] && [ "$resume_point" != "done" ]; then
-        echo "  [5] Resume from: $resume_point"
+        echo "  [5] 从 $resume_point 恢复"
     fi
 
-    echo "  [6] Show detailed status"
-    echo "  [q] Quit"
+    echo "  [6] 查看详细状态"
+    echo "  [q] 退出"
     echo ""
 
     local choice
     if [ ! -t 0 ]; then
-        log_info "Non-interactive mode, defaulting to full pipeline"
+        log_info "非交互模式，默认执行完整流程"
         choice="1"
     else
-        read -rp "  Enter choice [1-6/q]: " choice
+        read -rp "  请选择 [1-6/q] (默认: 1, 30s 后自动执行完整流程): " -t 30 choice || true
+        choice="${choice:-1}"
     fi
 
     # Ask for variant if not already set
@@ -408,6 +413,22 @@ interactive_mode() {
         VARIANT=$(select_model_variant)
         VARIANT="${VARIANT:-base-1.7b}"
         export MODEL_VARIANT="$VARIANT"
+    fi
+
+    # Ask for engine dtype when Phase B will run (choices 1, 3, or 5→build)
+    local needs_build=false
+    case "${choice:-1}" in
+        1) needs_build=true ;;
+        3) needs_build=true ;;
+        5) [[ "$resume_point" == "build" ]] && needs_build=true ;;
+    esac
+    if $needs_build && [ -z "$ENGINE_DTYPE" ] && [ -t 0 ]; then
+        echo ""
+        echo "  引擎精度 (阶段 B): bf16 | fp16 | fp32 (默认: bf16)"
+        read -rp "  精度 [bf16] (30s 后自动选择默认): " -t 30 _dtyp || true
+        if [ -n "$_dtyp" ]; then
+            ENGINE_DTYPE="$_dtyp"
+        fi
     fi
 
     build_forward_args
@@ -428,11 +449,11 @@ interactive_mode() {
             print_status_summary "$REPO_ROOT" "$VARIANT"
             ;;
         q|Q)
-            echo "  Bye."
+            echo "  已退出。"
             exit 0
             ;;
         *)
-            log_error "Invalid choice: $choice"
+            log_error "无效选择: $choice"
             exit 1
             ;;
     esac

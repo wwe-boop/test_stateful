@@ -88,8 +88,14 @@ assemble_model_repo() {
 
     local variant_dir="$exported_dir/$variant"
     local tokenizer_dir="$exported_dir/tokenizer"
+    # Read engine dtype from build_engines.sh output; default bf16
+    local engine_dtype="bf16"
+    if [ -f "$exported_dir/.engine_dtype" ]; then
+        engine_dtype=$(cat "$exported_dir/.engine_dtype" 2>/dev/null | tr -d '\n' || echo "bf16")
+    fi
+    engine_dtype="${engine_dtype:-bf16}"
 
-    log_step "Assembling Triton model repository (engine_mode=$engine_mode)"
+    log_step "Assembling Triton model repository (engine_mode=$engine_mode, dtype=$engine_dtype)"
     log_info "  Variant:    $variant"
     log_info "  Source:     $variant_dir"
     log_info "  Repository: $repo_dir"
@@ -158,7 +164,7 @@ assemble_model_repo() {
     if talker_src="$(_resolve_model_src "$variant_dir/talker_unified")"; then
         _place_model "talker_unified" "$talker_src"
         if [ "$engine_mode" = "trt" ]; then
-            _write_talker_unified_bf16_config "$repo_dir/talker_unified" "$variant_dir"
+            _write_talker_unified_trt_config "$repo_dir/talker_unified" "$variant_dir" "$engine_dtype"
         fi
         log_info "  talker_unified: OK"
     else
@@ -167,29 +173,13 @@ assemble_model_repo() {
     fi
 
     # ── 4. Code2Wav Decoder (required; stateful streaming chunk_T=4) ──
-    # Force ONNX backend for code2wav: TRT auto-complete cannot handle the mixed
-    # batching (cache_position has no batch dim while all other tensors do).
-    # TODO: once export adds batch dim to cache_position, remove this override.
-    local c2w_engine_mode="$engine_mode"
-    if [ "$engine_mode" = "trt" ] && [ -f "$tokenizer_dir/code2wav_decoder.onnx" ]; then
-        c2w_engine_mode="onnx"
-        log_info "  code2wav: using ONNX backend (TRT has mixed-batch conflict on cache_position)"
-    fi
     local c2w_src
-    local c2w_ext; [ "$c2w_engine_mode" = "trt" ] && c2w_ext=".engine" || c2w_ext=".onnx"
-    if [ -f "$tokenizer_dir/code2wav_decoder${c2w_ext}" ]; then
-        c2w_src="$tokenizer_dir/code2wav_decoder${c2w_ext}"
-        local c2w_model_dir="$repo_dir/code2wav/1"
-        mkdir -p "$c2w_model_dir"
-        if [ "$c2w_engine_mode" = "trt" ]; then
-            _link_or_copy "$c2w_src" "$c2w_model_dir/model.plan"
-        else
-            _link_or_copy "$c2w_src" "$c2w_model_dir/model.onnx"
-        fi
-        _write_code2wav_streaming_config "$repo_dir/code2wav" "$c2w_engine_mode"
+    if c2w_src="$(_resolve_model_src "$tokenizer_dir/code2wav_decoder")"; then
+        _place_model "code2wav" "$c2w_src"
+        _write_code2wav_streaming_config "$repo_dir/code2wav" "$engine_mode" "$engine_dtype"
         log_info "  code2wav: OK (streaming chunk_T=4)"
     else
-        log_error "  code2wav: MISSING ${c2w_engine_mode} file (required). Run Phase A/B first."
+        log_error "  code2wav: MISSING ${engine_mode} file (required). Run Phase A/B first."
         return 1
     fi
 
@@ -368,11 +358,11 @@ triton_run() {
         fi
     fi
 
-    # Stop existing container if running
-    if docker ps -q --filter "name=$container_name" | grep -q .; then
-        log_warn "Stopping existing container: $container_name"
-        docker stop "$container_name" &>/dev/null || true
-        docker rm "$container_name" &>/dev/null || true
+    # Remove existing container (running or exited) so we can start fresh
+    if docker ps -aq --filter "name=^${container_name}$" 2>/dev/null | grep -q . || \
+       docker ps -aq --filter "name=$container_name" 2>/dev/null | grep -q .; then
+        log_warn "Removing existing container: $container_name"
+        docker rm -f "$container_name" &>/dev/null || true
     fi
 
     log_step "Starting Triton Inference Server"
@@ -394,11 +384,18 @@ triton_run() {
         if [ -n "$type_val" ]; then type_label="--label tts.model_type=${type_val}"; fi
     fi
 
+    # When code2wav uses TensorRT (BF16), pass override so orchestrator sends correct dtype
+    local code2wav_bf16_env=""
+    if [ -f "$repo_dir/code2wav/config.pbtxt" ] && grep -q "tensorrt" "$repo_dir/code2wav/config.pbtxt" 2>/dev/null; then
+        code2wav_bf16_env="-e OVERRIDE_CODE2WAV_BF16=1"
+    fi
+
     docker run -d --gpus "\"device=${gpu_device}\"" \
         --name "$container_name" \
         --shm-size=1g \
         --ulimit memlock=-1 \
         $variant_label $type_label \
+        $code2wav_bf16_env \
         -p "${TRITON_HTTP_PORT}:8000" \
         -p "${TRITON_GRPC_PORT}:8001" \
         -p "${TRITON_METRICS_PORT}:8002" \
@@ -409,6 +406,7 @@ triton_run() {
             --model-repository=/models \
             --log-verbose=1 \
             --strict-model-config=false \
+            --disable-auto-complete-config \
         || { log_error "Failed to start Triton container"; return 1; }
 
     log_info "Container started: $container_name"
@@ -449,13 +447,13 @@ triton_health_check() {
 triton_stop() {
     local container_name="${1:-qwen3-tts-triton}"
 
-    if docker ps -q --filter "name=$container_name" | grep -q .; then
-        log_info "Stopping Triton container: $container_name"
-        docker stop "$container_name" &>/dev/null
-        docker rm "$container_name" &>/dev/null
-        log_info "Container stopped and removed: $container_name"
+    # Remove container whether running or exited (docker rm -f stops + removes)
+    if docker ps -aq --filter "name=$container_name" 2>/dev/null | grep -q .; then
+        log_info "Stopping and removing Triton container: $container_name"
+        docker rm -f "$container_name" 2>/dev/null || true
+        log_info "Container removed: $container_name"
     else
-        log_info "Container not running: $container_name"
+        log_info "Container not found: $container_name"
     fi
 }
 
@@ -506,22 +504,31 @@ instance_group [
 EOF
 }
 
-# _write_talker_unified_bf16_config <model_dir> <variant_dir>
-# Full config for talker_unified TRT engine (BF16 I/O, 58 inputs, 60 outputs).
+# _write_talker_unified_trt_config <model_dir> <variant_dir> [engine_dtype]
+# Full config for talker_unified TRT engine (58 inputs, 60 outputs).
+# I/O dtype from engine_dtype (bf16|fp16|fp32; default bf16).
 # Uses explicit min dims (1,1,1) for dynamic axes so Triton TRT backend can bind;
 # engine was built with min/opt/max profiles, runtime shapes within profile are valid.
 # Reads dimensions from <variant_dir>/weights/config.json.
-_write_talker_unified_bf16_config() {
+_write_talker_unified_trt_config() {
     local model_dir="$1"
     local variant_dir="$2"
+    local engine_dtype="${3:-bf16}"
+    local float_type
+    float_type=$(_to_triton_dtype "$engine_dtype")
     local cfg="$variant_dir/weights/config.json"
     local H=2048 KV_HEADS=8 HEAD_DIM=128 NUM_LAYERS=28 V=3072
     if [ -f "$cfg" ]; then
-        H=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_hidden_size', 2048))")
-        KV_HEADS=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_num_kv_heads', 8))")
-        NUM_LAYERS=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_num_layers', 28))")
-        V=$(python3 -c "import json; c=json.load(open('$cfg')); print(c.get('talker_vocab_size', 3072))")
-        HEAD_DIM=$(( H / 16 ))
+        read -r H KV_HEADS HEAD_DIM NUM_LAYERS V <<< "$(python3 -c "
+import json
+c = json.load(open('$cfg'))
+h = c.get('talker_hidden_size', 2048)
+kv = c.get('talker_num_kv_heads', 8)
+hd = c.get('talker_head_dim', h // c.get('talker_num_heads', 16))
+nl = c.get('talker_num_layers', 28)
+v = c.get('talker_vocab_size', 3072)
+print(h, kv, hd, nl, v)
+")"
     fi
     local config_file="$model_dir/config.pbtxt"
     # ONNX export: input_embeds [B,S,H], position_ids [B,3,S], past_kv [B,KV,Spast,HD]
@@ -532,7 +539,7 @@ backend: "tensorrt"
 max_batch_size: 0
 
 input [
-  { name: "input_embeds"  data_type: TYPE_BF16  dims: [ -1, -1, $H ] }
+  { name: "input_embeds"  data_type: ${float_type}  dims: [ -1, -1, $H ] }
 ]
 input [
   { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1 ] }
@@ -542,10 +549,10 @@ EOF
     while [ "$i" -lt "$NUM_LAYERS" ]; do
         cat >> "$config_file" << EOF
 input [
-  { name: "past_kv_${i}_k"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+  { name: "past_kv_${i}_k"  data_type: ${float_type}  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
 ]
 input [
-  { name: "past_kv_${i}_v"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+  { name: "past_kv_${i}_v"  data_type: ${float_type}  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
 ]
 EOF
         i=$((i + 1))
@@ -553,26 +560,26 @@ EOF
     # Outputs: batch dim is dynamic (-1), seq dim is dynamic where applicable.
     cat >> "$config_file" << EOF
 output [
-  { name: "codec_sum"  data_type: TYPE_BF16  dims: [ -1, 1, $H ] }
+  { name: "codec_sum"  data_type: ${float_type}  dims: [ -1, 1, $H ] }
 ]
 output [
   { name: "full_codec"  data_type: TYPE_INT64  dims: [ -1, 16 ] }
 ]
 output [
-  { name: "hidden"  data_type: TYPE_BF16  dims: [ -1, -1, $H ] }
+  { name: "hidden"  data_type: ${float_type}  dims: [ -1, -1, $H ] }
 ]
 output [
-  { name: "logits"  data_type: TYPE_BF16  dims: [ -1, -1, $V ] }
+  { name: "logits"  data_type: ${float_type}  dims: [ -1, -1, $V ] }
 ]
 EOF
     i=0
     while [ "$i" -lt "$NUM_LAYERS" ]; do
         cat >> "$config_file" << EOF
 output [
-  { name: "present_kv_${i}_k"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+  { name: "present_kv_${i}_k"  data_type: ${float_type}  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
 ]
 output [
-  { name: "present_kv_${i}_v"  data_type: TYPE_BF16  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
+  { name: "present_kv_${i}_v"  data_type: ${float_type}  dims: [ -1, $KV_HEADS, -1, $HEAD_DIM ] }
 ]
 EOF
         i=$((i + 1))
@@ -582,15 +589,17 @@ instance_group [
   { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
 ]
 EOF
-    log_info "    + talker_unified config.pbtxt (BF16 I/O, ${NUM_LAYERS} layers, min-shape for TRT load)"
+    log_info "    + talker_unified config.pbtxt (${float_type} I/O, ${NUM_LAYERS} layers, min-shape for TRT load)"
 }
 
-# _write_code2wav_streaming_config <model_dir> <engine_mode>
+# _write_code2wav_streaming_config <model_dir> <engine_mode> [engine_dtype]
 # Stateful code2wav: 39 inputs (codes, cache_position, 16 KV, 17 conv states, 4 transconv overlaps),
 # 38 outputs (wav, 16 present_kv, 17 new_conv_state, 4 new_transconv_overlap). chunk_T=4 fixed.
+# When engine_mode=trt, engine_dtype (bf16|fp16|fp32) sets float tensor types in config.
 _write_code2wav_streaming_config() {
     local model_dir="$1"
     local engine_mode="$2"
+    local engine_dtype="${3:-bf16}"
     local backend="onnxruntime"
     [ "$engine_mode" = "trt" ] && backend="tensorrt"
 
@@ -611,7 +620,8 @@ instance_group [
 EOF
     else
         # TRT mode: explicit shapes (engine profiles define valid ranges).
-        local float_type="TYPE_BF16"
+        local float_type
+        float_type=$(_to_triton_dtype "$engine_dtype")
         cat > "$config_file" << EOF
 name: "code2wav"
 backend: "tensorrt"

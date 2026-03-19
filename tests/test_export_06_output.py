@@ -20,21 +20,12 @@ def _variant_weights_dir(variant: str = "base-1.7b"):
     return EXPORTED / variant / "weights"
 
 
-def _variant_dir(variant: str = "base-1.7b"):
-    return EXPORTED / variant
-
-
 @pytest.fixture(scope="module")
 def weights_dir():
     d = _variant_weights_dir()
     if not d.is_dir():
         pytest.skip(f"Export output not found: {d} (run export_06_embeddings.py first)")
     return d
-
-
-@pytest.fixture(scope="module")
-def variant_dir():
-    return _variant_dir()
 
 
 def test_legacy_pt_files_exist(weights_dir):
@@ -80,22 +71,6 @@ def test_config_has_hidden_act(weights_dir):
     assert cfg["hidden_act"] in ("silu", "gelu", "quick_gelu"), (
         f"Unexpected hidden_act: {cfg['hidden_act']}"
     )
-
-
-def test_onnx_text_embedder_exists(variant_dir):
-    """New ONNX: text_embedder.onnx in variant dir."""
-    p = variant_dir / "text_embedder.onnx"
-    if not p.is_file():
-        pytest.skip(f"text_embedder.onnx not found (export_06 writes it to variant dir)")
-    assert p.stat().st_size > 0
-
-
-def test_onnx_codec_embedder_exists(variant_dir):
-    """New ONNX: codec_embedder.onnx in variant dir."""
-    p = variant_dir / "codec_embedder.onnx"
-    if not p.is_file():
-        pytest.skip(f"codec_embedder.onnx not found")
-    assert p.stat().st_size > 0
 
 
 def test_code_predictor_lm_heads_optional(weights_dir):

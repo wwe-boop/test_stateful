@@ -7,9 +7,8 @@
 #  (tritonserver:xx.yy-py3, trtexec at /usr/src/tensorrt/bin/trtexec).
 #
 #  Builds: talker_unified.engine (single engine for prefill+decode, per variant),
-#  plus text_embedder.engine, codec_embedder.engine, speaker_encoder.engine,
-#  speech_tokenizer_encoder.engine, code2wav_decoder.engine
-#  (shared or per-variant as per Phase A layout).
+#  plus speaker_encoder.engine, speech_tokenizer_encoder.engine,
+#  code2wav_decoder.engine (shared or per-variant as per Phase A layout).
 #
 #  Prerequisites:
 #    - NVIDIA GPU with driver >= 550.54
@@ -25,10 +24,10 @@
 #
 #  Environment variables:
 #    NGC_IMAGE        Docker image override (default: auto-detect from driver)
-#    MAX_BATCH_SIZE   Max batch (default: 16)
-#    MAX_INPUT_LEN    Prefill len (default: 512)
-#    MAX_SEQ_LEN      Total seq len (default: 1024)
-#    ENGINE_DTYPE     bfloat16|float16 (default: bfloat16)
+#    MAX_BATCH_SIZE   Max batch (default: 32)
+#    MAX_INPUT_LEN    Prefill len (default: 128)
+#    MAX_SEQ_LEN      Total seq len (default: 512)
+#    ENGINE_DTYPE     bfloat16|float16|float32|fp8 (default: bfloat16)
 #
 #  Output: workspace/exported/<variant>/*.engine, workspace/exported/tokenizer/*.engine
 # ===========================================================================
@@ -43,9 +42,9 @@ source "${SCRIPT_DIR}/tools.sh"
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 
 # ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=1024, batch=16) ──
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-16}"
-MAX_INPUT_LEN="${MAX_INPUT_LEN:-512}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-1024}"
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-32}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-128}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}" # 512/128 for 30.72s, 1024/256 for 61.44s 
 ENGINE_DTYPE="${ENGINE_DTYPE:-bfloat16}"
 
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
@@ -55,6 +54,38 @@ DRY_RUN=false
 PULL_ONLY=false
 USER_IMAGE="${NGC_IMAGE:-}"
 TARGET_DRIVER="${TARGET_DRIVER:-}"
+
+# Normalize ENGINE_DTYPE: bf16|fp16|fp32|fp8
+ENGINE_DTYPE="${ENGINE_DTYPE,,}"
+case "$ENGINE_DTYPE" in
+    bf16|bfloat16) ENGINE_DTYPE="bf16" ;;
+    fp16|float16)  ENGINE_DTYPE="fp16" ;;
+    fp32|float32)  ENGINE_DTYPE="fp32" ;;
+    fp8|float8)    ENGINE_DTYPE="fp8" ;;
+    *) log_error "Unknown ENGINE_DTYPE: $ENGINE_DTYPE (use bf16|fp16|fp32|fp8)"; exit 1 ;;
+esac
+
+# _trtexec_precision_flags: echo trtexec precision flags for current ENGINE_DTYPE
+_trtexec_precision_flags() {
+    case "$ENGINE_DTYPE" in
+        bf16) echo "--bf16" ;;
+        fp16) echo "--fp16" ;;
+        fp32) echo "" ;;
+        fp8)  echo "--fp8" ;;
+        *)    echo "" ;;
+    esac
+}
+
+# _trtexec_io_format: echo IO format string for float tensors (e.g. bf16:chw)
+_trtexec_io_format() {
+    case "$ENGINE_DTYPE" in
+        bf16) echo "bf16:chw" ;;
+        fp16) echo "fp16:chw" ;;
+        fp32) echo "fp32:chw" ;;
+        fp8)  echo "fp8:chw" ;;
+        *)    echo "fp32:chw" ;;
+    esac
+}
 
 # Talker dimensions for trtexec. Read from model config.json, else fallback.
 # Output: H num_kv_heads head_dim num_layers
@@ -94,7 +125,7 @@ print(h, nkv, head_dim, nlayers)
 }
 
 # Build single Talker unified TRT engine (prefill + decode) from ONNX via trtexec.
-# S_past min=1: prefill passes dummy past_kv; decode uses real KV cache.
+# S_past min=0: prefill passes empty past_kv; decode uses real KV cache.
 build_talker_unified_trt() {
     local variant="$1"
     local variant_dir="$EXPORTED_DIR/$variant"
@@ -122,37 +153,41 @@ build_talker_unified_trt() {
     # Single engine: min/opt/max for input_embeds, position_ids, and all past_kv_{i}_k/v
     # All tensors sharing the "batch" dim must have the same batch value per profile.
     # ONNX export shape: input_embeds [B,S,H], position_ids [B,3,S] (dim1=3 is the three token-type streams)
-    # min: batch=1, S=1, S_past=1 (dummy); opt: batch=1, S=1, S_past=128 (decode hot path); max: batch=B, S=512, S_past=4096
+    # min: batch=1, S=1, S_past=0 (prefill, no history); opt: batch=1, S=1, S_past=128 (decode hot path); max: batch=B, S=512, S_past=4096
     local OPT_BATCH=1 OPT_S_PAST=128
     local unif_min="input_embeds:1x1x${H},position_ids:1x3x1"
     local unif_opt="input_embeds:${OPT_BATCH}x1x${H},position_ids:${OPT_BATCH}x3x1"
     local unif_max="input_embeds:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}x${H},position_ids:${MAX_BATCH_SIZE}x3x${MAX_INPUT_LEN}"
     local i=0
     while [ "$i" -lt "$NUM_LAYERS" ]; do
-        unif_min="$unif_min,past_kv_${i}_k:1x${KV_HEADS}x1x${HEAD_DIM},past_kv_${i}_v:1x${KV_HEADS}x1x${HEAD_DIM}"
+        unif_min="$unif_min,past_kv_${i}_k:1x${KV_HEADS}x0x${HEAD_DIM},past_kv_${i}_v:1x${KV_HEADS}x0x${HEAD_DIM}"
         unif_opt="$unif_opt,past_kv_${i}_k:${OPT_BATCH}x${KV_HEADS}x${OPT_S_PAST}x${HEAD_DIM},past_kv_${i}_v:${OPT_BATCH}x${KV_HEADS}x${OPT_S_PAST}x${HEAD_DIM}"
         unif_max="$unif_max,past_kv_${i}_k:${MAX_BATCH_SIZE}x${KV_HEADS}x${MAX_SEQ_LEN}x${HEAD_DIM},past_kv_${i}_v:${MAX_BATCH_SIZE}x${KV_HEADS}x${MAX_SEQ_LEN}x${HEAD_DIM}"
         i=$((i + 1))
     done
 
-    # BF16 I/O formats: input_embeds=bf16, position_ids=int64, all KV=bf16 (58 inputs, 60 outputs)
-    local io_in="bf16:chw,int64:chw"
-    local io_out="bf16:chw,int64:chw,bf16:chw,bf16:chw"
+    # I/O formats: input_embeds, position_ids=int64, all KV (58 inputs, 60 outputs)
+    local io_fmt
+    io_fmt=$(_trtexec_io_format)
+    local io_in="${io_fmt},int64:chw"
+    local io_out="${io_fmt},int64:chw,${io_fmt},${io_fmt}"
     i=0
     while [ "$i" -lt "$NUM_LAYERS" ]; do
-        io_in="$io_in,bf16:chw,bf16:chw"
-        io_out="$io_out,bf16:chw,bf16:chw"
+        io_in="$io_in,${io_fmt},${io_fmt}"
+        io_out="$io_out,${io_fmt},${io_fmt}"
         i=$((i + 1))
     done
 
-    log_info "Building talker_unified.engine (trtexec, BF16 I/O) ..."
+    local prec_flag
+    prec_flag=$(_trtexec_precision_flags)
+    log_info "Building talker_unified.engine (trtexec, ${ENGINE_DTYPE^^} I/O) ..."
     local unif_cmd=(
         docker run --rm --gpus all
         -v "$variant_dir:/mnt/model"
         "$NGC_IMAGE"
         $TRTEXEC --onnx=/mnt/model/talker_unified.onnx
         --saveEngine=/mnt/model/talker_unified.engine
-        --bf16
+        $prec_flag
         --memPoolSize=workspace:8192
         --minShapes="$unif_min"
         --optShapes="$unif_opt"
@@ -169,62 +204,14 @@ build_talker_unified_trt() {
     return 0
 }
 
-# Build peripheral TRT engines (text_embedder, codec_embedder, speaker_encoder, speech_tokenizer_encoder, code2wav_decoder)
+# Build peripheral TRT engines (speaker_encoder, speech_tokenizer_encoder, code2wav_decoder)
 build_peripheral_engines() {
     if $DRY_RUN; then
-        log_info "[DRY RUN] Would run trtexec for text_embedder, codec_embedder, speaker_encoder, speech_tokenizer_encoder, code2wav_decoder"
+        log_info "[DRY RUN] Would run trtexec for speaker_encoder, speech_tokenizer_encoder, code2wav_decoder"
         return 0
     fi
     local image="$1"
     local failed=0
-
-    # Text embedder: per-variant (Embedding + ResizeMLP, required for lightweight deploy)
-    for vdir in "$EXPORTED_DIR"/*/; do
-        [ -d "$vdir" ] || continue
-        local onnx="${vdir}text_embedder.onnx"
-        [ -f "$onnx" ] || continue
-        local variant_name
-        variant_name=$(basename "$vdir")
-        log_info "Building text_embedder.engine for $variant_name ..."
-        local te_cmd=(
-            docker run --rm --gpus all -v "$vdir:/mnt/model" "$image"
-            $TRTEXEC --onnx=/mnt/model/text_embedder.onnx
-            --saveEngine=/mnt/model/text_embedder.engine
-            --bf16
-            --minShapes=token_ids:1x1
-            --optShapes=token_ids:1x64
-            --maxShapes=token_ids:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}
-            --memPoolSize=workspace:4096
-        )
-        if [ -f "${onnx}.data" ]; then
-            log_info "  (has external data file)"
-        fi
-        if ! "${te_cmd[@]}"; then
-            log_error "text_embedder trtexec failed for $variant_name"
-            failed=$((failed + 1))
-        fi
-    done
-
-    # Codec embedder: per-variant (Embedding lookup, required for lightweight deploy)
-    for vdir in "$EXPORTED_DIR"/*/; do
-        [ -d "$vdir" ] || continue
-        local onnx="${vdir}codec_embedder.onnx"
-        [ -f "$onnx" ] || continue
-        local variant_name
-        variant_name=$(basename "$vdir")
-        log_info "Building codec_embedder.engine for $variant_name ..."
-        if ! docker run --rm --gpus all -v "$vdir:/mnt/model" "$image" \
-            $TRTEXEC --onnx=/mnt/model/codec_embedder.onnx \
-            --saveEngine=/mnt/model/codec_embedder.engine \
-            --bf16 \
-            --minShapes=codec_ids:1x1 \
-            --optShapes=codec_ids:1x8 \
-            --maxShapes=codec_ids:${MAX_BATCH_SIZE}x64 \
-            --memPoolSize=workspace:1024; then
-            log_error "codec_embedder trtexec failed for $variant_name"
-            failed=$((failed + 1))
-        fi
-    done
 
     # Speaker encoder: per-variant, only if ONNX exists (base variants)
     for vdir in "$EXPORTED_DIR"/*/; do
@@ -237,7 +224,9 @@ build_peripheral_engines() {
         if ! docker run --rm --gpus all -v "$vdir:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/speaker_encoder.onnx \
             --saveEngine=/mnt/model/speaker_encoder.engine \
-            --bf16 \
+            $(_trtexec_precision_flags) \
+            --inputIOFormats=$(_trtexec_io_format) \
+            --outputIOFormats=$(_trtexec_io_format) \
             --minShapes=mel:1x1x128 \
             --optShapes=mel:1x300x128 \
             --maxShapes=mel:${MAX_BATCH_SIZE}x1000x128 \
@@ -250,12 +239,13 @@ build_peripheral_engines() {
     # Speech tokenizer encoder (shared, in tokenizer dir)
     # Min waveform = 960 samples (1 codec frame at stride 8×6×5×4=960, 24kHz → 40ms).
     # Smaller values produce 0-length intermediates that TRT cannot handle.
+    # speech_tokenizer_encoder: output audio_codes is Int64 (discrete codes). Must NOT use
+    # --outputIOFormats/--bf16 which would override it. Use default fp32 for this small model.
     if [ -f "$TOKENIZER_DIR/speech_tokenizer_encoder.onnx" ]; then
         log_info "Building speech_tokenizer_encoder.engine ..."
         if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/speech_tokenizer_encoder.onnx \
             --saveEngine=/mnt/model/speech_tokenizer_encoder.engine \
-            --bf16 \
             --minShapes=waveform:1x1x960 \
             --optShapes=waveform:1x1x48000 \
             --maxShapes=waveform:1x1x480000 \
@@ -272,9 +262,9 @@ build_peripheral_engines() {
         log_info "Building code2wav_decoder.engine (streaming, chunk_T=4) ..."
         C2W_BATCH="${MAX_BATCH_SIZE:-8}"
         # Dynamic: codes (batch), cache_position fixed [4], past_kv_* (batch + past_len 0..72), conv/transconv states (batch)
-        C2W_MIN="codes:1x16x4,cache_position:4"
-        C2W_OPT="codes:1x16x4,cache_position:4"
-        C2W_MAX="codes:${C2W_BATCH}x16x4,cache_position:4"
+        C2W_MIN="codes:1x16x4,cache_position:1x4"
+        C2W_OPT="codes:1x16x4,cache_position:1x4"
+        C2W_MAX="codes:${C2W_BATCH}x16x4,cache_position:${C2W_BATCH}x4"
         for i in 0 1 2 3 4 5 6 7; do
             C2W_MIN="${C2W_MIN},past_kv_${i}_k:1x16x0x64,past_kv_${i}_v:1x16x0x64"
             C2W_OPT="${C2W_OPT},past_kv_${i}_k:1x16x4x64,past_kv_${i}_v:1x16x4x64"
@@ -291,10 +281,13 @@ build_peripheral_engines() {
             C2W_OPT="${C2W_OPT},${n}:${s}"
             C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
         done
+        # Force I/O type to match engine precision; Triton config must match.
         if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/code2wav_decoder.onnx \
             --saveEngine=/mnt/model/code2wav_decoder.engine \
-            --bf16 \
+            $(_trtexec_precision_flags) \
+            --inputIOFormats=$(_trtexec_io_format) \
+            --outputIOFormats=$(_trtexec_io_format) \
             --minShapes="$C2W_MIN" \
             --optShapes="$C2W_OPT" \
             --maxShapes="$C2W_MAX" \
@@ -421,6 +414,8 @@ log_info "  Succeeded: $SUCCEEDED (talker variants)"
 [ "$FAILED" -gt 0 ] && log_error "  Failed: $FAILED"
 
 if [ "$SUCCEEDED" -gt 0 ] && ! $DRY_RUN; then
+    echo "$ENGINE_DTYPE" > "$EXPORTED_DIR/.engine_dtype"
+    log_info "Saved ENGINE_DTYPE=$ENGINE_DTYPE to $EXPORTED_DIR/.engine_dtype"
     echo ""
     log_info "Engines: $EXPORTED_DIR/<variant>/*.engine, $TOKENIZER_DIR/*.engine"
     log_info "Next: bash scripts/bash/build_triton.sh assemble --engine-mode trt && build_triton.sh run"

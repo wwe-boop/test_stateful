@@ -3,7 +3,7 @@
 [Step 04 Unified] Export single Talker ONNX for both prefill and decode (unified engine).
 
 Single engine: input_embeds [B, S, H] + position_ids [3, B, S] + past_kv_* [B, kv, S_past, hd].
-- Prefill: S > 1, S_past = 1 (dummy) or 0; causal mask = standard upper-triangular over S_total.
+- Prefill: S > 1, S_past = 0 (empty KV); causal mask = standard upper-triangular over S.
 - Decode:  S = 1, S_past > 0; causal mask = zeros (attend all).
 
 Outputs: codec_sum, full_codec, hidden, logits, present_kv_{i}_k, present_kv_{i}_v.

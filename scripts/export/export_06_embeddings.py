@@ -2,13 +2,10 @@
 """
 [Step 06] Export Embedding weights for the TTS Orchestrator.
 
-Exports both .pt (legacy) and ONNX/npz for lightweight Triton deploy:
-  - text_embedder.onnx, codec_embedder.onnx (variant dir) — BLS sub-models, bf16-safe
-  - special_embeddings.npz, codec_embeddings_3d.npz (weights dir) — numpy for BLS
-
-Legacy .pt components (unchanged):
-  1. text_embedding.pt, text_projection.pt, codec_embeddings.pt, codec_embeddings_3d.pt
-  2. special_embeddings.pt, codec_head.pt, code_predictor_lm_heads.pt, config.json
+Exports .pt weights + numpy snapshots for in-process torch embedding in Orchestrator:
+  - .pt: text_embedding, text_projection, codec_embeddings, codec_embeddings_3d,
+         special_embeddings, codec_head, code_predictor_lm_heads, config.json
+  - .npz: special_embeddings.npz, codec_embeddings_3d.npz (lightweight numpy for BLS)
 
 Applies to: ALL variants
 """
@@ -35,16 +32,12 @@ from utils import (
     resolve_model_path,
     ensure_output_dir,
     load_tts_model,
-    export_onnx,
-    to_numpy,
-    verify_onnx,
     resolve_device,
     resolve_dtype,
     add_common_args,
     MODEL_VARIANTS,
     DEFAULT_DTYPE,
     DTYPE_NAMES,
-    ONNX_EXPORT_DTYPE,
 )
 
 logger = logging.getLogger("onnx_export")
@@ -53,29 +46,6 @@ logger = logging.getLogger("onnx_export")
 def _cast_state_dict(state_dict: dict, dtype: torch.dtype) -> dict:
     """Cast all float tensors in a state_dict to the target dtype."""
     return {k: v.to(dtype) if v.is_floating_point() else v for k, v in state_dict.items()}
-
-
-class _TextEmbedderONNX(nn.Module):
-    """Embedding + ResizeMLP for ONNX export: token_ids [B,S] -> [B,S,H]."""
-
-    def __init__(self, text_embedding: nn.Module, text_projection: nn.Module):
-        super().__init__()
-        self.text_embedding = text_embedding
-        self.text_projection = text_projection
-
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.text_projection(self.text_embedding(token_ids))
-
-
-class _CodecEmbedderONNX(nn.Module):
-    """Codec embedding lookup for ONNX export: codec_ids [B,S] -> [B,S,H]."""
-
-    def __init__(self, codec_embedding: nn.Module):
-        super().__init__()
-        self.codec_embedding = codec_embedding
-
-    def forward(self, codec_ids: torch.Tensor) -> torch.Tensor:
-        return self.codec_embedding(codec_ids)
 
 
 def export_embeddings(
@@ -144,7 +114,7 @@ def export_embeddings(
     path_3d_npz = out_dir / "codec_embeddings_3d.npz"
     np.savez_compressed(
         path_3d_npz,
-        data=stacked.float().cpu().numpy(),
+        data=stacked.float().detach().cpu().numpy(),
     )
     logger.info(f"  codec_embeddings_3d.npz: saved to {path_3d_npz}")
 
@@ -212,6 +182,10 @@ def export_embeddings(
         "talker_num_layers": talker.config.num_hidden_layers,
         "talker_num_heads": talker.config.num_attention_heads,
         "talker_num_kv_heads": talker.config.num_key_value_heads,
+        "talker_head_dim": getattr(
+            talker.config, "head_dim",
+            talker.config.hidden_size // talker.config.num_attention_heads,
+        ),
         "num_code_groups": talker.config.num_code_groups,
         "code_predictor_hidden_size": talker.config.code_predictor_config.hidden_size,
         "code_predictor_num_layers": talker.config.code_predictor_config.num_hidden_layers,
@@ -236,75 +210,6 @@ def export_embeddings(
     with open(path, "w") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     logger.info(f"  config.json: saved to {path}")
-
-    # --- Optional: ONNX sub-models for BLS fallback (orchestrator uses in-process torch by default) ---
-    variant_dir = out_dir.parent
-    _device = next(talker.parameters()).device
-
-    # 1. text_embedder.onnx
-    text_embedder_wrapper = _TextEmbedderONNX(
-        talker.model.text_embedding.to(_device),
-        talker.text_projection.to(_device),
-    ).eval()
-    dummy_token_ids = torch.randint(0, 1000, (1, 10), device=_device, dtype=torch.int64)
-    with torch.no_grad():
-        ref_text_emb = text_embedder_wrapper(dummy_token_ids)
-    text_embedder_onnx = str(variant_dir / "text_embedder.onnx")
-    export_onnx(
-        model=text_embedder_wrapper,
-        dummy_inputs=(dummy_token_ids,),
-        input_names=["token_ids"],
-        output_names=["embeddings"],
-        dynamic_axes={
-            "token_ids": {0: "batch", 1: "seq_len"},
-            "embeddings": {0: "batch", 1: "seq_len"},
-        },
-        onnx_path=text_embedder_onnx,
-        simplify=True,
-    )
-    test_inputs = {"token_ids": dummy_token_ids.cpu().numpy()}
-    torch_outputs = {"embeddings": to_numpy(ref_text_emb)}
-    try:
-        ok = verify_onnx(text_embedder_onnx, test_inputs, torch_outputs, atol=1e-4)
-        if ok:
-            logger.info("  text_embedder.onnx verification PASSED")
-        else:
-            logger.warning("  text_embedder.onnx verification FAILED")
-    except Exception as e:
-        logger.warning("  text_embedder.onnx verification skip: %s", e)
-    del text_embedder_wrapper, ref_text_emb, dummy_token_ids
-
-    # 2. codec_embedder.onnx
-    codec_embedder_wrapper = _CodecEmbedderONNX(
-        talker.model.codec_embedding.to(_device),
-    ).eval()
-    dummy_codec_ids = torch.randint(0, 100, (1, 5), device=_device, dtype=torch.int64)
-    with torch.no_grad():
-        ref_codec_emb = codec_embedder_wrapper(dummy_codec_ids)
-    codec_embedder_onnx = str(variant_dir / "codec_embedder.onnx")
-    export_onnx(
-        model=codec_embedder_wrapper,
-        dummy_inputs=(dummy_codec_ids,),
-        input_names=["codec_ids"],
-        output_names=["embeddings"],
-        dynamic_axes={
-            "codec_ids": {0: "batch", 1: "seq_len"},
-            "embeddings": {0: "batch", 1: "seq_len"},
-        },
-        onnx_path=codec_embedder_onnx,
-        simplify=True,
-    )
-    test_inputs_ce = {"codec_ids": dummy_codec_ids.cpu().numpy()}
-    torch_outputs_ce = {"embeddings": to_numpy(ref_codec_emb)}
-    try:
-        ok = verify_onnx(codec_embedder_onnx, test_inputs_ce, torch_outputs_ce, atol=1e-4)
-        if ok:
-            logger.info("  codec_embedder.onnx verification PASSED")
-        else:
-            logger.warning("  codec_embedder.onnx verification FAILED")
-    except Exception as e:
-        logger.warning("  codec_embedder.onnx verification skip: %s", e)
-    del codec_embedder_wrapper, ref_codec_emb, dummy_codec_ids
 
     del model
     if device != "cpu":

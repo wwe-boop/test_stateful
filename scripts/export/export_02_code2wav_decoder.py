@@ -60,9 +60,13 @@ def export_code2wav_decoder(
     wrapper = Code2WavStreamingWrapper(decoder).to(device).eval()
 
     B = 1
+    # Use past_kv_len > 0 for export so KV inputs survive ONNX trace & simplification.
+    # Zero-length tensors would be constant-folded away, removing KV inputs entirely.
+    EXPORT_PAST_LEN = CHUNK_T
     dummy_codes = torch.randint(0, 2048, (B, 16, CHUNK_T), device=device, dtype=torch.long)
-    cache_position = torch.arange(CHUNK_T, device=device, dtype=torch.long)
-    state_tensors = create_initial_states(decoder, device, torch.float32, batch_size=B)
+    cache_position = torch.arange(EXPORT_PAST_LEN, EXPORT_PAST_LEN + CHUNK_T, device=device, dtype=torch.long).unsqueeze(0)  # [1, CHUNK_T]
+    state_shapes = get_initial_state_shapes(decoder, batch_size=B, past_kv_len=EXPORT_PAST_LEN)
+    state_tensors = [torch.randn(s, device=device, dtype=torch.float32) for _, s in state_shapes]
 
     with torch.no_grad():
         out = wrapper(dummy_codes, cache_position, *state_tensors)
@@ -84,7 +88,7 @@ def export_code2wav_decoder(
 
     dynamic_axes = {
         "codes": {0: "batch"},
-        "cache_position": {},
+        "cache_position": {0: "batch"},
         "wav": {0: "batch"},
     }
     for i in range(8):
@@ -107,6 +111,7 @@ def export_code2wav_decoder(
         do_constant_folding=False,
     )
 
+    # Verify with the same non-zero-length KV states used for export
     cpu_codes = dummy_codes.cpu()
     cpu_cache_pos = cache_position.cpu()
     cpu_states = [s.cpu() for s in state_tensors]

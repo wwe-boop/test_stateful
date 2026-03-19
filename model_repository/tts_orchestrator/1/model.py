@@ -116,23 +116,47 @@ class TritonPythonModel:
 
         self.prefill_builder = PrefillBuilder(self.weights, self.tokenizer)
 
-        # Detect talker_unified backend: TRT (BF16) vs ONNX (FP32)
-        # position_ids is always [B, 3, S] for both backends (engine rebuilt with correct axis order)
+        # Detect talker_unified backend and dtype: TRT (bf16/fp16/fp32) vs ONNX (FP32)
         repo_root = Path(_MODEL_DIR).resolve().parent.parent
         talker_config = repo_root / "talker_unified" / "config.pbtxt"
         self._talker_backend = "onnxruntime"
+        self._talker_dtype = torch.float32
         if talker_config.exists():
             raw = talker_config.read_text()
             if "backend: \"tensorrt\"" in raw or 'backend: "tensorrt"' in raw:
                 self._talker_backend = "tensorrt"
-        self._talker_dtype = torch.bfloat16 if self._talker_backend == "tensorrt" else torch.float32
-        # Code2wav: same backend/dtype as talker (streaming model chunk_T=4, 39 inputs, 38 outputs)
+                # Infer TRT engine dtype from config (TYPE_BF16 / TYPE_FP16 / TYPE_FP32)
+                if "TYPE_BF16" in raw:
+                    self._talker_dtype = torch.bfloat16
+                elif "TYPE_FP16" in raw:
+                    self._talker_dtype = torch.float16
+                else:
+                    self._talker_dtype = torch.float32
+            else:
+                self._talker_dtype = torch.float32
+        # Code2wav: infer dtype from config (TYPE_BF16 / TYPE_FP16 / TYPE_FP32).
+        # TRT engine uses engine_dtype from .engine_dtype; ONNX uses FP32 from graph.
+        # Env OVERRIDE_CODE2WAV_BF16=1 forces BF16 when detection fails in Docker/etc.
         code2wav_config = repo_root / "code2wav" / "config.pbtxt"
         self._code2wav_dtype = torch.float32
-        if code2wav_config.exists():
+        if os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
+            self._code2wav_dtype = torch.bfloat16
+            logger.info("[TTS Orchestrator] code2wav_dtype=BF16 (OVERRIDE_CODE2WAV_BF16 env)")
+        elif code2wav_config.exists():
             raw = code2wav_config.read_text()
-            if "backend: \"tensorrt\"" in raw or 'backend: "tensorrt"' in raw:
+            if "TYPE_BF16" in raw:
                 self._code2wav_dtype = torch.bfloat16
+            elif "TYPE_FP16" in raw:
+                self._code2wav_dtype = torch.float16
+            elif "TYPE_FP32" in raw:
+                self._code2wav_dtype = torch.float32
+            elif "tensorrt" in raw.lower() and "backend" in raw:
+                # TRT config without explicit float type → assume same as talker
+                self._code2wav_dtype = self._talker_dtype
+            elif self._talker_backend == "tensorrt":
+                self._code2wav_dtype = self._talker_dtype
+        elif self._talker_backend == "tensorrt":
+            self._code2wav_dtype = self._talker_dtype
         logger.info(
             f"[TTS Orchestrator] Initialized: variant={self.variant}, num_layers={self.num_layers}, "
             f"talker_backend={self._talker_backend}, code2wav_dtype={self._code2wav_dtype}"
@@ -337,29 +361,35 @@ class TritonPythonModel:
         # TRT: BF16; ONNX: FP32 (set in initialize from talker_unified config.pbtxt)
         inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
-        inputs = [
-            pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
-            pb_utils.Tensor.from_dlpack("position_ids", pos_ids),
-        ]
+        try:
+            inputs = [
+                pb_utils.Tensor.from_dlpack("input_embeds", inp_emb.contiguous()),
+                pb_utils.Tensor.from_dlpack("position_ids", pos_ids.contiguous()),
+            ]
+        except Exception as e:
+            logger.error(f"Error in from_dlpack input_embeds/position_ids: {e}")
+            raise
         if past_kv_tensors is None:
             B = input_embeds.shape[0]
             for i in range(self.num_layers):
-                empty_k = torch.empty(
-                    B, self.kv_heads, 0, self.head_dim,
-                    dtype=self._talker_dtype, device=self.device,
-                )
-                empty_v = torch.empty(
-                    B, self.kv_heads, 0, self.head_dim,
-                    dtype=self._talker_dtype, device=self.device,
-                )
-                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", empty_k))
-                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", empty_v))
+                empty_k_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
+                empty_v_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
+                try:
+                    inputs.append(pb_utils.Tensor(f"past_kv_{i}_k", empty_k_np))
+                    inputs.append(pb_utils.Tensor(f"past_kv_{i}_v", empty_v_np))
+                except Exception as e:
+                    logger.error(f"Error in pb_utils.Tensor empty_k/v: {e}")
+                    raise
         else:
             for i in range(self.num_layers):
                 k = past_kv_tensors[2 * i].contiguous().to(self._talker_dtype)
                 v = past_kv_tensors[2 * i + 1].contiguous().to(self._talker_dtype)
-                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", k))
-                inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", v))
+                try:
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", k.contiguous()))
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", v.contiguous()))
+                except Exception as e:
+                    logger.error(f"Error in from_dlpack k/v: {e}")
+                    raise
 
         out_names = ["codec_sum", "full_codec", "hidden", "logits"]
         for i in range(self.num_layers):
@@ -401,7 +431,8 @@ class TritonPythonModel:
             return torch.from_numpy(t.as_numpy()).to(self.device)
         try:
             return torch.from_dlpack(t)
-        except (AttributeError, TypeError):
+        except Exception as e:
+            logger.error(f"Error in torch.from_dlpack for {name}: {e}")
             return torch.from_numpy(t.as_numpy()).to(self.device)
 
     def _bls_speaker_encoder(self, ref_audio_b64: str) -> torch.Tensor:
@@ -521,10 +552,14 @@ class TritonPythonModel:
     ) -> tuple:
         """Stateful code2wav: codes [1, 16, 4], cache_position [4], 37 states -> wav [7680], 37 new states. Uses DLPack for GPU tensors."""
         codes = codes.to(torch.int64)
-        inputs = [
-            pb_utils.Tensor.from_dlpack("codes", codes),
-            pb_utils.Tensor.from_dlpack("cache_position", cache_position),
-        ]
+        try:
+            inputs = [
+                pb_utils.Tensor.from_dlpack("codes", codes.contiguous()),
+                pb_utils.Tensor.from_dlpack("cache_position", cache_position.contiguous()),
+            ]
+        except Exception as e:
+            logger.error(f"Error in from_dlpack codes/cache_position: {e}")
+            raise
         state_input_names = []
         for i in range(8):
             state_input_names.append(f"past_kv_{i}_k")
@@ -534,9 +569,13 @@ class TritonPythonModel:
         for i in range(4):
             state_input_names.append(f"transconv_overlap_{i}")
         for i, t in enumerate(state_tensors):
-            inputs.append(
-                pb_utils.Tensor.from_dlpack(state_input_names[i], t.contiguous().to(self._code2wav_dtype))
-            )
+            try:
+                inputs.append(
+                    pb_utils.Tensor.from_dlpack(state_input_names[i], t.contiguous().to(self._code2wav_dtype))
+                )
+            except Exception as e:
+                logger.error(f"Error in from_dlpack state_tensors {state_input_names[i]}: {e}")
+                raise
 
         out_names = ["wav"]
         for i in range(8):
