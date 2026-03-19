@@ -17,6 +17,8 @@ logger = logging.getLogger("audio_utils")
 
 # Qwen3-TTS Speaker Encoder mel params (modeling_qwen3_tts.py extract_speaker_embedding)
 TARGET_SR = 24000
+# Max waveform length for speech_tokenizer_encoder (matches build_engines.sh maxShapes)
+MAX_WAVEFORM_SAMPLES = 192000  # 8s @ 24kHz
 N_FFT = 1024
 HOP_LENGTH = 256
 WIN_LENGTH = 1024
@@ -166,8 +168,12 @@ def prepare_waveform_tensor(audio_np: np.ndarray) -> np.ndarray:
 
     Input: 1D float32 waveform (samples,).
     Output: [1, 1, samples] float32 numpy for ONNX (B, 1, samples).
+    Truncates to MAX_WAVEFORM_SAMPLES (8s @ 24kHz) to match TRT engine maxShapes.
     """
     audio = np.asarray(audio_np, dtype=np.float32)
+    if len(audio) > MAX_WAVEFORM_SAMPLES:
+        logger.info("Truncating ref_audio from %d to %d samples (8s max)", len(audio), MAX_WAVEFORM_SAMPLES)
+        audio = audio[:MAX_WAVEFORM_SAMPLES]
     if audio.ndim == 1:
         audio = audio[np.newaxis, np.newaxis, :]
     elif audio.ndim == 2:

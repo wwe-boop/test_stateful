@@ -22,6 +22,7 @@ from utils import (
     resolve_tokenizer_path,
     ensure_output_dir,
     load_speech_tokenizer,
+    patch_decoder_transconv_for_trt,
     export_onnx,
     verify_onnx,
     to_numpy,
@@ -57,6 +58,7 @@ def export_code2wav_decoder(
     tokenizer_model = load_speech_tokenizer(tokenizer_path, device=device, dtype=torch.float32)
 
     decoder = tokenizer_model.decoder.to(device).eval()
+    patch_decoder_transconv_for_trt(decoder)  # ConvTranspose -> Conv1d+Reshape for TRT BF16
     wrapper = Code2WavStreamingWrapper(decoder).to(device).eval()
 
     B = 1

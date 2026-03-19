@@ -245,6 +245,135 @@ def _patch_decoder_rotary_from_weights(decoder) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+#  ConvTranspose1d → Conv1d equivalent for TensorRT BF16 compatibility
+#
+#  TensorRT has known BF16 support gaps for ConvTranspose. Two equivalent formulations:
+#  1. Insert-zeros + Conv1d: proven to match PyTorch ConvTranspose (test baseline).
+#  2. Sub-Pixel (Conv1d + reshape): theoretically equivalent but weight mapping is complex.
+#
+#  We use Conv1dInsertZeros (insert zeros, pad, Conv1d with flipped kernel).
+# ---------------------------------------------------------------------------
+
+
+class Conv1dInsertZeros(nn.Module):
+    """Drop-in replacement for ConvTranspose1d: insert zeros + Conv1d.
+
+    Proven equivalent: PyTorch ConvTranspose1d flips the kernel; insert-zeros then
+    Conv1d with flipped weight produces identical output (see test_conv_transpose_equals_insert_zeros).
+    Ops: scatter/index (zeros + place x), pad, conv1d.
+    """
+
+    def __init__(self, transconv: nn.ConvTranspose1d):
+        super().__init__()
+        in_ch = transconv.in_channels
+        out_ch = transconv.out_channels
+        K = transconv.kernel_size[0] if isinstance(transconv.kernel_size, (tuple, list)) else transconv.kernel_size
+        S = transconv.stride[0] if isinstance(transconv.stride, (tuple, list)) else transconv.stride
+        self.stride = S
+        self.kernel_size = K
+        self.out_channels = out_ch
+        self.right_pad = K - S  # same as CausalTransConvNet
+
+        self.conv = nn.Conv1d(in_ch, out_ch, K, padding=0, bias=transconv.bias is not None)
+        # Conv1d needs (out_ch, in_ch, K). PyTorch ConvTranspose flips kernel along K.
+        W_tc = transconv.weight.data  # (in_ch, out_ch, K)
+        self.conv.weight.data = W_tc.permute(1, 0, 2).flip(-1).contiguous()
+        if transconv.bias is not None:
+            self.conv.bias.data.copy_(transconv.bias.data)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, C_in, L] -> [B, C_out, (L-1)*S + K]."""
+        B, C, L = x.shape
+        L_up = (L - 1) * self.stride + 1
+        up = torch.zeros(B, C, L_up, dtype=x.dtype, device=x.device)
+        up[..., 0::self.stride] = x
+        up = torch.nn.functional.pad(up, (self.kernel_size - 1, self.kernel_size - 1), mode="constant", value=0)
+        return self.conv(up)
+
+
+class Conv1dSubPixel(nn.Module):
+    """Drop-in replacement for ConvTranspose1d: Conv1d + reshape (sub-pixel convolution).
+
+    Mathematically equivalent. Uses only Conv1d (TRT BF16 supported) + Reshape.
+    When right_pad > 0, streaming_causal_transconv does raw[..., :-rp]; we must output
+    length (L-1)*S + K so the slice yields L*S. Achieved by extra right-pad on input.
+    """
+
+    def __init__(self, transconv: nn.ConvTranspose1d):
+        super().__init__()
+        in_ch = transconv.in_channels
+        out_ch = transconv.out_channels
+        K = transconv.kernel_size[0] if isinstance(transconv.kernel_size, (tuple, list)) else transconv.kernel_size
+        S = transconv.stride[0] if isinstance(transconv.stride, (tuple, list)) else transconv.stride
+        self.stride = S
+        self.kernel_size = K
+        self.out_channels = out_ch
+        self.right_pad = K - S  # same as CausalTransConvNet; 0 when K==S
+
+        self.conv = nn.Conv1d(in_ch, out_ch * S, K, padding=0, bias=transconv.bias is not None)
+        self._copy_weights_from_transpose(transconv)
+
+    def _copy_weights_from_transpose(self, tc: nn.ConvTranspose1d):
+        """Copy weights. Conv1d uses cross-corr (input[n+k]*w[k]); ConvTranspose places
+        kernel so output[i*S+k] += input[i]*w[k]. Causal: we need input[t-m]*w.
+        Cross-corr gives input[t+k]*w[k], so we flip: w_conv[m] = w_tc[K-1-(s+m*S)]."""
+        S = tc.stride[0] if isinstance(tc.stride, (tuple, list)) else tc.stride
+        K = tc.kernel_size[0] if isinstance(tc.kernel_size, (tuple, list)) else tc.kernel_size
+        in_ch, out_ch = tc.in_channels, tc.out_channels
+        W_tc = tc.weight.data  # (in_ch, out_ch, K)
+        W_conv = self.conv.weight.data  # (out_ch*S, in_ch, K)
+        W_conv.zero_()
+        for s in range(S):
+            for m in range(K):
+                k = s + m * S
+                if k < K:
+                    k_flip = K - 1 - k  # Conv1d cross-corr vs ConvTranspose kernel dir
+                    for c in range(out_ch):
+                        W_conv[c * S + s, :, m] = W_tc[:, c, k_flip]
+        if tc.bias is not None:
+            for c in range(out_ch):
+                for s_idx in range(S):
+                    self.conv.bias.data[c * S + s_idx] = tc.bias.data[c]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, C_in, L] -> [B, C_out, out_len] with out_len = (L-1)*S + K (matches ConvTranspose)."""
+        B, _, L = x.shape
+        pad_left = self.kernel_size - 1
+        # When right_pad > 0, streaming expects (L-1)*S + K so slice yields L*S.
+        # Conv1d needs (L-1)+K/S output cells; for K=n*S that is L+n-1. n=2 -> L+1.
+        pad_right = 1 if self.right_pad > 0 else 0
+        x = torch.nn.functional.pad(x, (pad_left, pad_right), mode="constant", value=0)
+        out = self.conv(x)  # [B, out_ch*S, L + pad_right]
+        L_conv = out.shape[-1]
+        out = out.reshape(B, self.out_channels, L_conv * self.stride)
+        return out
+
+
+def patch_decoder_transconv_for_trt(decoder: nn.Module) -> int:
+    """Replace ConvTranspose1d in code2wav decoder with Conv1d+Reshape equivalent.
+
+    Call before ONNX export so the graph uses only TRT BF16-supported ops.
+    Returns the number of CausalTransConvNet modules replaced.
+    """
+    from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        Qwen3TTSTokenizerV2CausalTransConvNet,
+    )
+
+    n = 0
+    for mod in decoder.modules():
+        if isinstance(mod, Qwen3TTSTokenizerV2CausalTransConvNet):
+            if isinstance(mod.conv, nn.ConvTranspose1d):
+                mod.conv = Conv1dInsertZeros(mod.conv)
+                n += 1
+    if n > 0:
+        logger.info(
+            "Patched %d ConvTranspose1d -> Conv1dInsertZeros for TensorRT BF16 (no ConvTranspose)",
+            n,
+        )
+    return n
+
+
 def load_speech_tokenizer(tokenizer_path: Path, device: str = "cpu", dtype: torch.dtype = torch.float32):
     """Load the speech tokenizer (encoder + decoder) from the tokenizer checkpoint."""
     from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Model

@@ -238,9 +238,10 @@ build_peripheral_engines() {
 
     # Speech tokenizer encoder (shared, in tokenizer dir)
     # Min waveform = 960 samples (1 codec frame at stride 8×6×5×4=960, 24kHz → 40ms).
-    # Smaller values produce 0-length intermediates that TRT cannot handle.
+    # Max waveform = 192000 samples (8s @ 24kHz). Smaller values produce 0-length intermediates that TRT cannot handle.
     # speech_tokenizer_encoder: output audio_codes is Int64 (discrete codes). Must NOT use
     # --outputIOFormats/--bf16 which would override it. Use default fp32 for this small model.
+    # maxShapes 192000 = 8s @24kHz. With 8s cap, workspace ~1.7GB; 6GB leaves margin.
     if [ -f "$TOKENIZER_DIR/speech_tokenizer_encoder.onnx" ]; then
         log_info "Building speech_tokenizer_encoder.engine ..."
         if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
@@ -248,8 +249,8 @@ build_peripheral_engines() {
             --saveEngine=/mnt/model/speech_tokenizer_encoder.engine \
             --minShapes=waveform:1x1x960 \
             --optShapes=waveform:1x1x48000 \
-            --maxShapes=waveform:1x1x480000 \
-            --memPoolSize=workspace:4096; then
+            --maxShapes=waveform:1x1x192000 \
+            --memPoolSize=workspace:6144; then
             log_error "speech_tokenizer_encoder trtexec failed"
             failed=$((failed + 1))
         fi

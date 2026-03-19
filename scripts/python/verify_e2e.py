@@ -21,6 +21,7 @@ Usage:
 """
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -44,6 +45,7 @@ from utils import (
     resolve_model_path,
     load_tts_model,
     load_speech_tokenizer,
+    patch_decoder_transconv_for_trt,
     resolve_device,
     MODEL_VARIANTS,
     DEFAULT_MODELS_DIR,
@@ -294,16 +296,12 @@ def verify_code_predictor(model, past_hidden, codec_token_0, variant,
 # ---------------------------------------------------------------------------
 
 def verify_code2wav(variant, exported_dir, device):
-    """Compare Code2Wav: PyTorch vs ONNX using random codec tokens."""
+    """Compare Code2Wav: Original vs Patched (Conv1dSubPixel) PyTorch, then vs ONNX."""
     logger.info("=" * 60)
-    logger.info("  Stage D: Code2Wav Decoder (PyTorch vs ONNX)")
+    logger.info("  Stage D: Code2Wav Decoder (Original vs Patched vs ONNX)")
     logger.info("=" * 60)
 
     onnx_path = str(exported_dir / "tokenizer" / "code2wav_decoder.onnx")
-    if not os.path.exists(onnx_path):
-        logger.warning(f"  ONNX not found: {onnx_path}, skipping")
-        return True
-
     tok_path = DEFAULT_MODELS_DIR / "Qwen3-TTS-Tokenizer-12Hz"
     if not tok_path.exists():
         logger.warning(f"  Tokenizer model not found: {tok_path}, skipping")
@@ -311,15 +309,41 @@ def verify_code2wav(variant, exported_dir, device):
 
     tokenizer_model = load_speech_tokenizer(tok_path, device="cpu", dtype=torch.float32)
 
-    # Generate test codes (random, B=1, T=5 frames, 16 codebooks)
-    test_codes = torch.randint(0, 2048, (1, 16, 5), dtype=torch.long)
+    # Generate test codes (random, B=1, T=8 frames, 16 codebooks; T%4=0 for streaming alignment)
+    torch.manual_seed(42)
+    test_codes = torch.randint(0, 2048, (1, 16, 8), dtype=torch.long)
 
-    # PyTorch decode
+    # (1) Original PyTorch decoder (ConvTranspose)
     with torch.no_grad():
-        decoder = tokenizer_model.decoder
-        pt_wav = decoder(test_codes)
+        decoder_orig = tokenizer_model.decoder
+        wav_orig = decoder_orig(test_codes)
 
-    logger.info(f"  PyTorch output: {pt_wav.shape}")
+    logger.info(f"  Original (ConvTranspose) output: {wav_orig.shape}")
+
+    # (2) Patched PyTorch decoder (Conv1dSubPixel) — verify equivalence
+    import copy
+    decoder_patched = copy.deepcopy(decoder_orig)
+    patch_decoder_transconv_for_trt(decoder_patched)
+    with torch.no_grad():
+        decoder_patched.eval()
+        wav_patched = decoder_patched(test_codes)
+
+    logger.info(f"  Patched (Conv1dSubPixel) output: {wav_patched.shape}")
+
+    sim_orig_patched = cosine_sim(wav_orig, wav_patched)
+    mad_orig_patched = max_abs_diff(wav_orig, wav_patched)
+    ok = report("code2wav Orig vs Patched (Conv1dSubPixel equiv)", sim_orig_patched, mad_orig_patched, threshold=0.9999)
+
+    if not ok:
+        logger.warning("  Conv1dSubPixel replacement may not be equivalent; check weight transform.")
+
+    # (3) ONNX decode (streaming has 39 inputs; skip if interface mismatch)
+    if not os.path.exists(onnx_path):
+        logger.warning(f"  ONNX not found: {onnx_path}, skipping")
+        del tokenizer_model
+        return ok
+
+    pt_wav = wav_orig  # use original as reference for ONNX
 
     # ONNX decode
     import onnxruntime as ort
