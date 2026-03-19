@@ -144,6 +144,58 @@ ensure_git_lfs() {
 }
 
 # ---------------------------------------------------------------------------
+#  ensure_sox
+#  Installs SoX (Sound eXchange) if missing. Required by Qwen3-TTS 25Hz tokenizer
+#  for audio processing. Non-fatal: logs warning if install fails.
+# ---------------------------------------------------------------------------
+ensure_sox() {
+    if command -v sox &>/dev/null; then
+        log_info "sox: $(command -v sox)"
+        return 0
+    fi
+
+    log_step "Installing SoX (required by Qwen3-TTS audio processing)..."
+
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq sox libsox-dev 2>/dev/null || {
+            log_warn "SoX install failed. Install manually: sudo apt install sox libsox-dev"
+            return 1
+        }
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y sox sox-devel 2>/dev/null || {
+            log_warn "SoX install failed. Install manually: sudo yum install sox sox-devel"
+            return 1
+        }
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y sox sox-devel 2>/dev/null || {
+            log_warn "SoX install failed. Install manually: sudo dnf install sox sox-devel"
+            return 1
+        }
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm sox 2>/dev/null || {
+            log_warn "SoX install failed. Install manually: sudo pacman -S sox"
+            return 1
+        }
+    elif command -v brew &>/dev/null; then
+        brew install sox 2>/dev/null || {
+            log_warn "SoX install failed. Install manually: brew install sox"
+            return 1
+        }
+    else
+        log_warn "Cannot auto-install SoX: no supported package manager found"
+        log_warn "Install manually: https://sox.sourceforge.net/"
+        return 1
+    fi
+
+    if ! command -v sox &>/dev/null; then
+        log_warn "SoX not found after install attempt"
+        return 1
+    fi
+    log_info "SoX installed: $(command -v sox)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 #  check_disk_space <path> <required_gb>
 #  Returns 1 if available space is below the threshold.
 # ---------------------------------------------------------------------------
@@ -279,6 +331,9 @@ check_prerequisites() {
     check_docker
 
     ensure_git_lfs || errors=$((errors + 1))
+
+    # SoX: required by Qwen3-TTS 25Hz tokenizer. Non-fatal (some variants use 12Hz without it)
+    ensure_sox || log_warn "SoX not installed — install manually: sudo apt install sox libsox-dev"
 
     check_disk_space "." 20 || errors=$((errors + 1))
 

@@ -59,6 +59,7 @@ Usage: build_triton.sh <command> [options]
 Commands:
   assemble               Assemble model_repository/ from exported artifacts
   pull                   Pull the NGC Triton container image
+  build-image            Build deploy image (NGC base + torch/tokenizers, no model repo)
   run                    Assemble (if needed) + start Triton server
   build                  Build a self-contained deployment Docker image
   stop                   Stop the running Triton container
@@ -338,6 +339,14 @@ cmd_run() {
     fi
 }
 
+cmd_build_image() {
+    log_step "Building Triton deploy image (Triton base + torch + tokenizers)"
+    log_info "Can run in parallel with engine build (build_engines.sh)"
+    check_docker_gpu_ready || exit 1
+    ensure_triton_deploy_image || exit 1
+    log_info "Deploy image ready. Run 'build' or 'run' after engines are ready."
+}
+
 cmd_build() {
     if [ -z "$BUILD_TAG" ]; then
         BUILD_TAG="qwen3-tts-triton:latest"
@@ -405,8 +414,9 @@ cmd_status() {
 
 # ── Main dispatch ──
 case "$COMMAND" in
-    assemble)    cmd_assemble ;;
+    assemble)     cmd_assemble ;;
     pull)        cmd_pull ;;
+    build-image) cmd_build_image ;;
     run)         cmd_run ;;
     build)       cmd_build ;;
     stop)        cmd_stop ;;
