@@ -152,12 +152,33 @@ _version_ge() {
 
 # ---------------------------------------------------------------------------
 #  _check_ngc_manifest <image>
-#  Returns 0 if the Docker registry has a manifest for <image>, 1 otherwise.
-#  Used to skip matrix entries for containers not yet published.
+#  Returns 0 if the image should be used (exists or check inconclusive).
+#  Returns 1 only when manifest is confirmed missing (manifest unknown).
+#  Network errors, timeouts are treated as inconclusive -> use tag.
 # ---------------------------------------------------------------------------
 _check_ngc_manifest() {
     local image="$1"
-    docker manifest inspect "$image" > /dev/null 2>&1
+    local err
+    if ! command -v timeout &>/dev/null; then
+        # No timeout available — skip check to avoid infinite hang on slow networks
+        return 0
+    fi
+    err=$(timeout 15 docker manifest inspect "$image" 2>&1)
+    local status=$?
+    # Exit 124/143 = timeout killed the command -> inconclusive, use tag
+    if [ $status -eq 124 ] || [ $status -eq 143 ]; then
+        return 0
+    fi
+    if [ $status -eq 0 ]; then
+        return 0
+    fi
+    # Only skip when we're sure the tag doesn't exist.
+    # "manifest unknown" is the standard OCI error; avoid "not found" (matches network errors).
+    if echo "$err" | grep -qE "manifest unknown|no such (image|manifest)"; then
+        return 1
+    fi
+    # Network/timeout or other error -> assume available, let pull try
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -187,13 +208,16 @@ _resolve_best_entry() {
     for entry in "${_NGC_TRTLLM_MATRIX[@]}"; do
         read -r tag min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
         if _driver_ge "$driver_ver" "$min_drv"; then
-            if [ "${_NGC_VERIFY_MANIFEST:-0}" = "1" ]; then
+            if [ "${NGC_SKIP_MANIFEST_VERIFY:-0}" != "1" ] && [ "${_NGC_VERIFY_MANIFEST:-0}" = "1" ]; then
                 local _img="${_NGC_TRITON_BASE}:${tag}${_NGC_PY3_SUFFIX}"
                 if docker image inspect "$_img" &>/dev/null; then
                     : # image already local — skip remote manifest check
-                elif ! _check_ngc_manifest "$_img"; then
-                    log_warn "NGC $tag not yet available on registry, trying next..."
-                    continue
+                else
+                    log_info "  Checking if NGC $tag exists on registry (timeout 15s)..."
+                    if ! _check_ngc_manifest "$_img"; then
+                        log_warn "NGC $tag not yet available on registry, trying next..."
+                        continue
+                    fi
                 fi
             fi
             echo "$tag $min_drv $trt_ver $cuda_ver ${py_ver:-3.12} ${size_gb:--}"

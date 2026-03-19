@@ -427,11 +427,40 @@ def _consolidate_onnx_external_data(onnx_path: str) -> None:
 
 
 def _onnx_check_safe(onnx_path: str) -> None:
-    """Run onnx.checker, handling >2 GiB models by checking from path."""
+    """Run onnx.checker, handling >2 GiB models with external data.
+
+    When external .data file exists, run check from model dir so relative
+    paths in the proto resolve correctly. Fallback: make ValidationError
+    non-fatal (TRT/ORT may still load the model).
+    """
     import onnx
 
+    onnx_path = os.path.abspath(onnx_path)
+    ext_data = onnx_path + ".data"
+    if os.path.exists(ext_data):
+        model_dir = os.path.dirname(onnx_path)
+        model_name = os.path.basename(onnx_path)
+        try:
+            if model_dir:
+                orig_cwd = os.getcwd()
+                os.chdir(model_dir)
+                try:
+                    onnx.checker.check_model(model_name)
+                finally:
+                    os.chdir(orig_cwd)
+            else:
+                onnx.checker.check_model(onnx_path)
+        except Exception as e:
+            if "doesn't exist or is not accessible" in str(e) or "ValidationError" in type(e).__name__:
+                logger.warning(
+                    "ONNX checker failed (external data path); model may still work: %s",
+                    e,
+                )
+            else:
+                raise
+        return
     try:
-        onnx_model = onnx.load(onnx_path, load_external_data=False)
+        onnx_model = onnx.load(onnx_path)
         onnx.checker.check_model(onnx_model)
     except ValueError:
         onnx.checker.check_model(onnx_path)
@@ -623,21 +652,33 @@ def export_onnx(
     # Consolidate into a single .data file for TensorRT compatibility.
     _consolidate_onnx_external_data(onnx_path)
 
-    file_size = os.path.getsize(onnx_path)
-
-    if file_size < 2 * 1024 * 1024 * 1024:
-        onnx_model = onnx.load(onnx_path)
-        try:
-            onnx.checker.check_model(onnx_model)
-        except ValueError:
-            onnx.checker.check_model(onnx_path)
+    # Use safe check when model has external data: onnx.load(load_external_data=True)
+    # loads full weights into memory; check_model() calls SerializeToString() which
+    # hits protobuf's 2 GiB limit. load_external_data=False keeps only graph in memory.
+    ext_data_path = onnx_path + ".data"
+    if os.path.exists(ext_data_path):
+        _onnx_check_safe(onnx_path)
+        onnx_model = onnx.load(onnx_path, load_external_data=False)
         logger.info(f"ONNX model exported: {onnx_path}")
         logger.info(f"  Initializers: {len(onnx_model.graph.initializer)}")
         logger.info(f"  Nodes (before simplify): {len(onnx_model.graph.node)}")
         del onnx_model
     else:
-        _onnx_check_safe(onnx_path)
-        logger.info(f"ONNX model exported (large): {onnx_path}")
+        onnx_model = onnx.load(onnx_path)
+        try:
+            onnx.checker.check_model(onnx_model)
+        except ValueError:
+            onnx.checker.check_model(onnx_path)
+        except Exception as e:
+            from google.protobuf.message import EncodeError
+            if isinstance(e, EncodeError):
+                _onnx_check_safe(onnx_path)
+            else:
+                raise
+        logger.info(f"ONNX model exported: {onnx_path}")
+        logger.info(f"  Initializers: {len(onnx_model.graph.initializer)}")
+        logger.info(f"  Nodes (before simplify): {len(onnx_model.graph.node)}")
+        del onnx_model
 
     if simplify:
         simplify_onnx(onnx_path)

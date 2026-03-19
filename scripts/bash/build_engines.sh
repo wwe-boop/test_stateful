@@ -359,6 +359,11 @@ if [ -n "$USER_IMAGE" ]; then
     NGC_IMAGE="$USER_IMAGE"
     log_info "Using user-specified image: $NGC_IMAGE"
 else
+    # Sync NGC compatibility matrix from NVIDIA website (best-effort; skip if offline)
+    if [[ -z "${NGC_SKIP_MATRIX_UPDATE:-}" ]]; then
+        source "${SCRIPT_DIR}/lib/ngc_updater.sh" 2>/dev/null || true
+        update_ngc_matrix "${SCRIPT_DIR}/ngc_matrix.conf" 2>/dev/null || true
+    fi
     _NGC_VERIFY_MANIFEST=1
     NGC_IMAGE=$(resolve_ngc_image_info) \
         || { log_error "Cannot determine NGC container. Use --image."; exit 1; }

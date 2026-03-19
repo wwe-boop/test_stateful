@@ -306,13 +306,20 @@ download_model() {
     local DEST="$TARGET_DIR/$MODEL_NAME"
     mkdir -p "$TARGET_DIR"
 
+    # Only skip when we have proof of prior successful completion (.model_revision).
+    # Interrupted downloads leave partial files; _model_dir_valid may be true but we
+    # must run ModelScope to validate hashes and re-download only corrupted files.
     if _model_dir_valid "$DEST"; then
-        if _revision_matches "$DEST" "$REVISION"; then
-            log_info "Model '$MODEL_NAME' already at $DEST (revision OK), skipping"
+        if _revision_matches "$DEST" "$REVISION" && [ -f "$DEST/.model_revision" ]; then
+            log_info "Model '$MODEL_NAME' already at $DEST (revision OK, validated), skipping"
             return 0
         fi
-        log_warn "Model '$MODEL_NAME' exists but revision mismatch, re-downloading..."
-        rm -rf "$DEST"
+        if ! _revision_matches "$DEST" "$REVISION"; then
+            log_warn "Model '$MODEL_NAME' exists but revision mismatch, re-downloading..."
+            rm -rf "$DEST"
+        else
+            log_info "Model '$MODEL_NAME' at $DEST may be incomplete; validating and resuming..."
+        fi
     fi
 
     local rev_info=""
@@ -443,8 +450,11 @@ _download_via_modelscope() {
     local rev_args=()
     [ -n "$revision" ] && [ "$revision" != "main" ] && rev_args=(--revision "$revision")
 
-    log_info "Using ModelScope to download: $model_id"
-    retry 2 10 modelscope download --model "$model_id" "${rev_args[@]}" --local_dir "$dest"
+    # Enable SHA256 hash validation to detect truncated/corrupted files from interrupted
+    # downloads; ModelScope >= 1.21 will auto-redownload mismatched files.
+    log_info "Using ModelScope to download: $model_id (hash validation enabled)"
+    MODELSCOPE_ENABLE_DEFAULT_HASH_VALIDATION=True retry 2 10 \
+        modelscope download --model "$model_id" "${rev_args[@]}" --local_dir "$dest"
 }
 
 # ---------------------------------------------------------------------------

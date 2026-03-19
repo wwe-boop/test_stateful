@@ -220,14 +220,27 @@ cmd_assemble() {
 cmd_pull() {
     check_docker_gpu_ready || exit 1
 
-    check_docker_gpu_ready || exit 1
-
     if $DRY_RUN; then
         log_info "[DRY RUN] Would pull Triton full image (py3)"
         return 0
     fi
 
+    # Sync NGC compatibility matrix from NVIDIA website (best-effort, 25s timeout)
+    if [[ -z "${NGC_SKIP_MATRIX_UPDATE:-}" ]]; then
+        log_info "[1/3] Syncing NGC matrix from NVIDIA website (timeout 25s)..."
+        if command -v timeout &>/dev/null; then
+            timeout 25 bash -c "source '${SCRIPT_DIR}/lib/ngc_updater.sh' 2>/dev/null && update_ngc_matrix '${SCRIPT_DIR}/ngc_matrix.conf'" 2>/dev/null || true
+        else
+            source "${SCRIPT_DIR}/lib/ngc_updater.sh" 2>/dev/null || true
+            update_ngc_matrix "${SCRIPT_DIR}/ngc_matrix.conf" 2>/dev/null || true
+        fi
+        log_info "[1/3] Done (or skipped)"
+    fi
+
+    log_info "[2/3] Resolving NGC image for your driver (checking registry)..."
     TRITON_IMAGE=$(resolve_triton_deploy_image) || exit 1
+    log_info "[2/3] Using: $TRITON_IMAGE"
+    log_info "[3/3] Pulling image (15-30 GB, may take several minutes)..."
     ensure_ngc_image "$TRITON_IMAGE" || exit 1
     log_info "Image ready: $TRITON_IMAGE"
 }
