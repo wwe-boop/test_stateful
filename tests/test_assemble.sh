@@ -5,7 +5,7 @@
 #  Verifies:
 #    - ONNX mode: .onnx + .onnx.data copy, tokenizer.json, audio_utils.py,
 #                 lightweight_tokenizer.py in tts_orchestrator/1
-#    - TRT mode:  talker_unified config has TYPE_BF16, same Python files
+#    - TRT mode:  talker_code2wav_fused config has TYPE_BF16, same Python files
 #    - Both: first_chunk_frames in tts_orchestrator config, weights/ .pt files
 #
 #  Run from repo root:
@@ -59,15 +59,15 @@ fi
 log_info "ONNX assemble checks passed"
 
 # ---- TRT mode (if .engine exists) ----
-if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_unified.engine" ] || [ -f "${EXPORTED_DIR}/${VARIANT}/talker_unified.plan" ]; then
+if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.plan" ]; then
   log_info "Assembling TRT mode -> ${TEST_REPO_TRT}"
   rm -rf "${TEST_REPO_TRT}"
   assemble_model_repo "${EXPORTED_DIR}" "${VARIANT}" "${TEST_REPO_TRT}" "trt" || { log_error "assemble (trt) failed"; exit 1; }
   validate_model_repo "${TEST_REPO_TRT}" || { log_error "validate (trt) failed"; exit 1; }
-  grep -q "TYPE_BF16" "${TEST_REPO_TRT}/talker_unified/config.pbtxt" || { log_error "talker_unified TRT config missing TYPE_BF16"; exit 1; }
+  grep -q "TYPE_BF16" "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" || { log_error "talker_code2wav_fused TRT config missing TYPE_BF16"; exit 1; }
   log_info "TRT assemble checks passed"
 else
-  log_warn "No talker_unified.engine/.plan found; skipping TRT assemble test"
+  log_warn "No talker_code2wav_fused.engine/.plan found; skipping TRT assemble test"
 fi
 
 log_info "T2.4 test_assemble.sh passed"

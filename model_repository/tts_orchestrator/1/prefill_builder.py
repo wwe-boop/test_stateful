@@ -94,7 +94,7 @@ class EmbeddingWeights:
         text_emb_path = weights_dir / "text_embedding.pt"
         if not text_emb_path.exists():
             raise FileNotFoundError(
-                f"text_embedding.pt not found in {weights_dir}. Run export_06_embeddings.py."
+                f"text_embedding.pt not found in {weights_dir}. Run export_01_embeddings.py."
             )
         text_emb_sd = torch.load(text_emb_path, map_location=self.device, weights_only=True)
         weight = text_emb_sd["weight"]
@@ -111,7 +111,7 @@ class EmbeddingWeights:
         text_proj_path = weights_dir / "text_projection.pt"
         if not text_proj_path.exists():
             raise FileNotFoundError(
-                f"text_projection.pt not found in {weights_dir}. Run export_06_embeddings.py."
+                f"text_projection.pt not found in {weights_dir}. Run export_01_embeddings.py."
             )
         text_proj_sd = torch.load(text_proj_path, map_location=self.device, weights_only=True)
         in_size = text_proj_sd["linear_fc1.weight"].shape[1]
@@ -129,7 +129,7 @@ class EmbeddingWeights:
         codec_path = weights_dir / "codec_embeddings.pt"
         if not codec_path.exists():
             raise FileNotFoundError(
-                f"codec_embeddings.pt not found in {weights_dir}. Run export_06_embeddings.py."
+                f"codec_embeddings.pt not found in {weights_dir}. Run export_01_embeddings.py."
             )
         codec_data = torch.load(codec_path, map_location=self.device, weights_only=True)
         talker_sd = codec_data["talker_codec_embedding"]
@@ -147,7 +147,7 @@ class EmbeddingWeights:
         special_path = weights_dir / "special_embeddings.pt"
         if not special_path.exists():
             raise FileNotFoundError(
-                f"special_embeddings.pt not found in {weights_dir}. Run export_06_embeddings.py."
+                f"special_embeddings.pt not found in {weights_dir}. Run export_01_embeddings.py."
             )
         special = torch.load(special_path, map_location=self.device, weights_only=True)
         self.tts_pad_embed = special["tts_pad_embed"].to(device=self.device, dtype=dtype)
@@ -206,6 +206,7 @@ class PrefillBuilder:
         spk_embedding: Optional[torch.Tensor] = None,
         ref_codes: Optional[torch.Tensor] = None,
         ref_text: Optional[str] = None,
+        ref_codec_sum_vec: Optional[torch.Tensor] = None,
     ) -> tuple:
         """
         Build prefill inputs_embeds and trailing_text_hidden queue.
@@ -312,8 +313,47 @@ class PrefillBuilder:
         first_text_with_bos = first_text_embed + codec_input_embedding[:, -1:]
         talker_input_embed = torch.cat([talker_input_embed, first_text_with_bos], dim=1)
 
-        # ICL path (voice_clone_icl) — unchanged from original
-        if (
+        # ICL path (voice_clone_icl)
+        if task_type == TaskType.VOICE_CLONE_ICL and ref_codec_sum_vec is not None:
+            # From speech_tokenizer_codec_fused BLS: [1, 1, H] (fp32/bf16)
+            codec_sum_vec = ref_codec_sum_vec.to(device=device, dtype=torch.bfloat16)
+            if codec_sum_vec.dim() == 2:
+                codec_sum_vec = codec_sum_vec.unsqueeze(0)
+            codec_embed_icl = torch.cat(
+                [w.codec_embed(torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)),
+                 codec_sum_vec], dim=1
+            )
+            if ref_text and ref_text.strip():
+                ref_assistant = OFFICIAL_ASSISTANT_FMT.format(text=ref_text.strip())
+                ref_ids_np = self.tokenizer(ref_assistant, return_tensors="pt")["input_ids"]
+                if not isinstance(ref_ids_np, np.ndarray):
+                    ref_ids_np = np.asarray(ref_ids_np, dtype=np.int64)
+                if ref_ids_np.ndim == 1:
+                    ref_ids_np = ref_ids_np.reshape(1, -1)
+                ref_ids = torch.as_tensor(ref_ids_np, device=device, dtype=torch.int64)
+                ref_id = ref_ids[:, 3:-5] if ref_ids.shape[1] > 8 else ref_ids[:, :0]
+            else:
+                ref_id = input_ids[:, :0]
+            text_id = input_ids[:, 3:-5] if input_ids.shape[1] > 8 else input_ids[:, 3:4]
+            text_embed_icl = w.text_embed(torch.cat([ref_id, text_id], dim=1))
+            text_embed_icl = torch.cat([text_embed_icl, w.tts_eos_embed], dim=1)
+            text_lens = text_embed_icl.shape[1]
+            codec_lens = codec_embed_icl.shape[1]
+            if text_lens > codec_lens:
+                icl_embed = text_embed_icl[:, :codec_lens] + codec_embed_icl
+                trailing = [
+                    text_embed_icl[:, i : i + 1] for i in range(codec_lens, text_lens)
+                ]
+            else:
+                pad_len = codec_lens - text_lens
+                if pad_len > 0:
+                    pads = [w.tts_pad_embed] * pad_len
+                    text_embed_icl = torch.cat([text_embed_icl] + pads, dim=1)
+                icl_embed = text_embed_icl + codec_embed_icl
+                trailing = [w.tts_pad_embed]
+            prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
+
+        elif (
             task_type == TaskType.VOICE_CLONE_ICL
             and ref_codes is not None
             and w.codec_embeddings_3d is not None

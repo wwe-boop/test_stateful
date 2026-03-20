@@ -2,23 +2,18 @@
 """
 Master export script: exports all Qwen3-TTS components for Triton deployment.
 
-Runs the numbered export scripts (01-06) in order for all (or selected) variants.
-Dual-engine mode: pure ONNX Runtime and pure TensorRT (no TRT-LLM).
+Order (atomic subgraphs before composed ONNX):
+  01. Embeddings → .pt + config
+  02. Speaker Encoder → ONNX (base only)
+  03. Speech Tokenizer Encoder → ONNX (shared)
+  04. Speech Tokenizer + Codec 3D fused → ONNX (base only)
+  05. Code Predictor → ONNX (verification)
+  06. Code2Wav Decoder → ONNX (shared, verification)
+  07. Talker backbone → ONNX (verification)
+  08. Talker Unified (+CP+sum) → ONNX (verification)
+  09. Talker + Code2Wav fused → ONNX (production)
 
-Export pipeline:
-  01. Speech Tokenizer Encoder → ONNX  (shared)
-  02. Code2Wav Decoder → ONNX          (shared)
-  Per-variant:
-    03. Speaker Encoder → ONNX         (base variants only)
-    04. Talker Context Fused → ONNX    (prefill + CP + codec_sum)
-    05. Talker Decode Fused → ONNX     (decode step + CP + codec_sum)
-    06. Embedding weights → .pt        (for Orchestrator prefill; text_embedding in-process)
-
-Usage:
-  python scripts/export/export_all.py                        # all variants, bf16, auto GPU
-  python scripts/export/export_all.py --variant custom-1.7b  # single variant
-  python scripts/export/export_all.py --dtype fp32           # fp32 precision
-  python scripts/export/export_all.py --device cpu           # force CPU
+Use --skip-verification to run only 01–04 + 09 (minimal for production TRT build).
 """
 
 import argparse
@@ -33,7 +28,6 @@ from utils import (
     has_model_weights,
     resolve_device,
     resolve_dtype,
-    DEFAULT_DTYPE,
     DTYPE_NAMES,
 )
 
@@ -54,18 +48,20 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: workspace/exported)")
     parser.add_argument("--device", type=str, default=None,
-                        help="Device: cpu | cuda | cuda:0 | cuda:1 ... "
-                             "(default: auto-select GPU with most free VRAM)")
+                        help="Device: cpu | cuda | cuda:0 ... (default: auto)")
     parser.add_argument("--dtype", type=str, default="bf16",
                         choices=["bf16", "fp16", "fp32"],
-                        help="Target inference precision for embedding weights and TRT engine build "
-                             "(default: bf16). ONNX export always uses fp32 internally.")
+                        help="Target inference precision for embedding weights (default: bf16)")
     parser.add_argument("--skip-tokenizer", action="store_true",
-                        help="Skip shared tokenizer exports (steps 01-02)")
-    parser.add_argument("--skip-talker", action="store_true",
-                        help="Skip Talker Backbone export (step 04)")
+                        help="Skip shared tokenizer ONNX exports (steps 03, 06)")
+    parser.add_argument("--skip-speech-codec-fused", action="store_true",
+                        help="Skip step 04 (Speech Tokenizer + Codec 3D fused, base only)")
+    parser.add_argument("--skip-verification", action="store_true",
+                        help="Skip steps 05–08 (code_predictor, code2wav, talker_backbone, talker_unified)")
+    parser.add_argument("--skip-talker-code2wav-fused", action="store_true",
+                        help="Skip step 09 (Talker+Code2Wav fused production ONNX)")
     parser.add_argument("--skip-embeddings", action="store_true",
-                        help="Skip Embedding weights export (step 06)")
+                        help="Skip step 01 (embeddings)")
     args = parser.parse_args()
 
     device = resolve_device(args.device)
@@ -75,33 +71,6 @@ def main():
     t_start = time.time()
     results = {}
 
-    # ── Steps 01 & 02: Shared tokenizer components ──
-    if not args.skip_tokenizer:
-        logger.info("=" * 60)
-        logger.info("Step 01/06: Speech Tokenizer Encoder → ONNX")
-        logger.info("=" * 60)
-        try:
-            from export_01_speech_tokenizer_encoder import export_speech_tokenizer_encoder
-            path = export_speech_tokenizer_encoder(args.models_dir, args.output_dir, device, dtype)
-            results["speech_tokenizer_encoder"] = ("OK", path)
-        except Exception as e:
-            logger.error(f"Speech Tokenizer Encoder failed: {e}", exc_info=True)
-            results["speech_tokenizer_encoder"] = ("FAILED", str(e))
-
-        logger.info("=" * 60)
-        logger.info("Step 02/06: Code2Wav Decoder → ONNX")
-        logger.info("=" * 60)
-        try:
-            from export_02_code2wav_decoder import export_code2wav_decoder
-            path = export_code2wav_decoder(args.models_dir, args.output_dir, device, dtype)
-            results["code2wav_decoder"] = ("OK", path)
-        except Exception as e:
-            logger.error(f"Code2Wav Decoder failed: {e}", exc_info=True)
-            results["code2wav_decoder"] = ("FAILED", str(e))
-    else:
-        logger.info("Skipping shared tokenizer exports (--skip-tokenizer)")
-
-    # ── Steps 03-06: Per-variant exports ──
     from utils import DEFAULT_MODELS_DIR
     models_base = Path(args.models_dir) if args.models_dir else DEFAULT_MODELS_DIR
 
@@ -109,8 +78,7 @@ def main():
         variant_dir = models_base / MODEL_VARIANTS[args.variant]
         if not has_model_weights(variant_dir):
             logger.error(
-                f"Variant '{args.variant}' has no weight files in {variant_dir}. "
-                "Only config found — weights may not have been downloaded."
+                f"Variant '{args.variant}' has no weight files in {variant_dir}."
             )
             sys.exit(1)
         variants = [args.variant]
@@ -130,55 +98,152 @@ def main():
             sys.exit(1)
         logger.info(f"Detected variants with weights: {variants}")
 
-    for variant in variants:
-        logger.info("")
-        logger.info("#" * 60)
-        logger.info(f"  Exporting variant: {variant}")
-        logger.info("#" * 60)
+    TOTAL = 9
 
-        # 03. Speaker Encoder (base variants only)
-        if variant.startswith("base-"):
+    # ── Step 01: Embeddings ──
+    if not args.skip_embeddings:
+        for variant in variants:
             logger.info("=" * 60)
-            logger.info(f"Step 03/06: [{variant}] Speaker Encoder → ONNX")
+            logger.info(f"Step 01/{TOTAL}: [{variant}] Embeddings → .pt")
             logger.info("=" * 60)
             try:
-                from export_03_speaker_encoder import export_speaker_encoder
-                path = export_speaker_encoder(variant, args.models_dir, args.output_dir, device, dtype)
-                results[f"{variant}/speaker_encoder"] = ("OK", path)
-            except Exception as e:
-                logger.error(f"[{variant}] Speaker Encoder failed: {e}", exc_info=True)
-                results[f"{variant}/speaker_encoder"] = ("FAILED", str(e))
-
-        # 04. Talker Unified → ONNX (single engine for prefill + decode; replaces context + decode_fused)
-        if not args.skip_talker:
-            logger.info("=" * 60)
-            logger.info(f"Step 04/06: [{variant}] Talker Unified → ONNX")
-            logger.info("=" * 60)
-            try:
-                from export_04_talker_unified import export_talker_unified
-                out = export_talker_unified(
-                    variant, args.models_dir, args.output_dir, device,
-                )
-                path = out.get("onnx", out) if isinstance(out, dict) else out
-                results[f"{variant}/talker_unified"] = ("OK", path)
-            except Exception as e:
-                logger.error(f"[{variant}] Talker Unified failed: {e}", exc_info=True)
-                results[f"{variant}/talker_unified"] = ("FAILED", str(e))
-
-        # 06. Embedding weights (.pt) for Orchestrator prefill
-        if not args.skip_embeddings:
-            logger.info("=" * 60)
-            logger.info(f"Step 06/06: [{variant}] Embedding weights → .pt")
-            logger.info("=" * 60)
-            try:
-                from export_06_embeddings import export_embeddings
+                from export_01_embeddings import export_embeddings
                 path = export_embeddings(variant, args.models_dir, args.output_dir, device, dtype)
                 results[f"{variant}/embeddings"] = ("OK", str(path))
             except Exception as e:
                 logger.error(f"[{variant}] Embeddings failed: {e}", exc_info=True)
                 results[f"{variant}/embeddings"] = ("FAILED", str(e))
+    else:
+        logger.info("Skipping step 01 (--skip-embeddings)")
 
-    # ── Summary ──
+    # ── Step 02: Speaker Encoder (base only) ──
+    for variant in variants:
+        if not variant.startswith("base-"):
+            continue
+        logger.info("=" * 60)
+        logger.info(f"Step 02/{TOTAL}: [{variant}] Speaker Encoder → ONNX")
+        logger.info("=" * 60)
+        try:
+            from export_02_speaker_encoder import export_speaker_encoder
+            path = export_speaker_encoder(variant, args.models_dir, args.output_dir, device, dtype)
+            results[f"{variant}/speaker_encoder"] = ("OK", path)
+        except Exception as e:
+            logger.error(f"[{variant}] Speaker Encoder failed: {e}", exc_info=True)
+            results[f"{variant}/speaker_encoder"] = ("FAILED", str(e))
+
+    # ── Step 03: Speech Tokenizer Encoder ──
+    if not args.skip_tokenizer:
+        logger.info("=" * 60)
+        logger.info(f"Step 03/{TOTAL}: Speech Tokenizer Encoder → ONNX")
+        logger.info("=" * 60)
+        try:
+            from export_03_speech_tokenizer_encoder import export_speech_tokenizer_encoder
+            path = export_speech_tokenizer_encoder(args.models_dir, args.output_dir, device, dtype)
+            results["speech_tokenizer_encoder"] = ("OK", path)
+        except Exception as e:
+            logger.error(f"Speech Tokenizer Encoder failed: {e}", exc_info=True)
+            results["speech_tokenizer_encoder"] = ("FAILED", str(e))
+    else:
+        logger.info("Skipping step 03 (--skip-tokenizer)")
+
+    # ── Step 04: Speech + Codec 3D fused (base only) ──
+    if not args.skip_speech_codec_fused:
+        for variant in variants:
+            if not variant.startswith("base-"):
+                continue
+            logger.info("=" * 60)
+            logger.info(f"Step 04/{TOTAL}: [{variant}] Speech + Codec 3D fused → ONNX")
+            logger.info("=" * 60)
+            try:
+                from export_04_speech_tokenizer_codec_fused import export_speech_tokenizer_codec_fused
+                path = export_speech_tokenizer_codec_fused(
+                    variant, args.models_dir, args.output_dir, device, dtype
+                )
+                results[f"{variant}/speech_tokenizer_codec_fused"] = ("OK", path)
+            except FileNotFoundError as e:
+                logger.warning(f"[{variant}] Step 04 skipped: {e}")
+                results[f"{variant}/speech_tokenizer_codec_fused"] = ("SKIPPED", str(e))
+            except Exception as e:
+                logger.error(f"[{variant}] Speech+Codec fused failed: {e}", exc_info=True)
+                results[f"{variant}/speech_tokenizer_codec_fused"] = ("FAILED", str(e))
+    elif args.skip_speech_codec_fused:
+        logger.info("Skipping step 04 (--skip-speech-codec-fused)")
+
+    # ── Steps 05–08: verification-only ONNX ──
+    if not args.skip_verification:
+        for variant in variants:
+            logger.info("=" * 60)
+            logger.info(f"Step 05/{TOTAL}: [{variant}] Code Predictor → ONNX (verification)")
+            logger.info("=" * 60)
+            try:
+                from export_05_code_predictor import export_code_predictor_unrolled
+                path = export_code_predictor_unrolled(
+                    variant, args.models_dir, args.output_dir, device
+                )
+                results[f"{variant}/code_predictor_unrolled"] = ("OK", path)
+            except Exception as e:
+                logger.error(f"[{variant}] Code Predictor export failed: {e}", exc_info=True)
+                results[f"{variant}/code_predictor_unrolled"] = ("FAILED", str(e))
+
+        if not args.skip_tokenizer:
+            logger.info("=" * 60)
+            logger.info(f"Step 06/{TOTAL}: Code2Wav Decoder → ONNX")
+            logger.info("=" * 60)
+            try:
+                from export_06_code2wav_decoder import export_code2wav_decoder
+                path = export_code2wav_decoder(args.models_dir, args.output_dir, device, dtype)
+                results["code2wav_decoder"] = ("OK", path)
+            except Exception as e:
+                logger.error(f"Code2Wav Decoder failed: {e}", exc_info=True)
+                results["code2wav_decoder"] = ("FAILED", str(e))
+        else:
+            logger.info("Skipping step 06 (--skip-tokenizer)")
+
+        for variant in variants:
+            logger.info("=" * 60)
+            logger.info(f"Step 07/{TOTAL}: [{variant}] Talker backbone → ONNX")
+            logger.info("=" * 60)
+            try:
+                from export_07_talker_backbone import export_talker_backbone
+                out = export_talker_backbone(variant, args.models_dir, args.output_dir, device)
+                path = out.get("onnx", out) if isinstance(out, dict) else out
+                results[f"{variant}/talker_backbone"] = ("OK", path)
+            except Exception as e:
+                logger.error(f"[{variant}] Talker backbone failed: {e}", exc_info=True)
+                results[f"{variant}/talker_backbone"] = ("FAILED", str(e))
+
+        for variant in variants:
+            logger.info("=" * 60)
+            logger.info(f"Step 08/{TOTAL}: [{variant}] Talker Unified → ONNX")
+            logger.info("=" * 60)
+            try:
+                from export_08_talker_unified import export_talker_unified
+                out = export_talker_unified(variant, args.models_dir, args.output_dir, device)
+                path = out.get("onnx", out) if isinstance(out, dict) else out
+                results[f"{variant}/talker_unified"] = ("OK", path)
+            except Exception as e:
+                logger.error(f"[{variant}] Talker Unified failed: {e}", exc_info=True)
+                results[f"{variant}/talker_unified"] = ("FAILED", str(e))
+    else:
+        logger.info("Skipping steps 05–08 (--skip-verification)")
+
+    # ── Step 09: Talker + Code2Wav fused (production) ──
+    if not args.skip_talker_code2wav_fused:
+        for variant in variants:
+            logger.info("=" * 60)
+            logger.info(f"Step 09/{TOTAL}: [{variant}] Talker + Code2Wav fused → ONNX")
+            logger.info("=" * 60)
+            try:
+                from export_09_talker_code2wav_fused import export_talker_code2wav_fused
+                out = export_talker_code2wav_fused(variant, args.models_dir, args.output_dir, device)
+                path = out.get("onnx", out) if isinstance(out, dict) else out
+                results[f"{variant}/talker_code2wav_fused"] = ("OK", path)
+            except Exception as e:
+                logger.error(f"[{variant}] Talker+Code2Wav fused failed: {e}", exc_info=True)
+                results[f"{variant}/talker_code2wav_fused"] = ("FAILED", str(e))
+    else:
+        logger.info("Skipping step 09 (--skip-talker-code2wav-fused)")
+
     elapsed = time.time() - t_start
     logger.info("")
     logger.info("=" * 60)
@@ -189,7 +254,7 @@ def main():
     n_fail = sum(1 for s, _ in results.values() if s == "FAILED")
 
     for name, (status, detail) in results.items():
-        icon = "✓" if status == "OK" else "✗"
+        icon = "✓" if status == "OK" else ("○" if status == "SKIPPED" else "✗")
         logger.info(f"  {icon} {name}: {status}")
         if status == "FAILED":
             logger.info(f"    → {detail}")

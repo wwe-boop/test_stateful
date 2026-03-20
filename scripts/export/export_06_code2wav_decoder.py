@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-[Step 02] Export Code2Wav Decoder to ONNX.
+[Step 04] Export Code2Wav Decoder to ONNX.
 
 Component: Code2Wav Decoder (stateful streaming, chunk_T=4)
 Architecture: RVQ Dequant + Transformer(8L, sliding window) + BigVGAN ConvNet
-Input:  codes [B, 16, 4], cache_position [4], 37 state tensors
-Output: wav [B, 7680], 37 updated state tensors
+Input:  codes [B, 16, 4], cache_position [4], streaming state tensors (layout from decoder)
+Output: wav [B, 7680], updated state tensors
 Engine: ONNX Runtime / TensorRT
 Usage: Incremental decode per 4 codec frames; states kept on GPU for batching.
 
@@ -34,12 +34,11 @@ from utils import (
 
 from code2wav_streaming import (
     Code2WavStreamingWrapper,
-    create_initial_states,
     get_initial_state_shapes,
-    NUM_KV,
     NUM_CONV,
     NUM_TRANSCONV,
     CHUNK_T,
+    num_code2wav_hidden_layers,
 )
 
 logger = logging.getLogger("onnx_export")
@@ -76,11 +75,12 @@ def export_code2wav_decoder(
     wav_ref = out[0]
     logger.info(f"Streaming decoder output wav shape: {wav_ref.shape} (expected [1, 7680])")
 
+    n_c2w = num_code2wav_hidden_layers(decoder)
     input_names = ["codes", "cache_position"]
     output_names = ["wav"]
     for name, _ in get_initial_state_shapes(decoder, batch_size=B, past_kv_len=0):
         input_names.append(name)
-    for i in range(8):
+    for i in range(n_c2w):
         output_names.append(f"present_kv_{i}_k")
         output_names.append(f"present_kv_{i}_v")
     for i in range(NUM_CONV):
@@ -93,7 +93,7 @@ def export_code2wav_decoder(
         "cache_position": {0: "batch"},
         "wav": {0: "batch"},
     }
-    for i in range(8):
+    for i in range(n_c2w):
         dynamic_axes[f"past_kv_{i}_k"] = {0: "batch", 2: "past_len"}
         dynamic_axes[f"past_kv_{i}_v"] = {0: "batch", 2: "past_len"}
         dynamic_axes[f"present_kv_{i}_k"] = {0: "batch", 2: "total_len"}

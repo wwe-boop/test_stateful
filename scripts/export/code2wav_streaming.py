@@ -118,16 +118,28 @@ def streaming_causal_transconv(
 # Code2Wav streaming wrapper (chunk_T=4 fixed)
 # -----------------------------------------------------------------------------
 
-# State layout (37): kv_0..kv_15 (16), conv_0..conv_16 (17), transconv_0..transconv_3 (4)
-NUM_KV = 16
+# State layout: 2 * num_hidden_layers KV + NUM_CONV + NUM_TRANSCONV (e.g. 8 layers → 37 tensors).
 NUM_CONV = 17
 NUM_TRANSCONV = 4
 CHUNK_T = 4
 SAMPLES_PER_CHUNK = CHUNK_T * 1920  # 7680
 
+def num_code2wav_hidden_layers(decoder: nn.Module) -> int:
+    """Match the actual pre_transformer depth (checkpoint may disagree with config)."""
+    pt = getattr(decoder, "pre_transformer", None)
+    layers = getattr(pt, "layers", None) if pt is not None else None
+    if layers is not None and len(layers) > 0:
+        return int(len(layers))
+    return int(getattr(decoder.config, "num_hidden_layers", 8))
+
+
+def count_code2wav_state_tensors(decoder: nn.Module) -> int:
+    """Total streaming state tensors (KV + conv + transconv)."""
+    return 2 * num_code2wav_hidden_layers(decoder) + NUM_CONV + NUM_TRANSCONV
+
 
 def get_initial_state_shapes(decoder: nn.Module, batch_size: int = 1, past_kv_len: int = 0):
-    """Return list of (name, shape) for the 37 state tensors. Used for ONNX export dummy inputs."""
+    """Return list of (name, shape) for code2wav streaming state tensors. Used for ONNX export."""
     cfg = decoder.config
     codebook_dim = getattr(cfg, "codebook_dim", 512)
     latent_dim = cfg.latent_dim
@@ -135,8 +147,9 @@ def get_initial_state_shapes(decoder: nn.Module, batch_size: int = 1, past_kv_le
     num_kv_heads = cfg.num_key_value_heads
     head_dim = getattr(cfg, "head_dim", getattr(cfg, "hidden_size", 512) // cfg.num_attention_heads)
     B = batch_size
+    n_layers = num_code2wav_hidden_layers(decoder)
     shapes = []
-    for i in range(8):
+    for i in range(n_layers):
         shapes.append((f"past_kv_{i}_k", (B, num_kv_heads, past_kv_len, head_dim)))
         shapes.append((f"past_kv_{i}_v", (B, num_kv_heads, past_kv_len, head_dim)))
     shapes.append(("conv_state_0", (B, codebook_dim, 2)))
@@ -164,8 +177,8 @@ def create_initial_states(decoder: nn.Module, device: torch.device, dtype: torch
 
 class Code2WavStreamingWrapper(nn.Module):
     """
-    Stateful code2wav for ONNX/TRT: input codes [B, 16, 4] + cache_position [4] + 37 states,
-    output wav [B, 7680] + 37 updated states.
+    Stateful code2wav for ONNX/TRT: input codes [B, 16, 4] + cache_position [4] + state tensors,
+    output wav [B, 7680] + updated states (layout matches get_initial_state_shapes).
     """
 
     def __init__(self, decoder: nn.Module, window_size: int = 72):
@@ -173,7 +186,9 @@ class Code2WavStreamingWrapper(nn.Module):
         self.decoder = decoder
         self.window_size = window_size
         cfg = decoder.config
-        self.num_layers = cfg.num_hidden_layers
+        self.num_layers = num_code2wav_hidden_layers(decoder)
+        # KV states are 2 * num_layers; conv/transconv follow immediately (not a fixed 16-slot pad).
+        self._num_kv_state_tensors = 2 * self.num_layers
         self.hidden_size = getattr(cfg, "hidden_size", 512)
         self.latent_dim = cfg.latent_dim
         self.num_kv_heads = cfg.num_key_value_heads
@@ -191,7 +206,7 @@ class Code2WavStreamingWrapper(nn.Module):
     ) -> Tuple[torch.Tensor, ...]:
         """
         codes: [B, 16, 4], cache_position: [4] (absolute positions for this chunk).
-        states: 16 KV + 17 conv + 4 transconv = 37 tensors.
+        states: 2*num_hidden_layers KV + 17 conv + 4 transconv.
         Returns: (wav [B, 7680], *new_states).
         """
         B = codes.shape[0]
@@ -200,8 +215,9 @@ class Code2WavStreamingWrapper(nn.Module):
 
         # Unpack states
         kv_list = [(states[2 * i], states[2 * i + 1]) for i in range(self.num_layers)]
-        conv_states = list(states[NUM_KV : NUM_KV + NUM_CONV])
-        transconv_states = list(states[NUM_KV + NUM_CONV :])
+        off = self._num_kv_state_tensors
+        conv_states = list(states[off : off + NUM_CONV])
+        transconv_states = list(states[off + NUM_CONV :])
 
         # 1. Quantizer (stateless)
         hidden = self.decoder.quantizer.decode(codes)  # [B, codebook_dim, 4]

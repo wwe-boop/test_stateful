@@ -4,6 +4,13 @@ Three-way audio quality comparison: prototype (official high-level API) vs manua
 decode loop vs ORT (talker_unified.onnx) decode loop. All three produce codec tokens,
 then decode to WAV via the same PyTorch speech_tokenizer.decode() for fair comparison.
 
+For **listenability only** (official vs deployed fused path), prefer:
+  `scripts/python/compare_official_vs_triton_audio.py`
+which writes `proto.wav` + `triton.wav` only.
+
+This script adds manual/ORT paths and optional Triton (`trt_bf16.wav`); Triton uses the
+same orchestrator as production (fused engine when `talker_code2wav_fused` is deployed).
+
 Key: VoiceDesign uses non_streaming_mode=True by default, which folds ALL text tokens
 into the prefill. The official _build_assistant_text format also includes a trailing
 `\\n<|im_start|>assistant\\n` suffix. Both must be replicated exactly in manual/ORT paths.
@@ -362,11 +369,26 @@ def main():
             triton_client = grpcclient.InferenceServerClient(url=args.triton_url)
             if not triton_client.is_server_ready():
                 raise RuntimeError(f"Triton not ready at {args.triton_url}")
-            req_dict = {
-                "text": args.text,
-                "task_type": "voice_design",
-                "language": language,
-            }
+            if "design" in args.variant.lower():
+                req_dict = {
+                    "text": args.text,
+                    "task_type": "voice_design",
+                    "language": language,
+                    "instruct": args.instruct or "",
+                }
+            elif "custom" in args.variant.lower():
+                req_dict = {
+                    "text": args.text,
+                    "task_type": "custom_voice",
+                    "language": language,
+                    "speaker": speaker or "serena",
+                }
+            else:
+                logger.warning(
+                    "Triton A/B: variant %s not mapped (use design-* or custom-*); skipping TRT",
+                    args.variant,
+                )
+                raise RuntimeError("unsupported variant for auto task_type")
             req_input = grpcclient.InferInput("request", [1], "BYTES")
             req_input.set_data_from_numpy(np.array([json.dumps(req_dict)], dtype=object))
             audio_out = grpcclient.InferRequestedOutput("audio_chunk")

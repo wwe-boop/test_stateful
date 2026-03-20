@@ -408,7 +408,22 @@ def verify_onnx(onnx_path: str, test_inputs: Dict[str, np.ndarray],
         providers=["CPUExecutionProvider"],
     )
 
-    ort_outputs = session.run(None, test_inputs)
+    # ORT rejects unknown input names; traced graphs may omit unused c2w_* / optional inputs.
+    required = [inp.name for inp in session.get_inputs()]
+    feed = {k: test_inputs[k] for k in required if k in test_inputs}
+    missing = [k for k in required if k not in feed]
+    if missing:
+        logger.error("verify_onnx: missing feeds for required inputs: %s", missing)
+        return False
+    extra = set(test_inputs.keys()) - set(feed.keys())
+    if extra:
+        logger.warning(
+            "verify_onnx: ignoring %d test_inputs not in ONNX model: %s",
+            len(extra),
+            sorted(extra)[:20] + (["..."] if len(extra) > 20 else []),
+        )
+
+    ort_outputs = session.run(None, feed)
 
     output_names = [o.name for o in session.get_outputs()]
     all_close = True

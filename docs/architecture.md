@@ -49,7 +49,7 @@
 
 > **Codec Embedding Sum 优化（已实现）**: 每个 decode step 需计算 `Σ embed_i(codec_ids[i]), i=0..15`。朴素实现为 16 次 Embedding.forward() + 逐元素加法（~0.15ms）。已实现预合并 3D 查找表方案：
 > - Talker codec embedding vocab=3072，CP 15 个 embedding vocab=2048；CP 零填充至 3072 后与 Talker 堆叠为 `[16, 3072, H]`（H=talker_hidden_size），单次 advanced indexing + sum 完成
-> - 导出见 `codec_embeddings_3d.pt`（export_06）；推理使用 `scripts/python/codec_embedding_sum.py` 的 `CodecEmbeddingSum` 模块
+> - 导出见 `codec_embeddings_3d.pt`（export_01_embeddings）；推理使用 `scripts/python/codec_embedding_sum.py` 的 `CodecEmbeddingSum` 模块
 > - 实测（design-1.7b, GPU）：3D gather ~0.02ms，naive 循环 ~0.17ms，**约 7.7x 加速**；同 dtype 时与朴素实现 bitwise 一致，导出 BF16 时 max_abs_diff < 0.001
 
 ### 2.2 模型变体与任务类型
@@ -188,15 +188,11 @@ TaskType
 │  │          Pure TRT Engines (自管理 KV Cache)           │  │
 │  │                                                      │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │ talker_unified (单引擎 prefill + decode)          │  │  │
-│  │  │ → codec_sum, full_codec, logits, present_kv_*     │  │  │
+│  │  │ talker_code2wav_fused (生产：Talker + Code2Wav T=1) │  │  │
+│  │  │ → wav, codec_sum, logits, present_kv_*, c2w_*      │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └──────────────────────────────────────────────────────┘  │
-│                                      ┌────────┐            │
-│                                      │Code2Wav│            │
-│                                      │ (ONNX) │            │
-│                                      │ 异步stream│           │
-│                                      └────────┘            │
+│     (遗留：talker_unified + code2wav 分模型 + 帧缓冲)          │
 └─────────────────────────────────────────────────────────────┘
                                  │
                                  │ audio chunk stream
@@ -625,39 +621,53 @@ Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 
 ### 6.0 部署方式
 
-Talker 使用**单引擎 talker_unified**（prefill 与 decode 合一），消除权重重复 (~1.6GB)。所有子模型（含 talker_unified、code2wav）注册为独立 Triton 模型，BLS 通过 `pb_utils.InferenceRequest` 统一调用：
+**生产默认**：子模型为 `speaker_encoder`（Base voice clone）、`speech_tokenizer_codec_fused`（Base ICL）、**`talker_code2wav_fused`**（每变体必选）+ `tts_orchestrator`（BLS）。整段生成由 **talker_code2wav_fused** 完成：Talker（prefill+decode+CP+codec_sum）与 Code2Wav（chunk_T=1）在同一引擎内；BLS 维护 Talker `present_kv_*` 与 Code2Wav 的 `c2w_*` 状态。`position_ids` 布局 **(B,3,S)**；空 KV 为 **S_past=0**（与导出/TRT profile 一致）。
+
+**遗留路径**：若仅组装了 `talker_unified` + `code2wav`（验证模式或旧仓库），BLS 自动走分步解码与 chunk_T=4 缓冲；也可设置环境变量 `USE_LEGACY_TALKER_CODE2WAV=1` 强制该路径。
+
+**验证用 ONNX**（`export_all.py` 步骤 01–09；`--skip-verification` 跳过 05–08）：`speech_tokenizer_encoder`、`code_predictor`、`code2wav_decoder`、`talker_backbone`、`talker_unified` 用于分步一致性测试；默认 **不** 编入 Phase B TRT、不进入默认 Triton 组装（`BUILD_VERIFICATION_ENGINES=1` / `ASSEMBLE_VERIFICATION_MODELS=1` 时启用）。
 
 | 部署模式 | 模型文件 | Triton backend | config.pbtxt |
 |---------|---------|---------------|-------------|
-| ONNX Runtime | `model.onnx` | `onnxruntime` | `_write_onnx_minimal_config()` |
-| TensorRT | `model.plan` | `tensorrt` | `_write_trt_minimal_config()` |
+| ONNX Runtime | `model.onnx` | `onnxruntime` | `generate_triton_configs.py` |
+| TensorRT | `model.plan` | `tensorrt` | `generate_triton_configs.py`（显式 I/O 与 minimal） |
 
-切换方式：`build_triton.sh assemble --engine-mode onnx|trt`，BLS `model.py` 代码无需任何修改。
+**`triton_manifest.json`**（`export_09` 必填）：合并 `weights/config.json` 中的 Talker 维度与融合图 Code2Wav 状态（`code2wav_fused`）。Phase C `assemble` **要求**该文件存在，将其复制到 `model_repository/` 根与 `tts_orchestrator/1/`，并仅通过 [`scripts/python/generate_triton_configs.py`](../scripts/python/generate_triton_configs.py) 生成全部 `config.pbtxt`。Schema 见 [`scripts/python/schemas/triton_manifest.schema.json`](../scripts/python/schemas/triton_manifest.schema.json)。
 
-### 6.1 单引擎统一架构 (talker_unified)
+切换方式：`build_triton.sh assemble --engine-mode onnx|trt`。BLS 根据是否存在 `talker_code2wav_fused/config.pbtxt` 选择融合或遗留流水线；融合路径下从 `triton_manifest.json` 的 `code2wav_fused` 读取 Code2Wav 状态张量布局（与导出融合 ONNX 一致）。
+
+### 6.1 生产融合引擎 (talker_code2wav_fused)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  talker_unified.engine (Prefill + Decode 合一，无权重重复)                  │
+│  talker_code2wav_fused (Prefill + Decode + Code2Wav chunk_T=1)            │
 │                                                                            │
 │  Inputs:                                                                   │
-│    input_embeds [B, S, H]     (S>1 prefill, S=1 decode)                   │
-│    position_ids [3, B, S]                                                  │
-│    past_kv_{i}_k [B, kv, S_past, hd]  (S_past=1 为 prefill dummy)          │
-│    past_kv_{i}_v [B, kv, S_past, hd]                                       │
+│    input_embeds [B, S, H]     (S>1 prefill, S=1 decode)                    │
+│    position_ids [B, 3, S]                                                  │
+│    cache_position [B, 1]      (vocoder 绝对帧索引)                         │
+│    past_kv_{i}_k/v [B, kv, S_past, hd]   (S_past=0 冷启动)                 │
+│    c2w_*                      (37 路 Code2Wav 状态，与 code2wav 导出一致)   │
 │                                                                            │
-│  Internals: 统一因果掩码 (row_idx + col_idx 算术)，UnifiedKVCache(cat past+new) │
-│    Talker 28L → norm + codec_head → argmax → CP 15步 → Codec Embedding Sum │
+│  Internals: TalkerUnifiedFused → full_codec → Code2WavStreaming (1 frame)│
 │                                                                            │
-│  Outputs: codec_sum [B,1,H], full_codec [B,16], hidden, logits, present_kv_* │
+│  Outputs: wav, codec_sum, full_codec, logits, present_kv_*, 更新 c2w_*       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 ONNX 导出
+### 6.2 ONNX 导出（步骤 07–09 与验证子图）
 
-#### 6.2.0 Unified 单引擎导出 (`export_04_talker_unified.py`，推荐)
+#### 6.2.0 Talker 主干 (`export_07_talker_backbone.py`，验证)
 
-单 ONNX 同时支持 prefill (S>1, S_past=1 dummy) 与 decode (S=1, S_past>0)。统一因果掩码用纯算术构造，无分支；`UnifiedKVCache` 始终 `cat(past, new, dim=2)`。导出时用 S=8、S_past=4 的 dummy 做 trace，dynamic axes 覆盖 `seq`、`S_past`、`S_total`。
+导出 `TalkerUnifiedONNX` → `talker_backbone.onnx`（hidden / logits / KV，无 CP / codec_sum）。用于与 PyTorch 对齐及作为 unified 的语义基线。
+
+#### 6.2.1 Talker Unified (`export_08_talker_unified.py`，验证)
+
+导出 `TalkerUnifiedFusedONNX` → `talker_unified.onnx`（与历史单引擎 talker 图一致：argmax + CP + codec_sum）。**不依赖** 05/06 的 ONNX 文件，仅共享 checkpoint 与 `talker_unified_modules`。
+
+#### 6.2.2 生产融合 (`export_09_talker_code2wav_fused.py`，推荐)
+
+在 08 同权重复用的 Talker 融合模块外再包一层 `Code2WavStreamingWrapper`（T=1），产出 `talker_code2wav_fused.onnx`；I/O 名含 `c2w_` 前缀，须与 Triton `config.pbtxt` 完全一致。
 
 #### 6.2.1 Context Engine 导出 (`export_04_talker_context.py`，已弃用)
 
@@ -709,30 +719,29 @@ class TalkerDecodeFusedONNX(nn.Module):
 
 ### 6.3 TRT 引擎编译 (`build_engines.sh`)
 
-单引擎编译，S_past min=1（prefill 时 BLS 传 dummy past_kv）：
+**默认 Phase B** 仅编译三颗引擎（存在对应 ONNX 时）：`speaker_encoder`、`speech_tokenizer_codec_fused`（Base）、**`talker_code2wav_fused`**（每变体）。`trt_fused_talk_c2w_profiles.py` 生成融合模型的 min/opt/max 形状；Talker 侧 **S_past min=0**（空 KV，与 BLS numpy 空张量一致）。
 
 ```bash
-trtexec --onnx=talker_unified.onnx --bf16 \
-  --minShapes=input_embeds:1x1x${H},position_ids:3x1x1,past_kv_0_k:1x${KV}x1x${HD},... \
-  --optShapes=input_embeds:1x1x${H},position_ids:3x1x1,past_kv_0_k:4x${KV}x64x${HD},... \
-  --maxShapes=input_embeds:${B}x512x${H},position_ids:3x${B}x512,past_kv_0_k:${B}x${KV}x${MAX_SEQ}x${HD},... \
-  --saveEngine=talker_unified.engine
+# 示例：融合引擎（具体形状由 profile 脚本生成）
+trtexec --onnx=talker_code2wav_fused.onnx --bf16 \
+  --minShapes=... --optShapes=... --maxShapes=... \
+  --saveEngine=talker_code2wav_fused.engine
 ```
 
-模型维度 (`H`, `KV`, `num_layers`) 由 `_get_talker_dims()` 从 `weights/config.json` 或硬编码表获取。
+`BUILD_VERIFICATION_ENGINES=1` 时再编 `talker_unified`、`speech_tokenizer_encoder`、`code2wav_decoder` 等验证引擎。
 
-### 6.4 KV Cache 管理 (BLS)
+### 6.4 KV Cache 与 Code2Wav 状态 (BLS)
 
-Talker 已从 Orchestrator 内置引擎改为独立 Triton 子模型。KV Cache 在 BLS Python 层用 `torch.Tensor` 管理，通过 `pb_utils.Tensor.from_dlpack("name", t.to_dlpack())` 实现 GPU 零拷贝传递：
+Talker KV 与 Code2Wav 状态在 BLS 层用 `torch.Tensor` 管理，经 `pb_utils.Tensor.from_dlpack` 零拷贝：
 
 ```python
-# Prefill: 调用 talker_unified，past_kv_tensors=None → BLS 传 dummy S_past=1
-codec_sum, full_codec, logits, kv_tensors = self._bls_talker(input_embeds, position_ids)
+# 融合路径：每步 talker_code2wav_fused（prefill: past_kv=None, cache_position=0）
+wav, codec_sum, logits, kv_tensors, c2w_states = self._bls_talker_code2wav_fused(
+    embeds, position_ids, cache_position, past_kv, c2w_states
+)
 
-# Decode loop: 同一模型，传入上一步 kv_tensors
-for step in range(max_steps):
-    codec_sum, full_codec, logits, kv_tensors = self._bls_talker(next_embed, pos, kv_tensors)
-    # kv_tensors 通过 dlpack 零拷贝传入/传出，无额外显存分配
+# 遗留路径：talker_unified + 独立 code2wav（chunk_T=4 缓冲）
+codec_sum, full_codec, logits, kv_tensors = self._bls_talker(embeds, position_ids, past_kv)
 ```
 
 KV 显存: 28L × 2 × 8(kv_heads) × max_seq × 128(head_dim) × 2B(bf16)。
@@ -801,7 +810,7 @@ model_repository/
 │   ├── config.pbtxt                     # model_transaction_policy: decoupled
 │   └── 1/
 │       ├── model.py                     # 主控逻辑: prefill + decode loop + Code2Wav
-│       # talker 为独立 Triton 模型 (talker_unified)，由 BLS 调用
+│       # 生产：BLS 调用 talker_code2wav_fused；遗留：talker_unified + code2wav
 │       ├── prefill_builder.py           # 4 种 task_type 的 prefill 构建
 │       ├── codec_embedding_sum.py       # 3D gather 优化的 codec embedding 求和
 │       ├── session_manager.py           # 会话状态管理 (Phase 3)
@@ -818,21 +827,23 @@ model_repository/
 │   ├── config.pbtxt
 │   └── 1/model.onnx
 │
-├── speech_tokenizer_encoder/            # ONNX Runtime
-│   ├── config.pbtxt
-│   └── 1/model.onnx
-│
-├── talker_unified/                      # ONNX/TRT (prefill + decode 合一，单引擎)
+├── speech_tokenizer_codec_fused/        # Base ICL：waveform → ref_codec_sum_vec
 │   └── 1/model.onnx 或 model.plan
 │
-└── code2wav/                            # ONNX Runtime
-    ├── config.pbtxt                     # dynamic batching enabled
+├── talker_code2wav_fused/               # 生产：Talker 融合 + Code2Wav (T=1)
+│   └── 1/model.onnx 或 model.plan
+│
+├── speech_tokenizer_encoder/            # 可选（验证 / ASSEMBLE_VERIFICATION_MODELS）
+│   └── 1/model.onnx
+│
+├── talker_unified/                      # 可选（验证或遗留流水线）
+│   └── 1/model.onnx 或 model.plan
+│
+└── code2wav/                            # 可选（遗留流水线，chunk_T=4）
     └── 1/model.onnx
-    # Input:  codes [B, 16, T_chunk], left_ctx [B, 16, T_ctx]
-    # Output: wav [B, T_chunk * 1920]
 ```
 
-> **注意**: talker_unified 为单 Triton 子模型，BLS 通过 `_bls_talker(input_embeds, position_ids, past_kv_tensors=None)` 调用；prefill 时 `past_kv_tensors=None` 传 dummy S_past=1，decode 时传入上一步的 KV；KV 经 dlpack 零拷贝传递。Code Predictor 已融合进统一引擎。
+> **注意**: 默认组装含 **talker_code2wav_fused**；BLS `_bls_talker_code2wav_fused` 传入 `cache_position` 与 37 路 `c2w_*` 状态。若仅存在 talker_unified + code2wav，则走 `_bls_talker` + `_bls_code2wav_streaming` 与帧缓冲。
 
 ---
 
@@ -1888,15 +1899,18 @@ Qwen3-TTS-Triton/
 │
 ├── scripts/
 │   ├── export/
-│   │   ├── export_all.py               # 总入口 (一键导出全部组件)
-│   │   ├── export_01_speech_tokenizer_encoder.py  # → ONNX
-│   │   ├── export_02_code2wav_decoder.py          # → ONNX
-│   │   ├── export_03_speaker_encoder.py           # → ONNX (base only)
-│   │   ├── export_04_talker_unified.py              # → ONNX (单引擎 prefill+decode，推荐)
-│   │   ├── export_04_talker_context.py               # (deprecated) context 融合
-│   │   ├── export_05_talker_decode_fused.py        # (deprecated) decode 融合
-│   │   ├── export_06_embeddings.py                 # → .pt 权重 + config
-│   │   ├── export_code_predictor.py                # → 独立 CP 调试/验证 (不在主流程)
+│   │   ├── export_all.py               # 总入口 (步骤 01–09)
+│   │   ├── export_01_embeddings.py      # → .pt 权重 + config
+│   │   ├── export_02_speaker_encoder.py
+│   │   ├── export_03_speech_tokenizer_encoder.py
+│   │   ├── export_04_speech_tokenizer_codec_fused.py
+│   │   ├── export_05_code_predictor.py  # 验证用独立 CP
+│   │   ├── export_06_code2wav_decoder.py
+│   │   ├── export_07_talker_backbone.py # 验证
+│   │   ├── export_08_talker_unified.py  # 验证（历史 talker 单图）
+│   │   ├── export_09_talker_code2wav_fused.py  # 生产融合引擎
+│   │   ├── talker_unified_modules.py
+│   │   ├── deprecated/                # 旧 talker context / decode fused 脚本
 │   │   └── utils.py                     # 共享工具 + CodePredictorUnrolled
 │   ├── bash/
 │   │   ├── autorun.sh                  # 智能入口 (串联 A→B→C, 子命令/交互)
@@ -1922,9 +1936,11 @@ Qwen3-TTS-Triton/
 │   │       ├── weights/               # text_embedding .pt 权重 + config.json
 │   │       └── tokenizer/             # text tokenizer 文件
 │   ├── speaker_encoder/               # model.onnx | model.plan (onnxruntime | tensorrt)
-│   ├── speech_tokenizer_encoder/      # model.onnx | model.plan
-│   ├── talker_unified/                # model.onnx | model.plan (prefill+decode 合一)
-│   └── code2wav/                      # model.onnx | model.plan
+│   ├── speech_tokenizer_codec_fused/ # Base ICL
+│   ├── talker_code2wav_fused/         # 生产主引擎
+│   ├── speech_tokenizer_encoder/      # 验证可选
+│   ├── talker_unified/                # 验证 / 遗留
+│   └── code2wav/                      # 验证 / 遗留
 │
 ├── gateway/                            # TTS Gateway (gRPC ↔ Triton 桥接, TODO)
 │   └── proto/
@@ -1940,7 +1956,7 @@ Qwen3-TTS-Triton/
     └── exported/                       # 导出产物 (ONNX/engine/权重, gitignored)
         └── <variant>/
             ├── *.onnx                  # ONNX 模型
-            ├── talker_unified.engine   # Pure TRT 单引擎 (prefill + decode)
+            ├── talker_code2wav_fused.engine   # 生产 TRT 主引擎
             ├── *.pt                    # PyTorch 权重
             └── *.engine                # trtexec 产出 (可选，--engine-mode trt 时使用)
 ```
@@ -1961,12 +1977,12 @@ Qwen3-TTS-Triton/
 flowchart LR
     subgraph hostPhase [Phase A: Host / 轻量环境]
         A1[下载模型权重] --> A2[PyTorch 加载模型]
-        A2 --> A3["ONNX 导出 (01-03, 04a, 04b)"]
-        A2 --> A5["Embedding 权重 .pt (06)"]
+        A2 --> A3["ONNX 导出 (01–09, --skip-verification 可跳过 05–08)"]
+        A2 --> A5["Embedding 权重 .pt (01)"]
     end
 
     subgraph trtPhase ["Phase B: NGC 容器 (可选, GPU)"]
-        B1["trtexec: 全部 ONNX → .engine (bf16)"]
+        B1["trtexec: 默认 3 引擎 + 可选验证引擎 (bf16)"]
     end
 
     A3 --> deployReady
@@ -1980,7 +1996,7 @@ flowchart LR
 ```
 
 - **Phase A** (`setup_env.sh`) 只需要 PyTorch + qwen_tts + ONNX 工具
-- **Phase B** (`build_engines.sh`) 使用 `trtexec` 编译全部 ONNX → `.engine`（可选，仅 TRT 模式需要）
+- **Phase B** (`build_engines.sh`) 默认 `trtexec` 编译 **speaker / speech_codec_fused / talker_code2wav_fused**；验证引擎见 `BUILD_VERIFICATION_ENGINES=1`
 - **Phase C** (`build_triton.sh`) 只需要 Triton + engine 文件，不需要任何构建工具
 - 三阶段通过 `workspace/exported/` 目录传递中间产物
 - `autorun.sh` 作为智能入口串联三阶段，支持子命令和交互式引导
@@ -2038,10 +2054,10 @@ docker run --rm --gpus all \
     -v "${REPO_ROOT}/workspace:/workspace" \
     nvcr.io/nvidia/tritonserver:xx.xx-py3 \
     bash -c "
-        trtexec --onnx=/workspace/exported/<variant>/talker_unified.onnx --bf16 \
+        trtexec --onnx=/workspace/exported/<variant>/talker_code2wav_fused.onnx --bf16 \
             --minShapes=... --optShapes=... --maxShapes=... \
-            --saveEngine=/workspace/exported/<variant>/talker_unified.engine
-        # + speaker_encoder, speech_tokenizer_encoder, code2wav_decoder
+            --saveEngine=/workspace/exported/<variant>/talker_code2wav_fused.engine
+        # + speaker_encoder, speech_tokenizer_codec_fused (Base); 验证引擎可选
     "
 ```
 
@@ -2091,10 +2107,10 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 
 ### Phase 2: TensorRT 优化 (3-5 天)
 
-9. [x] **Talker Backbone ONNX 导出 + trtexec 编译** (6.1/6.2/6.3 节)
-   - `export_04_talker_unified.py`: 单引擎 ONNX 导出 (prefill+decode)，统一因果掩码 + UnifiedKVCache
-   - `build_engines.sh`: `trtexec` 编译 talker_unified.onnx → talker_unified.engine，S_past min=1
-   - Talker 为 Triton 子模型 talker_unified，BLS 通过 _bls_talker() 调用，KV 经 dlpack 零拷贝传递
+9. [x] **Talker / 融合引擎 ONNX 导出 + trtexec 编译** (6.1/6.2/6.3 节)
+   - `export_08_talker_unified.py`: 验证用 talker 单图；`export_09_talker_code2wav_fused.py`: 生产融合
+   - `build_engines.sh`: 默认 `trtexec` → `talker_code2wav_fused.engine` 等；Talker 侧 S_past min=0
+   - BLS `_bls_talker_code2wav_fused()` 为默认路径；遗留 `_bls_talker` + code2wav 仍支持
 10. [x] Code Predictor ONNX → TRT (BF16, 验证权重共享) — 5 个变体已用 BF16 重新编译；unrolled ~129–141s/变体，~438 MB (0.6B)/~508 MB (1.7B)；single-stage ~8–12s，~151 MB；精度 single-stage cosine >0.999，unrolled 部分 token 差异属预期
     - fallback single-stage TRT engine 已同时验证，均可选用
     - CP 已融合进 context 和 fused decode 引擎，无需独立 CP Triton 模型

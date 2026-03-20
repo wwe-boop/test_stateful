@@ -1,12 +1,14 @@
 """
 L1 unit tests: EmbeddingWeights and PrefillBuilder (T1.3, T1.4, T4.2).
-Requires: workspace/exported/<variant>/weights/ with .pt from export_06_embeddings.py, and GPU.
+Requires: workspace/exported/<variant>/weights/ with .pt from export_01_embeddings.py, and GPU.
 Run from repo root: pytest tests/test_prefill_builder.py -v
 """
 import sys
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("torch")
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,7 +22,7 @@ TOKENIZER_DIR = REPO_ROOT / "workspace" / "exported" / "tokenizer" / "Qwen3-TTS-
 
 def _weights_dir():
     if not WEIGHTS_DIR.is_dir():
-        pytest.skip(f"Weights dir not found: {WEIGHTS_DIR} (run export_06_embeddings.py)")
+        pytest.skip(f"Weights dir not found: {WEIGHTS_DIR} (run export_01_embeddings.py)")
     return str(WEIGHTS_DIR)
 
 

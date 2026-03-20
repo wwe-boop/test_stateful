@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-[Step 06] Export Embedding weights for the TTS Orchestrator.
+[Step 01] Export Embedding weights for the TTS Orchestrator.
 
 Exports .pt weights + numpy snapshots for in-process torch embedding in Orchestrator:
   - .pt: text_embedding, text_projection, codec_embeddings, codec_embeddings_3d,

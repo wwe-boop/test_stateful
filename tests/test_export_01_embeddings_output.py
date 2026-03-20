@@ -1,13 +1,12 @@
 """
-L2 test T2.1: Verify export_06_embeddings.py output structure.
+L2 test T2.1: Verify export_01_embeddings.py output structure.
 
 Checks that after running:
-  mamba run -n qwen3-tts python scripts/export/export_06_embeddings.py --variant base-1.7b --device cuda
+  mamba run -n qwen3-tts python scripts/export/export_01_embeddings.py --variant base-1.7b --device cuda
 
 the expected files and config fields exist. Skips if workspace/exported/<variant> not present.
 """
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -24,7 +23,7 @@ def _variant_weights_dir(variant: str = "base-1.7b"):
 def weights_dir():
     d = _variant_weights_dir()
     if not d.is_dir():
-        pytest.skip(f"Export output not found: {d} (run export_06_embeddings.py first)")
+        pytest.skip(f"Export output not found: {d} (run export_01_embeddings.py first)")
     return d
 
 
@@ -50,23 +49,23 @@ def test_codec_embeddings_3d_pt_exists(weights_dir):
 
 
 def test_npz_files_exist(weights_dir):
-    """New .npz: special_embeddings.npz, codec_embeddings_3d.npz (from current export_06)."""
+    """New .npz: special_embeddings.npz, codec_embeddings_3d.npz (from current export_01)."""
     for name in ("special_embeddings.npz", "codec_embeddings_3d.npz"):
         p = weights_dir / name
         if not p.is_file():
             pytest.skip(
-                f"Missing {p} — re-run export_06_embeddings.py to produce .npz outputs"
+                f"Missing {p} — re-run export_01_embeddings.py to produce .npz outputs"
             )
 
 
 def test_config_has_hidden_act(weights_dir):
-    """config.json contains hidden_act field (from current export_06)."""
+    """config.json contains hidden_act field (from current export_01)."""
     cfg_path = weights_dir / "config.json"
     with open(cfg_path) as f:
         cfg = json.load(f)
     if "hidden_act" not in cfg:
         pytest.skip(
-            "config.json missing hidden_act — re-run export_06_embeddings.py"
+            "config.json missing hidden_act — re-run export_01_embeddings.py"
         )
     assert cfg["hidden_act"] in ("silu", "gelu", "quick_gelu"), (
         f"Unexpected hidden_act: {cfg['hidden_act']}"

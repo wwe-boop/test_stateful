@@ -2,10 +2,8 @@
 """
 Standalone Code Predictor export & verification (optional, not in main pipeline).
 
-NOTE: In the main pipeline (export_all.py), Code Predictor is NOT exported
-independently. Its logic (CodePredictorUnrolled) is fused into:
-  - export_04_talker_context.py  (context prefill + CP + codec_sum)
-  - export_05_talker_decode_fused.py  (decode step + CP + codec_sum)
+NOTE: In production, CP is fused into talker graphs (export_08 / export_09).
+Step 05 exports a standalone ONNX for verification only.
 
 The CodePredictorUnrolled class lives in utils.py and is imported here.
 
@@ -13,6 +11,8 @@ This script exists for:
   1. Standalone CP debugging / verification
   2. Exporting a standalone CP ONNX for comparison / profiling
   3. Single-stage fallback export (if the unrolled graph is too large for TRT)
+
+ONNX export skips onnxsim (simplify=False): intermediate verification graph; simplification is slow.
 
 Component: Code Predictor
 Architecture: Qwen3-style, 5L, h=1024, GQA(16h/8kv), head_dim=128
@@ -150,6 +150,7 @@ def export_code_predictor_unrolled(
             "codec_tokens": {0: "batch"},
         },
         onnx_path=onnx_path,
+        simplify=False,
     )
 
     import onnx
@@ -222,6 +223,7 @@ def export_code_predictor_single_stage(
             "logits": {0: "batch"},
         },
         onnx_path=onnx_path,
+        simplify=False,
     )
 
     test_inputs = {

@@ -2,7 +2,7 @@
 """
 [Step 04] Export Talker Context Fused (prefill + CP + codec_sum) to ONNX.
 
-Deprecated: Prefer export_04_talker_unified.py for single-engine deployment (no weight duplication).
+Deprecated: Prefer export_08_talker_unified.py / export_09_talker_code2wav_fused.py for deployment.
 
 Component: Talker prefill + argmax + Code Predictor (15-step) + Codec Embedding Sum.
 Input:  input_embeds [B, S, H], position_ids [3, B, S] (3D RoPE)

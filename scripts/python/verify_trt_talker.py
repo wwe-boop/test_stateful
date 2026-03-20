@@ -93,7 +93,7 @@ def main():
     engine_path = engine_dir / "talker_unified.engine"
     if not engine_path.exists():
         print(f"ERROR: {engine_path} not found")
-        print("  Run: python scripts/export/export_04_talker_unified.py --variant <variant>")
+        print("  Run: python scripts/export/export_08_talker_unified.py --variant <variant>")
         print("       bash scripts/bash/build_engines.sh --variant <variant>")
         sys.exit(1)
 

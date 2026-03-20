@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-[Step 03] Export Speaker Encoder (ECAPA-TDNN) to ONNX.
+[Step 05] Export Speaker Encoder (ECAPA-TDNN) to ONNX.
 
 Component: Speaker Encoder
 Architecture: ECAPA-TDNN, mel_dim=128, enc_dim=1024

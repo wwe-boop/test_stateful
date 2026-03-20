@@ -1,12 +1,12 @@
 """
 TTS Orchestrator — Triton Python BLS Backend.
 
-Unified pipeline (same BLS for ONNX and TensorRT backends):
-  1. Session init (Speaker Encoder / Speech Tokenizer via BLS)
-  2. Prefill construction (in-process torch embedding; no BLS for embedders)
-  3. BLS talker_unified: prefill (past_kv empty S_past=0) → codec_sum, full_codec, logits, KV
-  4. Decode loop: BLS talker_unified(next_embed, position_id, KV) → codec_sum, full_codec, logits, updated KV
-  5. Code2Wav (BLS) for chunked audio
+Production pipeline (talker_code2wav_fused present):
+  1. Speaker / speech_tokenizer_codec_fused (ICL) via BLS
+  2. PrefillBuilder (in-process embeddings)
+  3. BLS talker_code2wav_fused: prefill + each decode step → wav + KV + code2wav states
+
+Legacy pipeline (talker_unified + code2wav only): chunked code2wav buffer (chunk_T=4).
 
 Talker path uses torch + DLPack zero-copy (BF16 I/O); KV cache never leaves GPU.
 
@@ -23,6 +23,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -40,8 +41,8 @@ _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _MODEL_DIR not in sys.path:
     sys.path.insert(0, _MODEL_DIR)
 
-# Stateful code2wav: chunk_T=4 fixed; 37 state tensor shapes (batch=1, past_kv_len=0).
-# Order matches code2wav_streaming.get_initial_state_shapes (16 KV + 17 conv + 4 transconv).
+# Legacy code2wav (chunk_T=4): default shapes for 8 decoder KV layers + 17 conv + 4 transconv.
+# Fused path: triton_manifest.json must include code2wav_fused (export_09 + assemble).
 _CODE2WAV_STATE_SHAPES = [
     (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64),
     (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64), (1, 16, 0, 64),
@@ -54,6 +55,26 @@ _CODE2WAV_STATE_SHAPES = [
 ]
 CODE2WAV_CHUNK_T = 4
 SAMPLES_PER_CODEC_FRAME = 1920
+FUSED_CHUNK_T = 1
+
+# Default c2w_* I/O for split-engine path only (talker_unified + code2wav).
+_C2W_FUSED_DEFAULT_INPUT_NAMES = []
+for _i in range(8):
+    _C2W_FUSED_DEFAULT_INPUT_NAMES.append(f"c2w_past_kv_{_i}_k")
+    _C2W_FUSED_DEFAULT_INPUT_NAMES.append(f"c2w_past_kv_{_i}_v")
+for _i in range(17):
+    _C2W_FUSED_DEFAULT_INPUT_NAMES.append(f"c2w_conv_state_{_i}")
+for _i in range(4):
+    _C2W_FUSED_DEFAULT_INPUT_NAMES.append(f"c2w_transconv_overlap_{_i}")
+
+_C2W_FUSED_DEFAULT_OUTPUT_NAMES = []
+for _i in range(8):
+    _C2W_FUSED_DEFAULT_OUTPUT_NAMES.append(f"c2w_present_kv_{_i}_k")
+    _C2W_FUSED_DEFAULT_OUTPUT_NAMES.append(f"c2w_present_kv_{_i}_v")
+for _i in range(17):
+    _C2W_FUSED_DEFAULT_OUTPUT_NAMES.append(f"c2w_new_conv_state_{_i}")
+for _i in range(4):
+    _C2W_FUSED_DEFAULT_OUTPUT_NAMES.append(f"c2w_new_transconv_overlap_{_i}")
 
 _MODEL_TYPE_ALLOWED_TASKS = {
     "base": {"voice_clone_icl", "voice_clone_xvec"},
@@ -116,50 +137,110 @@ class TritonPythonModel:
 
         self.prefill_builder = PrefillBuilder(self.weights, self.tokenizer)
 
-        # Detect talker_unified backend and dtype: TRT (bf16/fp16/fp32) vs ONNX (FP32)
         repo_root = Path(_MODEL_DIR).resolve().parent.parent
-        talker_config = repo_root / "talker_unified" / "config.pbtxt"
+        self._triton_manifest: Optional[Dict[str, Any]] = None
+        for _mf in (
+            repo_root / "triton_manifest.json",
+            repo_root / "tts_orchestrator" / "1" / "triton_manifest.json",
+        ):
+            if _mf.is_file():
+                try:
+                    with open(_mf, encoding="utf-8") as _f:
+                        self._triton_manifest = json.load(_f)
+                    logger.info(
+                        f"[TTS Orchestrator] Loaded triton_manifest.json from {_mf.name}"
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(
+                        f"[TTS Orchestrator] Failed to load {_mf}: {e}"
+                    )
+        fused_cfg = repo_root / "talker_code2wav_fused" / "config.pbtxt"
+        legacy_force = os.environ.get("USE_LEGACY_TALKER_CODE2WAV", "").strip().lower() in (
+            "1", "true", "yes",
+        )
+        self._use_fused_decode = fused_cfg.exists() and not legacy_force
+        self._speech_codec_fused_available = (
+            repo_root / "speech_tokenizer_codec_fused" / "config.pbtxt"
+        ).exists()
+
+        def _dtype_from_pbtxt(path: Path) -> tuple:
+            backend = "onnxruntime"
+            dt = torch.float32
+            if not path.exists():
+                return backend, dt
+            raw = path.read_text()
+            if "tensorrt" in raw.lower() and "backend" in raw:
+                backend = "tensorrt"
+            if "TYPE_BF16" in raw:
+                dt = torch.bfloat16
+            elif "TYPE_FP16" in raw:
+                dt = torch.float16
+            elif "TYPE_FP32" in raw:
+                dt = torch.float32
+            return backend, dt
+
         self._talker_backend = "onnxruntime"
         self._talker_dtype = torch.float32
-        if talker_config.exists():
-            raw = talker_config.read_text()
-            if "backend: \"tensorrt\"" in raw or 'backend: "tensorrt"' in raw:
-                self._talker_backend = "tensorrt"
-                # Infer TRT engine dtype from config (TYPE_BF16 / TYPE_FP16 / TYPE_FP32)
-                if "TYPE_BF16" in raw:
-                    self._talker_dtype = torch.bfloat16
-                elif "TYPE_FP16" in raw:
-                    self._talker_dtype = torch.float16
-                else:
-                    self._talker_dtype = torch.float32
-            else:
-                self._talker_dtype = torch.float32
-        # Code2wav: infer dtype from config (TYPE_BF16 / TYPE_FP16 / TYPE_FP32).
-        # TRT engine uses engine_dtype from .engine_dtype; ONNX uses FP32 from graph.
-        # Env OVERRIDE_CODE2WAV_BF16=1 forces BF16 when detection fails in Docker/etc.
-        code2wav_config = repo_root / "code2wav" / "config.pbtxt"
         self._code2wav_dtype = torch.float32
-        if os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
-            self._code2wav_dtype = torch.bfloat16
-            logger.info("[TTS Orchestrator] code2wav_dtype=BF16 (OVERRIDE_CODE2WAV_BF16 env)")
-        elif code2wav_config.exists():
-            raw = code2wav_config.read_text()
-            if "TYPE_BF16" in raw:
+
+        if self._use_fused_decode:
+            self._talker_backend, self._talker_dtype = _dtype_from_pbtxt(fused_cfg)
+            self._code2wav_dtype = self._talker_dtype
+            if os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
                 self._code2wav_dtype = torch.bfloat16
-            elif "TYPE_FP16" in raw:
-                self._code2wav_dtype = torch.float16
-            elif "TYPE_FP32" in raw:
-                self._code2wav_dtype = torch.float32
-            elif "tensorrt" in raw.lower() and "backend" in raw:
-                # TRT config without explicit float type → assume same as talker
-                self._code2wav_dtype = self._talker_dtype
+            logger.info(
+                f"[TTS Orchestrator] fused pipeline: talker_code2wav_fused "
+                f"backend={self._talker_backend}, dtype={self._talker_dtype}"
+            )
+            if not self._triton_manifest or not isinstance(
+                self._triton_manifest.get("code2wav_fused"), dict
+            ):
+                raise RuntimeError(
+                    "Fused decode requires triton_manifest.json with code2wav_fused "
+                    "(run export_09 and assemble; manifest is copied to repo root and tts_orchestrator/1/)"
+                )
+            lay = self._triton_manifest["code2wav_fused"]
+            try:
+                self._c2w_state_input_names = lay["c2w_state_input_names"]
+                self._c2w_state_output_names = lay["c2w_state_output_names"]
+                self._code2wav_state_shapes_fused = [
+                    tuple(s) for s in lay["initial_state_shapes"]
+                ]
+                logger.info(
+                    f"[TTS Orchestrator] fused c2w layout: "
+                    f"decoder_layers={lay.get('num_code2wav_hidden_layers', '?')}, "
+                    f"c2w_inputs={len(self._c2w_state_input_names)}"
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Invalid code2wav_fused in triton_manifest.json: {e}"
+                ) from e
+        else:
+            talker_config = repo_root / "talker_unified" / "config.pbtxt"
+            self._talker_backend, self._talker_dtype = _dtype_from_pbtxt(talker_config)
+            code2wav_config = repo_root / "code2wav" / "config.pbtxt"
+            if os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
+                self._code2wav_dtype = torch.bfloat16
+                logger.info("[TTS Orchestrator] code2wav_dtype=BF16 (OVERRIDE_CODE2WAV_BF16 env)")
+            elif code2wav_config.exists():
+                _, self._code2wav_dtype = _dtype_from_pbtxt(code2wav_config)
+                if self._code2wav_dtype == torch.float32 and self._talker_backend == "tensorrt":
+                    self._code2wav_dtype = self._talker_dtype
             elif self._talker_backend == "tensorrt":
                 self._code2wav_dtype = self._talker_dtype
-        elif self._talker_backend == "tensorrt":
-            self._code2wav_dtype = self._talker_dtype
+            logger.info(
+                f"[TTS Orchestrator] legacy pipeline: talker_unified + code2wav "
+                f"talker_backend={self._talker_backend}"
+            )
+            self._c2w_state_input_names = list(_C2W_FUSED_DEFAULT_INPUT_NAMES)
+            self._c2w_state_output_names = list(_C2W_FUSED_DEFAULT_OUTPUT_NAMES)
+            self._code2wav_state_shapes_fused = list(_CODE2WAV_STATE_SHAPES)
+
         logger.info(
             f"[TTS Orchestrator] Initialized: variant={self.variant}, num_layers={self.num_layers}, "
-            f"talker_backend={self._talker_backend}, code2wav_dtype={self._code2wav_dtype}"
+            f"fused_decode={self._use_fused_decode}, speech_codec_fused={self._speech_codec_fused_available}, "
+            f"code2wav_dtype={self._code2wav_dtype}"
         )
 
     def execute(self, requests):
@@ -220,6 +301,7 @@ class TritonPythonModel:
                 "supported_speakers": sorted(self.weights.spk_id_map.keys()),
                 "max_decode_steps": self.max_steps,
                 "engine_backend": self._talker_backend,
+                "use_fused_decode": self._use_fused_decode,
             }
             self._send_capabilities(response_sender, caps)
             return
@@ -238,6 +320,7 @@ class TritonPythonModel:
 
         spk_embedding = None
         ref_codes = None
+        ref_codec_sum_vec = None
         if task_type.value.startswith("voice_clone"):
             ref_audio_b64 = req.get("ref_audio")
             try:
@@ -247,8 +330,16 @@ class TritonPythonModel:
                     logger.debug(f"speaker_encoder: {(time.perf_counter() - t0) * 1000:.1f}ms")
                 if task_type.value == "voice_clone_icl" and ref_audio_b64:
                     t0 = time.perf_counter()
-                    ref_codes = self._bls_speech_tokenizer(ref_audio_b64)
-                    logger.debug(f"speech_tokenizer_encoder: {(time.perf_counter() - t0) * 1000:.1f}ms")
+                    if self._speech_codec_fused_available:
+                        ref_codec_sum_vec = self._bls_speech_tokenizer_codec_fused(ref_audio_b64)
+                        logger.debug(
+                            f"speech_tokenizer_codec_fused: {(time.perf_counter() - t0) * 1000:.1f}ms"
+                        )
+                    else:
+                        ref_codes = self._bls_speech_tokenizer(ref_audio_b64)
+                        logger.debug(
+                            f"speech_tokenizer_encoder: {(time.perf_counter() - t0) * 1000:.1f}ms"
+                        )
             except Exception as e:
                 raise RuntimeError(f"Voice clone audio processing failed: {e}") from e
 
@@ -263,13 +354,13 @@ class TritonPythonModel:
                 instruct=instruct,
                 spk_embedding=spk_embedding,
                 ref_codes=ref_codes,
+                ref_codec_sum_vec=ref_codec_sum_vec,
                 ref_text=ref_text,
             )
         except Exception as e:
             raise RuntimeError(f"Prefill build failed: {e}") from e
 
         B, S, H = inputs_embeds.shape
-        # TRT engine often built with max S_past=1024; cap prefill to avoid shape error
         max_prefill_len = 1024
         if S > max_prefill_len:
             logger.warning("Prefill length %d exceeds engine max %d, truncating", S, max_prefill_len)
@@ -279,32 +370,151 @@ class TritonPythonModel:
         position_ids_1d = torch.arange(S, device=self.device, dtype=torch.int64)
         position_ids = position_ids_1d.reshape(1, 1, -1).expand(B, 3, S)
 
-        # Prefill: unified talker (past_kv empty S_past=0)
+        if self._use_fused_decode:
+            self._generation_loop_fused(
+                response_sender,
+                inputs_embeds,
+                position_ids,
+                trailing_text,
+                S,
+                B,
+                request_start,
+            )
+            return
+
+        self._generation_loop_legacy(
+            response_sender,
+            inputs_embeds,
+            position_ids,
+            trailing_text,
+            S,
+            B,
+            request_start,
+        )
+
+    def _generation_loop_fused(
+        self,
+        response_sender,
+        inputs_embeds,
+        position_ids,
+        trailing_text,
+        S,
+        B,
+        request_start,
+    ):
+        """Prefill + decode via talker_code2wav_fused (chunk_T=1 wav per step)."""
+        codec_eos_id = self.weights.codec_eos_id
+        c2w_states = self._create_code2wav_initial_states()
+        cache_pos = torch.zeros(B, FUSED_CHUNK_T, device=self.device, dtype=torch.int64)
+
+        t0 = time.perf_counter()
+        wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
+            self._bls_talker_code2wav_fused(
+                inputs_embeds, position_ids, cache_pos, None, c2w_states
+            )
+        )
+        logger.debug(f"fused prefill: {(time.perf_counter() - t0) * 1000:.1f}ms")
+
+        self._send_fused_wav(response_sender, wav)
+
+        if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+            logger.info("EOS at step 0")
+            self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+            return
+
+        text_idx = 0
+        next_embed = (
+            (codec_sum + trailing_text[text_idx]).to(torch.bfloat16)
+            if trailing_text
+            else (codec_sum + self._tts_pad_embed_torch).to(torch.bfloat16)
+        )
+        text_idx += 1
+        position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
+        frame_idx = 1
+        max_kv_len = 1024 - 32
+
+        for step in range(1, self.max_steps):
+            if S + step > max_kv_len:
+                logger.warning("KV cache approaching limit, forcing EOS")
+                break
+            if response_sender.is_cancelled():
+                logger.info("Client disconnected, stopping generation")
+                break
+            if (time.monotonic() - request_start) > self.request_timeout_sec:
+                self._send_error(response_sender, "request_timeout")
+                return
+
+            cache_pos = torch.full(
+                (B, FUSED_CHUNK_T), frame_idx, device=self.device, dtype=torch.int64
+            )
+            t0 = time.perf_counter()
+            wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
+                self._bls_talker_code2wav_fused(
+                    next_embed, position_id, cache_pos, kv_tensors, c2w_states
+                )
+            )
+            logger.debug(f"fused step {step}: {(time.perf_counter() - t0) * 1000:.1f}ms")
+            # Do not stream the EOS frame's wav: codec logits target EOS while Code2Wav still
+            # runs on clamped/special indices, often audible as a click or buzz at the tail.
+            if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+                logger.info(f"EOS at step {step}")
+                break
+
+            self._send_fused_wav(response_sender, wav)
+
+            text_add = (
+                trailing_text[text_idx]
+                if text_idx < len(trailing_text)
+                else self._tts_pad_embed_torch
+            )
+            text_idx += 1
+            next_embed = (codec_sum + text_add).to(torch.bfloat16)
+            position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
+            frame_idx += 1
+
+        self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+        logger.info("Generation complete (fused)")
+
+    def _send_fused_wav(self, response_sender, wav: torch.Tensor):
+        w = wav
+        if w.dim() == 3:
+            w = w.reshape(-1)
+        else:
+            w = w.flatten()
+        self._send_audio_chunk(response_sender, w.cpu().float().numpy(), is_final=False)
+
+    def _generation_loop_legacy(
+        self,
+        response_sender,
+        inputs_embeds,
+        position_ids,
+        trailing_text,
+        S,
+        B,
+        request_start,
+    ):
         t0 = time.perf_counter()
         codec_sum, full_codec, logits, kv_tensors = self._bls_talker(
             inputs_embeds, position_ids
         )
         logger.debug(f"talker prefill: {(time.perf_counter() - t0) * 1000:.1f}ms")
         codec_eos_id = self.weights.codec_eos_id
-        codec_frame_buffer = []  # list of [1, 16] full_codec tensors
+        codec_frame_buffer = []
         code2wav_states = self._create_code2wav_initial_states()
         frame_index = 0
         text_idx = 0
 
-        # EOS check: use FP32 argmax to avoid BF16 precision issues (Phase 0)
         if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
             logger.info("EOS at step 0")
             self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
             return
 
-        # Push first codec frame (stateful code2wav: decode in chunks of 4)
         codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
 
         next_embed = (codec_sum + trailing_text[text_idx]).to(torch.bfloat16)
         text_idx += 1
         position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
 
-        # KV length guard: engine MAX_SEQ_LEN=1024; stop before overflow (Phase 0)
         max_kv_len = 1024 - 32
         for step in range(1, self.max_steps):
             if S + step > max_kv_len:
@@ -328,12 +538,10 @@ class TritonPythonModel:
             logger.debug(f"talker step {step}: {(time.perf_counter() - t0) * 1000:.1f}ms")
             codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
 
-            # EOS check: use FP32 argmax to avoid BF16 precision issues (Phase 0)
             if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
                 logger.info(f"EOS at step {step}")
                 break
 
-            # Stateful code2wav: flush full chunks of 4 frames
             code2wav_states, frame_index = self._flush_code2wav_buffer(
                 response_sender, codec_frame_buffer, code2wav_states, frame_index, is_final=False
             )
@@ -343,7 +551,6 @@ class TritonPythonModel:
             next_embed = (codec_sum + text_add).to(torch.bfloat16)
             position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
 
-        # Final flush: decode remaining full chunks and any partial chunk (pad to 4)
         _, _ = self._flush_code2wav_buffer(
             response_sender, codec_frame_buffer, code2wav_states, frame_index, is_final=True
         )
@@ -431,6 +638,117 @@ class TritonPythonModel:
 
         return codec_sum, full_codec, logits, kv_tensors
 
+    def _bls_talker_code2wav_fused(
+        self,
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        cache_position: torch.Tensor,
+        past_kv_tensors,
+        c2w_states: list,
+    ):
+        """BLS talker_code2wav_fused: prefill or one decode step with chunk_T=1 wav."""
+        inp_emb = input_embeds.contiguous().to(self._talker_dtype)
+        pos_ids = position_ids.contiguous()
+        cache_pos = cache_position.contiguous()
+        try:
+            inputs = [
+                pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
+                pb_utils.Tensor.from_dlpack("position_ids", pos_ids),
+                pb_utils.Tensor.from_dlpack("cache_position", cache_pos),
+            ]
+        except Exception as e:
+            logger.error(f"fused: from_dlpack input_embeds/position_ids/cache_position: {e}")
+            raise
+
+        if past_kv_tensors is None:
+            B = input_embeds.shape[0]
+            for i in range(self.num_layers):
+                empty_k_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
+                empty_v_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
+                inputs.append(pb_utils.Tensor(f"past_kv_{i}_k", empty_k_np))
+                inputs.append(pb_utils.Tensor(f"past_kv_{i}_v", empty_v_np))
+        else:
+            for i in range(self.num_layers):
+                k = past_kv_tensors[2 * i].clone().to(
+                    device=self.device, dtype=self._talker_dtype
+                ).contiguous()
+                v = past_kv_tensors[2 * i + 1].clone().to(
+                    device=self.device, dtype=self._talker_dtype
+                ).contiguous()
+                try:
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", k))
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", v))
+                except Exception as e:
+                    logger.error(f"fused: from_dlpack talker past_kv {i}: {e}")
+                    raise
+
+        if len(c2w_states) != len(self._c2w_state_input_names):
+            raise RuntimeError(
+                f"c2w_states length {len(c2w_states)} != expected {len(self._c2w_state_input_names)}"
+            )
+        for in_name, st in zip(self._c2w_state_input_names, c2w_states):
+            t = st.contiguous().to(device=self.device, dtype=self._code2wav_dtype)
+            try:
+                inputs.append(pb_utils.Tensor.from_dlpack(in_name, t))
+            except Exception as e:
+                logger.error(f"fused: from_dlpack {in_name}: {e}")
+                raise
+
+        out_names = ["wav", "codec_sum", "full_codec", "logits"]
+        for i in range(self.num_layers):
+            out_names.append(f"present_kv_{i}_k")
+            out_names.append(f"present_kv_{i}_v")
+        out_names.extend(self._c2w_state_output_names)
+
+        request = pb_utils.InferenceRequest(
+            model_name="talker_code2wav_fused",
+            inputs=inputs,
+            requested_output_names=out_names,
+        )
+        response = request.exec()
+        if response.has_error():
+            raise RuntimeError(
+                f"talker_code2wav_fused BLS error: {response.error().message()}"
+            )
+
+        wav = self._tensor_from_response_torch(response, "wav")
+        codec_sum = self._tensor_from_response_torch(response, "codec_sum")
+        full_codec = self._tensor_from_response_torch(response, "full_codec")
+        logits = self._tensor_from_response_torch(response, "logits")
+
+        if self._talker_backend == "tensorrt":
+            if wav.dim() >= 1 and wav.shape[0] == 3:
+                wav = wav[:1].clone()
+            if codec_sum.shape[0] == 3:
+                codec_sum = codec_sum[:1].clone()
+                full_codec = full_codec[:1].clone()
+                logits = logits[:1].clone()
+
+        kv_tensors = []
+        for i in range(self.num_layers):
+            k = self._tensor_from_response_torch(response, f"present_kv_{i}_k")
+            v = self._tensor_from_response_torch(response, f"present_kv_{i}_v")
+            if self._talker_backend == "tensorrt" and k.shape[0] == 3:
+                k, v = k[:1].clone(), v[:1].clone()
+            k = torch.from_numpy(k.cpu().float().numpy()).to(
+                device=self.device, dtype=self._talker_dtype
+            ).contiguous()
+            v = torch.from_numpy(v.cpu().float().numpy()).to(
+                device=self.device, dtype=self._talker_dtype
+            ).contiguous()
+            kv_tensors.append(k)
+            kv_tensors.append(v)
+
+        new_c2w = []
+        for out_name in self._c2w_state_output_names:
+            t = self._tensor_from_response_torch(response, out_name)
+            if self._talker_backend == "tensorrt" and t.dim() >= 1 and t.shape[0] == 3:
+                t = t[:1].clone()
+            t = t.to(device=self.device, dtype=self._code2wav_dtype).contiguous()
+            new_c2w.append(t)
+
+        return wav, codec_sum, full_codec, logits, kv_tensors, new_c2w
+
     def _tensor_from_response_torch(self, response, name: str) -> torch.Tensor:
         """Get output tensor by name and return torch on GPU (zero-copy via DLPack when possible)."""
         t = pb_utils.get_output_tensor_by_name(response, name)
@@ -489,6 +807,29 @@ class TritonPythonModel:
         codes = self._tensor_from_response_torch(response, "audio_codes")
         return codes.squeeze(0).T
 
+    def _bls_speech_tokenizer_codec_fused(self, ref_audio_b64: str) -> torch.Tensor:
+        """Fused speech tokenizer + ref codec sum (ICL). Returns [1, 1, H] on GPU."""
+        from audio_utils import (
+            decode_audio_from_base64,
+            resample_to_24k,
+            prepare_waveform_tensor,
+        )
+        audio_np, sr = decode_audio_from_base64(ref_audio_b64)
+        audio_24k = resample_to_24k(audio_np, sr)
+        waveform = prepare_waveform_tensor(audio_24k)
+        inputs = [pb_utils.Tensor("waveform", waveform)]
+        request = pb_utils.InferenceRequest(
+            model_name="speech_tokenizer_codec_fused",
+            inputs=inputs,
+            requested_output_names=["ref_codec_sum_vec"],
+        )
+        response = request.exec()
+        if response.has_error():
+            raise RuntimeError(
+                f"speech_tokenizer_codec_fused BLS error: {response.error().message()}"
+            )
+        return self._tensor_from_response_torch(response, "ref_codec_sum_vec")
+
     def _full_codec_to_frame(self, full_codec: torch.Tensor) -> torch.Tensor:
         """Ensure full_codec from talker is [1, 16] for buffer. Always cast to int64:
         TRT/ORT may return full_codec as BF16; code2wav expects TYPE_INT64 for 'codes'."""
@@ -500,10 +841,15 @@ class TritonPythonModel:
         return t.to(self.device)
 
     def _create_code2wav_initial_states(self):
-        """Create 37 zero state tensors for stateful code2wav (GPU, correct dtype)."""
+        """Zero state tensors for code2wav / fused c2w (GPU, correct dtype)."""
+        shapes = (
+            self._code2wav_state_shapes_fused
+            if self._use_fused_decode
+            else _CODE2WAV_STATE_SHAPES
+        )
         return [
             torch.zeros(shape, device=self.device, dtype=self._code2wav_dtype)
-            for shape in _CODE2WAV_STATE_SHAPES
+            for shape in shapes
         ]
 
     def _flush_code2wav_buffer(

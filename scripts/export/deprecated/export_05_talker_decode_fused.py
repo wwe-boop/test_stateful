@@ -2,7 +2,7 @@
 """
 [Step 05] Export Fused Talker Decode (1 step) + Code Predictor + Codec Sum to ONNX.
 
-Deprecated: Prefer export_04_talker_unified.py for single-engine deployment (no weight duplication).
+Deprecated: Prefer export_08_talker_unified.py / export_09_talker_code2wav_fused.py for deployment.
 
 Single decode step: Talker 1-token forward (KV cache reuse) → argmax → CP 15-step
 → codec_sum. All in one ONNX for minimal GPU round-trips.

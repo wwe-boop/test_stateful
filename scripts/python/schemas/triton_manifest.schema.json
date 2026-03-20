@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://qwen3-tts-triton.local/schemas/triton_manifest.schema.json",
+  "title": "Triton deployment manifest",
+  "type": "object",
+  "required": ["schema_version", "variant"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest format version"
+    },
+    "variant": {
+      "type": "string",
+      "description": "Model variant id (e.g. custom-1.7b)"
+    },
+    "engine_mode": {
+      "type": "string",
+      "enum": ["onnx", "trt"],
+      "description": "Default engine mode for assembled repo"
+    },
+    "engine_dtype": {
+      "type": "string",
+      "enum": ["bf16", "fp16", "fp32", "bfloat16", "float16", "float32"],
+      "description": "TensorRT / float tensor dtype hint (bf16 default)"
+    },
+    "submodels": {
+      "type": "object",
+      "additionalProperties": { "type": "boolean" },
+      "description": "Optional flags for which logical models exist (assemble may still scan repo)"
+    },
+    "talker": {
+      "type": "object",
+      "description": "Talker dimensions for explicit TRT config (talker_unified)",
+      "properties": {
+        "hidden_size": { "type": "integer" },
+        "num_kv_heads": { "type": "integer" },
+        "head_dim": { "type": "integer" },
+        "num_layers": { "type": "integer" },
+        "vocab_size": { "type": "integer" }
+      }
+    },
+    "code2wav_fused": {
+      "type": "object",
+      "description": "Fused talker+code2wav state I/O (export_09)",
+      "properties": {
+        "num_code2wav_hidden_layers": { "type": "integer" },
+        "c2w_state_input_names": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "c2w_state_output_names": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "initial_state_shapes": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "orchestrator": {
+      "type": "object",
+      "description": "tts_orchestrator config.pbtxt parameters",
+      "additionalProperties": { "type": "string" }
+    },
+    "io_overrides": {
+      "type": "object",
+      "description": "Reserved for per-model I/O exceptions",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

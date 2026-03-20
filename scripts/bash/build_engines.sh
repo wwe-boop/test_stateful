@@ -6,9 +6,10 @@
 #  compiles them into TensorRT engines using trtexec inside an NGC container
 #  (tritonserver:xx.yy-py3, trtexec at /usr/src/tensorrt/bin/trtexec).
 #
-#  Builds: talker_unified.engine (single engine for prefill+decode, per variant),
-#  plus speaker_encoder.engine, speech_tokenizer_encoder.engine,
-#  code2wav_decoder.engine (shared or per-variant as per Phase A layout).
+#  Default production: speaker_encoder.engine, speech_tokenizer_codec_fused.engine (base),
+#  talker_code2wav_fused.engine (per variant).
+#  Set BUILD_VERIFICATION_ENGINES=1 to also build talker_unified, code2wav_decoder,
+#  speech_tokenizer_encoder (tokenizer dir).
 #
 #  Prerequisites:
 #    - NVIDIA GPU with driver >= 550.54
@@ -133,7 +134,7 @@ build_talker_unified_trt() {
 
     if [ ! -f "$unified_onnx" ]; then
         log_error "Unified TRT: missing ONNX for $variant (need talker_unified.onnx)"
-        log_error "  Run: python scripts/export/export_04_talker_unified.py --variant $variant"
+        log_error "  Run: python scripts/export/export_09_talker_code2wav_fused.py --variant $variant"
         return 1
     fi
 
@@ -204,37 +205,88 @@ build_talker_unified_trt() {
     return 0
 }
 
+# Production: talker + code2wav fused ONNX (step 09).
+build_talker_code2wav_fused_trt() {
+    local variant="$1"
+    local variant_dir="$EXPORTED_DIR/$variant"
+    local onnx="$variant_dir/talker_code2wav_fused.onnx"
+    if [ ! -f "$onnx" ]; then
+        log_error "Missing $onnx — run: python scripts/export/export_09_talker_code2wav_fused.py --variant $variant"
+        return 1
+    fi
+    local dims
+    dims=($(_get_talker_dims "$variant"))
+    local H="${dims[0]:-1024}" KV_HEADS="${dims[1]:-8}" HEAD_DIM="${dims[2]:-128}" NUM_LAYERS="${dims[3]:-28}"
+
+    local profile_py="${REPO_ROOT}/scripts/python/trt_fused_talk_c2w_profiles.py"
+    if [ ! -f "$profile_py" ]; then
+        log_error "Missing $profile_py"
+        return 1
+    fi
+    local n_c2w=8
+    if [ -f "$variant_dir/triton_manifest.json" ]; then
+        n_c2w=$(python3 -c "import json; d=json.load(open('$variant_dir/triton_manifest.json')); print(int(d['code2wav_fused']['num_code2wav_hidden_layers']))")
+    fi
+    local fused_min fused_opt fused_max
+    fused_min=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" | sed -n '1p')
+    fused_opt=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" | sed -n '2p')
+    fused_max=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" | sed -n '3p')
+
+    log_step "Building talker_code2wav_fused.engine: $variant"
+    if $DRY_RUN; then
+        log_info "[DRY RUN] trtexec talker_code2wav_fused"
+        return 0
+    fi
+    local prec_flag
+    prec_flag=$(_trtexec_precision_flags)
+    if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+        $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
+        --saveEngine=/mnt/model/talker_code2wav_fused.engine \
+        $prec_flag \
+        --memPoolSize=workspace:8192 \
+        --minShapes="$fused_min" \
+        --optShapes="$fused_opt" \
+        --maxShapes="$fused_max"; then
+        log_error "trtexec talker_code2wav_fused failed for $variant"
+        return 1
+    fi
+    log_info "talker_code2wav_fused.engine built: $variant_dir"
+    return 0
+}
+
+# Production (base ICL): speech_tokenizer_codec_fused in variant dir.
+build_speech_tokenizer_codec_fused_trt() {
+    local variant="$1"
+    local variant_dir="$EXPORTED_DIR/$variant"
+    local onnx="$variant_dir/speech_tokenizer_codec_fused.onnx"
+    [ -f "$onnx" ] || return 0
+    log_step "Building speech_tokenizer_codec_fused.engine: $variant"
+    if $DRY_RUN; then
+        log_info "[DRY RUN] trtexec speech_tokenizer_codec_fused"
+        return 0
+    fi
+    if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+        $TRTEXEC --onnx=/mnt/model/speech_tokenizer_codec_fused.onnx \
+        --saveEngine=/mnt/model/speech_tokenizer_codec_fused.engine \
+        --minShapes=waveform:1x1x960 \
+        --optShapes=waveform:1x1x48000 \
+        --maxShapes=waveform:1x1x192000 \
+        --memPoolSize=workspace:6144; then
+        log_error "trtexec speech_tokenizer_codec_fused failed for $variant"
+        return 1
+    fi
+    log_info "speech_tokenizer_codec_fused.engine built: $variant_dir"
+    return 0
+}
+
 # Build peripheral TRT engines (speaker_encoder, speech_tokenizer_encoder, code2wav_decoder)
 build_peripheral_engines() {
     if $DRY_RUN; then
-        log_info "[DRY RUN] Would run trtexec for speaker_encoder, speech_tokenizer_encoder, code2wav_decoder"
+        log_info "[DRY RUN] Would run trtexec for speech_tokenizer_encoder, code2wav_decoder"
         return 0
     fi
     local image="$1"
     local failed=0
-
-    # Speaker encoder: per-variant, only if ONNX exists (base variants)
-    for vdir in "$EXPORTED_DIR"/*/; do
-        [ -d "$vdir" ] || continue
-        local onnx="${vdir}speaker_encoder.onnx"
-        [ -f "$onnx" ] || continue
-        local variant_name
-        variant_name=$(basename "$vdir")
-        log_info "Building speaker_encoder.engine for $variant_name ..."
-        if ! docker run --rm --gpus all -v "$vdir:/mnt/model" "$image" \
-            $TRTEXEC --onnx=/mnt/model/speaker_encoder.onnx \
-            --saveEngine=/mnt/model/speaker_encoder.engine \
-            $(_trtexec_precision_flags) \
-            --inputIOFormats=$(_trtexec_io_format) \
-            --outputIOFormats=$(_trtexec_io_format) \
-            --minShapes=mel:1x1x128 \
-            --optShapes=mel:1x300x128 \
-            --maxShapes=mel:${MAX_BATCH_SIZE}x1000x128 \
-            --memPoolSize=workspace:1024; then
-            log_error "speaker_encoder trtexec failed for $variant_name"
-            failed=$((failed + 1))
-        fi
-    done
 
     # Speech tokenizer encoder (shared, in tokenizer dir)
     # Min waveform = 960 samples (1 codec frame at stride 8×6×5×4=960, 24kHz → 40ms).
@@ -312,23 +364,54 @@ build_peripheral_engines() {
             failed=$((failed + 1))
         fi
     else
-        log_error "code2wav_decoder.onnx not found (required)"
-        failed=$((failed + 1))
+        log_warn "code2wav_decoder.onnx not found, skipping (export step 06 / verification)"
     fi
 
     [ "$failed" -eq 0 ]
 }
 
-# Discover variants that have talker_unified ONNX (for TRT build)
+# Discover variants that have production fused talker+code2wav ONNX
 discover_trt_variants() {
     local found=()
     for vdir in "$EXPORTED_DIR"/*/; do
         [ -d "$vdir" ] || continue
-        if [ -f "${vdir}talker_unified.onnx" ]; then
+        if [ -f "${vdir}talker_code2wav_fused.onnx" ]; then
             found+=("$(basename "$vdir")")
         fi
     done
     echo "${found[@]}"
+}
+
+# Speaker engines for every variant directory that has speaker_encoder.onnx
+build_speaker_encoders_all() {
+    local image="$1"
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would build speaker_encoder engines"
+        return 0
+    fi
+    local failed=0
+    for vdir in "$EXPORTED_DIR"/*/; do
+        [ -d "$vdir" ] || continue
+        local onnx="${vdir}speaker_encoder.onnx"
+        [ -f "$onnx" ] || continue
+        local variant_name
+        variant_name=$(basename "$vdir")
+        log_info "Building speaker_encoder.engine for $variant_name ..."
+        if ! docker run --rm --gpus all -v "$vdir:/mnt/model" "$image" \
+            $TRTEXEC --onnx=/mnt/model/speaker_encoder.onnx \
+            --saveEngine=/mnt/model/speaker_encoder.engine \
+            $(_trtexec_precision_flags) \
+            --inputIOFormats=$(_trtexec_io_format) \
+            --outputIOFormats=$(_trtexec_io_format) \
+            --minShapes=mel:1x1x128 \
+            --optShapes=mel:1x300x128 \
+            --maxShapes=mel:${MAX_BATCH_SIZE}x1000x128 \
+            --memPoolSize=workspace:1024; then
+            log_error "speaker_encoder trtexec failed for $variant_name"
+            failed=$((failed + 1))
+        fi
+    done
+    [ "$failed" -eq 0 ]
 }
 
 # ── Argument parsing ──
@@ -398,15 +481,15 @@ if [ ! -d "$EXPORTED_DIR" ]; then
 fi
 
 if [[ -n "$VARIANT" && "$VARIANT" != all* ]]; then
-    if [ ! -f "$EXPORTED_DIR/$VARIANT/talker_unified.onnx" ]; then
-        log_error "Talker unified ONNX not found for $VARIANT. Run export_04_talker_unified.py first."
+    if [ ! -f "$EXPORTED_DIR/$VARIANT/talker_code2wav_fused.onnx" ]; then
+        log_error "Missing talker_code2wav_fused.onnx for $VARIANT. Run export_09_talker_code2wav_fused.py"
         exit 1
     fi
     VARIANTS=("$VARIANT")
 else
     read -ra VARIANTS <<< "$(discover_trt_variants)"
     if [ ${#VARIANTS[@]} -eq 0 ]; then
-        log_error "No talker_unified.onnx found in $EXPORTED_DIR (run export_04_talker_unified.py per variant)"
+        log_error "No talker_code2wav_fused.onnx in $EXPORTED_DIR (run export_all.py or export_09 per variant)"
         exit 1
     fi
     log_info "Discovered variants: ${VARIANTS[*]}"
@@ -415,23 +498,38 @@ fi
 FAILED=0
 SUCCEEDED=0
 
+if ! build_speaker_encoders_all "$NGC_IMAGE"; then
+    FAILED=$((FAILED + 1))
+fi
+
 for variant in "${VARIANTS[@]}"; do
-    if build_talker_unified_trt "$variant"; then
+    if [[ "$variant" == base-* ]] && [ -f "$EXPORTED_DIR/$variant/speech_tokenizer_codec_fused.onnx" ]; then
+        build_speech_tokenizer_codec_fused_trt "$variant" || FAILED=$((FAILED + 1))
+    fi
+done
+
+for variant in "${VARIANTS[@]}"; do
+    if build_talker_code2wav_fused_trt "$variant"; then
         SUCCEEDED=$((SUCCEEDED + 1))
     else
         FAILED=$((FAILED + 1))
     fi
 done
 
-# Peripheral engines (once, shared or per-variant)
-if ! build_peripheral_engines "$NGC_IMAGE"; then
-    FAILED=$((FAILED + 1))
+if [ "${BUILD_VERIFICATION_ENGINES:-0}" = "1" ]; then
+    log_step "BUILD_VERIFICATION_ENGINES=1: talker_unified + tokenizer ONNX engines"
+    for variant in "${VARIANTS[@]}"; do
+        build_talker_unified_trt "$variant" || FAILED=$((FAILED + 1))
+    done
+    if ! build_peripheral_engines "$NGC_IMAGE"; then
+        FAILED=$((FAILED + 1))
+    fi
 fi
 
 echo ""
 log_step "Engine Build Summary"
 log_info "  Image:     $NGC_IMAGE"
-log_info "  Succeeded: $SUCCEEDED (talker variants)"
+log_info "  Succeeded: $SUCCEEDED (talker_code2wav_fused variants)"
 [ "$FAILED" -gt 0 ] && log_error "  Failed: $FAILED"
 
 if [ "$SUCCEEDED" -gt 0 ] && ! $DRY_RUN; then

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-[Step 01] Export Speech Tokenizer Encoder (MimiModel encoder-only) to ONNX.
+[Step 02] Export Speech Tokenizer Encoder (MimiModel encoder-only) to ONNX.
 
 Component: Speech Tokenizer Encoder
 Architecture: MimiModel encoder (with VQ)
