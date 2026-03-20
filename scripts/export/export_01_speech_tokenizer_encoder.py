@@ -76,9 +76,12 @@ class SpeechTokenizerEncoderWrapper(torch.nn.Module):
         Args:
             input_values: [B, 1, samples] - mono waveform at 24kHz
         Returns:
-            audio_codes: [B, num_quantizers, T_codes]
+            audio_codes: [B, 16, T_codes] — num_quantizers=16 so only first 16 RVQ layers run
+            (saves ~50% compute vs full 32; matches code2wav/encoder_valid_num_quantizers).
         """
-        encoded = self.encoder.encode(input_values=input_values, return_dict=True)
+        encoded = self.encoder.encode(
+            input_values=input_values, return_dict=True, num_quantizers=16
+        )
         return encoded.audio_codes
 
 

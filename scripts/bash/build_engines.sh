@@ -282,13 +282,28 @@ build_peripheral_engines() {
             C2W_OPT="${C2W_OPT},${n}:${s}"
             C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
         done
+        # Input order: codes (int64), cache_position (int64), then 37 float tensors.
+        # Output order: 38 float tensors (wav + present_kv + new_conv_state + new_transconv_overlap).
+        # Do NOT use generic bf16:chw for all inputs — codes/cache_position must stay int64.
+        local io_fmt
+        io_fmt=$(_trtexec_io_format)
+        local c2w_io_in="int64:chw,int64:chw"
+        local i=0
+        while [ $i -lt 37 ]; do c2w_io_in="${c2w_io_in},${io_fmt}"; i=$((i+1)); done
+        local c2w_io_out=""
+        i=0
+        while [ $i -lt 38 ]; do
+            [ $i -gt 0 ] && c2w_io_out="${c2w_io_out},"
+            c2w_io_out="${c2w_io_out}${io_fmt}"
+            i=$((i+1))
+        done
         # Force I/O type to match engine precision; Triton config must match.
         if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/code2wav_decoder.onnx \
             --saveEngine=/mnt/model/code2wav_decoder.engine \
             $(_trtexec_precision_flags) \
-            --inputIOFormats=$(_trtexec_io_format) \
-            --outputIOFormats=$(_trtexec_io_format) \
+            --inputIOFormats="$c2w_io_in" \
+            --outputIOFormats="$c2w_io_out" \
             --minShapes="$C2W_MIN" \
             --optShapes="$C2W_OPT" \
             --maxShapes="$C2W_MAX" \

@@ -145,6 +145,7 @@ assemble_model_repo() {
     local spk_src
     if spk_src="$(_resolve_model_src "$variant_dir/speaker_encoder")"; then
         _place_model "speaker_encoder" "$spk_src"
+        [ "$engine_mode" = "trt" ] && _write_speaker_encoder_trt_config "$repo_dir/speaker_encoder" "$engine_dtype"
         log_info "  speaker_encoder: OK"
     else
         log_warn "  speaker_encoder: SKIPPED (${engine_mode} file not found — only needed for voice clone)"
@@ -154,6 +155,7 @@ assemble_model_repo() {
     local stoken_src
     if stoken_src="$(_resolve_model_src "$tokenizer_dir/speech_tokenizer_encoder")"; then
         _place_model "speech_tokenizer_encoder" "$stoken_src"
+        [ "$engine_mode" = "trt" ] && _write_speech_tokenizer_encoder_trt_config "$repo_dir/speech_tokenizer_encoder"
         log_info "  speech_tokenizer_encoder: OK"
     else
         log_warn "  speech_tokenizer_encoder: SKIPPED (${engine_mode} file not found — only needed for ICL mode)"
@@ -242,6 +244,35 @@ assemble_model_repo() {
     echo ""
     log_info "Model repository assembled: $repo_dir"
     return 0
+}
+
+# ---------------------------------------------------------------------------
+#  sync_trt_configs <repo_dir> <engine_mode> <exported_dir>
+#  When engine_mode=trt, ensure optional models (speaker_encoder,
+#  speech_tokenizer_encoder) that exist in the repo have full TRT config
+#  (explicit input/output). Fixes "failed to specify dimensions" when using
+#  an existing repo assembled for a different variant (e.g. base had speaker_encoder).
+# ---------------------------------------------------------------------------
+sync_trt_configs() {
+    local repo_dir="$1"
+    local engine_mode="$2"
+    local exported_dir="${3:-}"
+    [ "$engine_mode" != "trt" ] && return 0
+
+    local engine_dtype="bf16"
+    if [ -n "$exported_dir" ] && [ -f "$exported_dir/.engine_dtype" ]; then
+        engine_dtype=$(cat "$exported_dir/.engine_dtype" 2>/dev/null | tr -d '\n' || echo "bf16")
+    fi
+    engine_dtype="${engine_dtype:-bf16}"
+
+    if [ -f "$repo_dir/speaker_encoder/1/model.plan" ]; then
+        _write_speaker_encoder_trt_config "$repo_dir/speaker_encoder" "$engine_dtype"
+        log_info "  speaker_encoder: config synced (full TRT I/O)"
+    fi
+    if [ -f "$repo_dir/speech_tokenizer_encoder/1/model.plan" ]; then
+        _write_speech_tokenizer_encoder_trt_config "$repo_dir/speech_tokenizer_encoder"
+        log_info "  speech_tokenizer_encoder: config synced (full TRT I/O)"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -504,6 +535,56 @@ instance_group [
 EOF
 }
 
+# _write_speaker_encoder_trt_config <model_dir> [engine_dtype]
+# Explicit input/output for TRT backend; avoids "failed to specify dimensions of all input tensors".
+# Build: mel [B,T,128] min=1x1x128 opt=1x300x128 max=Bx1000x128.
+_write_speaker_encoder_trt_config() {
+    local model_dir="$1"
+    local engine_dtype="${2:-bf16}"
+    local float_type
+    float_type=$(_to_triton_dtype "$engine_dtype")
+    cat > "$model_dir/config.pbtxt" << EOF
+name: "speaker_encoder"
+backend: "tensorrt"
+max_batch_size: 0
+
+input [
+  { name: "mel"  data_type: ${float_type}  dims: [ -1, -1, 128 ] }
+]
+output [
+  { name: "speaker_embedding"  data_type: ${float_type}  dims: [ -1, 1024 ] }
+]
+
+instance_group [
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+EOF
+}
+
+# _write_speech_tokenizer_encoder_trt_config <model_dir>
+# Explicit input/output for TRT backend; engine built with FP32 (no bf16, output is INT64 codes).
+# Build: waveform [B,1,S] min=1x1x960 opt=1x1x48000 max=1x1x192000.
+# Output audio_codes: [B, 16, T] — export slices Mimi 32→16 (encoder_valid_num_quantizers).
+_write_speech_tokenizer_encoder_trt_config() {
+    local model_dir="$1"
+    cat > "$model_dir/config.pbtxt" << EOF
+name: "speech_tokenizer_encoder"
+backend: "tensorrt"
+max_batch_size: 0
+
+input [
+  { name: "waveform"  data_type: TYPE_FP32  dims: [ -1, 1, -1 ] }
+]
+output [
+  { name: "audio_codes"  data_type: TYPE_INT64  dims: [ -1, 16, -1 ] }
+]
+
+instance_group [
+  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }
+]
+EOF
+}
+
 # _write_talker_unified_trt_config <model_dir> <variant_dir> [engine_dtype]
 # Full config for talker_unified TRT engine (58 inputs, 60 outputs).
 # I/O dtype from engine_dtype (bf16|fp16|fp32; default bf16).
@@ -606,13 +687,19 @@ _write_code2wav_streaming_config() {
     local config_file="$model_dir/config.pbtxt"
 
     if [ "$engine_mode" = "onnx" ]; then
-        # ONNX mode: minimal config — let ORT auto-complete shapes from the model.
-        # The streaming code2wav ONNX has mixed dynamic/fixed dims that are hard to
-        # hand-write correctly; ORT reads them from the graph.
+        # ONNX mode: explicit codes/cache_position as TYPE_INT64 (required; BLS may send BF16 otherwise).
+        # Other inputs/outputs: let ORT auto-complete from the model.
         cat > "$config_file" << EOF
 name: "code2wav"
 backend: "onnxruntime"
 max_batch_size: 0
+
+input [
+  { name: "codes"  data_type: TYPE_INT64  dims: [ -1, 16, 4 ] }
+]
+input [
+  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 4 ] }
+]
 
 instance_group [
   { count: 1  kind: KIND_GPU  gpus: [ 0 ] }

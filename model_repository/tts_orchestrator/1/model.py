@@ -371,22 +371,21 @@ class TritonPythonModel:
             raise
         if past_kv_tensors is None:
             B = input_embeds.shape[0]
+            # Empty past_kv: 0-sized tensors cause DLPack "not contiguous" errors. Use numpy+pb_utils.Tensor.
+            # TRT expects BF16; numpy has no bf16. Use fp32 for 0-length - TRT may accept for empty.
             for i in range(self.num_layers):
                 empty_k_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
                 empty_v_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
-                try:
-                    inputs.append(pb_utils.Tensor(f"past_kv_{i}_k", empty_k_np))
-                    inputs.append(pb_utils.Tensor(f"past_kv_{i}_v", empty_v_np))
-                except Exception as e:
-                    logger.error(f"Error in pb_utils.Tensor empty_k/v: {e}")
-                    raise
+                inputs.append(pb_utils.Tensor(f"past_kv_{i}_k", empty_k_np))
+                inputs.append(pb_utils.Tensor(f"past_kv_{i}_v", empty_v_np))
         else:
             for i in range(self.num_layers):
-                k = past_kv_tensors[2 * i].contiguous().to(self._talker_dtype)
-                v = past_kv_tensors[2 * i + 1].contiguous().to(self._talker_dtype)
+                # Clone first to detach from any shared storage; ensure correct dtype for TRT.
+                k = past_kv_tensors[2 * i].clone().to(device=self.device, dtype=self._talker_dtype).contiguous()
+                v = past_kv_tensors[2 * i + 1].clone().to(device=self.device, dtype=self._talker_dtype).contiguous()
                 try:
-                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", k.contiguous()))
-                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", v.contiguous()))
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", k))
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", v))
                 except Exception as e:
                     logger.error(f"Error in from_dlpack k/v: {e}")
                     raise
@@ -418,7 +417,15 @@ class TritonPythonModel:
             k = self._tensor_from_response_torch(response, f"present_kv_{i}_k")
             v = self._tensor_from_response_torch(response, f"present_kv_{i}_v")
             if self._talker_backend == "tensorrt" and k.shape[0] == 3:
-                k, v = k[:1], v[:1]
+                k, v = k[:1].clone(), v[:1].clone()
+            # Force full copy + dtype: TRT returns BF16; fallback/triton path may yield FP32.
+            # cpu().numpy() route guarantees we get correct dtype on device.
+            k = torch.from_numpy(k.cpu().float().numpy()).to(
+                device=self.device, dtype=self._talker_dtype
+            ).contiguous()
+            v = torch.from_numpy(v.cpu().float().numpy()).to(
+                device=self.device, dtype=self._talker_dtype
+            ).contiguous()
             kv_tensors.append(k)
             kv_tensors.append(v)
 
@@ -483,8 +490,9 @@ class TritonPythonModel:
         return codes.squeeze(0).T
 
     def _full_codec_to_frame(self, full_codec: torch.Tensor) -> torch.Tensor:
-        """Ensure full_codec from talker is [1, 16] for buffer."""
-        t = full_codec.contiguous()
+        """Ensure full_codec from talker is [1, 16] for buffer. Always cast to int64:
+        TRT/ORT may return full_codec as BF16; code2wav expects TYPE_INT64 for 'codes'."""
+        t = full_codec.contiguous().to(torch.int64)
         if t.dim() == 3:
             t = t.squeeze(0)
         if t.dim() == 2 and t.shape[0] != 1:
@@ -551,7 +559,8 @@ class TritonPythonModel:
         state_tensors: list,
     ) -> tuple:
         """Stateful code2wav: codes [1, 16, 4], cache_position [4], 37 states -> wav [7680], 37 new states. Uses DLPack for GPU tensors."""
-        codes = codes.to(torch.int64)
+        # code2wav expects TYPE_INT64 for 'codes'; talker may return full_codec as BF16 in TRT mode.
+        codes = codes.to(device=self.device, dtype=torch.int64).contiguous()
         try:
             inputs = [
                 pb_utils.Tensor.from_dlpack("codes", codes.contiguous()),

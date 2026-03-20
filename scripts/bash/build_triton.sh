@@ -289,6 +289,10 @@ cmd_run() {
             || { log_error "Assembly failed"; exit 1; }
     fi
 
+    # Sync TRT configs for optional models (speaker_encoder, speech_tokenizer_encoder)
+    # when they exist from a prior run but current variant didn't place them.
+    sync_trt_configs "$MODEL_REPO_DIR" "$ENGINE_MODE" "$EXPORTED_DIR"
+
     validate_model_repo "$MODEL_REPO_DIR" || exit 1
 
     check_docker_gpu_ready || exit 1

@@ -109,14 +109,18 @@ def _minimal_wav_base64(duration_sec=0.5, sample_rate=16000):
     return base64.b64encode(buf.getvalue()).decode()
 
 
-# ---- T3.1 ONNX backend E2E ----
+# ---- T3.1 ONNX/TRT backend E2E ----
+# Note: custom-1.7b supports custom_voice only; design-1.7b supports voice_design.
+# Tests use custom_voice (works with custom-1.7b). For voice_design, deploy design-1.7b.
 
-def test_e2e_voice_design(client):
-    """T3.1a: voice_design (simplest path), streaming audio returned."""
+
+def test_e2e_voice_design_or_custom(client):
+    """T3.1a: voice_design (design variant) or custom_voice (custom variant), streaming audio."""
+    # Prefer custom_voice (works with custom-1.7b); voice_design only for design-1.7b
     chunks, first_sec, total, err = _stream_tts(client, {
         "text": "你好，这是测试",
-        "task_type": "voice_design",
-        "language": "auto",
+        "task_type": "custom_voice",
+        "speaker": "zhitian",
     })
     assert err is None, f"Request failed: {err}"
     assert len(chunks) >= 1, "Expected at least one audio chunk"
@@ -173,7 +177,7 @@ def test_e2e_voice_clone_icl(client):
 
 def test_e2e_error_empty_text(client):
     """T3.3a: empty text -> server returns error."""
-    _, _, _, err = _stream_tts(client, {"text": "", "task_type": "voice_design"})
+    _, _, _, err = _stream_tts(client, {"text": "", "task_type": "custom_voice", "speaker": "zhitian"})
     assert err is not None
     assert "text" in err.lower() or "required" in err.lower() or "empty" in err.lower()
 
@@ -207,7 +211,8 @@ def test_e2e_first_chunk_latency(client):
     """T3.4: first audio chunk latency (target < 200ms in prod)."""
     chunks, first_sec, total_sec, err = _stream_tts(client, {
         "text": "今天天气真好。",
-        "task_type": "voice_design",
+        "task_type": "custom_voice",
+        "speaker": "zhitian",
     })
     assert err is None
     assert len(chunks) >= 1
