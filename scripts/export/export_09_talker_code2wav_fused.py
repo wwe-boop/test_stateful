@@ -10,6 +10,15 @@ Outputs: wav, codec_sum, full_codec, hidden, logits, present_kv_*, new code2wav 
 Depends on: tokenizer (code2wav decoder) + TTS variant (talker). Run export_06 (code2wav) + export_08 (talker unified) for verification order.
 
 Also writes ``triton_manifest.json`` (includes ``code2wav_fused`` I/O layout for BLS + assemble); Phase C requires this file.
+
+**Precision policy** (see ``docs/architecture.md``):
+
+- **ONNX graph float I/O** is exported as **FP32** (``utils.ONNX_EXPORT_DTYPE``). This is the single source of truth for
+  TensorRT **network** input/output tensor types unless you intentionally re-export with another I/O dtype.
+- ``triton_manifest.json`` field ``engine_dtype`` (e.g. ``bf16``) refers to **TensorRT builder compute** (``trtexec --bf16``),
+  not necessarily the dtype of I/O bindings.
+- ``triton_io_float_dtype`` must match the ONNX/TRT engine I/O for ``talker_code2wav_fused`` (default ``fp32``). BLS / Triton
+  ``config.pbtxt`` use this so **runtime tensor dtypes** stay consistent with the deployed graph.
 """
 
 from __future__ import annotations
@@ -105,6 +114,8 @@ def _export_talker_code2wav_fused_onnx(
     output_dir: Path,
     device: str = "cpu",
     opset_version: int = 18,
+    engine_dtype: str = "bf16",
+    triton_io_float_dtype: str = "bf16",
 ) -> str:
     tokenizer_path = resolve_tokenizer_path(None)
     tokenizer_model = load_speech_tokenizer(tokenizer_path, device=device, dtype=torch.float32)
@@ -142,7 +153,7 @@ def _export_talker_code2wav_fused_onnx(
         decoder, batch_size=B, past_kv_len=TRACE_C2W_PAST_LEN
     )
     state_shapes_cold = get_initial_state_shapes(decoder, batch_size=B, past_kv_len=0)
-    state_tensors = [torch.randn(s, device=device, dtype=torch.float32) for _, s in state_shapes]
+    state_tensors = [torch.randn(s, device=device, dtype=ONNX_EXPORT_DTYPE) for _, s in state_shapes]
 
     dummy_inputs = (dummy_embeds, position_ids, cache_position, *past_list, *state_tensors)
 
@@ -230,7 +241,12 @@ def _export_talker_code2wav_fused_onnx(
             f"No {weights_cfg_path} — triton_manifest.json talker section uses export defaults"
         )
     manifest = build_manifest_for_export(
-        variant, weights_cfg, layout, engine_mode="trt", engine_dtype="bf16"
+        variant,
+        weights_cfg,
+        layout,
+        engine_mode="trt",
+        engine_dtype=engine_dtype,
+        triton_io_float_dtype=triton_io_float_dtype,
     )
     manifest_path = output_dir / "triton_manifest.json"
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -277,12 +293,21 @@ def export_talker_code2wav_fused(
     models_dir: str = None,
     output_dir: str = None,
     device: str = "cpu",
+    engine_dtype: str = "bf16",
+    triton_io_float_dtype: str = "bf16",
 ) -> dict:
     model_path = resolve_model_path(variant, models_dir)
     out_dir = ensure_output_dir(output_dir, variant)
     logger.info(f"Loading model: {variant} from {model_path}")
     model = load_tts_model(model_path, device="cpu", dtype=torch.float32)
-    onnx_path = _export_talker_code2wav_fused_onnx(model, variant, out_dir, device=device)
+    onnx_path = _export_talker_code2wav_fused_onnx(
+        model,
+        variant,
+        out_dir,
+        device=device,
+        engine_dtype=engine_dtype,
+        triton_io_float_dtype=triton_io_float_dtype,
+    )
     del model
     if device != "cpu":
         torch.cuda.empty_cache()
@@ -293,6 +318,20 @@ def main():
     setup_logging()
     parser = argparse.ArgumentParser(description="Export Talker + Code2Wav fused ONNX")
     parser.add_argument("--variant", type=str, default=None)
+    parser.add_argument(
+        "--engine-dtype",
+        type=str,
+        default="bf16",
+        choices=("bf16", "fp16", "fp32", "fp8"),
+        help="TensorRT builder precision written to triton_manifest.json (trtexec --bf16/--fp16/--fp8)",
+    )
+    parser.add_argument(
+        "--triton-io-float-dtype",
+        type=str,
+        default="bf16",
+        choices=("bf16", "fp16", "fp32"),
+        help="Float I/O binding + Triton TYPE_* (must match Phase B trtexec --inputIOFormats/--outputFormats)",
+    )
     add_common_args(parser)
     args = parser.parse_args()
     device = resolve_device(args.device)
@@ -302,7 +341,14 @@ def main():
             logger.error(f"Unknown variant: {variant}")
             continue
         try:
-            results = export_talker_code2wav_fused(variant, args.models_dir, args.output_dir, device)
+            results = export_talker_code2wav_fused(
+                variant,
+                args.models_dir,
+                args.output_dir,
+                device,
+                engine_dtype=args.engine_dtype,
+                triton_io_float_dtype=args.triton_io_float_dtype,
+            )
             for k, v in results.items():
                 logger.info(f"[{variant}] {k}: {v}")
         except FileNotFoundError as e:

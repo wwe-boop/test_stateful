@@ -64,7 +64,10 @@ if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${E
   rm -rf "${TEST_REPO_TRT}"
   assemble_model_repo "${EXPORTED_DIR}" "${VARIANT}" "${TEST_REPO_TRT}" "trt" || { log_error "assemble (trt) failed"; exit 1; }
   validate_model_repo "${TEST_REPO_TRT}" || { log_error "validate (trt) failed"; exit 1; }
-  grep -q "TYPE_BF16" "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" || { log_error "talker_code2wav_fused TRT config missing TYPE_BF16"; exit 1; }
+  # triton_io_float_dtype in manifest drives Triton float tensor types (default bf16 with export_09).
+  grep -q 'name: "input_embeds"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
+    && grep -qE "TYPE_BF16|TYPE_FP16|TYPE_FP32" "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
+    || { log_error "talker_code2wav_fused TRT config missing float input_embeds type"; exit 1; }
   log_info "TRT assemble checks passed"
 else
   log_warn "No talker_code2wav_fused.engine/.plan found; skipping TRT assemble test"

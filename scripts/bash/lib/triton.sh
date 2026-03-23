@@ -394,6 +394,37 @@ build_triton_image() {
 }
 
 # ---------------------------------------------------------------------------
+#  triton_resolve_container_name <model_repo_dir> <container_name_arg> [variant_cli]
+#  Must stay in sync with triton_run naming: default base name + model_variant
+#  from assembled tts_orchestrator/config.pbtxt, or explicit --variant on stop.
+#  Precedence: non-default container_name_arg; else variant_cli; else pbtxt.
+# ---------------------------------------------------------------------------
+triton_resolve_container_name() {
+    local repo_dir="$1"
+    local cname="${2:-qwen3-tts-triton}"
+    local variant_cli="${3:-}"
+
+    if [ "$cname" != "qwen3-tts-triton" ]; then
+        printf '%s\n' "$cname"
+        return 0
+    fi
+    if [ -n "$variant_cli" ]; then
+        printf '%s\n' "qwen3-tts-triton-${variant_cli}"
+        return 0
+    fi
+    local config_file="$repo_dir/tts_orchestrator/config.pbtxt"
+    if [ -f "$config_file" ]; then
+        local var_val
+        var_val=$(grep -A 1 'key: "model_variant"' "$config_file" | grep 'string_value' | cut -d'"' -f2 || true)
+        if [ -n "$var_val" ]; then
+            printf '%s\n' "qwen3-tts-triton-${var_val}"
+            return 0
+        fi
+    fi
+    printf '%s\n' "qwen3-tts-triton"
+}
+
+# ---------------------------------------------------------------------------
 #  triton_run <model_repo_dir> [image] [container_name] [extra_docker_args...]
 #  Starts a Triton server container with the model repository volume-mounted.
 #  Runs in detached mode; use triton_health_check to verify readiness.
@@ -401,7 +432,7 @@ build_triton_image() {
 triton_run() {
     local repo_dir="$1"
     local image="${2:-}"
-    local container_name="${3:-qwen3-tts-triton}"
+    local cname_arg="${3:-qwen3-tts-triton}"
     shift 3 2>/dev/null || true
 
     if [ -z "$image" ]; then
@@ -411,20 +442,11 @@ triton_run() {
 
     repo_dir="$(cd "$repo_dir" && pwd)"
 
-    # If container name is default, try to append variant name to it
-    if [ "$container_name" = "qwen3-tts-triton" ]; then
-        local config_file="$repo_dir/tts_orchestrator/config.pbtxt"
-        if [ -f "$config_file" ]; then
-            local var_val=$(grep -A 1 'key: "model_variant"' "$config_file" | grep 'string_value' | cut -d'"' -f2 || true)
-            if [ -n "$var_val" ]; then
-                container_name="qwen3-tts-triton-${var_val}"
-            fi
-        fi
-    fi
+    local container_name
+    container_name=$(triton_resolve_container_name "$repo_dir" "$cname_arg" "")
 
     # Remove existing container (running or exited) so we can start fresh
-    if docker ps -aq --filter "name=^${container_name}$" 2>/dev/null | grep -q . || \
-       docker ps -aq --filter "name=$container_name" 2>/dev/null | grep -q .; then
+    if docker container inspect "$container_name" &>/dev/null; then
         log_warn "Removing existing container: $container_name"
         docker rm -f "$container_name" &>/dev/null || true
     fi
@@ -511,14 +533,15 @@ triton_health_check() {
 triton_stop() {
     local container_name="${1:-qwen3-tts-triton}"
 
-    # Remove container whether running or exited (docker rm -f stops + removes)
-    if docker ps -aq --filter "name=$container_name" 2>/dev/null | grep -q .; then
-        log_info "Stopping and removing Triton container: $container_name"
-        docker rm -f "$container_name" 2>/dev/null || true
-        log_info "Container removed: $container_name"
-    else
+    # Exact name only (docker ps --filter name= is substring match and caused false positives)
+    if ! docker container inspect "$container_name" &>/dev/null; then
         log_info "Container not found: $container_name"
+        return 0
     fi
+    log_info "Stopping and removing Triton container: $container_name"
+    docker rm -f "$container_name" \
+        || { log_error "Failed to remove container: $container_name"; return 1; }
+    log_info "Container removed: $container_name"
 }
 
 

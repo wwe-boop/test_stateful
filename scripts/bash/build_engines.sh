@@ -238,17 +238,48 @@ build_talker_code2wav_fused_trt() {
         return 0
     fi
     local prec_flag
-    prec_flag=$(_trtexec_precision_flags)
-    if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
-        $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
-        --saveEngine=/mnt/model/talker_code2wav_fused.engine \
-        $prec_flag \
-        --memPoolSize=workspace:8192 \
-        --minShapes="$fused_min" \
-        --optShapes="$fused_opt" \
-        --maxShapes="$fused_max"; then
-        log_error "trtexec talker_code2wav_fused failed for $variant"
-        return 1
+    local fused_io_py="${REPO_ROOT}/scripts/python/trt_fused_io_formats.py"
+    local mf="$variant_dir/triton_manifest.json"
+    local fused_io_in="" fused_io_out=""
+    if [ -f "$mf" ] && [ -f "$fused_io_py" ]; then
+        fused_io_in=$(python3 "$fused_io_py" "$mf" --emit input)
+        fused_io_out=$(python3 "$fused_io_py" "$mf" --emit output)
+        prec_flag=$(python3 "$fused_io_py" "$mf" --emit prec)
+        log_info "  triton_manifest: engine_dtype + triton_io_float_dtype drive trtexec precision and I/O formats"
+    else
+        if [ ! -f "$mf" ]; then
+            log_warn "  No triton_manifest.json — using ENGINE_DTYPE for precision only; fused I/O formats omitted"
+        else
+            log_warn "  Missing $fused_io_py — using ENGINE_DTYPE only"
+        fi
+        prec_flag=$(_trtexec_precision_flags)
+    fi
+    if [ -n "$fused_io_in" ] && [ -n "$fused_io_out" ]; then
+        if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+            $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
+            --saveEngine=/mnt/model/talker_code2wav_fused.engine \
+            $prec_flag \
+            --inputIOFormats="$fused_io_in" \
+            --outputIOFormats="$fused_io_out" \
+            --memPoolSize=workspace:8192 \
+            --minShapes="$fused_min" \
+            --optShapes="$fused_opt" \
+            --maxShapes="$fused_max"; then
+            log_error "trtexec talker_code2wav_fused failed for $variant"
+            return 1
+        fi
+    else
+        if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+            $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
+            --saveEngine=/mnt/model/talker_code2wav_fused.engine \
+            $prec_flag \
+            --memPoolSize=workspace:8192 \
+            --minShapes="$fused_min" \
+            --optShapes="$fused_opt" \
+            --maxShapes="$fused_max"; then
+            log_error "trtexec talker_code2wav_fused failed for $variant"
+            return 1
+        fi
     fi
     log_info "talker_code2wav_fused.engine built: $variant_dir"
     return 0

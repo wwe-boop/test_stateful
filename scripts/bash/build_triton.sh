@@ -305,11 +305,14 @@ cmd_run() {
         log_info "Using user-specified image: $TRITON_IMAGE"
     fi
 
+    local resolved_cname
+    resolved_cname=$(triton_resolve_container_name "$MODEL_REPO_DIR" "$CONTAINER_NAME" "")
+
     if $DRY_RUN; then
         log_info "[DRY RUN] Would start Triton:"
         log_info "  Image:      $TRITON_IMAGE"
         log_info "  Repository: $MODEL_REPO_DIR"
-        log_info "  Container:  $CONTAINER_NAME"
+        log_info "  Container:  $resolved_cname"
         log_info "  Ports:      gRPC=$TRITON_GRPC_PORT HTTP=$TRITON_HTTP_PORT metrics=$TRITON_METRICS_PORT"
         return 0
     fi
@@ -324,7 +327,7 @@ cmd_run() {
             log_info "  gRPC endpoint:    localhost:${TRITON_GRPC_PORT}"
             log_info "  HTTP endpoint:    localhost:${TRITON_HTTP_PORT}"
             log_info "  Metrics endpoint: localhost:${TRITON_METRICS_PORT}/metrics"
-            log_info "  Container:        $CONTAINER_NAME"
+            log_info "  Container:        $resolved_cname"
             echo ""
             log_info "Loaded models:"
             curl -s "http://localhost:${TRITON_HTTP_PORT}/v2/models" 2>/dev/null \
@@ -334,7 +337,7 @@ cmd_run() {
             log_info "Stop server: bash scripts/bash/build_triton.sh stop"
         else
             log_error "Server failed to become ready within ${HEALTH_TIMEOUT}s"
-            log_info "Check logs: docker logs $CONTAINER_NAME"
+            log_info "Check logs: docker logs $resolved_cname"
             exit 1
         fi
     else
@@ -391,15 +394,21 @@ cmd_build() {
 }
 
 cmd_stop() {
-    triton_stop "$CONTAINER_NAME"
+    local cname
+    cname=$(triton_resolve_container_name "$MODEL_REPO_DIR" "$CONTAINER_NAME" "${VARIANT:-}")
+    triton_stop "$cname"
 }
 
 cmd_status() {
     log_step "Triton Container Status"
 
-    if docker ps --filter "name=$CONTAINER_NAME" --format "{{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -q .; then
+    local cname
+    cname=$(triton_resolve_container_name "$MODEL_REPO_DIR" "$CONTAINER_NAME" "${VARIANT:-}")
+
+    # Exact name match (avoid docker name= substring filter matching other triton containers)
+    if docker ps --format "{{.Names}}" | grep -Fxq "$cname"; then
         log_info "Container running:"
-        docker ps --filter "name=$CONTAINER_NAME" --format "  Name:    {{.Names}}\n  Status:  {{.Status}}\n  Ports:   {{.Ports}}"
+        docker ps --format "{{.Names}}\t{{.Status}}\t{{.Ports}}" | awk -F'\t' -v n="$cname" '$1==n {printf "  Name:    %s\n  Status:  %s\n  Ports:   %s\n", $1, $2, $3}'
         echo ""
         if curl -sf "http://localhost:${TRITON_HTTP_PORT}/v2/health/ready" &>/dev/null; then
             log_info "Health: READY"
@@ -412,7 +421,7 @@ cmd_status() {
             log_warn "Health: NOT READY (still loading or unhealthy)"
         fi
     else
-        log_info "Container '$CONTAINER_NAME' is not running"
+        log_info "Container '$cname' is not running"
     fi
 }
 

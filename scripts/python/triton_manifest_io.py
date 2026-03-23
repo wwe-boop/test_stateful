@@ -93,8 +93,14 @@ def build_manifest_for_export(
     code2wav_layout: Dict[str, Any],
     engine_mode: str = "trt",
     engine_dtype: str = "bf16",
+    triton_io_float_dtype: str = "bf16",
 ) -> Dict[str, Any]:
-    """Build a full manifest dict after export (e.g. export_09)."""
+    """Build a full manifest dict after export (e.g. export_09).
+
+    engine_dtype: TensorRT builder precision (e.g. trtexec --bf16); Phase B reads this for prec flags.
+    triton_io_float_dtype: Float tensor I/O for trtexec --inputIOFormats/--outputIOFormats and Triton config.pbtxt.
+        ONNX graph remains FP32 (ONNX_EXPORT_DTYPE); TRT may insert reformats at boundaries.
+    """
     talker = weights_to_talker_section(weights_config)
     orch = variant_orchestrator_defaults(variant)
     return {
@@ -102,6 +108,7 @@ def build_manifest_for_export(
         "variant": variant,
         "engine_mode": engine_mode,
         "engine_dtype": engine_dtype,
+        "triton_io_float_dtype": triton_io_float_dtype,
         "talker": talker,
         "code2wav_fused": {
             "num_code2wav_hidden_layers": code2wav_layout["num_code2wav_hidden_layers"],

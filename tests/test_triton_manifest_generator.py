@@ -18,6 +18,7 @@ from generate_triton_configs import (  # noqa: E402
     render_orchestrator,
     render_speech_tokenizer_encoder_trt,
     render_talker_unified_trt,
+    triton_io_float_pbtxt_from_manifest,
 )
 from triton_manifest_io import build_manifest_for_export, load_manifest  # noqa: E402
 
@@ -105,7 +106,13 @@ def test_build_manifest_for_export_roundtrip():
     }
     m = build_manifest_for_export("custom-1.7b", wc, lay)
     assert m["schema_version"] == 1
+    assert m.get("triton_io_float_dtype") == "bf16"
     assert m["code2wav_fused"]["c2w_state_input_names"][0] == "c2w_past_kv_0_k"
+
+
+def test_triton_io_float_dtype_from_manifest_defaults_fp32():
+    assert triton_io_float_pbtxt_from_manifest({}) == "TYPE_FP32"  # missing key defaults fp32
+    assert triton_io_float_pbtxt_from_manifest({"triton_io_float_dtype": "bf16"}) == "TYPE_BF16"
 
 
 def test_generate_configs_minimal_repo(tmp_path):
@@ -120,6 +127,12 @@ def test_generate_configs_minimal_repo(tmp_path):
     generate_configs(manifest, tmp_path, "trt", engine_dtype="bf16")
     fused_cfg = (tmp_path / "talker_code2wav_fused" / "config.pbtxt").read_text()
     assert "tensorrt" in fused_cfg
+    assert 'name: "input_embeds"' in fused_cfg
+    assert 'name: "cache_position"' in fused_cfg
+    assert 'name: "wav"' in fused_cfg
+    assert "c2w_past_kv_0_k" in fused_cfg
+    assert 'name: "past_kv_0_k"' in fused_cfg
+    assert "TYPE_BF16" in fused_cfg
     orch_cfg = (tmp_path / "tts_orchestrator" / "config.pbtxt").read_text()
     assert "tts_orchestrator" in orch_cfg
     assert "custom-1.7b" in orch_cfg

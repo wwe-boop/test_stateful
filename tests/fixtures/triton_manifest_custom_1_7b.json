@@ -3,6 +3,7 @@
   "variant": "custom-1.7b",
   "engine_mode": "trt",
   "engine_dtype": "bf16",
+  "triton_io_float_dtype": "bf16",
   "submodels": {
     "speaker_encoder": true,
     "speech_tokenizer_codec_fused": false,

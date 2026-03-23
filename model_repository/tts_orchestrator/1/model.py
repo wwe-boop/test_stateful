@@ -187,6 +187,22 @@ class TritonPythonModel:
         if self._use_fused_decode:
             self._talker_backend, self._talker_dtype = _dtype_from_pbtxt(fused_cfg)
             self._code2wav_dtype = self._talker_dtype
+            # Single source of truth: triton_manifest.json triton_io_float_dtype overrides pbtxt scan.
+            if self._triton_manifest:
+                raw_io = self._triton_manifest.get("triton_io_float_dtype") or self._triton_manifest.get(
+                    "onnx_io_dtype"
+                )
+                if raw_io:
+                    s = str(raw_io).lower().strip()
+                    if s in ("bf16", "bfloat16"):
+                        self._talker_dtype = torch.bfloat16
+                        self._code2wav_dtype = torch.bfloat16
+                    elif s in ("fp16", "float16"):
+                        self._talker_dtype = torch.float16
+                        self._code2wav_dtype = torch.float16
+                    elif s in ("fp32", "float32", "float"):
+                        self._talker_dtype = torch.float32
+                        self._code2wav_dtype = torch.float32
             if os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
                 self._code2wav_dtype = torch.bfloat16
             logger.info(

@@ -346,8 +346,10 @@ cmd_status() {
 }
 
 cmd_stop() {
-    local container="${CONTAINER_NAME:-qwen3-tts-triton}"
-    triton_stop "$container"
+    local repo="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
+    local cname
+    cname=$(triton_resolve_container_name "$repo" "${CONTAINER_NAME:-qwen3-tts-triton}" "${VARIANT:-}")
+    triton_stop "$cname"
 }
 
 cmd_update_matrix() {

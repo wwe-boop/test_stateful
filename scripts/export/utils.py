@@ -141,8 +141,9 @@ def add_common_args(parser) -> None:
     parser.add_argument(
         "--dtype", type=str, default="bf16",
         choices=["bf16", "fp16", "fp32"],
-        help="Target inference precision for embedding weights and TRT engine build "
-             "(default: bf16). ONNX export always uses fp32 internally.",
+        help="Target precision for embedding weights and TRT builder (e.g. trtexec --bf16). "
+             "ONNX graph float I/O for fused export remains fp32 unless a script overrides it; "
+             "triton_io_float_dtype in triton_manifest.json must match engine I/O.",
     )
     parser.add_argument("--models-dir", type=str, default=None,
                         help="Models directory (default: workspace/models)")

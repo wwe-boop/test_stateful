@@ -634,6 +634,13 @@ Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 
 **`triton_manifest.json`**（`export_09` 必填）：合并 `weights/config.json` 中的 Talker 维度与融合图 Code2Wav 状态（`code2wav_fused`）。Phase C `assemble` **要求**该文件存在，将其复制到 `model_repository/` 根与 `tts_orchestrator/1/`，并仅通过 [`scripts/python/generate_triton_configs.py`](../scripts/python/generate_triton_configs.py) 生成全部 `config.pbtxt`。Schema 见 [`scripts/python/schemas/triton_manifest.schema.json`](../scripts/python/schemas/triton_manifest.schema.json)。
 
+**精度与 manifest（单一来源）**：
+
+- **ONNX（export_09）**：浮点仍用 `utils.ONNX_EXPORT_DTYPE`（**FP32**）导出，保证工具链/API 兼容；**不**把「部署用 BF16/FP16」写进 ONNX 文件本身。
+- **`engine_dtype`**：`triton_manifest.json` 字段，驱动 Phase B `trtexec` 的 **`--bf16` / `--fp16` / `--fp8`**（`fp32` 则无精度标志），即 **TensorRT 算子侧**优先使用的精度。
+- **`triton_io_float_dtype`**：同一 manifest 中声明 **`talker_code2wav_fused` 浮点张量**的 binding（`fp32` / `bf16` / `fp16`）。Phase B 由 [`scripts/python/trt_fused_io_formats.py`](../scripts/python/trt_fused_io_formats.py) 按与 `export_09` **相同的 I/O 顺序**生成 `--inputIOFormats` / `--outputIOFormats`（整型输入/输出固定 `int64:chw`）。Phase C [`generate_triton_configs.py`](../scripts/python/generate_triton_configs.py) 据此生成 `TYPE_*`；BLS **优先读 manifest 的 `triton_io_float_dtype`** 设定 `torch` dtype，与 `config.pbtxt` 对齐。
+- **用户切换 fp16/bf16/fp32**：修改 manifest（或 `export_09 --engine-dtype` / `--triton-io-float-dtype`）后 **重跑 Phase B 编引擎 + Phase C assemble**；环境变量 `ENGINE_DTYPE` 仅在 **缺少 manifest** 时作为 fused 构建回退。
+
 切换方式：`build_triton.sh assemble --engine-mode onnx|trt`。BLS 根据是否存在 `talker_code2wav_fused/config.pbtxt` 选择融合或遗留流水线；融合路径下从 `triton_manifest.json` 的 `code2wav_fused` 读取 Code2Wav 状态张量布局（与导出融合 ONNX 一致）。
 
 ### 6.1 生产融合引擎 (talker_code2wav_fused)

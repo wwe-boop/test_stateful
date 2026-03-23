@@ -59,6 +59,8 @@ def normalize_engine_dtype(short: str) -> str:
         return "fp16"
     if s in ("float32", "float"):
         return "fp32"
+    if s in ("fp8", "float8"):
+        return "fp8"
     return s
 
 
@@ -72,12 +74,40 @@ def to_triton_dtype(short: str) -> str:
         "fp16": "TYPE_FP16",
         "bfloat16": "TYPE_BF16",
         "bf16": "TYPE_BF16",
+        "fp8": "TYPE_FP8",
+        "float8": "TYPE_FP8",
         "int32": "TYPE_INT32",
         "int64": "TYPE_INT64",
         "string": "TYPE_STRING",
         "bool": "TYPE_BOOL",
     }
     return mapping.get(s, "TYPE_FP32")
+
+
+def normalize_triton_io_float_dtype(short: str) -> str:
+    """Normalize manifest triton_io_float_dtype / onnx_io_dtype string."""
+    s = (short or "fp32").lower().strip()
+    if s in ("float32", "float"):
+        return "fp32"
+    if s in ("bfloat16",):
+        return "bf16"
+    if s in ("float16",):
+        return "fp16"
+    if s in ("float8", "fp8"):
+        return "fp8"
+    if s in ("fp32", "bf16", "fp16", "fp8"):
+        return s
+    return "fp32"
+
+
+def triton_io_float_pbtxt_from_manifest(manifest: Dict[str, Any]) -> str:
+    """
+    Float tensor types for Triton config must match trtexec --inputIOFormats/--outputIOFormats
+    (see trt_fused_io_formats.py). Missing key defaults to fp32 for backward compatibility;
+    export_09 writes triton_io_float_dtype (default bf16) into triton_manifest.json.
+    """
+    raw = manifest.get("triton_io_float_dtype") or manifest.get("onnx_io_dtype") or "fp32"
+    return to_triton_dtype(normalize_triton_io_float_dtype(str(raw)))
 
 
 def render_minimal_onnx(model_name: str) -> str:
@@ -204,6 +234,142 @@ def render_talker_unified_trt(talker: Dict[str, Any], engine_dtype: str) -> str:
         parts.append(
             f'  {{ name: "present_kv_{i}_v"  data_type: {ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
         )
+        parts.append("]")
+    parts.extend(
+        [
+            "instance_group [",
+            "  { count: 1  kind: KIND_GPU  gpus: [ 0 ] }",
+            "]",
+            "",
+        ]
+    )
+    return "\n".join(parts)
+
+
+# One codec frame at 24 kHz (matches model_repository/tts_orchestrator SAMPLES_PER_CODEC_FRAME).
+_FUSED_WAV_SAMPLES_PER_FRAME = 1920
+
+
+def _manifest_shape_to_triton_dims(shape: List[int]) -> str:
+    """Map manifest initial_state_shapes (batch leading 1) to Triton dims (-1 batch; 0 -> dynamic)."""
+    dims: List[str] = []
+    for i, x in enumerate(shape):
+        if i == 0:
+            dims.append("-1")
+        elif int(x) == 0:
+            dims.append("-1")
+        else:
+            dims.append(str(int(x)))
+    return "[ " + ", ".join(dims) + " ]"
+
+
+def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str) -> str:
+    """
+    Full I/O for TensorRT backend: empty input/output causes
+    'failed to specify the dimensions of all input tensors or values of all input shape tensors'.
+
+    Float tensor data_types come from manifest ``triton_io_float_dtype`` (default fp32), which must match
+    the deployed ONNX/TRT engine I/O. ``engine_dtype`` / CLI is TensorRT *compute* precision and is not used here.
+    """
+    io_ft = triton_io_float_pbtxt_from_manifest(manifest)
+    _ = engine_dtype
+    talker = manifest.get("talker") or {}
+    H = int(talker.get("hidden_size", 2048))
+    kv = int(talker.get("num_kv_heads", 8))
+    hd = int(talker.get("head_dim", 128))
+    nl = int(talker.get("num_layers", 28))
+    v = int(talker.get("vocab_size", 3072))
+
+    c2w = manifest.get("code2wav_fused")
+    if not isinstance(c2w, dict):
+        raise ValueError(
+            "triton_manifest.json must include code2wav_fused for talker_code2wav_fused TRT config"
+        )
+    in_names: List[str] = list(c2w.get("c2w_state_input_names") or [])
+    init_shapes_raw = c2w.get("initial_state_shapes") or []
+    out_names_c2w: List[str] = list(c2w.get("c2w_state_output_names") or [])
+
+    init_shapes: List[List[int]] = []
+    for row in init_shapes_raw:
+        if isinstance(row, (list, tuple)):
+            init_shapes.append([int(x) for x in row])
+        else:
+            raise ValueError("initial_state_shapes entries must be lists of integers")
+
+    if len(in_names) != len(init_shapes):
+        raise ValueError(
+            "code2wav_fused: len(c2w_state_input_names) != len(initial_state_shapes)"
+        )
+    if len(out_names_c2w) != len(in_names):
+        raise ValueError(
+            "code2wav_fused: len(c2w_state_output_names) must match c2w_state_input_names"
+        )
+
+    parts: List[str] = [
+        'name: "talker_code2wav_fused"',
+        'backend: "tensorrt"',
+        "max_batch_size: 0",
+        "",
+        "input [",
+        f"  {{ name: \"input_embeds\"  data_type: {io_ft}  dims: [ -1, -1, {H} ] }}",
+        "]",
+        "input [",
+        '  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1 ] }',
+        "]",
+        "input [",
+        '  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 1 ] }',
+        "]",
+    ]
+    for i in range(nl):
+        parts.append("input [")
+        parts.append(
+            f'  {{ name: "past_kv_{i}_k"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+        )
+        parts.append("]")
+        parts.append("input [")
+        parts.append(
+            f'  {{ name: "past_kv_{i}_v"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+        )
+        parts.append("]")
+    for name, shp in zip(in_names, init_shapes):
+        dims = _manifest_shape_to_triton_dims(shp)
+        parts.append("input [")
+        parts.append(f'  {{ name: "{name}"  data_type: {io_ft}  dims: {dims} }}')
+        parts.append("]")
+    parts.extend(
+        [
+            "output [",
+            f'  {{ name: "wav"  data_type: {io_ft}  dims: [ -1, 1, {_FUSED_WAV_SAMPLES_PER_FRAME} ] }}',
+            "]",
+            "output [",
+            f'  {{ name: "codec_sum"  data_type: {io_ft}  dims: [ -1, 1, {H} ] }}',
+            "]",
+            "output [",
+            '  { name: "full_codec"  data_type: TYPE_INT64  dims: [ -1, 16 ] }',
+            "]",
+            "output [",
+            f'  {{ name: "hidden"  data_type: {io_ft}  dims: [ -1, -1, {H} ] }}',
+            "]",
+            "output [",
+            f'  {{ name: "logits"  data_type: {io_ft}  dims: [ -1, -1, {v} ] }}',
+            "]",
+        ]
+    )
+    for i in range(nl):
+        parts.append("output [")
+        parts.append(
+            f'  {{ name: "present_kv_{i}_k"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+        )
+        parts.append("]")
+        parts.append("output [")
+        parts.append(
+            f'  {{ name: "present_kv_{i}_v"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+        )
+        parts.append("]")
+    for out_name, shp in zip(out_names_c2w, init_shapes):
+        dims = _manifest_shape_to_triton_dims(shp)
+        parts.append("output [")
+        parts.append(f'  {{ name: "{out_name}"  data_type: {io_ft}  dims: {dims} }}')
         parts.append("]")
     parts.extend(
         [
@@ -441,8 +607,13 @@ def generate_configs(
                 text = render_minimal_onnx(name)
         elif name == "code2wav":
             text = render_code2wav_streaming(emode, ed)
+        elif name == "talker_code2wav_fused":
+            if emode == "trt" and has_plan:
+                text = render_talker_code2wav_fused_trt(manifest, ed)
+            else:
+                text = render_minimal_onnx(name)
         else:
-            # speech_tokenizer_codec_fused, talker_code2wav_fused
+            # speech_tokenizer_codec_fused (and any future stubs)
             if emode == "trt" and has_plan:
                 text = render_minimal_trt(name)
             else:

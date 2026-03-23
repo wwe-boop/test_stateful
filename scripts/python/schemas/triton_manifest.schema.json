@@ -21,8 +21,13 @@
     },
     "engine_dtype": {
       "type": "string",
-      "enum": ["bf16", "fp16", "fp32", "bfloat16", "float16", "float32"],
-      "description": "TensorRT / float tensor dtype hint (bf16 default)"
+      "enum": ["bf16", "fp16", "fp32", "fp8", "bfloat16", "float16", "float32", "float8"],
+      "description": "TensorRT builder precision (trtexec --bf16/--fp16/--fp8); Phase B fused build reads this from manifest; must stay in sync with rebuilt engine"
+    },
+    "triton_io_float_dtype": {
+      "type": "string",
+      "enum": ["fp32", "bf16", "fp16", "fp8", "float32", "bfloat16", "float16", "float8"],
+      "description": "Float I/O for talker_code2wav_fused: trtexec --inputIOFormats/--outputIOFormats + Triton TYPE_* + BLS torch dtype; export_09 default bf16; ONNX file stays FP32"
     },
     "submodels": {
       "type": "object",
