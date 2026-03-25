@@ -192,7 +192,11 @@ def run_fused_onnx_loop(
     wav_chunks = [wav.reshape(-1)]
 
     if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
-        logger.info("fused ORT: EOS at step 0")
+        logger.info("fused ORT: EOS at step 0 (logits)")
+        return np.concatenate(wav_chunks)
+    fc0 = int(_get("full_codec")[0, 0])
+    if fc0 == codec_eos_id:
+        logger.info("fused ORT: EOS at step 0 (full_codec[0])")
         return np.concatenate(wav_chunks)
 
     text_idx = 0
@@ -229,8 +233,199 @@ def run_fused_onnx_loop(
         # Check EOS before appending wav: the EOS step still runs Code2Wav on codec ids that
         # may be EOS/special (often clamped into vocoder range), producing a click/buzz tail.
         logits = torch.from_numpy(_get("logits")).to(device)
+        logit_eos = (
+            int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
+        )
+        fc0 = int(_get("full_codec")[0, 0])
+        if logit_eos or fc0 == codec_eos_id:
+            logger.info(
+                "fused ORT: EOS at step %d (logits_eos=%s full_codec[0]=%s)",
+                step,
+                logit_eos,
+                fc0,
+            )
+            break
+
+        wav = _get("wav")
+        wav_chunks.append(wav.reshape(-1))
+        codec_sum = torch.from_numpy(_get("codec_sum")).to(device)
+
+        text_add = (
+            trailing_text[text_idx]
+            if text_idx < len(trailing_text)
+            else pad_embed
+        )
+        text_idx += 1
+        next_embed = (codec_sum + text_add).to(dtype=torch.float32)
+        position_id = torch.full(
+            (B, 3, 1), S + step, device=device, dtype=torch.int64
+        )
+        frame_idx += 1
+
+        past_kv = []
+        for i in range(num_layers):
+            past_kv.append(
+                torch.from_numpy(_get(f"present_kv_{i}_k")).to(device, dtype=torch.float32)
+            )
+            past_kv.append(
+                torch.from_numpy(_get(f"present_kv_{i}_v")).to(device, dtype=torch.float32)
+            )
+        new_c2w = []
+        for name in c2w_out_names:
+            new_c2w.append(torch.from_numpy(_get(name)).to(device, dtype=torch.float32))
+
+    return np.concatenate(wav_chunks).astype(np.float32)
+
+
+def _normalize_triton_dtype(dtype: str) -> str:
+    if dtype.startswith("TYPE_"):
+        return dtype[len("TYPE_") :]
+    return dtype
+
+
+def _cast_numpy_for_triton(arr: np.ndarray, triton_dtype: str) -> np.ndarray:
+    triton_dtype = _normalize_triton_dtype(triton_dtype)
+    if triton_dtype == "FP16":
+        return arr.astype(np.float16, copy=False)
+    if triton_dtype in {"FP32", "BF16"}:
+        return arr.astype(np.float32, copy=False)
+    if triton_dtype == "INT64":
+        return arr.astype(np.int64, copy=False)
+    raise RuntimeError(f"Unsupported Triton dtype for numpy feed: {triton_dtype}")
+
+
+def run_fused_triton_loop(
+    client: Any,
+    triton_input_dtypes: Dict[str, str],
+    input_names: List[str],
+    output_names: List[str],
+    manifest: Dict[str, Any],
+    *,
+    inputs_embeds: torch.Tensor,
+    position_ids_prefill: torch.Tensor,
+    trailing_text: List[torch.Tensor],
+    pad_embed: torch.Tensor,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    codec_eos_id: int,
+    max_steps: int,
+) -> np.ndarray:
+    """Same greedy fused loop as run_fused_onnx_loop, via Triton model `talker_code2wav_fused`."""
+    import tritonclient.grpc as grpcclient
+
+    lay = manifest["code2wav_fused"]
+    c2w_in_names = lay["c2w_state_input_names"]
+    c2w_out_names = lay["c2w_state_output_names"]
+
+    def _infer(feed: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        inputs = []
+        for name in input_names:
+            arr = feed[name]
+            dt_raw = triton_input_dtypes[name]
+            arr = _cast_numpy_for_triton(arr, dt_raw)
+            dt = _normalize_triton_dtype(dt_raw)
+            inp = grpcclient.InferInput(name, list(arr.shape), dt)
+            inp.set_data_from_numpy(arr)
+            inputs.append(inp)
+        outputs = [grpcclient.InferRequestedOutput(n) for n in output_names]
+        res = client.infer("talker_code2wav_fused", inputs=inputs, outputs=outputs)
+        return {n: res.as_numpy(n) for n in output_names}
+
+    B, S, _H = inputs_embeds.shape
+    device = inputs_embeds.device
+
+    def _to_feed(
+        inp_emb: torch.Tensor,
+        pos_ids: torch.Tensor,
+        cache_pos: torch.Tensor,
+        past_kv: List[torch.Tensor] | None,
+        c2w_states: List[torch.Tensor],
+    ) -> Dict[str, np.ndarray]:
+        past_len = int(past_kv[0].shape[2]) if past_kv else 0
+        seq = int(inp_emb.shape[1])
+        feed: Dict[str, np.ndarray] = {
+            "input_embeds": inp_emb.detach().cpu().float().numpy(),
+            "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
+            "attention_bias": np.zeros((B, 1, seq, past_len + seq), dtype=np.float32),
+            "past_seq_lens": np.full((B,), past_len, dtype=np.int64),
+            "cache_position": cache_pos.detach().cpu().numpy().astype(np.int64),
+        }
+        if past_kv is None:
+            feed.update(_build_past_kv_empty(B, num_layers, num_kv_heads, head_dim))
+        else:
+            for i in range(num_layers):
+                feed[f"past_kv_{i}_k"] = past_kv[2 * i].detach().cpu().float().numpy()
+                feed[f"past_kv_{i}_v"] = past_kv[2 * i + 1].detach().cpu().float().numpy()
+        for name, t in zip(c2w_in_names, c2w_states):
+            feed[name] = t.detach().cpu().float().numpy()
+        return {k: v for k, v in feed.items() if k in input_names}
+
+    c2w_states = [
+        torch.from_numpy(a).to(device=device, dtype=torch.float32)
+        for a in _create_initial_c2w(manifest)
+    ]
+
+    cache_pos = torch.zeros(B, FUSED_CHUNK_T, device=device, dtype=torch.int64)
+
+    feed = _to_feed(
+        inputs_embeds,
+        position_ids_prefill,
+        cache_pos,
+        None,
+        c2w_states,
+    )
+    out = _infer(feed)
+
+    def _get(name: str) -> np.ndarray:
+        if name not in out:
+            raise KeyError(f"Missing output {name}, have {list(out.keys())}")
+        return out[name]
+
+    wav = _get("wav")
+    codec_sum = torch.from_numpy(_get("codec_sum")).to(device)
+    logits = torch.from_numpy(_get("logits")).to(device)
+
+    wav_chunks = [wav.reshape(-1)]
+
+    if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+        logger.info("fused Triton: EOS at step 0")
+        return np.concatenate(wav_chunks)
+
+    text_idx = 0
+    if trailing_text:
+        next_embed = codec_sum + trailing_text[text_idx]
+        text_idx += 1
+    else:
+        next_embed = codec_sum + pad_embed
+    next_embed = next_embed.to(dtype=torch.float32)
+
+    position_id = torch.full((B, 3, 1), S, device=device, dtype=torch.int64)
+    frame_idx = 1
+
+    past_kv: List[torch.Tensor] = []
+    for i in range(num_layers):
+        past_kv.append(
+            torch.from_numpy(_get(f"present_kv_{i}_k")).to(device, dtype=torch.float32)
+        )
+        past_kv.append(
+            torch.from_numpy(_get(f"present_kv_{i}_v")).to(device, dtype=torch.float32)
+        )
+
+    new_c2w: List[torch.Tensor] = []
+    for name in c2w_out_names:
+        new_c2w.append(torch.from_numpy(_get(name)).to(device, dtype=torch.float32))
+
+    for step in range(1, max_steps):
+        cache_pos = torch.full(
+            (B, FUSED_CHUNK_T), frame_idx, device=device, dtype=torch.int64
+        )
+        feed = _to_feed(next_embed, position_id, cache_pos, past_kv, new_c2w)
+        out = _infer(feed)
+
+        logits = torch.from_numpy(_get("logits")).to(device)
         if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
-            logger.info("fused ORT: EOS at step %d", step)
+            logger.info("fused Triton: EOS at step %d", step)
             break
 
         wav = _get("wav")

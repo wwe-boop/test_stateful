@@ -68,6 +68,9 @@ _CODE2WAV_STATE_SHAPES = [
 CODE2WAV_CHUNK_T = 4
 SAMPLES_PER_CODEC_FRAME = 1920
 FUSED_CHUNK_T = 1
+# Prefill with no history: TRT/ORT may require a fixed min past_kv time dim; use one dummy slot
+# and past_seq_lens=0 so padded_attention_bias masks it (-inf), logical past length remains 0.
+_FUSED_DUMMY_PAST_LEN = 1
 
 # Default c2w_* I/O for split-engine path only (talker_unified + code2wav).
 _C2W_FUSED_DEFAULT_INPUT_NAMES = []
@@ -245,9 +248,10 @@ class TritonPythonModel:
         if self._use_fused_decode:
             self._talker_backend, self._talker_dtype = _dtype_from_pbtxt(fused_cfg)
             self._code2wav_dtype = self._talker_dtype
-            # TRT deploy may intentionally use BF16/FP16 bindings; ONNX deploy should follow the
-            # actual ONNX model config generated from the graph schema.
-            if self._triton_manifest and self._talker_backend == "tensorrt":
+            # Manifest I/O dtype (export_09 / generate_triton_configs) must drive Python tensors:
+            # config.pbtxt scan can miss BF16 if the on-disk file differs from assemble output, and
+            # c2w_* TRT bindings require the same dtype as talker floats (see triton_io_float_dtype).
+            if self._triton_manifest:
                 raw_io = self._triton_manifest.get("triton_io_float_dtype") or self._triton_manifest.get(
                     "onnx_io_dtype"
                 )
@@ -266,7 +270,8 @@ class TritonPythonModel:
                 self._code2wav_dtype = torch.bfloat16
             logger.info(
                 f"[TTS Orchestrator] fused pipeline: talker_code2wav_fused "
-                f"backend={self._talker_backend}, dtype={self._talker_dtype}"
+                f"backend={self._talker_backend}, talker_dtype={self._talker_dtype}, "
+                f"code2wav_dtype={self._code2wav_dtype}"
             )
             if not self._triton_manifest or not isinstance(
                 self._triton_manifest.get("code2wav_fused"), dict
@@ -562,7 +567,7 @@ class TritonPythonModel:
 
             text_add = plan.trailing[0] if plan.trailing else self._tts_pad_embed_torch
             session.trailing_text = plan.trailing
-            session.next_embed = (codec_sum + text_add).to(torch.bfloat16)
+            session.next_embed = (codec_sum + text_add).to(self._talker_dtype)
             session.text_idx = 1
             session.kv_tensors = kv_tensors
             session.c2w_states = c2w_states
@@ -609,7 +614,7 @@ class TritonPythonModel:
         active_out: list[_FusedBatchSession],
     ) -> None:
         batched_input = torch.cat(
-            [session.next_embed.to(torch.bfloat16) for session in sessions],
+            [session.next_embed.to(self._talker_dtype) for session in sessions],
             dim=0,
         )
         batched_pos = torch.cat(
@@ -697,7 +702,7 @@ class TritonPythonModel:
                 session.text_idx += 1
                 session.next_embed = (
                     codec_sum[row_idx : row_idx + 1] + text_add
-                ).to(torch.bfloat16)
+                ).to(self._talker_dtype)
                 session.kv_tensors = split_kv[row_idx]
                 session.c2w_states = split_c2w[row_idx]
                 session.past_len = new_past_lens[row_idx]
@@ -1129,10 +1134,11 @@ class TritonPythonModel:
             return
 
         text_idx = 0
+        dt = self._talker_dtype
         next_embed = (
-            (codec_sum + trailing_text[text_idx]).to(torch.bfloat16)
+            (codec_sum + trailing_text[text_idx]).to(dt)
             if trailing_text
-            else (codec_sum + self._tts_pad_embed_torch).to(torch.bfloat16)
+            else (codec_sum + self._tts_pad_embed_torch).to(dt)
         )
         text_idx += 1
         position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
@@ -1174,7 +1180,7 @@ class TritonPythonModel:
                 else self._tts_pad_embed_torch
             )
             text_idx += 1
-            next_embed = (codec_sum + text_add).to(torch.bfloat16)
+            next_embed = (codec_sum + text_add).to(self._talker_dtype)
             position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
             frame_idx += 1
 
@@ -1221,7 +1227,7 @@ class TritonPythonModel:
 
         codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
 
-        next_embed = (codec_sum + trailing_text[text_idx]).to(torch.bfloat16)
+        next_embed = (codec_sum + trailing_text[text_idx]).to(self._talker_dtype)
         text_idx += 1
         position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
 
@@ -1258,7 +1264,7 @@ class TritonPythonModel:
 
             text_add = trailing_text[text_idx] if text_idx < len(trailing_text) else self._tts_pad_embed_torch
             text_idx += 1
-            next_embed = (codec_sum + text_add).to(torch.bfloat16)
+            next_embed = (codec_sum + text_add).to(self._talker_dtype)
             position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
 
         _, _ = self._flush_code2wav_buffer(
@@ -1363,19 +1369,39 @@ class TritonPythonModel:
         pos_ids = position_ids.contiguous()
         cache_pos = cache_position.contiguous()
         batch = int(input_embeds.shape[0])
-        past_len = 0 if past_kv_tensors is None else int(past_kv_tensors[0].shape[2])
-        past_seq_lens = past_seq_lens_override
-        if past_seq_lens is None:
-            past_seq_lens = uniform_past_seq_lens(batch, past_len, self.device)
-        attention_bias = attention_bias_override
-        if attention_bias is None:
-            attention_bias = zeros_attention_bias(
-                batch=batch,
-                seq=input_embeds.shape[1],
-                past_len=past_len,
-                device=self.device,
-                dtype=self._talker_dtype,
-            )
+        seq = int(input_embeds.shape[1])
+        use_dummy_past_kv = past_kv_tensors is None
+
+        if use_dummy_past_kv:
+            if past_seq_lens_override is None:
+                past_seq_lens = uniform_past_seq_lens(batch, 0, self.device)
+            else:
+                past_seq_lens = past_seq_lens_override
+            if attention_bias_override is None:
+                attention_bias = padded_attention_bias(
+                    past_seq_lens,
+                    seq,
+                    _FUSED_DUMMY_PAST_LEN,
+                    self.device,
+                    self._talker_dtype,
+                )
+            else:
+                attention_bias = attention_bias_override
+        else:
+            past_len = int(past_kv_tensors[0].shape[2])
+            past_seq_lens = past_seq_lens_override
+            if past_seq_lens is None:
+                past_seq_lens = uniform_past_seq_lens(batch, past_len, self.device)
+            if attention_bias_override is None:
+                attention_bias = zeros_attention_bias(
+                    batch=batch,
+                    seq=seq,
+                    past_len=past_len,
+                    device=self.device,
+                    dtype=self._talker_dtype,
+                )
+            else:
+                attention_bias = attention_bias_override
         try:
             inputs = [
                 pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
@@ -1391,19 +1417,24 @@ class TritonPythonModel:
             )
             raise
 
-        if past_kv_tensors is None:
-            talker_np_dtype = np.float16 if self._talker_dtype == torch.float16 else np.float32
+        if use_dummy_past_kv:
             for i in range(self.num_layers):
-                empty_k_np = np.empty(
-                    (batch, self.kv_heads, 0, self.head_dim),
-                    dtype=talker_np_dtype,
+                dummy_k = torch.zeros(
+                    (batch, self.kv_heads, _FUSED_DUMMY_PAST_LEN, self.head_dim),
+                    device=self.device,
+                    dtype=self._talker_dtype,
                 )
-                empty_v_np = np.empty(
-                    (batch, self.kv_heads, 0, self.head_dim),
-                    dtype=talker_np_dtype,
+                dummy_v = torch.zeros(
+                    (batch, self.kv_heads, _FUSED_DUMMY_PAST_LEN, self.head_dim),
+                    device=self.device,
+                    dtype=self._talker_dtype,
                 )
-                inputs.append(pb_utils.Tensor(f"past_kv_{i}_k", empty_k_np))
-                inputs.append(pb_utils.Tensor(f"past_kv_{i}_v", empty_v_np))
+                try:
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_k", dummy_k))
+                    inputs.append(pb_utils.Tensor.from_dlpack(f"past_kv_{i}_v", dummy_v))
+                except Exception as e:
+                    logger.error(f"fused: from_dlpack dummy past_kv {i}: {e}")
+                    raise
         else:
             for i in range(self.num_layers):
                 k = past_kv_tensors[2 * i].clone().to(
@@ -1502,19 +1533,30 @@ class TritonPythonModel:
         dtype: torch.dtype,
         log_prefix: str,
     ) -> None:
-        t = tensor.contiguous().to(device=self.device, dtype=dtype)
+        t = tensor.contiguous().to(device=self.device, dtype=dtype).contiguous()
         if 0 in t.shape:
-            inputs.append(pb_utils.Tensor(name, self._empty_state_numpy(t.shape, dtype)))
+            # Code2wav cold-start uses c2w past_kv with T=0 (see SlidingWindowKVCache.get_seq_length).
+            # Do NOT pad T to 1 here: that would make S_past==1 and break causal math in the fused graph.
+            # Talker dummy past (T=1 + past_seq_lens=0 + bias) is talker-only; c2w is separate.
+            # 0-numel: prefer zeros_like (stable layout); some PyTorch builds still fail DLPack on 0-numel tensors.
+            z = torch.zeros_like(t, dtype=dtype, device=self.device).contiguous()
+            try:
+                inputs.append(pb_utils.Tensor.from_dlpack(name, z))
+            except Exception as e:
+                logger.warning(
+                    "%s: from_dlpack 0-size %s failed (%s); using NumPy empty (0 payload bytes)",
+                    log_prefix,
+                    name,
+                    e,
+                )
+                shape = tuple(int(dim) for dim in t.shape)
+                inputs.append(pb_utils.Tensor(name, np.empty(shape, dtype=np.float32)))
             return
         try:
             inputs.append(pb_utils.Tensor.from_dlpack(name, t))
         except Exception as e:
             logger.error(f"{log_prefix}: from_dlpack {name}: {e}")
             raise
-
-    def _empty_state_numpy(self, shape, dtype: torch.dtype) -> np.ndarray:
-        np_dtype = np.float16 if dtype == torch.float16 else np.float32
-        return np.empty(tuple(int(dim) for dim in shape), dtype=np_dtype)
 
     def _clip_code2wav_state_window(
         self,

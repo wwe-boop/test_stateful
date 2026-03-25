@@ -3,8 +3,8 @@
 #  L2 test T2.4: assemble_model_repo ONNX/TRT dual mode and validate.
 #
 #  Verifies:
-#    - ONNX mode: .onnx + .onnx.data copy, tokenizer.json, audio_utils.py,
-#                 lightweight_tokenizer.py in tts_orchestrator/1
+#    - ONNX mode: .onnx + .onnx.data copy, tokenizer.json, batch_decode_scheduler.py,
+#                 text_segmenter.py, audio_utils.py, lightweight_tokenizer.py in tts_orchestrator/1
 #    - TRT mode:  talker_code2wav_fused config has TYPE_BF16, same Python files
 #    - Both: first_chunk_frames in tts_orchestrator config, weights/ .pt files
 #
@@ -46,6 +46,8 @@ validate_model_repo "${TEST_REPO_ONNX}" || { log_error "validate (onnx) failed";
 # Assert ONNX-specific
 ORCH_1="${TEST_REPO_ONNX}/tts_orchestrator/1"
 [ -f "${ORCH_1}/model.py" ] || { log_error "Missing ${ORCH_1}/model.py"; exit 1; }
+[ -f "${ORCH_1}/batch_decode_scheduler.py" ] || { log_error "Missing batch_decode_scheduler.py"; exit 1; }
+[ -f "${ORCH_1}/text_segmenter.py" ] || { log_error "Missing text_segmenter.py"; exit 1; }
 [ -f "${ORCH_1}/prefill_builder.py" ] || { log_error "Missing prefill_builder.py"; exit 1; }
 [ -f "${ORCH_1}/audio_utils.py" ] || { log_error "Missing audio_utils.py"; exit 1; }
 [ -f "${ORCH_1}/lightweight_tokenizer.py" ] || { log_error "Missing lightweight_tokenizer.py"; exit 1; }

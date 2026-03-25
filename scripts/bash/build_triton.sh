@@ -277,6 +277,15 @@ cmd_run() {
             stale=true
             log_warn "Orchestrator Python source (model.py) is newer than assembled copy"
         fi
+        # Re-assemble if orchestrator helpers were added after an older assemble (see triton.sh copy list)
+        local orch_h
+        for orch_h in batch_decode_scheduler.py text_segmenter.py; do
+            if [ ! -f "$MODEL_REPO_DIR/tts_orchestrator/1/$orch_h" ]; then
+                stale=true
+                log_warn "Orchestrator helper missing in model repo: $orch_h (re-assemble required)"
+                break
+            fi
+        done
         if $stale; then
             need_assemble=true
             log_warn "Model repository is stale (source engines or orchestrator newer), re-assembling ..."
