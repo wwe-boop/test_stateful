@@ -17,8 +17,10 @@ In-process torch: text/codec embeddings via loaded .pt weights on GPU (BF16).
 All tensor ops use torch; no BLS for embedders. Tokenizer remains lightweight (tokenizers lib).
 """
 
+import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -47,6 +49,15 @@ class TaskType(Enum):
     VOICE_CLONE_XVEC = "voice_clone_xvec"
     CUSTOM_VOICE = "custom_voice"
     VOICE_DESIGN = "voice_design"
+
+
+@dataclass
+class PrefillPlan:
+    prefill_embeds: torch.Tensor
+    trailing: list
+    prefix_cache_key: Optional[str] = None
+    cacheable_prefix_embeds: Optional[torch.Tensor] = None
+    request_prefill_embeds: Optional[torch.Tensor] = None
 
 
 def parse_task_type(task_type_str: str, x_vector_only: bool = False) -> TaskType:
@@ -208,13 +219,76 @@ class PrefillBuilder:
         ref_text: Optional[str] = None,
         ref_codec_sum_vec: Optional[torch.Tensor] = None,
     ) -> tuple:
+        plan = self.build_plan(
+            task_type=task_type,
+            text=text,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            spk_embedding=spk_embedding,
+            ref_codes=ref_codes,
+            ref_text=ref_text,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+        )
+        return plan.prefill_embeds, plan.trailing
+
+    def _speaker_embedding_digest(self, spk_embedding: Optional[torch.Tensor]) -> Optional[str]:
+        if spk_embedding is None:
+            return None
+        arr = (
+            spk_embedding.detach()
+            .to(device="cpu", dtype=torch.float32)
+            .contiguous()
+            .numpy()
+        )
+        return hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+
+    def _prefix_cache_key(
+        self,
+        task_type: TaskType,
+        language: str = "auto",
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        spk_embedding: Optional[torch.Tensor] = None,
+    ) -> Optional[str]:
+        key_parts = [
+            self.w.variant,
+            task_type.value,
+            (language or "auto").strip().lower(),
+            (instruct or "").strip(),
+        ]
+        if task_type == TaskType.CUSTOM_VOICE:
+            key_parts.append((speaker or "").strip().lower())
+        elif task_type == TaskType.VOICE_CLONE_XVEC:
+            digest = self._speaker_embedding_digest(spk_embedding)
+            if digest is None:
+                return None
+            key_parts.append(digest)
+        elif task_type != TaskType.VOICE_DESIGN:
+            return None
+        return "|".join(key_parts)
+
+    def build_plan(
+        self,
+        task_type: TaskType,
+        text: str,
+        language: str = "auto",
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        spk_embedding: Optional[torch.Tensor] = None,
+        ref_codes: Optional[torch.Tensor] = None,
+        ref_text: Optional[str] = None,
+        ref_codec_sum_vec: Optional[torch.Tensor] = None,
+    ) -> PrefillPlan:
         """
         Build prefill inputs_embeds and trailing_text_hidden queue.
 
         Returns:
-            (inputs_embeds, trailing_text_hidden) where:
-              inputs_embeds: torch [1, S_prefill, H] bfloat16 on GPU
-              trailing_text_hidden: list of torch [1, 1, H] for decode
+            PrefillPlan:
+              prefill_embeds: torch [1, S_prefill, H] bfloat16 on GPU
+              trailing: list of torch [1, 1, H] for decode
+              cacheable_prefix_embeds/request_prefill_embeds are populated only for
+              TRT-safe cacheable prefixes that do not require graph changes.
         """
         w = self.w
         device = w.device
@@ -444,8 +518,40 @@ class PrefillBuilder:
                 for i in range(n_trailing)
             ]
 
+        prefix_cache_key = None
+        cacheable_prefix_embeds = None
+        request_prefill_embeds = None
+        if task_type in (
+            TaskType.CUSTOM_VOICE,
+            TaskType.VOICE_DESIGN,
+            TaskType.VOICE_CLONE_XVEC,
+        ):
+            if non_streaming_mode:
+                cacheable_prefix_embeds = talker_input_embed.clone().contiguous()
+                request_prefill_embeds = prefill[:, cacheable_prefix_embeds.shape[1] :, :].clone().contiguous()
+            else:
+                cacheable_prefix_embeds = prefill[:, :-1, :].clone().contiguous()
+                request_prefill_embeds = prefill[:, -1:, :].clone().contiguous()
+            if cacheable_prefix_embeds.shape[1] > 0 and request_prefill_embeds.shape[1] > 0:
+                prefix_cache_key = self._prefix_cache_key(
+                    task_type=task_type,
+                    language=language,
+                    speaker=speaker,
+                    instruct=instruct,
+                    spk_embedding=spk_embedding,
+                )
+            else:
+                cacheable_prefix_embeds = None
+                request_prefill_embeds = None
+
         logger.info(
             f"Prefill built: task={task_type.value}, non_streaming={non_streaming_mode}, "
             f"shape={tuple(prefill.shape)}, trailing={len(trailing)}"
         )
-        return prefill, trailing
+        return PrefillPlan(
+            prefill_embeds=prefill,
+            trailing=trailing,
+            prefix_cache_key=prefix_cache_key,
+            cacheable_prefix_embeds=cacheable_prefix_embeds,
+            request_prefill_embeds=request_prefill_embeds,
+        )

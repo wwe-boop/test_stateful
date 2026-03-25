@@ -73,7 +73,7 @@ class TalkerUnifiedONNX(nn.Module):
         self,
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        *past_key_values: torch.Tensor,
+        *inputs: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, ...]:
         B, S, H = input_embeds.shape
         device = input_embeds.device
@@ -81,6 +81,18 @@ class TalkerUnifiedONNX(nn.Module):
         n = self.num_layers
         if position_ids.dim() == 3 and position_ids.size(0) != 3:
             position_ids = position_ids.permute(1, 0, 2)
+        attention_bias = None
+        past_seq_lens = None
+        if len(inputs) == 2 * n:
+            past_key_values = inputs
+        elif len(inputs) == 2 + 2 * n:
+            attention_bias = inputs[0]
+            past_seq_lens = inputs[1]
+            past_key_values = inputs[2:]
+        else:
+            raise ValueError(
+                f"Expected {2 * n} or {2 + 2 * n} extra tensors, got {len(inputs)}"
+            )
         past_list = [
             (past_key_values[2 * i], past_key_values[2 * i + 1])
             for i in range(n)
@@ -98,6 +110,15 @@ class TalkerUnifiedONNX(nn.Module):
             torch.tensor(float("-inf"), dtype=dtype, device=device),
             torch.tensor(0.0, dtype=dtype, device=device),
         ).unsqueeze(0).unsqueeze(0).expand(B, 1, S, S_total)
+        if attention_bias is not None:
+            causal_mask = causal_mask + attention_bias.to(device=device, dtype=dtype)
+        if past_seq_lens is not None:
+            # Keep past_seq_lens as a live ONNX input for BLS bookkeeping while
+            # letting attention_bias carry the actual padded-key masking semantics.
+            causal_mask = causal_mask + (
+                past_seq_lens.to(device=device, dtype=dtype).sum()
+                * torch.tensor(0.0, dtype=dtype, device=device)
+            )
 
         text_position_ids = position_ids[0] if position_ids.dim() == 3 else position_ids
         cache_position = torch.arange(S_past, S_past + S, device=device, dtype=torch.long)
@@ -146,9 +167,9 @@ class TalkerUnifiedFusedONNX(nn.Module):
         self,
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
-        *past_key_values: torch.Tensor,
+        *inputs: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
-        talker_out = self.talker_unified(input_embeds, position_ids, *past_key_values)
+        talker_out = self.talker_unified(input_embeds, position_ids, *inputs)
         hidden = talker_out[0]
         logits = talker_out[1]
         present_kv = list(talker_out[2:])

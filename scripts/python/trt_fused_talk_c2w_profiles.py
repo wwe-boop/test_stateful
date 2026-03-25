@@ -64,15 +64,25 @@ def main():
     Bopt = "1"
     opt_spast = "128"
 
-    parts_min = [f"input_embeds:1x1x{H}", f"position_ids:1x3x1", "cache_position:1x1"]
+    parts_min = [
+        f"input_embeds:1x1x{H}",
+        f"position_ids:1x3x1",
+        "attention_bias:1x1x1x1",
+        "past_seq_lens:1",
+        "cache_position:1x1",
+    ]
     parts_opt = [
         f"input_embeds:{Bopt}x1x{H}",
         f"position_ids:{Bopt}x3x1",
+        f"attention_bias:{Bopt}x1x1x{int(opt_spast) + 1}",
+        f"past_seq_lens:{Bopt}",
         f"cache_position:{Bopt}x1",
     ]
     parts_max = [
         f"input_embeds:{Bmax}x{max_in}x{H}",
         f"position_ids:{Bmax}x3x{max_in}",
+        f"attention_bias:{Bmax}x1x{max_in}x{int(max_seq) + int(max_in)}",
+        f"past_seq_lens:{Bmax}",
         f"cache_position:{Bmax}x1",
     ]
 

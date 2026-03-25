@@ -2,9 +2,31 @@
 
 > **技术路线**: Triton Inference Server + TensorRT + ONNX Runtime
 >
-> **推理精度**: BF16 (BFloat16)。BF16 与 FP32 共享 8 位指数范围，彻底避免 FP16 在 RoPE / LayerNorm / Softmax 中的 overflow 风险，同时保持与 FP16 相同的显存占用和吞吐。
+> **推理精度**: 当前主推 **BF16**，但尚未宣布 fused TRT 已完成数值闭环。现阶段验证结论是：`FP16` 在当前 fused 图上不可用，`BF16` 明显优于 `FP16`，`FP32` 可作为诊断/基准精度。
 >
 > **核心策略**: 统一双后端部署（纯 ONNX Runtime / 纯 TensorRT），BLS 推理流程完全一致，仅 backend 和模型文件格式不同。Talker Context 和 Talker Decode 均融合 Code Predictor + Codec Embedding Sum 为单模型，注册为独立 Triton 子模型，BLS 通过 `pb_utils.InferenceRequest` 调用并用 `dlpack` 零拷贝传递 KV Cache。
+
+---
+
+## 0. 当前实现状态（2026-03-25）
+
+| 项目 | 当前状态 |
+|------|---------|
+| `talker_code2wav_fused` 导出 | **已可用**。当前导图已包含 `attention_bias` / `past_seq_lens` / `cache_position`，为 padding+mask batching 预留接口 |
+| TensorRT 编译 | **已恢复可编译**。当前 fused 图可编译 `FP16/BF16/FP32` engine，但“能编过”不等于“数值可上线” |
+| 纯流式推理 | **已可用**。融合图负责 prefill + decode，decode 上限按 `engine_max_decode_len` 控制 |
+| 长文本 rollover | **已接回到 orchestrator**。接近 decode 上限时优先按句读/空白切段，段间重启 session |
+| Prefix KV cache | **已接回到 orchestrator**。当前走“不改引擎图”的安全方案：先缓存稳定前缀的 Talker KV，再以剩余 request-specific prefill 继续推理 |
+| Prefix KV cache 适用范围 | `custom_voice`、`voice_design`、`voice_clone_xvec` 已纳入；`voice_clone_icl` 暂未做跨请求复用，因为 ref text / ref codec 与当前文本在 prefill 中仍耦合 |
+| 多路 padding+mask 拼 batch | **接口已接入，生产未闭环**。图上已支持 `attention_bias/past_seq_lens`，orchestrator 也已具备 padding/mask 工具，但 continuous batching 仍未完成全链验证 |
+| Scheduler 接入 | **基础设施已落代码**。当前可构造 heterogeneous past 长度批次所需的 padding 与 mask；是否作为生产默认路径仍取决于 fused TRT 数值稳定性 |
+| TRT 数值验证 | **当前最大阻塞点**。direct backend 验证表明：`FP16` step0 即严重发散，`BF16` 显著改善但后续 decode 仍会分叉，`FP32` step0 几乎完全对齐但后续 CP group 仍有偏差 |
+| 当前主嫌疑 | **已收缩到 fused TRT 的 `code predictor unroll / argmax / codec_sum` 路径**；BLS 不是当前随机噪声音频的主因 |
+
+**当前结论**：
+- 当前项目已经从“导图/编译恢复”进入“fused TRT 语义与精度收敛”阶段。
+- Prefix cache、长文本分段、scheduler 接口可以继续保留，但不能替代 engine/backend 层的数值闭环。
+- 下一阶段的核心不是继续堆 BLS 复杂度，而是把 `code_predictor_unrolled` 子图的 TRT 偏差单独钉死。
 
 ---
 
@@ -14,7 +36,7 @@
 |------|------|
 | 自适应流式文本输入 | 默认 token 级消费，自动适应上游 LLM 速度，按需降级 |
 | 帧级流式音频输出 | 每积累一定 codec frames 即合成并推送音频片段 |
-| 多用户 Batch 推理 | 共享 GPU 资源，支持 continuous insert/complete |
+| 多用户 Batch 推理 | 共享 GPU 资源，最终目标支持 continuous insert/complete；当前先保持 TRT 可编译基线 |
 | 高 GPU 利用率 | 推理引擎消除框架开销，GPU 利用率 > 80% |
 | LLM 无关性 | 无论上游是大模型还是小模型，TTS 服务无需任何改动 |
 
@@ -166,13 +188,13 @@ TaskType
 │  │  ┌───────────────────────────────────────────────┐   │  │
 │  │  │           Streaming Generation Loop            │   │  │
 │  │  │                                                │   │  │
-│  │  │  Prefill: context engine → hidden + logits     │   │  │
-│  │  │           + KV cache 填充                       │   │  │
-│  │  │  First step: standalone CP → full_codec        │   │  │
+│  │  │  Prefill: fused engine 直接完成 logits + KV     │   │  │
+│  │  │  Prefix cache: Orchestrator 复用稳定前缀 KV     │   │  │
 │  │  │  Decode loop (fused engine):                   │   │  │
 │  │  │    Talker decode + CP + codec_sum → single call│   │  │
-│  │  │    → codec_sum, full_codec, logits             │   │  │
+│  │  │    → wav, codec_sum, full_codec, logits        │   │  │
 │  │  │  Accumulate → Code2Wav (异步) → audio          │   │  │
+│  │  │  Long-text rollover: 句读优先分段后重启 session  │   │  │
 │  │  └───────────────────────────────────────────────┘   │  │
 │  └──┬────────┬────────┬────────────────────────────────┘   │
 │     │        │        │                                     │
@@ -193,6 +215,7 @@ TaskType
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └──────────────────────────────────────────────────────┘  │
 │     (遗留：talker_unified + code2wav 分模型 + 帧缓冲)          │
+│     (下一阶段：最小增量验证 `attention_bias/past_seq_lens`)    │
 └─────────────────────────────────────────────────────────────┘
                                  │
                                  │ audio chunk stream
@@ -344,6 +367,39 @@ Phase 2: Decode Loop (流式, Fused Decode Engine)
 │   ⑤ step += 1, position_id += 1                      │
 └──────────────────────────────────────────────────────┘
 
+### 4.3 当前 TRT 安全边界
+
+当前 fused 图已经扩展出 heterogeneous batching 所需的显式输入：
+
+- `input_embeds`
+- `position_ids`
+- `attention_bias`
+- `past_seq_lens`
+- `cache_position`
+- `past_kv_*`
+- `c2w_*`
+
+这意味着图签名层面已经为以下能力预留了接口：
+
+- heterogeneous past 长度 padding+mask
+- prefix cache 命中后不同请求的有效 past 长度对齐
+- 后续 continuous batching 的 batched decode 调度
+
+但当前“安全边界”已经从“图能不能编译”转移到了“fused TRT 数值是否足够可信”：
+
+- `FP16` fused TRT 在当前图上不可作为生产精度
+- `BF16` 是更合理的候选，但尚未完成逐步一致性闭环
+- `FP32` 可作为诊断基线，已证明 `step0` 几乎完全对齐 ORT
+- 当前最主要的语义偏差已收缩到 `code predictor unroll / argmax / codec_sum` 路径
+
+因此本阶段真正可保守推进的能力是：
+
+- 同请求长文本分段 + 段间重启 session
+- 稳定前缀 KV 复用
+- orchestrator 侧的 batching/scheduler 基础设施
+
+而**真正的 heterogeneous continuous batching** 仍需在 fused TRT 数值问题收敛后再宣布可用
+
 
 Phase 3: 收尾
 ═════════════
@@ -403,9 +459,9 @@ Phase 3: 收尾
 
 ## 5. Code Predictor: 无 KV Cache 循环展开方案
 
-这是本架构的关键优化。Code Predictor 的 15 步自回归**去掉 KV Cache**，每步从头做全量 prefill，15 步展开为**单一 TRT 引擎**的一次调用。
+这是当前 fused TRT 主链路中最敏感、也最需要继续收敛的部分。Code Predictor 的 15 步自回归被设计为**去掉 KV Cache**，每步从头做全量 prefill，并在融合图中展开为单次 TRT 调用。
 
-> **⚠️ TRT 编译风险**: 15 步展开的单引擎方案存在 TRT 编译层面的不确定性（详见 5.5 节），需在 Phase 1 优先验证。已准备 fallback 方案（5.6 节）。
+> **当前状态**: “能导出、能编译”已经成立，但“与 ORT 逐步语义等价”尚未闭环。当前 direct backend 验证表明，fused TRT 的主要剩余偏差已经收缩到 `code predictor unroll / argmax / codec_sum` 路径。
 
 ### 5.1 方案对比
 
@@ -534,7 +590,7 @@ n_nodes = len(model_onnx.graph.node)
 # 而不是 15 × 5层权重 ≈ 550 (说明权重正确共享)
 ```
 
-### 5.5 TRT 编译风险分析
+### 5.5 TRT 编译与数值风险分析
 
 15 步展开为单引擎虽然在理论上等价于纯静态图，但存在以下 TRT 编译层面的风险：
 
@@ -543,11 +599,17 @@ n_nodes = len(model_onnx.graph.node)
 3. **Stage 间串行依赖**：每个 stage 依赖前一个的 argmax 结果，TRT 无法跨 stage 并行优化，kernel fusion 空间有限。
 4. **编译器限制**：极大的静态图可能触发 TRT 的内部限制（如最大 node 数、最大 tensor 数），导致编译失败。
 
-**验证清单** (Phase 1 优先执行):
-- [x] ONNX 导出成功 + initializer 数量验证 — 154 inits, 8851 nodes (权重共享正确)
-- [x] TRT engine 编译成功 — 510 MB, 126.9s (TRT 10.9.0, FP16, RTX 4090 D)；**BF16 重编**: unrolled ~438 MB (0.6B)/~508 MB (1.7B), ~129–141s；single-stage ~151 MB, ~8–12s (TRT 10.13, NGC 26.01)
-- [x] TRT engine 精度对比 — 4/15 token argmax 差异 (FP16 边界敏感)；BF16: single-stage cosine >0.999，unrolled 部分 token 差异预期
-- [x] TRT engine 性能 benchmark — B=1: ~5.0–5.5ms (unrolled), ~0.38ms (single-stage)；B=8: ~6.2–6.9ms / ~0.41–0.46ms
+**当前验证口径**:
+- [x] ONNX 导出成功 + initializer 数量验证 — 权重共享本身不是当前阻塞点
+- [x] TRT engine 可编译 — 当前已确认 fused 图可编译 `FP16` / `BF16` / `FP32`
+- [x] 已完成 direct backend 数值对比（ORT vs Triton backend）
+- [ ] 尚未完成“fused TRT 与 ORT 逐步语义闭环”
+
+**当前结论**:
+- `FP16`：在当前 fused 图上不可用，`step0` 即可能严重发散
+- `BF16`：显著优于 `FP16`，但后续 decode 仍会出现 CP group 分叉
+- `FP32`：`step0` 几乎完全对齐，后续主 token 可维持更久，但 CP group 仍会先漂移
+- 因此当前不应把“standalone CP TRT 可编译”误解为“当前 fused TRT 已经验证通过”
 
 ### 5.6 Fallback 方案: 单 Stage TRT 引擎 + Python 循环
 
@@ -767,9 +829,20 @@ KV 显存: 28L × 2 × 8(kv_heads) × max_seq × 128(head_dim) × 2B(bf16)。
 | 显存占用 | 2 Bytes | 2 Bytes（**相同**） |
 | GPU 吞吐 | 330 TFLOPS (4090) | 330 TFLOPS（**相同**） |
 
-> BF16 的尾数精度略低于 FP16（7 位 vs 10 位），但对于 TTS 生成场景，指数范围的安全性远比尾数精度重要。实测中 BF16 与 FP32 的 logits KL 散度通常 <1e-4，可忽略。
+> BF16 的尾数精度略低于 FP16（7 位 vs 10 位），但对于当前 fused 图，指数范围的安全性远比尾数精度重要。当前 direct backend 实测已经证明：`FP16` 在 step0 即会严重发散，因此 BF16 仍然是更合理的生产候选精度。
 
-**验证**: 已通过 `verify_e2e_trt.sh` 实现：host 端生成 FP32 PyTorch 参考（e2e_trt_ref.npz），容器内 TRT + TRT CP 与参考对比；prefill logits cosine >0.999，decode token 因 BF16 边界存在差异属预期。长序列可指定 `--steps 1000` 做进一步对比。
+**当前验证口径（需与旧验证脚本区分）**：
+
+- 旧的 `verify_e2e_trt.sh` 主要覆盖遗留 `talker_unified`/分步路径，不能代表当前生产 fused 主链路。
+- 当前 fused 主链路应以 [`scripts/python/verify_fused_triton_backend.py`](../scripts/python/verify_fused_triton_backend.py) 为准，直接比较：
+  - 本地 ORT `talker_code2wav_fused.onnx`
+  - Triton `talker_code2wav_fused` backend
+- 现阶段结论是：
+  - `FP16`: step0 即严重发散，不可用
+  - `BF16`: step0 已可对齐，但后续 decode 仍会分叉
+  - `FP32`: step0 几乎完全对齐，后续主 token 可维持更久，但 CP group 仍会先漂移
+
+因此，`BF16` 目前应理解为“优于 FP16 的候选生产精度”，而不是“已经完成 fused TRT 数值闭环的最终答案”。
 
 ---
 
@@ -2094,10 +2167,10 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 2. [x] Speech Tokenizer Encoder → ONNX
 3. [x] Code2Wav Decoder → ONNX (含 chunked decode)
 4. [x] Talker Backbone → ONNX 导出 (04a context fused + 04b decode fused)
-5. [x] **⚠️ Code Predictor 无 KV Cache 展开版 + ONNX 导出 + TRT 编译验证** (5.5 节验证清单)
-   - Unrolled: 编译通过 (510 MB engine, 126.9s build), B=1 5.08ms / B=8 6.13ms, 少量 token argmax 差异(低精度预期行为)
-   - Single-stage: 编译通过 (151.5 MB), B=1 0.39ms / B=8 0.41ms, cosine similarity 高
-   - 结论: **Unrolled 方案可行，无需 fallback**
+5. [x] **⚠️ Code Predictor 无 KV Cache 展开版 + ONNX 导出 + TRT 编译验证** (5.5 节)
+   - 已证明：导图与编译链路成立，standalone / fused TRT 都可以生成 engine
+   - 尚未证明：当前 fused TRT 在 decode 过程中与 ORT 逐步语义等价
+   - 当前结论: **unrolled 方案“工程上可构建”，但“生产上可默认启用”仍需继续验证**
 6. [x] 单请求 Python 端到端验证 (PyTorch + ONNX)
    - Stage A (Prefill 权重): text_embedding/text_projection/codec_embedding/codec_head/special_embeddings 全部 cosine=1.000000
    - Stage B (Talker Backbone): PyTorch prefill+decode 基线建立
@@ -2118,20 +2191,28 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
    - `export_08_talker_unified.py`: 验证用 talker 单图；`export_09_talker_code2wav_fused.py`: 生产融合
    - `build_engines.sh`: 默认 `trtexec` → `talker_code2wav_fused.engine` 等；Talker 侧 S_past min=0
    - BLS `_bls_talker_code2wav_fused()` 为默认路径；遗留 `_bls_talker` + code2wav 仍支持
-10. [x] Code Predictor ONNX → TRT (BF16, 验证权重共享) — 5 个变体已用 BF16 重新编译；unrolled ~129–141s/变体，~438 MB (0.6B)/~508 MB (1.7B)；single-stage ~8–12s，~151 MB；精度 single-stage cosine >0.999，unrolled 部分 token 差异属预期
-    - fallback single-stage TRT engine 已同时验证，均可选用
-    - CP 已融合进 context 和 fused decode 引擎，无需独立 CP Triton 模型
+10. [x] Code Predictor ONNX → TRT (编译链路与权重共享验证)
+    - 已证明 unrolled / single-stage TRT 都可以构建
+    - 但当前 fused 主链路的核心问题仍集中在 CP 相关路径，不能再简单写成“精度差异属预期”
+    - 下一步应以 standalone `code_predictor_unrolled.onnx` 的 ORT vs TRT 对照进一步缩小问题
 11. [x] Codec Embedding Sum 优化 (3D gather, 2.1 节) — 已实现：`codec_embeddings_3d.pt` + `CodecEmbeddingSum` 模块；vocab 对齐（CP 2048→3072 零填充）；verify_e2e Stage E 已切 3D gather，实测 3D ~0.02ms vs naive ~0.17ms（约 7.7x）
     - Codec Embedding Sum 已融合进 context 和 fused decode 引擎
-12. [x] 单请求 TRT 端到端验证 + BF16 长序列精度对比 (6.5 节) — `verify_e2e_trt_ref.py`（host FP32 参考）+ `verify_e2e_trt.py`（Pure TRT talker_unified engine）+ `verify_e2e_trt.sh` 两步编排
+12. [x] 单请求 TRT 验证工具链已建立
+    - 旧链路：`verify_e2e_trt_ref.py` + `verify_e2e_trt.py` + `verify_e2e_trt.sh`，主要覆盖遗留 `talker_unified` / 分步路径
+    - 新链路：`verify_fused_triton_backend.py`，直接覆盖当前生产 fused 主链路
+    - 当前 fused 主链路尚未完成最终数值闭环，因此本项不应再理解为“生产 TRT 端到端已验证通过”
 
 ### Phase 3: 流式 + Batch (1-1.5 周)
 
-13. [ ] Orchestrator BLS Python 后端 (含错误隔离, 10.5 节; 多任务初始化, 10.2 节)
-14. [ ] Session Manager + Flow Controller (自适应流控: TOKEN/ADAPTIVE/SENTENCE)
-15. [ ] Batch Scheduler (continuous insert/remove + prefill/decode 交错调度, 9.2 节)
+13. [x] Orchestrator BLS Python 后端基础实现已接入
+    - 当前仍受 fused TRT 数值问题制约，不能视为生产闭环完成
+14. [x] Session Manager + Flow Controller 基础实现已接入
+15. [x] Batch Scheduler 基础设施已接入
+    - padding / mask helper、heterogeneous past 长度打包已落代码
+    - continuous insert/remove 的生产默认路径仍待 engine 稳定后再收敛
 16. [ ] Slot 耗尽处理 + 请求排队 (9.3 节)
-17. [ ] 流式音频输出 (自适应首包 chunk + Code2Wav 异步执行, 12.1/12.2 节)
+17. [x] 流式音频输出基础路径已可用
+    - 当前听感质量仍取决于 fused TRT backend 的数值稳定性
 18. [ ] gRPC 接口实现 (多任务 InitRequest, 12.3 节) + TTS Gateway 或 Triton 原生接口 (3.1 节)
 
 ### Phase 4: 优化 + 生产化 (1-1.5 周)
@@ -2153,7 +2234,7 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 
 | 风险 | 严重度 | 影响 | 缓解措施 |
 |------|--------|------|---------|
-| **CP 15步展开 TRT 编译** | **中高** | argmax→Gather 链路 + 75 层图规模，可能编译失败或耗时较长 | Phase 1 优先验证 (5.5 节); fallback: 单 stage TRT + 15 次调用 (5.6 节) |
+| **CP 15步展开 TRT 语义偏差** | **高** | 即使 engine 可编译，`code predictor unroll / argmax / codec_sum` 路径仍可能与 ORT 逐步分叉 | 先做 standalone CP ORT vs TRT 对照；必要时采用分图/分精度策略 |
 | ~~Talker TRT-LLM 集成~~ | ~~中~~ | ~~已解决~~ | **已移除** — 统一使用 ONNX→trtexec + BLS KV Cache 管理 |
 | **Python GIL 控制面瓶颈** | **中高** | Orchestrator 每步 Python 开销可能达 0.5-1ms（朴素实现） | Codec embed sum 优化 (2.1 节); Phase 4 考虑 C++ backend (10.6 节) |
 | Code Predictor ONNX 权重膨胀 | 中 | torch.onnx.export 可能复制共享权重 | 导出后验证 initializer 数量; 必要时用 TRT API 直接构建 |
@@ -2162,8 +2243,8 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 | Code2Wav 分块边界伪影 | 低 | 分块合成产生不连续性 | 使用 left_context overlap (原始实现已支持) |
 | **Slot 耗尽** | **中** | 多 session 同时 PAUSE 时可用 slot 为零 | PAUSED 超时回收 + 强制驱逐最久 PAUSED session (9.3 节) |
 | **Pause 导致 Batch 碎片化** | 中 | 频繁 pause 使 batch size 波动 | AIMD 自适应阈值 + 动态 batch 重组 |
-| Attention mask 批量处理 | 中 | 不同 slot 的 seq_len 不同 | Pure TRT: per-layer KV cache 按实际 seq_len 切片; causal mask 在 ONNX 导出时构造 |
-| BF16 精度验证 | **低** | BF16 尾数精度略低于 FP16（7 vs 10 位），需确认生成质量无退化 | 导出后做长序列精度对比 (6.5 节)；BF16 指数范围与 FP32 相同，overflow 风险已消除 |
+| Attention mask / padded batching | 中 | 不同 slot 的 `seq_len` / `past_len` 不同，图虽已支持但生产路径仍未闭环 | 保留 orchestrator 侧 helper；待 fused TRT 数值问题收敛后再启用生产默认 |
+| BF16 数值稳定性 | **中** | BF16 明显优于 FP16，但 fused decode 中仍可能出现 CP group 级别分叉 | 以 direct backend parity 为准持续收敛；必要时对敏感子图使用更高精度 |
 | 错误隔离 | 中 | 单 session 异常影响 batch 中其他 session | try-except 隔离 + 超时 slot 回收 (10.5 节) |
 | gRPC 协议集成 | 低中 | 自定义 proto 与 Triton 协议不兼容 | TTS Gateway 做协议桥接 (3.1 节); 或直接用 Triton 协议 |
 | **多变体权重差异** | **中** | 三变体 Talker/CP 权重不同, 无法共享单引擎实现多任务 | Phase 1 验证权重差异 (2.2.3 节); 单变体部署兜底 |

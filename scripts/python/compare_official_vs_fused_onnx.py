@@ -139,9 +139,13 @@ def run_fused_onnx_loop(
         past_kv: List[torch.Tensor] | None,
         c2w_states: List[torch.Tensor],
     ) -> Dict[str, np.ndarray]:
+        past_len = int(past_kv[0].shape[2]) if past_kv else 0
+        seq = int(inp_emb.shape[1])
         feed: Dict[str, np.ndarray] = {
             "input_embeds": inp_emb.detach().cpu().float().numpy(),
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
+            "attention_bias": np.zeros((B, 1, seq, past_len + seq), dtype=np.float32),
+            "past_seq_lens": np.full((B,), past_len, dtype=np.int64),
             "cache_position": cache_pos.detach().cpu().numpy().astype(np.int64),
         }
         if past_kv is None:

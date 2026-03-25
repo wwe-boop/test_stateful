@@ -40,11 +40,13 @@ def test_fused_io_format_counts_and_int_positions():
     nl = int(m["talker"]["num_layers"])
     n_c2w_in = len(m["code2wav_fused"]["c2w_state_input_names"])
     n_c2w_out = len(m["code2wav_fused"]["c2w_state_output_names"])
-    assert len(in_parts) == 3 + 2 * nl + n_c2w_in
+    assert len(in_parts) == 5 + 2 * nl + n_c2w_in
     assert len(out_parts) == 5 + 2 * nl + n_c2w_out
     assert in_parts[0] == "bf16:chw"
     assert in_parts[1] == "int64:chw"
-    assert in_parts[2] == "int64:chw"
+    assert in_parts[2] == "bf16:chw"
+    assert in_parts[3] == "int64:chw"
+    assert in_parts[4] == "int64:chw"
     assert out_parts[0] == "bf16:chw"
     assert out_parts[1] == "bf16:chw"
     assert out_parts[2] == "int64:chw"
@@ -56,7 +58,7 @@ def test_fused_io_fp32_float_tokens():
     m = _load_fixture()
     m["triton_io_float_dtype"] = "fp32"
     inp, out = fused_input_output_io_format_strings(m)
-    assert inp.startswith("fp32:chw,int64:chw,int64:chw,")
+    assert inp.startswith("fp32:chw,int64:chw,fp32:chw,int64:chw,int64:chw,")
     assert "fp32:chw" in out.split(",")[0]
 
 

@@ -96,7 +96,23 @@ def test_prefill_builder_voice_design():
     assert embeds.dtype == torch.bfloat16
     assert embeds.shape[0] == 1 and embeds.shape[2] == weights.hidden_size
     assert len(trailing) >= 1
-    assert trailing[-1] is weights.tts_eos_embed
+    assert trailing[-1].shape == weights.tts_pad_embed.shape
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_plan_voice_design_exposes_cacheable_prefix():
+    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    weights = EmbeddingWeights(_weights_dir(), device_id=0)
+    builder = PrefillBuilder(weights, _tokenizer())
+    plan = builder.build_plan(
+        task_type=TaskType.VOICE_DESIGN,
+        text="你好世界",
+        instruct="请设计一个温柔成熟的女声",
+    )
+    assert plan.prefix_cache_key
+    assert plan.cacheable_prefix_embeds is not None
+    assert plan.request_prefill_embeds is not None
+    assert plan.cacheable_prefix_embeds.shape[1] + plan.request_prefill_embeds.shape[1] == plan.prefill_embeds.shape[1]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -116,6 +132,23 @@ def test_prefill_builder_custom_voice():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_plan_custom_voice_exposes_cacheable_prefix():
+    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    weights = EmbeddingWeights(_weights_dir(), device_id=0)
+    builder = PrefillBuilder(weights, _tokenizer())
+    plan = builder.build_plan(
+        task_type=TaskType.CUSTOM_VOICE,
+        text="测试文本",
+        speaker="zhitian",
+        instruct="用温柔的语气说",
+    )
+    assert plan.prefix_cache_key
+    assert plan.cacheable_prefix_embeds is not None
+    assert plan.request_prefill_embeds is not None
+    assert plan.cacheable_prefix_embeds.shape[1] + plan.request_prefill_embeds.shape[1] == plan.prefill_embeds.shape[1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_builder_voice_clone_xvec():
     """T1.4c: VOICE_CLONE_XVEC with spk_embedding."""
     from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
@@ -129,6 +162,22 @@ def test_prefill_builder_voice_clone_xvec():
     )
     assert embeds.shape[0] == 1 and embeds.shape[2] == weights.hidden_size
     assert embeds.dtype == torch.bfloat16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_plan_voice_clone_xvec_exposes_cacheable_prefix():
+    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    weights = EmbeddingWeights(_weights_dir(), device_id=0)
+    builder = PrefillBuilder(weights, _tokenizer())
+    fake_spk = torch.randn(1, 1024, device=weights.device, dtype=torch.bfloat16)
+    plan = builder.build_plan(
+        task_type=TaskType.VOICE_CLONE_XVEC,
+        text="克隆测试",
+        spk_embedding=fake_spk,
+    )
+    assert plan.prefix_cache_key
+    assert plan.cacheable_prefix_embeds is not None
+    assert plan.request_prefill_embeds is not None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -151,6 +200,27 @@ def test_prefill_builder_voice_clone_icl():
     assert embeds.shape[1] > 10
     assert embeds.dtype == torch.bfloat16
     assert len(trailing) >= 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_plan_voice_clone_icl_has_no_cross_request_prefix_cache():
+    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    weights = EmbeddingWeights(_weights_dir(), device_id=0)
+    if weights.codec_embeddings_3d is None:
+        pytest.skip("codec_embeddings_3d.pt required for ICL")
+    builder = PrefillBuilder(weights, _tokenizer())
+    fake_spk = torch.randn(1, 1024, device=weights.device, dtype=torch.bfloat16)
+    fake_codes = torch.randint(0, 100, (50, 16), device=weights.device)
+    plan = builder.build_plan(
+        task_type=TaskType.VOICE_CLONE_ICL,
+        text="ICL测试",
+        spk_embedding=fake_spk,
+        ref_codes=fake_codes,
+        ref_text="参考文本",
+    )
+    assert plan.prefix_cache_key is None
+    assert plan.cacheable_prefix_embeds is None
+    assert plan.request_prefill_embeds is None
 
 
 def test_parse_task_type():

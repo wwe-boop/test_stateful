@@ -317,6 +317,12 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         '  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1 ] }',
         "]",
         "input [",
+        f"  {{ name: \"attention_bias\"  data_type: {io_ft}  dims: [ -1, 1, -1, -1 ] }}",
+        "]",
+        "input [",
+        '  { name: "past_seq_lens"  data_type: TYPE_INT64  dims: [ -1 ] }',
+        "]",
+        "input [",
         '  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 1 ] }',
         "]",
     ]

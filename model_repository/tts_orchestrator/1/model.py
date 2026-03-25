@@ -22,6 +22,8 @@ import os
 import sys
 import time
 import traceback
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -40,6 +42,16 @@ logging.basicConfig(
 _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _MODEL_DIR not in sys.path:
     sys.path.insert(0, _MODEL_DIR)
+
+from batch_decode_scheduler import (
+    FusedDecodeTicket,
+    group_by_c2w_past_len,
+    pad_talker_past_kv,
+    padded_attention_bias,
+    uniform_past_seq_lens,
+    zeros_attention_bias,
+)
+from text_segmenter import split_text_for_token_budget
 
 # Legacy code2wav (chunk_T=4): default shapes for 8 decoder KV layers + 17 conv + 4 transconv.
 # Fused path: triton_manifest.json must include code2wav_fused (export_09 + assemble).
@@ -82,6 +94,31 @@ _MODEL_TYPE_ALLOWED_TASKS = {
     "voice_design": {"voice_design"},
 }
 
+
+@dataclass
+class _FusedBatchSession:
+    response_sender: Any
+    req: dict
+    task_type: Any
+    language: str
+    speaker: Optional[str]
+    instruct: Optional[str]
+    spk_embedding: Optional[torch.Tensor]
+    ref_codes: Optional[torch.Tensor]
+    ref_codec_sum_vec: Optional[torch.Tensor]
+    ref_text: Optional[str]
+    text_segments: list[str]
+    request_start: float
+    segment_idx: int = 0
+    kv_tensors: Optional[list] = None
+    c2w_states: Optional[list] = None
+    trailing_text: Optional[list] = None
+    next_embed: Optional[torch.Tensor] = None
+    text_idx: int = 0
+    past_len: int = 0
+    frame_idx: int = 0
+    done: bool = False
+
 class TritonPythonModel:
 
     def initialize(self, args):
@@ -102,6 +139,26 @@ class TritonPythonModel:
         self.device = torch.device("cuda", self.device_id)
         self.max_steps = int(params.get("max_decode_steps", {}).get(
             "string_value", "2000"))
+        self.engine_max_prefill_len = int(params.get("engine_max_prefill_len", {}).get(
+            "string_value", os.environ.get("ENGINE_MAX_PREFILL_LEN", "128")))
+        self.engine_max_decode_len = int(params.get("engine_max_decode_len", {}).get(
+            "string_value", os.environ.get("ENGINE_MAX_DECODE_LEN", "512")))
+        self.rollover_margin = int(params.get("rollover_margin", {}).get(
+            "string_value", os.environ.get("ROLLOVER_MARGIN", "64")))
+        self.enable_text_rollover = params.get("enable_text_rollover", {}).get(
+            "string_value",
+            os.environ.get("ENABLE_TEXT_ROLLOVER", "1"),
+        ).strip().lower() not in ("0", "false", "no")
+        self.enable_prefix_kv_cache = params.get("enable_prefix_kv_cache", {}).get(
+            "string_value",
+            os.environ.get("ENABLE_PREFIX_KV_CACHE", "1"),
+        ).strip().lower() not in ("0", "false", "no")
+        self.prefix_kv_cache_max_entries = int(params.get("prefix_kv_cache_max_entries", {}).get(
+            "string_value",
+            os.environ.get("PREFIX_KV_CACHE_MAX_ENTRIES", "8")))
+        self.code2wav_sliding_window = int(params.get("code2wav_sliding_window", {}).get(
+            "string_value",
+            os.environ.get("CODE2WAV_SLIDING_WINDOW", "72")))
         # Stateful code2wav: fixed chunk_T=4; legacy params kept for config compatibility
         self.audio_chunk_threshold = int(params.get("audio_chunk_frames", {}).get(
             "string_value", "25"))
@@ -136,6 +193,7 @@ class TritonPythonModel:
         logger.info("Tokenizer loaded (lightweight: tokenizers only)")
 
         self.prefill_builder = PrefillBuilder(self.weights, self.tokenizer)
+        self._prefix_kv_cache: "OrderedDict[str, list[torch.Tensor]]" = OrderedDict()
 
         repo_root = Path(_MODEL_DIR).resolve().parent.parent
         self._triton_manifest: Optional[Dict[str, Any]] = None
@@ -187,8 +245,9 @@ class TritonPythonModel:
         if self._use_fused_decode:
             self._talker_backend, self._talker_dtype = _dtype_from_pbtxt(fused_cfg)
             self._code2wav_dtype = self._talker_dtype
-            # Single source of truth: triton_manifest.json triton_io_float_dtype overrides pbtxt scan.
-            if self._triton_manifest:
+            # TRT deploy may intentionally use BF16/FP16 bindings; ONNX deploy should follow the
+            # actual ONNX model config generated from the graph schema.
+            if self._triton_manifest and self._talker_backend == "tensorrt":
                 raw_io = self._triton_manifest.get("triton_io_float_dtype") or self._triton_manifest.get(
                     "onnx_io_dtype"
                 )
@@ -203,7 +262,7 @@ class TritonPythonModel:
                     elif s in ("fp32", "float32", "float"):
                         self._talker_dtype = torch.float32
                         self._code2wav_dtype = torch.float32
-            if os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
+            if self._talker_backend == "tensorrt" and os.environ.get("OVERRIDE_CODE2WAV_BF16", "").strip() in ("1", "true", "yes"):
                 self._code2wav_dtype = torch.bfloat16
             logger.info(
                 f"[TTS Orchestrator] fused pipeline: talker_code2wav_fused "
@@ -256,10 +315,20 @@ class TritonPythonModel:
         logger.info(
             f"[TTS Orchestrator] Initialized: variant={self.variant}, num_layers={self.num_layers}, "
             f"fused_decode={self._use_fused_decode}, speech_codec_fused={self._speech_codec_fused_available}, "
-            f"code2wav_dtype={self._code2wav_dtype}"
+            f"code2wav_dtype={self._code2wav_dtype}, "
+            f"engine_max_prefill_len={self.engine_max_prefill_len}, "
+            f"engine_max_decode_len={self.engine_max_decode_len}, "
+            f"rollover_margin={self.rollover_margin}, "
+            f"text_rollover={self.enable_text_rollover}, "
+            f"prefix_kv_cache={self.enable_prefix_kv_cache}, "
+            f"prefix_kv_cache_max_entries={self.prefix_kv_cache_max_entries}, "
+            f"code2wav_sliding_window={self.code2wav_sliding_window}"
         )
 
     def execute(self, requests):
+        if self._use_fused_decode and len(requests) > 1:
+            self._execute_fused_batched_requests(requests)
+            return None
         for request in requests:
             response_sender = request.get_response_sender()
             try:
@@ -275,6 +344,373 @@ class TritonPythonModel:
                 response_sender.send(
                     flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL)
         return None
+
+    def _execute_fused_batched_requests(self, requests):
+        response_senders = [request.get_response_sender() for request in requests]
+        sessions: list[_FusedBatchSession] = []
+        try:
+            for request, response_sender in zip(requests, response_senders):
+                try:
+                    session = self._prepare_fused_batch_session(request, response_sender)
+                    if session is not None:
+                        sessions.append(session)
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"Request failed (OOM): {e}")
+                    self._send_error(response_sender, "out_of_memory: GPU OOM")
+                except Exception as e:
+                    logger.error(f"Request failed during batched prepare: {e}")
+                    logger.error(traceback.format_exc())
+                    self._send_error(response_sender, str(e))
+
+            active: list[_FusedBatchSession] = []
+            for session in sessions:
+                self._activate_next_segment_or_finish(session, active)
+
+            while active:
+                ready: list[FusedDecodeTicket[_FusedBatchSession]] = []
+                still_active: list[_FusedBatchSession] = []
+                for session in active:
+                    if session.response_sender.is_cancelled():
+                        logger.info("Client disconnected, dropping session from batch")
+                        session.done = True
+                        continue
+                    if (time.monotonic() - session.request_start) > self.request_timeout_sec:
+                        self._send_error(session.response_sender, "request_timeout")
+                        session.done = True
+                        continue
+                    if (
+                        session.next_embed is None
+                        or session.kv_tensors is None
+                        or session.c2w_states is None
+                    ):
+                        session.done = True
+                        continue
+                    c2w_past_len = int(session.c2w_states[0].shape[2]) if session.c2w_states else -1
+                    ready.append(
+                        FusedDecodeTicket(
+                            payload=session,
+                            talker_past_len=session.past_len,
+                            c2w_past_len=c2w_past_len,
+                        )
+                    )
+                    still_active.append(session)
+
+                active = []
+                for group in group_by_c2w_past_len(ready).values():
+                    batch_sessions = [ticket.payload for ticket in group]
+                    try:
+                        self._run_fused_decode_batch_step(batch_sessions, active)
+                    except torch.cuda.OutOfMemoryError as e:
+                        for session in batch_sessions:
+                            self._send_error(
+                                session.response_sender,
+                                f"out_of_memory: GPU OOM ({e})",
+                            )
+                            session.done = True
+                    except Exception as e:
+                        logger.error(f"Batched decode step failed: {e}")
+                        logger.error(traceback.format_exc())
+                        for session in batch_sessions:
+                            self._send_error(
+                                session.response_sender,
+                                f"batched_decode_failed: {e}",
+                            )
+                            session.done = True
+
+                for session in still_active:
+                    if not session.done and session not in active and session.next_embed is not None:
+                        active.append(session)
+        finally:
+            for response_sender in response_senders:
+                try:
+                    response_sender.send(
+                        flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL
+                    )
+                except Exception:
+                    pass
+
+    def _prepare_fused_batch_session(
+        self,
+        request,
+        response_sender,
+    ) -> Optional[_FusedBatchSession]:
+        req_tensor = pb_utils.get_input_tensor_by_name(request, "request")
+        req_json = req_tensor.as_numpy()[0].decode("utf-8")
+        req = json.loads(req_json)
+
+        if req.get("action") == "capabilities":
+            caps = {
+                "variant": self.variant,
+                "tts_model_type": self._tts_model_type,
+                "tts_model_size": self.weights.config.get("tts_model_size"),
+                "supported_task_types": sorted(
+                    _MODEL_TYPE_ALLOWED_TASKS.get(self._tts_model_type, set())
+                ),
+                "supported_languages": sorted(self.weights.codec_language_id.keys()),
+                "supported_speakers": sorted(self.weights.spk_id_map.keys()),
+                "max_decode_steps": self.max_steps,
+                "engine_max_prefill_len": self.engine_max_prefill_len,
+                "engine_max_decode_len": self.engine_max_decode_len,
+                "rollover_margin": self.rollover_margin,
+                "enable_text_rollover": self.enable_text_rollover,
+                "enable_prefix_kv_cache": self.enable_prefix_kv_cache,
+                "prefix_kv_cache_max_entries": self.prefix_kv_cache_max_entries,
+                "code2wav_sliding_window": self.code2wav_sliding_window,
+                "engine_backend": self._talker_backend,
+                "use_fused_decode": self._use_fused_decode,
+            }
+            self._send_capabilities(response_sender, caps)
+            return None
+
+        self._validate_request(req)
+        task_type_str = req.get("task_type", "voice_design")
+        language = req.get("language", "auto")
+        speaker = req.get("speaker")
+        instruct = req.get("instruct")
+        x_vector_only = req.get("x_vector_only", False)
+        task_type = self._parse_task_type(task_type_str, x_vector_only)
+
+        spk_embedding = None
+        ref_codes = None
+        ref_codec_sum_vec = None
+        if task_type.value.startswith("voice_clone"):
+            ref_audio_b64 = req.get("ref_audio")
+            if ref_audio_b64:
+                spk_embedding = self._bls_speaker_encoder(ref_audio_b64)
+                if task_type.value == "voice_clone_icl":
+                    if self._speech_codec_fused_available:
+                        ref_codec_sum_vec = self._bls_speech_tokenizer_codec_fused(
+                            ref_audio_b64
+                        )
+                    else:
+                        ref_codes = self._bls_speech_tokenizer(ref_audio_b64)
+
+        ref_text = req.get("ref_text")
+        text_segments = self._plan_text_segments(
+            text=req.get("text", ""),
+            task_type=task_type,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            spk_embedding=spk_embedding,
+            ref_codes=ref_codes,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_text=ref_text,
+        )
+        return _FusedBatchSession(
+            response_sender=response_sender,
+            req=req,
+            task_type=task_type,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            spk_embedding=spk_embedding,
+            ref_codes=ref_codes,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_text=ref_text,
+            text_segments=text_segments,
+            request_start=time.monotonic(),
+        )
+
+    def _activate_next_segment_or_finish(
+        self,
+        session: _FusedBatchSession,
+        active_out: list[_FusedBatchSession],
+    ) -> None:
+        while session.segment_idx < len(session.text_segments):
+            seg_text = session.text_segments[session.segment_idx]
+            plan = self.prefill_builder.build_plan(
+                task_type=session.task_type,
+                text=seg_text,
+                language=session.language,
+                speaker=session.speaker,
+                instruct=session.instruct,
+                spk_embedding=session.spk_embedding,
+                ref_codes=session.ref_codes,
+                ref_codec_sum_vec=session.ref_codec_sum_vec,
+                ref_text=session.ref_text,
+            )
+            (
+                inputs_embeds,
+                position_ids,
+                effective_prompt_len,
+                initial_past_kv_tensors,
+                prefix_cache_used,
+            ) = self._prepare_segment_prefill(plan)
+
+            cache_pos = torch.zeros(
+                inputs_embeds.shape[0],
+                FUSED_CHUNK_T,
+                device=self.device,
+                dtype=torch.int64,
+            )
+            wav, codec_sum, _, logits, kv_tensors, c2w_states = (
+                self._bls_talker_code2wav_fused(
+                    inputs_embeds,
+                    position_ids,
+                    cache_pos,
+                    initial_past_kv_tensors,
+                    self._create_code2wav_initial_states(),
+                )
+            )
+            self._send_fused_wav(session.response_sender, wav)
+            codec_eos_id = self.weights.codec_eos_id
+            if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+                logger.info("EOS at segment %d step 0", session.segment_idx)
+                session.segment_idx += 1
+                continue
+
+            text_add = plan.trailing[0] if plan.trailing else self._tts_pad_embed_torch
+            session.trailing_text = plan.trailing
+            session.next_embed = (codec_sum + text_add).to(torch.bfloat16)
+            session.text_idx = 1
+            session.kv_tensors = kv_tensors
+            session.c2w_states = c2w_states
+            session.past_len = effective_prompt_len
+            session.frame_idx = 1
+            active_out.append(session)
+            if len(session.text_segments) > 1:
+                logger.info(
+                    "Activate segment %d/%d: chars=%d, prompt=%d, trailing=%d, prefix_cache=%s",
+                    session.segment_idx + 1,
+                    len(session.text_segments),
+                    len(seg_text),
+                    effective_prompt_len,
+                    len(plan.trailing),
+                    prefix_cache_used,
+                )
+            return
+
+        session.done = True
+        self._send_audio_chunk(
+            session.response_sender,
+            np.zeros(1, dtype=np.float32),
+            is_final=True,
+        )
+
+    def _split_batched_kv_rows(
+        self,
+        batched_kv_tensors: list[torch.Tensor],
+        new_past_lens: list[int],
+    ) -> list[list[torch.Tensor]]:
+        rows: list[list[torch.Tensor]] = []
+        for row_idx, keep in enumerate(new_past_lens):
+            row: list[torch.Tensor] = []
+            for tensor in batched_kv_tensors:
+                row.append(
+                    tensor[row_idx : row_idx + 1, :, : int(keep), :].clone().contiguous()
+                )
+            rows.append(row)
+        return rows
+
+    def _run_fused_decode_batch_step(
+        self,
+        sessions: list[_FusedBatchSession],
+        active_out: list[_FusedBatchSession],
+    ) -> None:
+        batched_input = torch.cat(
+            [session.next_embed.to(torch.bfloat16) for session in sessions],
+            dim=0,
+        )
+        batched_pos = torch.cat(
+            [
+                torch.full(
+                    (1, 3, 1),
+                    session.past_len,
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+                for session in sessions
+            ],
+            dim=0,
+        )
+        batched_cache_pos = torch.cat(
+            [
+                torch.full(
+                    (1, FUSED_CHUNK_T),
+                    session.frame_idx,
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+                for session in sessions
+            ],
+            dim=0,
+        )
+        batched_past_kv, past_seq_lens = pad_talker_past_kv(
+            [session.kv_tensors for session in sessions],
+            device=self.device,
+            dtype=self._talker_dtype,
+        )
+        padded_past_len = int(past_seq_lens.max().item()) if len(sessions) > 0 else 0
+        batched_attention = padded_attention_bias(
+            past_seq_lens,
+            seq=int(batched_input.shape[1]),
+            padded_past_len=padded_past_len,
+            device=self.device,
+            dtype=self._talker_dtype,
+        )
+
+        batched_c2w_states = []
+        for state_idx in range(len(sessions[0].c2w_states)):
+            batched_c2w_states.append(
+                torch.cat(
+                    [
+                        session.c2w_states[state_idx].to(
+                            device=self.device,
+                            dtype=self._code2wav_dtype,
+                        )
+                        for session in sessions
+                    ],
+                    dim=0,
+                ).contiguous()
+            )
+
+        wav, codec_sum, _, logits, kv_tensors, c2w_states = (
+            self._bls_talker_code2wav_fused(
+                batched_input,
+                batched_pos,
+                batched_cache_pos,
+                batched_past_kv,
+                batched_c2w_states,
+                attention_bias_override=batched_attention,
+                past_seq_lens_override=past_seq_lens,
+            )
+        )
+        new_past_lens = [session.past_len + int(batched_input.shape[1]) for session in sessions]
+        split_kv = self._split_batched_kv_rows(kv_tensors, new_past_lens)
+        split_c2w = []
+        for row_idx in range(len(sessions)):
+            row_states = [t[row_idx : row_idx + 1].clone().contiguous() for t in c2w_states]
+            split_c2w.append(row_states)
+
+        codec_eos_id = self.weights.codec_eos_id
+        for row_idx, session in enumerate(sessions):
+            row_logits = logits[row_idx : row_idx + 1]
+            eos = int(row_logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
+            if not eos:
+                self._send_fused_wav(session.response_sender, wav[row_idx : row_idx + 1])
+                text_add = (
+                    session.trailing_text[session.text_idx]
+                    if session.text_idx < len(session.trailing_text)
+                    else self._tts_pad_embed_torch
+                )
+                session.text_idx += 1
+                session.next_embed = (
+                    codec_sum[row_idx : row_idx + 1] + text_add
+                ).to(torch.bfloat16)
+                session.kv_tensors = split_kv[row_idx]
+                session.c2w_states = split_c2w[row_idx]
+                session.past_len = new_past_lens[row_idx]
+                session.frame_idx += 1
+                active_out.append(session)
+                continue
+
+            session.segment_idx += 1
+            session.kv_tensors = None
+            session.c2w_states = None
+            session.next_embed = None
+            session.trailing_text = None
+            self._activate_next_segment_or_finish(session, active_out)
 
     def _validate_request(self, req: dict) -> None:
         """Validate request fields. Raises ValueError with clear message if invalid."""
@@ -316,6 +752,13 @@ class TritonPythonModel:
                 "supported_languages": sorted(self.weights.codec_language_id.keys()),
                 "supported_speakers": sorted(self.weights.spk_id_map.keys()),
                 "max_decode_steps": self.max_steps,
+                "engine_max_prefill_len": self.engine_max_prefill_len,
+                "engine_max_decode_len": self.engine_max_decode_len,
+                "rollover_margin": self.rollover_margin,
+                "enable_text_rollover": self.enable_text_rollover,
+                "enable_prefix_kv_cache": self.enable_prefix_kv_cache,
+                "prefix_kv_cache_max_entries": self.prefix_kv_cache_max_entries,
+                "code2wav_sliding_window": self.code2wav_sliding_window,
                 "engine_backend": self._talker_backend,
                 "use_fused_decode": self._use_fused_decode,
             }
@@ -360,11 +803,260 @@ class TritonPythonModel:
                 raise RuntimeError(f"Voice clone audio processing failed: {e}") from e
 
         ref_text = req.get("ref_text")
+        request_start = time.monotonic()
+
+        text_segments = self._plan_text_segments(
+            text=text,
+            task_type=task_type,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            spk_embedding=spk_embedding,
+            ref_codes=ref_codes,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_text=ref_text,
+        )
+
+        for seg_idx, seg_text in enumerate(text_segments):
+            if response_sender.is_cancelled():
+                logger.info("Client disconnected before segment %d", seg_idx)
+                return
+            try:
+                plan = self.prefill_builder.build_plan(
+                    task_type=task_type,
+                    text=seg_text,
+                    language=language,
+                    speaker=speaker,
+                    instruct=instruct,
+                    spk_embedding=spk_embedding,
+                    ref_codes=ref_codes,
+                    ref_codec_sum_vec=ref_codec_sum_vec,
+                    ref_text=ref_text,
+                )
+            except Exception as e:
+                raise RuntimeError(f"Prefill build failed: {e}") from e
+
+            inputs_embeds, position_ids, effective_prompt_len, initial_past_kv_tensors, prefix_cache_used = (
+                self._prepare_segment_prefill(plan)
+            )
+            trailing_text = plan.trailing
+            batch = int(inputs_embeds.shape[0])
+            send_terminal_marker = seg_idx == len(text_segments) - 1
+
+            if len(text_segments) > 1:
+                logger.info(
+                    "Synthesize segment %d/%d: chars=%d, prefill=%d, trailing=%d, prefix_cache=%s",
+                    seg_idx + 1,
+                    len(text_segments),
+                    len(seg_text),
+                    effective_prompt_len,
+                    len(trailing_text),
+                    prefix_cache_used,
+                )
+
+            if self._use_fused_decode:
+                self._generation_loop_fused(
+                    response_sender,
+                    inputs_embeds,
+                    position_ids,
+                    trailing_text,
+                    effective_prompt_len,
+                    batch,
+                    request_start,
+                    send_terminal_marker=send_terminal_marker,
+                    initial_past_kv_tensors=initial_past_kv_tensors,
+                )
+                continue
+
+            self._generation_loop_legacy(
+                response_sender,
+                inputs_embeds,
+                position_ids,
+                trailing_text,
+                effective_prompt_len,
+                batch,
+                request_start,
+                send_terminal_marker=send_terminal_marker,
+                initial_past_kv_tensors=initial_past_kv_tensors,
+            )
+
+    def _prepare_segment_prefill(self, plan):
+        full_prefill_embeds = plan.prefill_embeds
+        full_prefill_len = int(full_prefill_embeds.shape[1])
+
+        inputs_embeds = full_prefill_embeds
+        effective_prompt_len = full_prefill_len
+        initial_past_kv_tensors = None
+        prefix_cache_used = False
+        if (
+            self.enable_prefix_kv_cache
+            and plan.prefix_cache_key
+            and plan.cacheable_prefix_embeds is not None
+            and plan.request_prefill_embeds is not None
+        ):
+            cached_prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
+            request_prefill_len = int(plan.request_prefill_embeds.shape[1])
+            if request_prefill_len <= self.engine_max_prefill_len:
+                prefix_kv = self._get_or_build_prefix_kv(
+                    plan.prefix_cache_key,
+                    plan.cacheable_prefix_embeds,
+                )
+            else:
+                prefix_kv = None
+            if prefix_kv is not None:
+                prefix_cache_used = True
+                initial_past_kv_tensors = prefix_kv
+                inputs_embeds = plan.request_prefill_embeds
+                effective_prompt_len = cached_prefix_len + int(inputs_embeds.shape[1])
+                logger.info(
+                    "Prefix KV cache hit: key=%s, prefix_len=%d",
+                    plan.prefix_cache_key,
+                    cached_prefix_len,
+                )
+
+        if not prefix_cache_used and full_prefill_len > self.engine_max_prefill_len:
+            logger.warning(
+                "Segment prefill length %d exceeds engine max %d, truncating",
+                full_prefill_len,
+                self.engine_max_prefill_len,
+            )
+            inputs_embeds = full_prefill_embeds[:, : self.engine_max_prefill_len, :].contiguous()
+            effective_prompt_len = self.engine_max_prefill_len
+
+        batch = int(inputs_embeds.shape[0])
+        seq = int(inputs_embeds.shape[1])
+        if prefix_cache_used:
+            position_ids_1d = torch.arange(
+                effective_prompt_len - seq,
+                effective_prompt_len,
+                device=self.device,
+                dtype=torch.int64,
+            )
+            position_ids = position_ids_1d.reshape(1, 1, -1).expand(batch, 3, seq)
+        else:
+            position_ids_1d = torch.arange(seq, device=self.device, dtype=torch.int64)
+            position_ids = position_ids_1d.reshape(1, 1, -1).expand(batch, 3, seq)
+        return inputs_embeds, position_ids, effective_prompt_len, initial_past_kv_tensors, prefix_cache_used
+
+    def _get_cached_prefix_kv(self, key: str) -> Optional[list[torch.Tensor]]:
+        hit = self._prefix_kv_cache.get(key)
+        if hit is None:
+            return None
+        self._prefix_kv_cache.move_to_end(key)
+        return [t.clone().contiguous() for t in hit]
+
+    def _put_cached_prefix_kv(self, key: str, kv_tensors: list[torch.Tensor]) -> None:
+        self._prefix_kv_cache[key] = [t.clone().contiguous() for t in kv_tensors]
+        self._prefix_kv_cache.move_to_end(key)
+        while len(self._prefix_kv_cache) > self.prefix_kv_cache_max_entries:
+            old_key, _ = self._prefix_kv_cache.popitem(last=False)
+            logger.info("Evict prefix KV cache entry: %s", old_key)
+
+    def _get_or_build_prefix_kv(
+        self,
+        cache_key: str,
+        prefix_embeds: torch.Tensor,
+    ) -> Optional[list[torch.Tensor]]:
+        cached = self._get_cached_prefix_kv(cache_key)
+        if cached is not None:
+            return cached
+
+        prefix_len = int(prefix_embeds.shape[1])
+        batch = int(prefix_embeds.shape[0])
+        prefix_position_ids = torch.arange(
+            prefix_len, device=self.device, dtype=torch.int64
+        ).reshape(1, 1, -1).expand(batch, 3, prefix_len)
 
         try:
-            inputs_embeds, trailing_text = self.prefill_builder.build(
+            if self._use_fused_decode:
+                cache_pos = torch.zeros(batch, FUSED_CHUNK_T, device=self.device, dtype=torch.int64)
+                _, _, _, _, kv_tensors, _ = self._bls_talker_code2wav_fused(
+                    prefix_embeds,
+                    prefix_position_ids,
+                    cache_pos,
+                    None,
+                    self._create_code2wav_initial_states(),
+                )
+            else:
+                _, _, _, kv_tensors = self._bls_talker(prefix_embeds, prefix_position_ids)
+        except Exception as e:
+            logger.warning("Prefix KV cache build failed for key=%s: %s", cache_key, e)
+            return None
+
+        self._put_cached_prefix_kv(cache_key, kv_tensors)
+        logger.info("Built prefix KV cache entry: key=%s, prefix_len=%d", cache_key, prefix_len)
+        return self._get_cached_prefix_kv(cache_key)
+
+    def _segment_budget_for_task(self, task_type) -> int:
+        if task_type.value == "voice_design":
+            return max(16, self.engine_max_prefill_len - max(16, self.rollover_margin // 2))
+        return max(16, self.engine_max_decode_len - max(16, self.rollover_margin))
+
+    def _segment_within_limits(
+        self,
+        task_type,
+        text: str,
+        language: str,
+        speaker: Optional[str],
+        instruct: Optional[str],
+        spk_embedding: Optional[torch.Tensor],
+        ref_codes: Optional[torch.Tensor],
+        ref_codec_sum_vec: Optional[torch.Tensor],
+        ref_text: Optional[str],
+    ) -> tuple[bool, int, int]:
+        plan = self.prefill_builder.build_plan(
+            task_type=task_type,
+            text=text,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            spk_embedding=spk_embedding,
+            ref_codes=ref_codes,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_text=ref_text,
+        )
+        prefill_len = int(plan.prefill_embeds.shape[1])
+        input_len = prefill_len
+        if (
+            self.enable_prefix_kv_cache
+            and plan.prefix_cache_key
+            and plan.request_prefill_embeds is not None
+        ):
+            input_len = int(plan.request_prefill_embeds.shape[1])
+        trailing_len = int(len(plan.trailing))
+        decode_budget = max(1, self.engine_max_decode_len - self.rollover_margin)
+        total_budget = self.engine_max_prefill_len + self.engine_max_decode_len - max(16, self.rollover_margin // 2)
+        within = input_len <= self.engine_max_prefill_len and prefill_len <= total_budget
+        if task_type.value != "voice_design":
+            within = within and trailing_len <= decode_budget
+        return within, input_len, trailing_len
+
+    def _plan_text_segments(
+        self,
+        text: str,
+        task_type,
+        language: str,
+        speaker: Optional[str],
+        instruct: Optional[str],
+        spk_embedding: Optional[torch.Tensor],
+        ref_codes: Optional[torch.Tensor],
+        ref_codec_sum_vec: Optional[torch.Tensor],
+        ref_text: Optional[str],
+    ) -> list[str]:
+        if not self.enable_text_rollover:
+            return [text]
+
+        coarse_budget = self._segment_budget_for_task(task_type)
+        pending = split_text_for_token_budget(text, self.tokenizer, coarse_budget)
+        if not pending:
+            return [text]
+
+        planned: list[str] = []
+        while pending:
+            seg_text = pending.pop(0)
+            ok, prefill_len, trailing_len = self._segment_within_limits(
                 task_type=task_type,
-                text=text,
+                text=seg_text,
                 language=language,
                 speaker=speaker,
                 instruct=instruct,
@@ -373,40 +1065,35 @@ class TritonPythonModel:
                 ref_codec_sum_vec=ref_codec_sum_vec,
                 ref_text=ref_text,
             )
-        except Exception as e:
-            raise RuntimeError(f"Prefill build failed: {e}") from e
+            if ok:
+                planned.append(seg_text)
+                continue
 
-        B, S, H = inputs_embeds.shape
-        max_prefill_len = 1024
-        if S > max_prefill_len:
-            logger.warning("Prefill length %d exceeds engine max %d, truncating", S, max_prefill_len)
-            inputs_embeds = inputs_embeds[:, :max_prefill_len, :].contiguous()
-            S = max_prefill_len
-        request_start = time.monotonic()
-        position_ids_1d = torch.arange(S, device=self.device, dtype=torch.int64)
-        position_ids = position_ids_1d.reshape(1, 1, -1).expand(B, 3, S)
+            refined_budget = max(16, coarse_budget // 2)
+            refined = split_text_for_token_budget(seg_text, self.tokenizer, refined_budget)
+            if len(refined) <= 1:
+                logger.warning(
+                    "Segment still exceeds safe limits but cannot be refined further: "
+                    "chars=%d prefill=%d trailing=%d",
+                    len(seg_text),
+                    prefill_len,
+                    trailing_len,
+                )
+                planned.append(seg_text)
+                continue
 
-        if self._use_fused_decode:
-            self._generation_loop_fused(
-                response_sender,
-                inputs_embeds,
-                position_ids,
-                trailing_text,
-                S,
-                B,
-                request_start,
+            logger.info(
+                "Split oversized segment: chars=%d prefill=%d trailing=%d -> %d subsegments",
+                len(seg_text),
+                prefill_len,
+                trailing_len,
+                len(refined),
             )
-            return
+            pending = refined + pending
 
-        self._generation_loop_legacy(
-            response_sender,
-            inputs_embeds,
-            position_ids,
-            trailing_text,
-            S,
-            B,
-            request_start,
-        )
+        if len(planned) > 1:
+            logger.info("Long-text rollover planned: %d segments", len(planned))
+        return planned
 
     def _generation_loop_fused(
         self,
@@ -417,6 +1104,8 @@ class TritonPythonModel:
         S,
         B,
         request_start,
+        send_terminal_marker: bool = True,
+        initial_past_kv_tensors=None,
     ):
         """Prefill + decode via talker_code2wav_fused (chunk_T=1 wav per step)."""
         codec_eos_id = self.weights.codec_eos_id
@@ -426,7 +1115,7 @@ class TritonPythonModel:
         t0 = time.perf_counter()
         wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
             self._bls_talker_code2wav_fused(
-                inputs_embeds, position_ids, cache_pos, None, c2w_states
+                inputs_embeds, position_ids, cache_pos, initial_past_kv_tensors, c2w_states
             )
         )
         logger.debug(f"fused prefill: {(time.perf_counter() - t0) * 1000:.1f}ms")
@@ -435,7 +1124,8 @@ class TritonPythonModel:
 
         if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
             logger.info("EOS at step 0")
-            self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+            if send_terminal_marker:
+                self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
             return
 
         text_idx = 0
@@ -447,7 +1137,7 @@ class TritonPythonModel:
         text_idx += 1
         position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
         frame_idx = 1
-        max_kv_len = 1024 - 32
+        max_kv_len = self.engine_max_prefill_len + self.engine_max_decode_len - max(16, self.rollover_margin // 2)
 
         for step in range(1, self.max_steps):
             if S + step > max_kv_len:
@@ -488,7 +1178,8 @@ class TritonPythonModel:
             position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
             frame_idx += 1
 
-        self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+        if send_terminal_marker:
+            self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
         logger.info("Generation complete (fused)")
 
     def _send_fused_wav(self, response_sender, wav: torch.Tensor):
@@ -508,10 +1199,12 @@ class TritonPythonModel:
         S,
         B,
         request_start,
+        send_terminal_marker: bool = True,
+        initial_past_kv_tensors=None,
     ):
         t0 = time.perf_counter()
         codec_sum, full_codec, logits, kv_tensors = self._bls_talker(
-            inputs_embeds, position_ids
+            inputs_embeds, position_ids, initial_past_kv_tensors
         )
         logger.debug(f"talker prefill: {(time.perf_counter() - t0) * 1000:.1f}ms")
         codec_eos_id = self.weights.codec_eos_id
@@ -522,7 +1215,8 @@ class TritonPythonModel:
 
         if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
             logger.info("EOS at step 0")
-            self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+            if send_terminal_marker:
+                self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
             return
 
         codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
@@ -531,7 +1225,7 @@ class TritonPythonModel:
         text_idx += 1
         position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
 
-        max_kv_len = 1024 - 32
+        max_kv_len = self.engine_max_prefill_len + self.engine_max_decode_len - max(16, self.rollover_margin // 2)
         for step in range(1, self.max_steps):
             if S + step > max_kv_len:
                 logger.warning(
@@ -570,7 +1264,8 @@ class TritonPythonModel:
         _, _ = self._flush_code2wav_buffer(
             response_sender, codec_frame_buffer, code2wav_states, frame_index, is_final=True
         )
-        self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
+        if send_terminal_marker:
+            self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
 
         logger.info("Generation complete")
 
@@ -584,6 +1279,7 @@ class TritonPythonModel:
         # TRT: BF16; ONNX: FP32 (set in initialize from talker_unified config.pbtxt)
         inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
+        expected_batch = int(input_embeds.shape[0])
         try:
             inputs = [
                 pb_utils.Tensor.from_dlpack("input_embeds", inp_emb.contiguous()),
@@ -630,17 +1326,15 @@ class TritonPythonModel:
         codec_sum = self._tensor_from_response_torch(response, "codec_sum")
         full_codec = self._tensor_from_response_torch(response, "full_codec")
         logits = self._tensor_from_response_torch(response, "logits")
-        # TRT engine may return (3,1,H)/(3,16)/(3,1,V); slice to (1,...) for downstream
-        if self._talker_backend == "tensorrt" and codec_sum.shape[0] == 3:
-            codec_sum = codec_sum[:1]
-            full_codec = full_codec[:1]
-            logits = logits[:1]
+        codec_sum = self._maybe_fix_trt_batch_axis(codec_sum, expected_batch)
+        full_codec = self._maybe_fix_trt_batch_axis(full_codec, expected_batch)
+        logits = self._maybe_fix_trt_batch_axis(logits, expected_batch)
         kv_tensors = []
         for i in range(self.num_layers):
             k = self._tensor_from_response_torch(response, f"present_kv_{i}_k")
             v = self._tensor_from_response_torch(response, f"present_kv_{i}_v")
-            if self._talker_backend == "tensorrt" and k.shape[0] == 3:
-                k, v = k[:1].clone(), v[:1].clone()
+            k = self._maybe_fix_trt_batch_axis(k, expected_batch)
+            v = self._maybe_fix_trt_batch_axis(v, expected_batch)
             # Force full copy + dtype: TRT returns BF16; fallback/triton path may yield FP32.
             # cpu().numpy() route guarantees we get correct dtype on device.
             k = torch.from_numpy(k.cpu().float().numpy()).to(
@@ -661,26 +1355,53 @@ class TritonPythonModel:
         cache_position: torch.Tensor,
         past_kv_tensors,
         c2w_states: list,
+        attention_bias_override: Optional[torch.Tensor] = None,
+        past_seq_lens_override: Optional[torch.Tensor] = None,
     ):
         """BLS talker_code2wav_fused: prefill or one decode step with chunk_T=1 wav."""
         inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
         cache_pos = cache_position.contiguous()
+        batch = int(input_embeds.shape[0])
+        past_len = 0 if past_kv_tensors is None else int(past_kv_tensors[0].shape[2])
+        past_seq_lens = past_seq_lens_override
+        if past_seq_lens is None:
+            past_seq_lens = uniform_past_seq_lens(batch, past_len, self.device)
+        attention_bias = attention_bias_override
+        if attention_bias is None:
+            attention_bias = zeros_attention_bias(
+                batch=batch,
+                seq=input_embeds.shape[1],
+                past_len=past_len,
+                device=self.device,
+                dtype=self._talker_dtype,
+            )
         try:
             inputs = [
                 pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
                 pb_utils.Tensor.from_dlpack("position_ids", pos_ids),
+                pb_utils.Tensor.from_dlpack("attention_bias", attention_bias.contiguous()),
+                pb_utils.Tensor.from_dlpack("past_seq_lens", past_seq_lens.contiguous()),
                 pb_utils.Tensor.from_dlpack("cache_position", cache_pos),
             ]
         except Exception as e:
-            logger.error(f"fused: from_dlpack input_embeds/position_ids/cache_position: {e}")
+            logger.error(
+                f"fused: from_dlpack input_embeds/position_ids/attention_bias/"
+                f"past_seq_lens/cache_position: {e}"
+            )
             raise
 
         if past_kv_tensors is None:
-            B = input_embeds.shape[0]
+            talker_np_dtype = np.float16 if self._talker_dtype == torch.float16 else np.float32
             for i in range(self.num_layers):
-                empty_k_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
-                empty_v_np = np.empty((B, self.kv_heads, 0, self.head_dim), dtype=np.float32)
+                empty_k_np = np.empty(
+                    (batch, self.kv_heads, 0, self.head_dim),
+                    dtype=talker_np_dtype,
+                )
+                empty_v_np = np.empty(
+                    (batch, self.kv_heads, 0, self.head_dim),
+                    dtype=talker_np_dtype,
+                )
                 inputs.append(pb_utils.Tensor(f"past_kv_{i}_k", empty_k_np))
                 inputs.append(pb_utils.Tensor(f"past_kv_{i}_v", empty_v_np))
         else:
@@ -703,12 +1424,9 @@ class TritonPythonModel:
                 f"c2w_states length {len(c2w_states)} != expected {len(self._c2w_state_input_names)}"
             )
         for in_name, st in zip(self._c2w_state_input_names, c2w_states):
-            t = st.contiguous().to(device=self.device, dtype=self._code2wav_dtype)
-            try:
-                inputs.append(pb_utils.Tensor.from_dlpack(in_name, t))
-            except Exception as e:
-                logger.error(f"fused: from_dlpack {in_name}: {e}")
-                raise
+            self._append_state_tensor_input(
+                inputs, in_name, st, self._code2wav_dtype, "fused"
+            )
 
         out_names = ["wav", "codec_sum", "full_codec", "logits"]
         for i in range(self.num_layers):
@@ -731,21 +1449,17 @@ class TritonPythonModel:
         codec_sum = self._tensor_from_response_torch(response, "codec_sum")
         full_codec = self._tensor_from_response_torch(response, "full_codec")
         logits = self._tensor_from_response_torch(response, "logits")
-
-        if self._talker_backend == "tensorrt":
-            if wav.dim() >= 1 and wav.shape[0] == 3:
-                wav = wav[:1].clone()
-            if codec_sum.shape[0] == 3:
-                codec_sum = codec_sum[:1].clone()
-                full_codec = full_codec[:1].clone()
-                logits = logits[:1].clone()
+        wav = self._maybe_fix_trt_batch_axis(wav, batch)
+        codec_sum = self._maybe_fix_trt_batch_axis(codec_sum, batch)
+        full_codec = self._maybe_fix_trt_batch_axis(full_codec, batch)
+        logits = self._maybe_fix_trt_batch_axis(logits, batch)
 
         kv_tensors = []
         for i in range(self.num_layers):
             k = self._tensor_from_response_torch(response, f"present_kv_{i}_k")
             v = self._tensor_from_response_torch(response, f"present_kv_{i}_v")
-            if self._talker_backend == "tensorrt" and k.shape[0] == 3:
-                k, v = k[:1].clone(), v[:1].clone()
+            k = self._maybe_fix_trt_batch_axis(k, batch)
+            v = self._maybe_fix_trt_batch_axis(v, batch)
             k = torch.from_numpy(k.cpu().float().numpy()).to(
                 device=self.device, dtype=self._talker_dtype
             ).contiguous()
@@ -758,12 +1472,62 @@ class TritonPythonModel:
         new_c2w = []
         for out_name in self._c2w_state_output_names:
             t = self._tensor_from_response_torch(response, out_name)
-            if self._talker_backend == "tensorrt" and t.dim() >= 1 and t.shape[0] == 3:
-                t = t[:1].clone()
-            t = t.to(device=self.device, dtype=self._code2wav_dtype).contiguous()
+            t = self._maybe_fix_trt_batch_axis(t, batch)
+            t = self._clip_code2wav_state_window(
+                out_name,
+                t.to(device=self.device, dtype=self._code2wav_dtype).contiguous(),
+            )
             new_c2w.append(t)
 
         return wav, codec_sum, full_codec, logits, kv_tensors, new_c2w
+
+    def _maybe_fix_trt_batch_axis(
+        self,
+        tensor: torch.Tensor,
+        expected_batch: int,
+    ) -> torch.Tensor:
+        if self._talker_backend != "tensorrt":
+            return tensor
+        if tensor.dim() == 0 or tensor.shape[0] == expected_batch:
+            return tensor
+        if expected_batch == 1 and tensor.shape[0] == 3:
+            return tensor[:1].clone()
+        return tensor
+
+    def _append_state_tensor_input(
+        self,
+        inputs: list,
+        name: str,
+        tensor: torch.Tensor,
+        dtype: torch.dtype,
+        log_prefix: str,
+    ) -> None:
+        t = tensor.contiguous().to(device=self.device, dtype=dtype)
+        if 0 in t.shape:
+            inputs.append(pb_utils.Tensor(name, self._empty_state_numpy(t.shape, dtype)))
+            return
+        try:
+            inputs.append(pb_utils.Tensor.from_dlpack(name, t))
+        except Exception as e:
+            logger.error(f"{log_prefix}: from_dlpack {name}: {e}")
+            raise
+
+    def _empty_state_numpy(self, shape, dtype: torch.dtype) -> np.ndarray:
+        np_dtype = np.float16 if dtype == torch.float16 else np.float32
+        return np.empty(tuple(int(dim) for dim in shape), dtype=np_dtype)
+
+    def _clip_code2wav_state_window(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        if tensor.dim() < 4:
+            return tensor
+        if "past_kv" not in name and "present_kv" not in name:
+            return tensor
+        if tensor.shape[2] <= self.code2wav_sliding_window:
+            return tensor
+        return tensor[:, :, -self.code2wav_sliding_window :, :].contiguous()
 
     def _tensor_from_response_torch(self, response, name: str) -> torch.Tensor:
         """Get output tensor by name and return torch on GPU (zero-copy via DLPack when possible)."""
@@ -940,13 +1704,13 @@ class TritonPythonModel:
         for i in range(4):
             state_input_names.append(f"transconv_overlap_{i}")
         for i, t in enumerate(state_tensors):
-            try:
-                inputs.append(
-                    pb_utils.Tensor.from_dlpack(state_input_names[i], t.contiguous().to(self._code2wav_dtype))
-                )
-            except Exception as e:
-                logger.error(f"Error in from_dlpack state_tensors {state_input_names[i]}: {e}")
-                raise
+            self._append_state_tensor_input(
+                inputs,
+                state_input_names[i],
+                t,
+                self._code2wav_dtype,
+                "code2wav",
+            )
 
         out_names = ["wav"]
         for i in range(8):
@@ -970,8 +1734,18 @@ class TritonPythonModel:
         wav_np = wav_t.cpu().float().numpy().flatten()
         new_states = []
         for i in range(8):
-            new_states.append(self._tensor_from_response_torch(response, f"present_kv_{i}_k"))
-            new_states.append(self._tensor_from_response_torch(response, f"present_kv_{i}_v"))
+            new_states.append(
+                self._clip_code2wav_state_window(
+                    f"present_kv_{i}_k",
+                    self._tensor_from_response_torch(response, f"present_kv_{i}_k"),
+                )
+            )
+            new_states.append(
+                self._clip_code2wav_state_window(
+                    f"present_kv_{i}_v",
+                    self._tensor_from_response_torch(response, f"present_kv_{i}_v"),
+                )
+            )
         for i in range(17):
             new_states.append(self._tensor_from_response_torch(response, f"new_conv_state_{i}"))
         for i in range(4):

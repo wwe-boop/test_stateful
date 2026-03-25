@@ -83,6 +83,8 @@ class TalkerCode2WavFusedONNX(nn.Module):
         self,
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        attention_bias: torch.Tensor,
+        past_seq_lens: torch.Tensor,
         cache_position: torch.Tensor,
         *inputs: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
@@ -95,7 +97,7 @@ class TalkerCode2WavFusedONNX(nn.Module):
         code2wav_states = inputs[2 * n :]
 
         codec_sum, full_codec, hidden, logits, *present_kv = self.talker_fused(
-            input_embeds, position_ids, *past_kv
+            input_embeds, position_ids, attention_bias, past_seq_lens, *past_kv
         )
         # Vocoder quantizer tables are 2048 rows per codebook; talker may emit specials (e.g. EOS)
         # outside this range — clamp so Gather in decoder stays in-bounds (matches safe decode path).
@@ -133,6 +135,8 @@ def _export_talker_code2wav_fused_onnx(
     B, one, S_past = 1, 1, 0
     dummy_embeds = torch.randn(B, one, hidden_size, device=device, dtype=ONNX_EXPORT_DTYPE)
     position_ids = torch.full((B, 3, one), S_past, device=device, dtype=torch.long)
+    attention_bias = torch.zeros(B, 1, one, S_past + one, device=device, dtype=ONNX_EXPORT_DTYPE)
+    past_seq_lens = torch.full((B,), S_past, device=device, dtype=torch.long)
 
     past_list = []
     for _ in range(num_layers):
@@ -155,12 +159,26 @@ def _export_talker_code2wav_fused_onnx(
     state_shapes_cold = get_initial_state_shapes(decoder, batch_size=B, past_kv_len=0)
     state_tensors = [torch.randn(s, device=device, dtype=ONNX_EXPORT_DTYPE) for _, s in state_shapes]
 
-    dummy_inputs = (dummy_embeds, position_ids, cache_position, *past_list, *state_tensors)
+    dummy_inputs = (
+        dummy_embeds,
+        position_ids,
+        attention_bias,
+        past_seq_lens,
+        cache_position,
+        *past_list,
+        *state_tensors,
+    )
 
     with torch.no_grad():
         out = fused(*dummy_inputs)
 
-    input_names = ["input_embeds", "position_ids", "cache_position"]
+    input_names = [
+        "input_embeds",
+        "position_ids",
+        "attention_bias",
+        "past_seq_lens",
+        "cache_position",
+    ]
     for i in range(num_layers):
         input_names.append(f"past_kv_{i}_k")
         input_names.append(f"past_kv_{i}_v")
@@ -183,6 +201,8 @@ def _export_talker_code2wav_fused_onnx(
     dynamic_axes = {
         "input_embeds": {0: "batch", 1: "seq"},
         "position_ids": {0: "batch", 1: "three", 2: "seq"},
+        "attention_bias": {0: "batch", 2: "seq", 3: "key_total"},
+        "past_seq_lens": {0: "batch"},
         "cache_position": {0: "batch", 1: "chunk_t"},
         "wav": {0: "batch"},
         "codec_sum": {0: "batch"},
@@ -255,20 +275,32 @@ def _export_talker_code2wav_fused_onnx(
 
     cpu_embeds = dummy_embeds.cpu()
     cpu_pos = position_ids.cpu()
+    cpu_bias = attention_bias.cpu()
+    cpu_past_seq_lens = past_seq_lens.cpu()
     cpu_cache = cache_position.cpu()
     cpu_past = [t.cpu() for t in past_list]
     cpu_states = [t.cpu() for t in state_tensors]
     cpu_fused = fused.cpu().eval()
     with torch.no_grad():
-        cpu_out = cpu_fused(cpu_embeds, cpu_pos, cpu_cache, *cpu_past, *cpu_states)
+        cpu_out = cpu_fused(
+            cpu_embeds,
+            cpu_pos,
+            cpu_bias,
+            cpu_past_seq_lens,
+            cpu_cache,
+            *cpu_past,
+            *cpu_states,
+        )
     fused.to(device)
 
     test_inputs = {
         "input_embeds": to_numpy(cpu_embeds),
         "position_ids": cpu_pos.numpy(),
+        "attention_bias": to_numpy(cpu_bias),
+        "past_seq_lens": cpu_past_seq_lens.numpy(),
         "cache_position": cpu_cache.numpy(),
     }
-    off = 3
+    off = 5
     for i, t in enumerate(cpu_past):
         test_inputs[input_names[off + i]] = to_numpy(t)
     off += len(cpu_past)
