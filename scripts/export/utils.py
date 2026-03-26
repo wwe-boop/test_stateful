@@ -287,8 +287,13 @@ class Conv1dInsertZeros(nn.Module):
         """x: [B, C_in, L] -> [B, C_out, (L-1)*S + K]."""
         B, C, L = x.shape
         L_up = (L - 1) * self.stride + 1
-        up = torch.zeros(B, C, L_up, dtype=x.dtype, device=x.device)
-        up[..., 0::self.stride] = x
+        if self.stride == 1:
+            up = x
+        else:
+            # Build interleaved zeros without in-place scatter to keep ONNX/TRT graph functional.
+            zeros = torch.zeros(B, C, L, self.stride - 1, dtype=x.dtype, device=x.device)
+            up_full = torch.cat([x.reshape(B, C, L, 1), zeros], dim=-1).reshape(B, C, L * self.stride)
+            up = up_full[..., :L_up]
         up = torch.nn.functional.pad(up, (self.kernel_size - 1, self.kernel_size - 1), mode="constant", value=0)
         return self.conv(up)
 
@@ -877,11 +882,11 @@ class CodePredictorUnrolled(nn.Module):
         position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
         position_embeddings = self.rotary_emb(x, position_ids)
 
-        causal_mask = torch.triu(
-            torch.full((S, S), float('-inf'), device=device, dtype=x.dtype),
-            diagonal=1,
-        )
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+        row_idx = torch.arange(S, device=device, dtype=torch.long).reshape(S, 1)
+        col_idx = torch.arange(S, device=device, dtype=torch.long).reshape(1, S)
+        neg_val = -1.0e4
+        causal_mask = (col_idx > row_idx).to(dtype=x.dtype) * neg_val
+        causal_mask = causal_mask.reshape(1, 1, S, S)
 
         hidden = x
         for layer in self.transformer_layers:

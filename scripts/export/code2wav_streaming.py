@@ -8,6 +8,7 @@ and streaming CausalTransConvNet (overlap-add) for incremental decode.
 
 from __future__ import annotations
 
+import types
 from typing import List, Tuple
 
 import torch
@@ -31,12 +32,6 @@ class SlidingWindowKVCache:
         self._past = list(past_key_values)
         self.window_size = window_size
 
-    def get_seq_length(self) -> int:
-        k = self._past[0][0]
-        if k is None or k.numel() == 0 or k.shape[2] == 0:
-            return 0
-        return k.shape[2]
-
     def update(
         self,
         key_states: torch.Tensor,
@@ -45,13 +40,9 @@ class SlidingWindowKVCache:
         cache_kwargs: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         past_k, past_v = self._past[layer_idx]
-        if past_k.shape[2] == 0:
-            full_k = key_states
-            full_v = value_states
-        else:
-            full_k = torch.cat([past_k, key_states], dim=2)
-            full_v = torch.cat([past_v, value_states], dim=2)
-        if full_k.shape[2] > self.window_size:
+        full_k = torch.cat([past_k, key_states], dim=2)
+        full_v = torch.cat([past_v, value_states], dim=2)
+        if self.window_size is not None and self.window_size > 0:
             full_k = full_k[:, :, -self.window_size :, :]
             full_v = full_v[:, :, -self.window_size :, :]
         self._past[layer_idx] = (full_k, full_v)
@@ -97,13 +88,17 @@ def streaming_causal_transconv(
     overlap_state shape [B, C_out, right_pad]. right_pad = kernel_size - stride.
     overlap_state is bias-free to avoid double-counting bias in the overlap region.
     Returns (out [B, C_out, T*stride], new_overlap [B, C_out, right_pad]).
+    Note: this implementation avoids https://github.com/NVIDIA/TensorRT-Incubator/issues/565 @ 2026.03.26
     """
     raw = transconv_module.conv(x)  # length (M-1)*S + K, includes bias
     rp = transconv_module.right_pad
-    if rp > 0 and overlap_state.shape[-1] > 0:
-        raw = raw.clone()
-        raw[..., :rp] = raw[..., :rp] + overlap_state
-    output = raw[..., :-rp] if rp > 0 else raw
+    if rp > 0:
+        # Functional form (no in-place slice write) is more stable for ONNX/TRT.
+        head = raw[..., :rp] + overlap_state
+        body = raw[..., rp:-rp]
+        output = torch.cat([head, body], dim=-1)
+    else:
+        output = raw
     if rp > 0:
         new_overlap = raw[..., -rp:].clone()
         bias = getattr(transconv_module.conv, "bias", None)
@@ -123,6 +118,7 @@ NUM_CONV = 17
 NUM_TRANSCONV = 4
 CHUNK_T = 4
 SAMPLES_PER_CHUNK = CHUNK_T * 1920  # 7680
+COLD_START_DUMMY_PAST_LEN = 1
 
 def num_code2wav_hidden_layers(decoder: nn.Module) -> int:
     """Match the actual pre_transformer depth (checkpoint may disagree with config)."""
@@ -138,7 +134,11 @@ def count_code2wav_state_tensors(decoder: nn.Module) -> int:
     return 2 * num_code2wav_hidden_layers(decoder) + NUM_CONV + NUM_TRANSCONV
 
 
-def get_initial_state_shapes(decoder: nn.Module, batch_size: int = 1, past_kv_len: int = 0):
+def get_initial_state_shapes(
+    decoder: nn.Module,
+    batch_size: int = 1,
+    past_kv_len: int = COLD_START_DUMMY_PAST_LEN,
+):
     """Return list of (name, shape) for code2wav streaming state tensors. Used for ONNX export."""
     cfg = decoder.config
     codebook_dim = getattr(cfg, "codebook_dim", 512)
@@ -171,19 +171,63 @@ def get_initial_state_shapes(decoder: nn.Module, batch_size: int = 1, past_kv_le
 
 def create_initial_states(decoder: nn.Module, device: torch.device, dtype: torch.dtype, batch_size: int = 1):
     """Create zero-initialized state tensors for the streaming wrapper."""
-    shapes = get_initial_state_shapes(decoder, batch_size=batch_size, past_kv_len=0)
+    shapes = get_initial_state_shapes(
+        decoder,
+        batch_size=batch_size,
+        past_kv_len=COLD_START_DUMMY_PAST_LEN,
+    )
     return [torch.zeros(s, device=device, dtype=dtype) for _, s in shapes]
+
+
+def freeze_quantizer_codebooks_for_export(decoder: nn.Module) -> None:
+    """
+    Materialize codebook embedding tables for export so ONNX graph does not carry
+    per-call clamp/divide subgraphs from cluster_usage + embedding_sum.
+    """
+    quantizer = getattr(decoder, "quantizer", None)
+    if quantizer is None:
+        return
+
+    rvq_modules = []
+    for name in ("rvq_first", "rvq_rest"):
+        mod = getattr(quantizer, name, None)
+        if mod is not None:
+            rvq_modules.append(mod)
+
+    for rvq in rvq_modules:
+        vq = getattr(rvq, "vq", None)
+        layers = getattr(vq, "layers", None)
+        if layers is None:
+            continue
+        for layer in layers:
+            codebook = getattr(layer, "_codebook", None)
+            if codebook is None:
+                continue
+            with torch.no_grad():
+                embedding = codebook.embedding_sum / codebook.cluster_usage.clamp(min=codebook.epsilon).unsqueeze(1)
+            if hasattr(codebook, "inference_embedding"):
+                codebook.inference_embedding = embedding
+            else:
+                codebook.register_buffer("inference_embedding", embedding)
+            if not hasattr(codebook, "_orig_decode_for_export"):
+                codebook._orig_decode_for_export = codebook.decode
+
+            def _decode_with_frozen_embedding(self, codes: torch.Tensor) -> torch.Tensor:
+                return F.embedding(codes, self.inference_embedding)
+
+            codebook.decode = types.MethodType(_decode_with_frozen_embedding, codebook)
 
 
 class Code2WavStreamingWrapper(nn.Module):
     """
-    Stateful code2wav for ONNX/TRT: input codes [B, 16, 4] + cache_position [4] + state tensors,
+    Stateful code2wav for ONNX/TRT: codes [B,16,T] + cache_position + c2w_attention_bias + state tensors,
     output wav [B, 7680] + updated states (layout matches get_initial_state_shapes).
     """
 
     def __init__(self, decoder: nn.Module, window_size: int = 72):
         super().__init__()
         self.decoder = decoder
+        freeze_quantizer_codebooks_for_export(self.decoder)
         self.window_size = window_size
         cfg = decoder.config
         self.num_layers = num_code2wav_hidden_layers(decoder)
@@ -202,10 +246,12 @@ class Code2WavStreamingWrapper(nn.Module):
         self,
         codes: torch.Tensor,
         cache_position: torch.Tensor,
+        c2w_attention_bias: torch.Tensor,
         *states: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         """
-        codes: [B, 16, 4], cache_position: [4] (absolute positions for this chunk).
+        codes: [B, 16, T], cache_position: [T] or [B, T] (absolute positions for this chunk).
+        c2w_attention_bias: [B, 1, T, T_pad+T] additive mask built outside graph.
         states: 2*num_hidden_layers KV + 17 conv + 4 transconv.
         Returns: (wav [B, 7680], *new_states).
         """
@@ -230,9 +276,6 @@ class Code2WavStreamingWrapper(nn.Module):
 
         # 3. Transformer with sliding-window KV cache
         cache = SlidingWindowKVCache(kv_list, self.window_size)
-        S_past = cache.get_seq_length()
-        S = hidden.shape[1]
-        S_total = S_past + S
 
         hidden = self.decoder.pre_transformer.input_proj(hidden)  # [B, 4, hidden_size]
         # position_ids [1, 4] to match transformer's expectation (same as cache_position.unsqueeze(0))
@@ -241,21 +284,7 @@ class Code2WavStreamingWrapper(nn.Module):
             position_ids = position_ids.expand(B, -1)
         position_embeddings = self.decoder.pre_transformer.rotary_emb(hidden, position_ids)
 
-        min_dtype = torch.finfo(dtype).min
-        row_idx = torch.arange(S, device=device, dtype=torch.long).unsqueeze(1) + S_past
-        col_idx = torch.arange(S_total, device=device, dtype=torch.long).unsqueeze(0)
-        causal_mask = torch.where(
-            col_idx > row_idx,
-            torch.tensor(min_dtype, dtype=dtype, device=device),
-            torch.tensor(0.0, dtype=dtype, device=device),
-        )
-        if self.window_size is not None:
-            causal_mask = torch.where(
-                row_idx - col_idx >= self.window_size,
-                torch.tensor(min_dtype, dtype=dtype, device=device),
-                causal_mask,
-            )
-        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S_total)
+        causal_mask = c2w_attention_bias.to(device=device, dtype=dtype).contiguous()
 
         for layer in self.decoder.pre_transformer.layers:
             hidden = layer(

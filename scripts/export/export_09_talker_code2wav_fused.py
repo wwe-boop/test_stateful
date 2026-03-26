@@ -3,7 +3,8 @@
 [Step 09] Export Talker Unified + Code2Wav (chunk_T=1) fused ONNX.
 
 Single engine per decode step: talker (prefill+decode+CP+codec_sum) -> full_codec -> code2wav(1 frame) -> wav.
-Inputs: input_embeds, position_ids, past_kv_*, cache_position, code2wav state tensors
+Inputs: input_embeds, position_ids, attention_bias, past_seq_lens, cache_position,
+  c2w_attention_bias, code2wav state tensors
   (2 * decoder.num_hidden_layers KV + 17 conv + 4 transconv; often 37 when n_layers=8).
 Outputs: wav, codec_sum, full_codec, hidden, logits, present_kv_*, new code2wav states.
 
@@ -38,6 +39,7 @@ sys.path.insert(0, str(_scripts_export))
 sys.path.insert(0, str(_scripts_export.parent / "python"))
 
 from code2wav_streaming import (
+    COLD_START_DUMMY_PAST_LEN,
     Code2WavStreamingWrapper,
     get_initial_state_shapes,
     NUM_CONV,
@@ -86,6 +88,7 @@ class TalkerCode2WavFusedONNX(nn.Module):
         attention_bias: torch.Tensor,
         past_seq_lens: torch.Tensor,
         cache_position: torch.Tensor,
+        c2w_attention_bias: torch.Tensor,
         *inputs: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         """
@@ -104,7 +107,7 @@ class TalkerCode2WavFusedONNX(nn.Module):
         _cb = 2048
         fc = full_codec.long().clamp(0, _cb - 1)
         codes = fc.unsqueeze(-1)
-        c2w_out = self.code2wav(codes, cache_position, *code2wav_states)
+        c2w_out = self.code2wav(codes, cache_position, c2w_attention_bias, *code2wav_states)
         wav = c2w_out[0]
         new_c2w = c2w_out[1:]
         return (wav, codec_sum, full_codec, hidden, logits, *present_kv, *new_c2w)
@@ -149,14 +152,18 @@ def _export_talker_code2wav_fused_onnx(
 
     # First fused frame index in the vocoder stream (chunk_T=1).
     cache_position = torch.zeros(B, FUSED_CHUNK_T, device=device, dtype=torch.long)
-
     # Code2wav states: use past_kv_len>0 for trace only (export_06 pattern). Zero-length KV
     # tensors are often dropped from the ONNX graph; runtime still uses S_past=0 via dynamic axes.
     TRACE_C2W_PAST_LEN = 1
+    c2w_attention_bias = torch.zeros(
+        B, 1, FUSED_CHUNK_T, TRACE_C2W_PAST_LEN + FUSED_CHUNK_T, device=device, dtype=ONNX_EXPORT_DTYPE
+    )
     state_shapes = get_initial_state_shapes(
         decoder, batch_size=B, past_kv_len=TRACE_C2W_PAST_LEN
     )
-    state_shapes_cold = get_initial_state_shapes(decoder, batch_size=B, past_kv_len=0)
+    state_shapes_cold = get_initial_state_shapes(
+        decoder, batch_size=B, past_kv_len=COLD_START_DUMMY_PAST_LEN
+    )
     state_tensors = [torch.randn(s, device=device, dtype=ONNX_EXPORT_DTYPE) for _, s in state_shapes]
 
     dummy_inputs = (
@@ -165,6 +172,7 @@ def _export_talker_code2wav_fused_onnx(
         attention_bias,
         past_seq_lens,
         cache_position,
+        c2w_attention_bias,
         *past_list,
         *state_tensors,
     )
@@ -178,6 +186,7 @@ def _export_talker_code2wav_fused_onnx(
         "attention_bias",
         "past_seq_lens",
         "cache_position",
+        "c2w_attention_bias",
     ]
     for i in range(num_layers):
         input_names.append(f"past_kv_{i}_k")
@@ -204,6 +213,7 @@ def _export_talker_code2wav_fused_onnx(
         "attention_bias": {0: "batch", 2: "seq", 3: "key_total"},
         "past_seq_lens": {0: "batch"},
         "cache_position": {0: "batch", 1: "chunk_t"},
+        "c2w_attention_bias": {0: "batch", 2: "chunk_t", 3: "c2w_key_total"},
         "wav": {0: "batch"},
         "codec_sum": {0: "batch"},
         "full_codec": {0: "batch"},
@@ -278,6 +288,7 @@ def _export_talker_code2wav_fused_onnx(
     cpu_bias = attention_bias.cpu()
     cpu_past_seq_lens = past_seq_lens.cpu()
     cpu_cache = cache_position.cpu()
+    cpu_c2w_bias = c2w_attention_bias.cpu()
     cpu_past = [t.cpu() for t in past_list]
     cpu_states = [t.cpu() for t in state_tensors]
     cpu_fused = fused.cpu().eval()
@@ -288,19 +299,19 @@ def _export_talker_code2wav_fused_onnx(
             cpu_bias,
             cpu_past_seq_lens,
             cpu_cache,
+            cpu_c2w_bias,
             *cpu_past,
             *cpu_states,
         )
-    fused.to(device)
-
     test_inputs = {
         "input_embeds": to_numpy(cpu_embeds),
         "position_ids": cpu_pos.numpy(),
         "attention_bias": to_numpy(cpu_bias),
         "past_seq_lens": cpu_past_seq_lens.numpy(),
         "cache_position": cpu_cache.numpy(),
+        "c2w_attention_bias": to_numpy(cpu_c2w_bias),
     }
-    off = 5
+    off = 6
     for i, t in enumerate(cpu_past):
         test_inputs[input_names[off + i]] = to_numpy(t)
     off += len(cpu_past)
@@ -309,10 +320,57 @@ def _export_talker_code2wav_fused_onnx(
 
     torch_outputs = {output_names[i]: to_numpy(cpu_out[i]) for i in range(len(output_names))}
     ok = verify_onnx(onnx_path, test_inputs, torch_outputs, atol=2e-3, rtol=1e-2)
-    if ok:
-        logger.info("Talker+Code2Wav fused ONNX verification PASSED")
+
+    # Case-2: alternate prefill/decode setting (B=1, non-zero logical past with explicit bias)
+    B2, S_past2 = 1, 4
+    c2w_past2 = 5
+    cpu_embeds2 = torch.randn(B2, one, hidden_size, dtype=ONNX_EXPORT_DTYPE)
+    cpu_pos2 = torch.full((B2, 3, one), S_past2, dtype=torch.long)
+    cpu_bias2 = torch.zeros(B2, 1, one, S_past2 + one, dtype=ONNX_EXPORT_DTYPE)
+    cpu_bias2[0, :, :, :2] = -1.0e4
+    cpu_past_seq_lens2 = torch.tensor([3], dtype=torch.long)
+    cpu_cache2 = torch.zeros(B2, FUSED_CHUNK_T, dtype=torch.long)
+    cpu_c2w_bias2 = torch.zeros(B2, 1, FUSED_CHUNK_T, c2w_past2 + FUSED_CHUNK_T, dtype=ONNX_EXPORT_DTYPE)
+    cpu_c2w_bias2[0, :, :, :3] = -1.0e4
+    cpu_past2 = []
+    for _ in range(num_layers):
+        cpu_past2.append(torch.randn(B2, num_kv_heads, S_past2, head_dim, dtype=ONNX_EXPORT_DTYPE))
+        cpu_past2.append(torch.randn(B2, num_kv_heads, S_past2, head_dim, dtype=ONNX_EXPORT_DTYPE))
+    state_shapes2 = get_initial_state_shapes(decoder, batch_size=B2, past_kv_len=c2w_past2)
+    cpu_states2 = [torch.randn(s, dtype=ONNX_EXPORT_DTYPE) for _, s in state_shapes2]
+    with torch.no_grad():
+        cpu_out2 = cpu_fused(
+            cpu_embeds2,
+            cpu_pos2,
+            cpu_bias2,
+            cpu_past_seq_lens2,
+            cpu_cache2,
+            cpu_c2w_bias2,
+            *cpu_past2,
+            *cpu_states2,
+        )
+    test_inputs2 = {
+        "input_embeds": to_numpy(cpu_embeds2),
+        "position_ids": cpu_pos2.numpy(),
+        "attention_bias": to_numpy(cpu_bias2),
+        "past_seq_lens": cpu_past_seq_lens2.numpy(),
+        "cache_position": cpu_cache2.numpy(),
+        "c2w_attention_bias": to_numpy(cpu_c2w_bias2),
+    }
+    off = 6
+    for i, t in enumerate(cpu_past2):
+        test_inputs2[input_names[off + i]] = to_numpy(t)
+    off += len(cpu_past2)
+    for i, t in enumerate(cpu_states2):
+        test_inputs2[input_names[off + i]] = to_numpy(t)
+    torch_outputs2 = {output_names[i]: to_numpy(cpu_out2[i]) for i in range(len(output_names))}
+    ok2 = verify_onnx(onnx_path, test_inputs2, torch_outputs2, atol=2e-3, rtol=1e-2)
+
+    if ok and ok2:
+        logger.info("Talker+Code2Wav fused ONNX verification PASSED (base + alternate-prefill cases)")
     else:
         logger.warning("Talker+Code2Wav fused ONNX verification had differences")
+    fused.to(device)
 
     del tokenizer_model
     if device != "cpu":

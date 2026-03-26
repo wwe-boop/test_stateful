@@ -4,7 +4,7 @@
 
 Component: Code2Wav Decoder (stateful streaming, chunk_T=4)
 Architecture: RVQ Dequant + Transformer(8L, sliding window) + BigVGAN ConvNet
-Input:  codes [B, 16, 4], cache_position [4], streaming state tensors (layout from decoder)
+Input:  codes [B, 16, 4], cache_position [B, T], c2w_attention_bias [B,1,T,T_pad+T], streaming states
 Output: wav [B, 7680], updated state tensors
 Engine: ONNX Runtime / TensorRT
 Usage: Incremental decode per 4 codec frames; states kept on GPU for batching.
@@ -33,6 +33,7 @@ from utils import (
 )
 
 from code2wav_streaming import (
+    COLD_START_DUMMY_PAST_LEN,
     Code2WavStreamingWrapper,
     get_initial_state_shapes,
     NUM_CONV,
@@ -66,19 +67,24 @@ def export_code2wav_decoder(
     EXPORT_PAST_LEN = CHUNK_T
     dummy_codes = torch.randint(0, 2048, (B, 16, CHUNK_T), device=device, dtype=torch.long)
     cache_position = torch.arange(EXPORT_PAST_LEN, EXPORT_PAST_LEN + CHUNK_T, device=device, dtype=torch.long).unsqueeze(0)  # [1, CHUNK_T]
+    c2w_attention_bias = torch.zeros(
+        (B, 1, CHUNK_T, EXPORT_PAST_LEN + CHUNK_T), device=device, dtype=torch.float32
+    )
     state_shapes = get_initial_state_shapes(decoder, batch_size=B, past_kv_len=EXPORT_PAST_LEN)
     state_tensors = [torch.randn(s, device=device, dtype=torch.float32) for _, s in state_shapes]
 
     with torch.no_grad():
-        out = wrapper(dummy_codes, cache_position, *state_tensors)
+        out = wrapper(dummy_codes, cache_position, c2w_attention_bias, *state_tensors)
 
     wav_ref = out[0]
     logger.info(f"Streaming decoder output wav shape: {wav_ref.shape} (expected [1, 7680])")
 
     n_c2w = num_code2wav_hidden_layers(decoder)
-    input_names = ["codes", "cache_position"]
+    input_names = ["codes", "cache_position", "c2w_attention_bias"]
     output_names = ["wav"]
-    for name, _ in get_initial_state_shapes(decoder, batch_size=B, past_kv_len=0):
+    for name, _ in get_initial_state_shapes(
+        decoder, batch_size=B, past_kv_len=COLD_START_DUMMY_PAST_LEN
+    ):
         input_names.append(name)
     for i in range(n_c2w):
         output_names.append(f"present_kv_{i}_k")
@@ -90,16 +96,21 @@ def export_code2wav_decoder(
 
     dynamic_axes = {
         "codes": {0: "batch"},
-        "cache_position": {0: "batch"},
+        "cache_position": {0: "batch", 1: "chunk_t"},
+        "c2w_attention_bias": {0: "batch", 2: "chunk_t", 3: "c2w_key_total"},
         "wav": {0: "batch"},
     }
+    for name, _ in get_initial_state_shapes(
+        decoder, batch_size=B, past_kv_len=COLD_START_DUMMY_PAST_LEN
+    ):
+        dynamic_axes[name] = {0: "batch"}
+        if name.startswith("past_kv_"):
+            dynamic_axes[name][2] = "past_len"
     for i in range(n_c2w):
-        dynamic_axes[f"past_kv_{i}_k"] = {0: "batch", 2: "past_len"}
-        dynamic_axes[f"past_kv_{i}_v"] = {0: "batch", 2: "past_len"}
         dynamic_axes[f"present_kv_{i}_k"] = {0: "batch", 2: "total_len"}
         dynamic_axes[f"present_kv_{i}_v"] = {0: "batch", 2: "total_len"}
 
-    dummy_inputs = (dummy_codes, cache_position, *state_tensors)
+    dummy_inputs = (dummy_codes, cache_position, c2w_attention_bias, *state_tensors)
     onnx_path = str(out_dir / "code2wav_decoder.onnx")
     export_onnx(
         model=wrapper,
@@ -116,15 +127,20 @@ def export_code2wav_decoder(
     # Verify with the same non-zero-length KV states used for export
     cpu_codes = dummy_codes.cpu()
     cpu_cache_pos = cache_position.cpu()
+    cpu_c2w_bias = c2w_attention_bias.cpu()
     cpu_states = [s.cpu() for s in state_tensors]
     cpu_wrapper = wrapper.cpu().eval()
     with torch.no_grad():
-        cpu_out = cpu_wrapper(cpu_codes, cpu_cache_pos, *cpu_states)
+        cpu_out = cpu_wrapper(cpu_codes, cpu_cache_pos, cpu_c2w_bias, *cpu_states)
     wrapper.to(device)
 
-    test_inputs = {"codes": to_numpy(cpu_codes), "cache_position": to_numpy(cpu_cache_pos)}
+    test_inputs = {
+        "codes": to_numpy(cpu_codes),
+        "cache_position": to_numpy(cpu_cache_pos),
+        "c2w_attention_bias": to_numpy(cpu_c2w_bias),
+    }
     for i, t in enumerate(cpu_states):
-        test_inputs[input_names[2 + i]] = to_numpy(t)
+        test_inputs[input_names[3 + i]] = to_numpy(t)
     torch_outputs = {output_names[i]: to_numpy(cpu_out[i]) for i in range(len(output_names))}
     ok = verify_onnx(onnx_path, test_inputs, torch_outputs, atol=1e-3)
     if ok:

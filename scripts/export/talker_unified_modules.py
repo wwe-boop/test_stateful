@@ -105,19 +105,16 @@ class TalkerUnifiedONNX(nn.Module):
 
         row_idx = torch.arange(S, device=device, dtype=torch.long).unsqueeze(1) + S_past
         col_idx = torch.arange(S_total, device=device, dtype=torch.long).unsqueeze(0)
-        causal_mask = torch.where(
-            col_idx > row_idx,
-            torch.tensor(float("-inf"), dtype=dtype, device=device),
-            torch.tensor(0.0, dtype=dtype, device=device),
-        ).unsqueeze(0).unsqueeze(0).expand(B, 1, S, S_total)
+        neg_val = -1.0e4
+        causal_mask = (col_idx > row_idx).to(dtype=dtype) * neg_val
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S_total)
         if attention_bias is not None:
             causal_mask = causal_mask + attention_bias.to(device=device, dtype=dtype)
         if past_seq_lens is not None:
             # Keep past_seq_lens as a live ONNX input for BLS bookkeeping while
             # letting attention_bias carry the actual padded-key masking semantics.
             causal_mask = causal_mask + (
-                past_seq_lens.to(device=device, dtype=dtype).sum()
-                * torch.tensor(0.0, dtype=dtype, device=device)
+                past_seq_lens.to(device=device, dtype=dtype).sum() * 0.0
             )
 
         text_position_ids = position_ids[0] if position_ids.dim() == 3 else position_ids

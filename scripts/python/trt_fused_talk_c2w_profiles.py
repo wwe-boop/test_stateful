@@ -12,8 +12,8 @@ import sys
 def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
     specs = []
     for i in range(n_c2w_layers):
-        specs.append((f"past_kv_{i}_k", "1x16x0x64", "1x16x4x64", f"{bmax}x16x72x64"))
-        specs.append((f"past_kv_{i}_v", "1x16x0x64", "1x16x4x64", f"{bmax}x16x72x64"))
+        specs.append((f"past_kv_{i}_k", "1x16x1x64", "1x16x4x64", f"{bmax}x16x72x64"))
+        specs.append((f"past_kv_{i}_v", "1x16x1x64", "1x16x4x64", f"{bmax}x16x72x64"))
     conv = [
         ("conv_state_0", "1x512x2"),
         ("conv_state_1", "1x1024x6"),
@@ -70,6 +70,7 @@ def main():
         "attention_bias:1x1x1x1",
         "past_seq_lens:1",
         "cache_position:1x1",
+        "c2w_attention_bias:1x1x1x2",
     ]
     parts_opt = [
         f"input_embeds:{Bopt}x1x{H}",
@@ -77,6 +78,7 @@ def main():
         f"attention_bias:{Bopt}x1x1x{int(opt_spast) + 1}",
         f"past_seq_lens:{Bopt}",
         f"cache_position:{Bopt}x1",
+        f"c2w_attention_bias:{Bopt}x1x1x5",
     ]
     parts_max = [
         f"input_embeds:{Bmax}x{max_in}x{H}",
@@ -84,6 +86,7 @@ def main():
         f"attention_bias:{Bmax}x1x{max_in}x{int(max_seq) + int(max_in)}",
         f"past_seq_lens:{Bmax}",
         f"cache_position:{Bmax}x1",
+        f"c2w_attention_bias:{Bmax}x1x1x73",
     ]
 
     for i in range(nl):

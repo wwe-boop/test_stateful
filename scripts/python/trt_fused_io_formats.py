@@ -74,8 +74,9 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
     fp_spec = f"{ft}:chw"
     i64 = "int64:chw"
 
-    # Inputs: input_embeds, position_ids, attention_bias, past_seq_lens, cache_position, past_kv_* x 2*nl, c2w_*
-    in_parts: List[str] = [fp_spec, i64, fp_spec, i64, i64]
+    # Inputs: input_embeds, position_ids, attention_bias, past_seq_lens, cache_position,
+    # c2w_attention_bias, past_kv_* x 2*nl, c2w_*
+    in_parts: List[str] = [fp_spec, i64, fp_spec, i64, i64, fp_spec]
     in_parts.extend([fp_spec] * (2 * nl))
     in_parts.extend([fp_spec] * len(c2w_in))
 
