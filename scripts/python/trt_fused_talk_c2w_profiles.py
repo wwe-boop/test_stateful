@@ -7,11 +7,9 @@ Print three lines: MIN, OPT, MAX (comma-separated, no spaces).
 from __future__ import annotations
 
 import sys
-import os
 
 
 def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
-    static_state_batch = os.getenv("C2W_STATIC_STATE_BATCH", "").strip()
     specs = []
     for i in range(n_c2w_layers):
         specs.append((f"past_kv_{i}_k", "1x16x1x64", "1x16x4x64", f"{bmax}x16x72x64"))
@@ -36,13 +34,8 @@ def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
         ("conv_state_16", "1x96x6"),
     ]
     for name, s in conv:
-        if static_state_batch:
-            rest = s[2:]  # drop "1x"
-            fixed = f"{static_state_batch}x{rest}"
-            specs.append((name, fixed, fixed, fixed))
-        else:
-            rest = s[2:]
-            specs.append((name, s, s, f"{bmax}x{rest}"))
+        rest = s[2:]
+        specs.append((name, s, s, f"{bmax}x{rest}"))
     tc = [
         ("transconv_overlap_0", "1x768x8"),
         ("transconv_overlap_1", "1x384x5"),
@@ -50,13 +43,8 @@ def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
         ("transconv_overlap_3", "1x96x3"),
     ]
     for name, s in tc:
-        if static_state_batch:
-            rest = s[2:]
-            fixed = f"{static_state_batch}x{rest}"
-            specs.append((name, fixed, fixed, fixed))
-        else:
-            rest = s[2:]
-            specs.append((name, s, s, f"{bmax}x{rest}"))
+        rest = s[2:]
+        specs.append((name, s, s, f"{bmax}x{rest}"))
     return specs
 
 

@@ -45,7 +45,6 @@ from code2wav_streaming import (
     NUM_CONV,
     NUM_TRANSCONV,
     num_code2wav_hidden_layers,
-    resolve_code2wav_state_batch_size,
 )
 from talker_unified_modules import build_talker_unified_fused_module
 from triton_manifest_io import build_manifest_for_export
@@ -157,7 +156,7 @@ def _export_talker_code2wav_fused_onnx(
     c2w_attention_bias = torch.zeros(
         B, 1, FUSED_CHUNK_T, TRACE_C2W_PAST_LEN + FUSED_CHUNK_T, device=device, dtype=ONNX_EXPORT_DTYPE
     )
-    c2w_state_batch = resolve_code2wav_state_batch_size(B)
+    c2w_state_batch = B
     state_shapes = get_initial_state_shapes(
         decoder,
         batch_size=B,
@@ -228,21 +227,19 @@ def _export_talker_code2wav_fused_onnx(
         dynamic_axes[f"past_kv_{i}_v"] = {0: "batch", 2: "S_past"}
         dynamic_axes[f"present_kv_{i}_k"] = {0: "batch", 2: "S_total"}
         dynamic_axes[f"present_kv_{i}_v"] = {0: "batch", 2: "S_total"}
-    static_c2w_state_batch = c2w_state_batch != B
     for name, _ in state_shapes_cold:
         key = f"c2w_{name}"
         if "past_kv" in name:
             dynamic_axes[key] = {0: "batch", 2: "past_len"}
-        elif not static_c2w_state_batch and ("conv_state" in name or "transconv_overlap" in name):
+        elif "conv_state" in name or "transconv_overlap" in name:
             dynamic_axes[key] = {0: "batch"}
     for i in range(n_c2w):
         dynamic_axes[f"c2w_present_kv_{i}_k"] = {0: "batch", 2: "total_len"}
         dynamic_axes[f"c2w_present_kv_{i}_v"] = {0: "batch", 2: "total_len"}
-    if not static_c2w_state_batch:
-        for i in range(NUM_CONV):
-            dynamic_axes[f"c2w_new_conv_state_{i}"] = {0: "batch"}
-        for i in range(NUM_TRANSCONV):
-            dynamic_axes[f"c2w_new_transconv_overlap_{i}"] = {0: "batch"}
+    for i in range(NUM_CONV):
+        dynamic_axes[f"c2w_new_conv_state_{i}"] = {0: "batch"}
+    for i in range(NUM_TRANSCONV):
+        dynamic_axes[f"c2w_new_transconv_overlap_{i}"] = {0: "batch"}
 
     onnx_path = str(output_dir / "talker_code2wav_fused.onnx")
     export_onnx(
@@ -347,7 +344,7 @@ def _export_talker_code2wav_fused_onnx(
         decoder,
         batch_size=B2,
         past_kv_len=c2w_past2,
-        conv_state_batch_size=resolve_code2wav_state_batch_size(B2),
+        conv_state_batch_size=B2,
     )
     cpu_states2 = [torch.randn(s, dtype=ONNX_EXPORT_DTYPE) for _, s in state_shapes2]
     with torch.no_grad():

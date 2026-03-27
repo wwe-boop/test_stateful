@@ -350,7 +350,6 @@ build_peripheral_engines() {
         C2W_MIN="codes:1x16x4,cache_position:1x4,c2w_attention_bias:1x1x4x5"
         C2W_OPT="codes:1x16x4,cache_position:1x4,c2w_attention_bias:1x1x4x8"
         C2W_MAX="codes:${C2W_BATCH}x16x4,cache_position:${C2W_BATCH}x4,c2w_attention_bias:${C2W_BATCH}x1x4x76"
-        local c2w_static_state_batch="${C2W_STATIC_STATE_BATCH:-}"
         for i in 0 1 2 3 4 5 6 7; do
             C2W_MIN="${C2W_MIN},past_kv_${i}_k:1x16x1x64,past_kv_${i}_v:1x16x1x64"
             C2W_OPT="${C2W_OPT},past_kv_${i}_k:1x16x4x64,past_kv_${i}_v:1x16x4x64"
@@ -363,16 +362,9 @@ build_peripheral_engines() {
             transconv_overlap_0:1x768x8 transconv_overlap_1:1x384x5 transconv_overlap_2:1x192x4 transconv_overlap_3:1x96x3; do
             n="${name%%:*}"
             s="${name#*:}"
-            if [ -n "$c2w_static_state_batch" ]; then
-                fixed="${c2w_static_state_batch}x${s#1x}"
-                C2W_MIN="${C2W_MIN},${n}:${fixed}"
-                C2W_OPT="${C2W_OPT},${n}:${fixed}"
-                C2W_MAX="${C2W_MAX},${n}:${fixed}"
-            else
-                C2W_MIN="${C2W_MIN},${n}:${s}"
-                C2W_OPT="${C2W_OPT},${n}:${s}"
-                C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
-            fi
+            C2W_MIN="${C2W_MIN},${n}:${s}"
+            C2W_OPT="${C2W_OPT},${n}:${s}"
+            C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
         done
         # Input order: codes (int64), cache_position (fp32), c2w_attention_bias (float), then 37 state float tensors.
         # Output order: 38 float tensors (wav + present_kv + new_conv_state + new_transconv_overlap).

@@ -106,6 +106,13 @@ def _build_past_kv_empty(
     return d
 
 
+def _build_c2w_attention_bias(
+    batch: int, chunk_t: int, c2w_past_len: int
+) -> np.ndarray:
+    key_total = min(c2w_past_len + 1, 72)
+    return np.zeros((batch, 1, chunk_t, key_total), dtype=np.float32)
+
+
 def run_fused_onnx_loop(
     sess: Any,
     manifest: Dict[str, Any],
@@ -141,11 +148,14 @@ def run_fused_onnx_loop(
     ) -> Dict[str, np.ndarray]:
         past_len = int(past_kv[0].shape[2]) if past_kv else 0
         seq = int(inp_emb.shape[1])
+        chunk_t = int(cache_pos.shape[1])
+        c2w_past_len = int(c2w_states[0].shape[2]) if c2w_states else 0
         feed: Dict[str, np.ndarray] = {
             "input_embeds": inp_emb.detach().cpu().float().numpy(),
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
             "attention_bias": np.zeros((B, 1, seq, past_len + seq), dtype=np.float32),
             "cache_position": cache_pos.detach().cpu().numpy().astype(np.float32),
+            "c2w_attention_bias": _build_c2w_attention_bias(B, chunk_t, c2w_past_len),
         }
         if past_kv is None:
             pk = _build_past_kv_empty(B, num_layers, num_kv_heads, head_dim)
@@ -343,11 +353,14 @@ def run_fused_triton_loop(
     ) -> Dict[str, np.ndarray]:
         past_len = int(past_kv[0].shape[2]) if past_kv else 0
         seq = int(inp_emb.shape[1])
+        chunk_t = int(cache_pos.shape[1])
+        c2w_past_len = int(c2w_states[0].shape[2]) if c2w_states else 0
         feed: Dict[str, np.ndarray] = {
             "input_embeds": inp_emb.detach().cpu().float().numpy(),
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
             "attention_bias": np.zeros((B, 1, seq, past_len + seq), dtype=np.float32),
             "cache_position": cache_pos.detach().cpu().numpy().astype(np.float32),
+            "c2w_attention_bias": _build_c2w_attention_bias(B, chunk_t, c2w_past_len),
         }
         if past_kv is None:
             feed.update(_build_past_kv_empty(B, num_layers, num_kv_heads, head_dim))

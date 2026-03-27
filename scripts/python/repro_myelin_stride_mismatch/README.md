@@ -43,6 +43,31 @@ bash scripts/python/repro_myelin_stride_mismatch/run_repro.sh pass /tmp/myelin_r
 - fail 日志: `/tmp/myelin_repro_case/logs/fail.log`
 - pass 日志: `/tmp/myelin_repro_case/logs/pass.log`
 
+## 2.5 一条命令的“净化环境”最小链路（推荐）
+
+```bash
+bash scripts/python/repro_myelin_stride_mismatch/minimal_pipeline.sh \
+  /tmp/myelin_repro_minimal both
+```
+
+这个入口会先清理常见干扰变量（如 `C2W_DEBUG_*`、`TRT_MYELIN_DISABLE`、`C2W_STATIC_STATE_BATCH` 等），
+再固定容器版本跑完整 fail/pass 复现链路，避免你分析时被历史实验环境污染。
+
+## 2.6 一条命令的“冻结环境”链路（用于提 bug）
+
+```bash
+bash scripts/python/repro_myelin_stride_mismatch/frozen_pipeline.sh \
+  /tmp/myelin_repro_frozen both
+```
+
+相比 `minimal_pipeline.sh`，该入口额外做三件事：
+
+- 用 `env -i` 白名单环境变量启动（最小环境）
+- 记录命令清单：`/tmp/myelin_repro_frozen/manifest/cmd.txt`
+- 记录环境快照和文件哈希：`env.txt`、`sha256.txt`
+
+这套输出适合直接附在 NVIDIA issue 里，避免“你本地环境变量导致”的争议。
+
 ## 3. 预期现象
 
 ### Fail case（dynamic state batch）

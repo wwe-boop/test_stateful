@@ -8,7 +8,6 @@ and streaming CausalTransConvNet (overlap-add) for incremental decode.
 
 from __future__ import annotations
 
-import os
 import types
 from typing import List, Tuple
 
@@ -132,11 +131,8 @@ COLD_START_DUMMY_PAST_LEN = 1
 
 
 def resolve_code2wav_state_batch_size(batch_size: int) -> int:
-    env = os.getenv("C2W_STATIC_STATE_BATCH", "").strip()
-    if not env:
-        return batch_size
-    value = int(env)
-    return value if value > 0 else batch_size
+    # Static-state-batch workaround removed: keep state batch fully dynamic with request batch.
+    return batch_size
 
 def num_code2wav_hidden_layers(decoder: nn.Module) -> int:
     """Match the actual pre_transformer depth (checkpoint may disagree with config)."""
@@ -236,6 +232,34 @@ def freeze_quantizer_codebooks_for_export(decoder: nn.Module) -> None:
                 return F.embedding(codes, self.inference_embedding)
 
             codebook.decode = types.MethodType(_decode_with_frozen_embedding, codebook)
+
+
+def _build_rvq_embedding_table(rvq: nn.Module) -> torch.Tensor | None:
+    """
+    Build stacked embedding table [n_q, vocab, dim] from RVQ codebooks.
+    Returns None when RVQ/codebooks are unavailable.
+    """
+    if rvq is None:
+        return None
+    n_q = int(getattr(rvq, "n_q", 0))
+    vq = getattr(rvq, "vq", None)
+    layers = getattr(vq, "layers", None) if vq is not None else None
+    if layers is None or n_q <= 0:
+        return None
+
+    emb_list = []
+    for idx in range(n_q):
+        codebook = getattr(layers[idx], "_codebook", None)
+        if codebook is None:
+            return None
+        emb = getattr(codebook, "inference_embedding", None)
+        if emb is None:
+            with torch.no_grad():
+                emb = codebook.embedding_sum / codebook.cluster_usage.clamp(min=codebook.epsilon).unsqueeze(1)
+        emb_list.append(emb.detach())
+    if not emb_list:
+        return None
+    return torch.stack(emb_list, dim=0).contiguous()
 
 
 def _rotate_half_export(x: torch.Tensor, half_dim: int) -> torch.Tensor:
@@ -568,20 +592,10 @@ class Code2WavStreamingWrapper(nn.Module):
 
     def __init__(self, decoder: nn.Module, window_size: int = 72):
         super().__init__()
-        if os.getenv("C2W_DEBUG_PATCH_ATTN_SLICE", "0") == "1":
-            patch_decoder_attention_mask_slice_for_export()
-        if os.getenv("C2W_DEBUG_PATCH_ROPE_RESHAPE", "0") == "1":
-            patch_decoder_rope_reshape_for_export()
         self.decoder = decoder
         patch_decoder_snakebeta_for_export(self.decoder)
-        patch_quantizer_decode_no_split_for_export(self.decoder)
-        if os.getenv("C2W_DEBUG_PATCH_QUANT_SPLIT", "0") == "1":
-            patch_quantizer_split_decode_for_export(self.decoder)
         freeze_quantizer_codebooks_for_export(self.decoder)
-        self._debug_bypass_quantizer = os.getenv("C2W_DEBUG_BYPASS_QUANTIZER", "0") == "1"
-        self._debug_bypass_transformer = os.getenv("C2W_DEBUG_BYPASS_TRANSFORMER", "0") == "1"
-        self._debug_bridge_fp32 = os.getenv("C2W_DEBUG_BRIDGE_FP32", "0") == "1"
-        self._static_state_batch = resolve_code2wav_state_batch_size(0)
+        patch_quantizer_decode_no_split_for_export(self.decoder)
         self.window_size = window_size
         cfg = decoder.config
         self.num_layers = num_code2wav_hidden_layers(decoder)
@@ -591,7 +605,10 @@ class Code2WavStreamingWrapper(nn.Module):
         self.latent_dim = cfg.latent_dim
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = getattr(cfg, "head_dim", self.hidden_size // cfg.num_attention_heads)
-        self._bridge_kind = os.getenv("C2W_DEBUG_BRIDGE_KIND", "conv").strip().lower()
+        self._use_direct_quantizer_decode = True
+        self._rvq_first_proj = None
+        self._rvq_rest_proj = None
+        self._setup_direct_quantizer_decode()
         # Export-only identity bridge. A real Conv op is harder for ONNX/TRT to
         # optimize away than clone/reduce identity chains, while keeping batch dynamic.
         self.decoder_bridge = nn.Conv1d(
@@ -608,6 +625,62 @@ class Code2WavStreamingWrapper(nn.Module):
         if hasattr(cfg, "_attn_implementation"):
             self._saved_attn_impl = getattr(cfg, "_attn_implementation", None)
         setattr(cfg, "_attn_implementation", "eager")
+
+    def _setup_direct_quantizer_decode(self) -> None:
+        quantizer = getattr(self.decoder, "quantizer", None)
+        if quantizer is None:
+            self._use_direct_quantizer_decode = False
+            return
+
+        n_sem = int(getattr(quantizer, "n_q_semantic", 1))
+        n_aco = int(getattr(quantizer, "n_q_acoustic", 0))
+        rvq_first = getattr(quantizer, "rvq_first", None)
+        rvq_rest = getattr(quantizer, "rvq_rest", None)
+        first_table = _build_rvq_embedding_table(rvq_first)
+        rest_table = _build_rvq_embedding_table(rvq_rest) if n_aco > 0 else None
+        first_proj = getattr(rvq_first, "output_proj", None) if rvq_first is not None else None
+        rest_proj = getattr(rvq_rest, "output_proj", None) if rvq_rest is not None else None
+
+        if first_table is None or first_proj is None or (n_aco > 0 and (rest_table is None or rest_proj is None)):
+            self._use_direct_quantizer_decode = False
+            return
+
+        self.register_buffer("_rvq_first_table", first_table, persistent=False)
+        if rest_table is not None:
+            self.register_buffer("_rvq_rest_table", rest_table, persistent=False)
+        self._rvq_first_proj = first_proj
+        self._rvq_rest_proj = rest_proj
+        self.register_buffer("_idx_sem", torch.arange(0, n_sem, dtype=torch.long), persistent=False)
+        if n_aco > 0:
+            self.register_buffer("_idx_aco", torch.arange(n_sem, n_sem + n_aco, dtype=torch.long), persistent=False)
+
+    @staticmethod
+    def _decode_rvq_from_table(
+        table: torch.Tensor,
+        proj: nn.Module,
+        codes: torch.Tensor,
+    ) -> torch.Tensor:
+        # table: [n_q, vocab, d], codes: [B, n_q, T]
+        codes_t = codes.transpose(0, 1).long()  # [n_q, B, T]
+        n_q, _, d = table.shape
+        bsz = codes_t.shape[1]
+        table_expand = table.unsqueeze(1).expand(n_q, bsz, -1, -1)
+        gather_idx = codes_t.unsqueeze(-1).expand(-1, -1, -1, d)
+        quantized = torch.gather(table_expand, 2, gather_idx).sum(dim=0)  # [B, T, d]
+        quantized = quantized.permute(0, 2, 1).contiguous()  # [B, d, T]
+        return proj(quantized)
+
+    def _decode_quantizer_direct(self, codes: torch.Tensor) -> torch.Tensor:
+        codes_sem = torch.index_select(codes, 1, self._idx_sem)
+        quantized = self._decode_rvq_from_table(self._rvq_first_table, self._rvq_first_proj, codes_sem)
+        if self._idx_aco is not None and self._rvq_rest_table is not None and self._rvq_rest_proj is not None:
+            codes_aco = torch.index_select(codes, 1, self._idx_aco)
+            quantized = quantized + self._decode_rvq_from_table(
+                self._rvq_rest_table,
+                self._rvq_rest_proj,
+                codes_aco,
+            )
+        return quantized
 
     def forward(
         self,
@@ -635,12 +708,8 @@ class Code2WavStreamingWrapper(nn.Module):
         transconv_states = list(transconv_state_templates)
 
         # 1. Quantizer (stateless)
-        if self._debug_bypass_quantizer:
-            hidden = torch.zeros(
-                (B, self.decoder.pre_conv.conv.in_channels, CHUNK_T),
-                device=device,
-                dtype=torch.float32,
-            )
+        if self._use_direct_quantizer_decode:
+            hidden = self._decode_quantizer_direct(codes)
         else:
             hidden = self.decoder.quantizer.decode(codes)  # [B, codebook_dim, 4]
 
@@ -653,64 +722,38 @@ class Code2WavStreamingWrapper(nn.Module):
         # 3. Transformer with sliding-window KV cache
         cache = SlidingWindowKVCache(kv_list, self.window_size)
 
-        if self._debug_bypass_transformer:
-            # Keep these inputs alive in graph so export/build signatures stay stable.
-            keep = (
-                c2w_attention_bias.to(dtype=torch.float32).sum() * 0.0
-                + cache_position.to(dtype=torch.float32).sum() * 0.0
-            )
-            hidden = hidden + keep.to(dtype=hidden.dtype).reshape(1, 1, 1)
-            hidden = hidden.permute(0, 2, 1)  # [B, latent_dim, 4]
-        else:
-            hidden = self.decoder.pre_transformer.input_proj(hidden)  # [B, 4, hidden_size]
-            # position_ids [1, 4] to match transformer's expectation (same as cache_position.unsqueeze(0))
-            position_ids = cache_position.unsqueeze(0) if cache_position.dim() == 1 else cache_position
-            if position_ids.shape[0] != B:
-                position_ids = position_ids.expand(B, -1)
-            position_embeddings = _build_decoder_rope_embeddings_export(
-                self.decoder.pre_transformer.rotary_emb,
+        hidden = self.decoder.pre_transformer.input_proj(hidden)  # [B, 4, hidden_size]
+        # position_ids [1, 4] to match transformer's expectation (same as cache_position.unsqueeze(0))
+        position_ids = cache_position.unsqueeze(0) if cache_position.dim() == 1 else cache_position
+        if position_ids.shape[0] != B:
+            position_ids = position_ids.expand(B, -1)
+        position_embeddings = _build_decoder_rope_embeddings_export(
+            self.decoder.pre_transformer.rotary_emb,
+            hidden,
+            position_ids,
+        )
+
+        causal_mask = c2w_attention_bias.contiguous()
+
+        for layer in self.decoder.pre_transformer.layers:
+            hidden = _run_decoder_transformer_layer_export(
+                layer,
                 hidden,
-                position_ids,
+                causal_mask,
+                cache,
+                cache_position,
+                position_embeddings,
             )
 
-            causal_mask = c2w_attention_bias.contiguous()
-
-            for layer in self.decoder.pre_transformer.layers:
-                hidden = _run_decoder_transformer_layer_export(
-                    layer,
-                    hidden,
-                    causal_mask,
-                    cache,
-                    cache_position,
-                    position_embeddings,
-                )
-
-            hidden = self.decoder.pre_transformer.norm(hidden)
-            hidden = self.decoder.pre_transformer.output_proj(hidden)  # [B, 4, latent_dim]
-            hidden = hidden.permute(0, 2, 1)  # [B, latent_dim, 4]
+        hidden = self.decoder.pre_transformer.norm(hidden)
+        hidden = self.decoder.pre_transformer.output_proj(hidden)  # [B, 4, latent_dim]
+        hidden = hidden.permute(0, 2, 1)  # [B, latent_dim, 4]
 
         # Create an explicit tensor boundary between transformer and decoder path.
         hidden = hidden.contiguous()
-        if self._bridge_kind == "conv":
-            # A channel-wise 1x1 Conv is exact identity and survives export/simplify
-            # better than clone/reduce no-ops, but some TRT versions still absorb it.
-            hidden = self.decoder_bridge(hidden)
-        elif self._bridge_kind == "cumsum":
-            # Exact identity: x = cumsum(x) - shifted(cumsum(x)).
-            # This introduces a sequence op that is harder for Myelin to merge into
-            # the surrounding 4D attention + 3D decoder giant segment.
-            prefix = torch.cumsum(hidden, dim=-1)
-            hidden = prefix - F.pad(prefix[..., :-1], (1, 0))
-        elif self._bridge_kind == "resize":
-            # Nearest resize-to-self is semantically identity but exports as Resize.
-            hidden = F.interpolate(hidden, size=hidden.shape[-1], mode="nearest")
-        else:
-            raise RuntimeError(f"Unsupported C2W_DEBUG_BRIDGE_KIND={self._bridge_kind}")
-        if self._debug_bridge_fp32:
-            hidden = hidden.to(torch.float32)
-            hidden = hidden.to(dtype)
-        if self._static_state_batch > 0 and len(conv_state_templates) > 1:
-            hidden = _pad_batch_to_size(hidden, int(conv_state_templates[1].shape[0]))
+        # A channel-wise 1x1 Conv is exact identity and survives export/simplify
+        # better than clone/reduce no-ops.
+        hidden = self.decoder_bridge(hidden)
 
         # 4. Upsample blocks (2x): transconv (no overlap) + ConvNeXt with streaming
         hidden = self._upsample_streaming(hidden, conv_states)
@@ -727,9 +770,7 @@ class Code2WavStreamingWrapper(nn.Module):
         wav, conv_states[16] = streaming_causal_conv(
             self.decoder.decoder[6], hidden, conv_states[16]
         )
-        if self._static_state_batch > 0:
-            wav = wav[:B]
-        wav = wav.clamp(min=-1, max=1)
+        # wav = wav.clamp(min=-1, max=1)
 
         # Pack new states
         new_kv = []
@@ -737,15 +778,6 @@ class Code2WavStreamingWrapper(nn.Module):
             k, v = cache.get_present(i)
             new_kv.append(k)
             new_kv.append(v)
-        if self._static_state_batch > 0:
-            conv_states = [
-                _pad_state_batch_to_template(state, template)
-                for state, template in zip(conv_states, conv_state_templates)
-            ]
-            transconv_states = [
-                _pad_state_batch_to_template(state, template)
-                for state, template in zip(transconv_states, transconv_state_templates)
-            ]
         return (wav,) + tuple(new_kv) + tuple(conv_states) + tuple(transconv_states)
 
     def _upsample_streaming(
@@ -793,17 +825,3 @@ class Code2WavStreamingWrapper(nn.Module):
             hidden = res_unit.conv2(hidden)  # kernel 1, no state
             hidden = residual + hidden
         return hidden, conv_states, transconv_states
-
-
-def _pad_state_batch_to_template(state: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
-    return _pad_batch_to_size(state, int(template.shape[0]))
-
-
-def _pad_batch_to_size(state: torch.Tensor, target_batch: int) -> torch.Tensor:
-    if state.shape[0] == target_batch:
-        return state
-    pad = int(target_batch - state.shape[0])
-    if pad <= 0:
-        return state[:target_batch]
-    zeros = state.new_zeros((pad, *state.shape[1:]))
-    return torch.cat([state, zeros], dim=0)

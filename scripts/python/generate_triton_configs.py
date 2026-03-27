@@ -263,6 +263,18 @@ def _manifest_shape_to_triton_dims(shape: List[int]) -> str:
     return "[ " + ", ".join(dims) + " ]"
 
 
+def _c2w_state_shape_to_triton_dims(name: str, shape: List[int]) -> str:
+    """
+    Map manifest c2w state shapes to Triton dims.
+    Keep batch dynamic; for c2w past-kv, force past length dynamic even if manifest keeps
+    a concrete cold-start length (usually 1) for orchestrator initialization.
+    """
+    s = [int(x) for x in shape]
+    if ("past_kv" in name or "present_kv" in name) and len(s) >= 3:
+        s[2] = 0
+    return _manifest_shape_to_triton_dims(s)
+
+
 def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str) -> str:
     """
     Full I/O for TensorRT backend: empty input/output causes
@@ -320,7 +332,10 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         f"  {{ name: \"attention_bias\"  data_type: {io_ft}  dims: [ -1, 1, -1, -1 ] }}",
         "]",
         "input [",
-        '  { name: "cache_position"  data_type: TYPE_FP32  dims: [ -1, 1 ] }',
+        '  { name: "cache_position"  data_type: TYPE_FP32  dims: [ -1, -1 ] }',
+        "]",
+        "input [",
+        f"  {{ name: \"c2w_attention_bias\"  data_type: {io_ft}  dims: [ -1, 1, -1, -1 ] }}",
         "]",
     ]
     for i in range(nl):
@@ -335,7 +350,7 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         )
         parts.append("]")
     for name, shp in zip(in_names, init_shapes):
-        dims = _manifest_shape_to_triton_dims(shp)
+        dims = _c2w_state_shape_to_triton_dims(name, shp)
         parts.append("input [")
         parts.append(f'  {{ name: "{name}"  data_type: {io_ft}  dims: {dims} }}')
         parts.append("]")
@@ -370,7 +385,7 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         )
         parts.append("]")
     for out_name, shp in zip(out_names_c2w, init_shapes):
-        dims = _manifest_shape_to_triton_dims(shp)
+        dims = _c2w_state_shape_to_triton_dims(out_name, shp)
         parts.append("output [")
         parts.append(f'  {{ name: "{out_name}"  data_type: {io_ft}  dims: {dims} }}')
         parts.append("]")

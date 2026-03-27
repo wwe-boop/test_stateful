@@ -40,7 +40,6 @@ from code2wav_streaming import (
     NUM_TRANSCONV,
     CHUNK_T,
     num_code2wav_hidden_layers,
-    resolve_code2wav_state_batch_size,
 )
 
 logger = logging.getLogger("onnx_export")
@@ -63,7 +62,7 @@ def export_code2wav_decoder(
     wrapper = Code2WavStreamingWrapper(decoder).to(device).eval()
 
     B = 1
-    state_batch = resolve_code2wav_state_batch_size(B)
+    state_batch = B
     # Use past_kv_len > 0 for export so KV inputs survive ONNX trace & simplification.
     # Zero-length tensors would be constant-folded away, removing KV inputs entirely.
     EXPORT_PAST_LEN = CHUNK_T
@@ -116,20 +115,18 @@ def export_code2wav_decoder(
         "c2w_attention_bias": {0: "batch", 2: "chunk_t", 3: "c2w_key_total"},
         "wav": {0: "batch"},
     }
-    static_state_batch = state_batch != B
     for name, _ in state_shapes_cold:
         if name.startswith("past_kv_"):
             dynamic_axes[name] = {0: "batch", 2: "past_len"}
-        elif not static_state_batch and (name.startswith("conv_state_") or name.startswith("transconv_overlap_")):
+        elif name.startswith("conv_state_") or name.startswith("transconv_overlap_"):
             dynamic_axes[name] = {0: "batch"}
     for i in range(n_c2w):
         dynamic_axes[f"present_kv_{i}_k"] = {0: "batch", 2: "total_len"}
         dynamic_axes[f"present_kv_{i}_v"] = {0: "batch", 2: "total_len"}
-    if not static_state_batch:
-        for i in range(NUM_CONV):
-            dynamic_axes[f"new_conv_state_{i}"] = {0: "batch"}
-        for i in range(NUM_TRANSCONV):
-            dynamic_axes[f"new_transconv_overlap_{i}"] = {0: "batch"}
+    for i in range(NUM_CONV):
+        dynamic_axes[f"new_conv_state_{i}"] = {0: "batch"}
+    for i in range(NUM_TRANSCONV):
+        dynamic_axes[f"new_transconv_overlap_{i}"] = {0: "batch"}
 
     dummy_inputs = (dummy_codes, cache_position, c2w_attention_bias, *state_tensors)
     onnx_path = str(out_dir / "code2wav_decoder.onnx")

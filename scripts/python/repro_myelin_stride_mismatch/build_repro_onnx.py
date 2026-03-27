@@ -16,12 +16,30 @@ def run(cmd: list[str], env: dict[str, str], cwd: Path) -> None:
     subprocess.run(cmd, cwd=str(cwd), env=env, check=True)
 
 
-def export_code2wav(repo_root: Path, out_dir: Path, static_state_batch: int | None) -> Path:
+def _clean_export_env(static_state_batch: int | None) -> dict[str, str]:
     env = os.environ.copy()
-    if static_state_batch is None:
-        env.pop("C2W_STATIC_STATE_BATCH", None)
-    else:
+
+    # Remove known debug/experimental toggles that make reproduction non-deterministic.
+    remove_exact = {
+        "C2W_STATIC_STATE_BATCH",
+        "C2W_DEBUG_BYPASS_QUANTIZER",
+        "C2W_DEBUG_BYPASS_TRANSFORMER",
+        "TRT_MYELIN_DISABLE",
+        "ENGINE_DTYPE",
+        "MAX_BATCH_SIZE",
+        "BUILD_VERIFICATION_ENGINES",
+    }
+    for key in list(env.keys()):
+        if key in remove_exact or key.startswith("C2W_DEBUG_"):
+            env.pop(key, None)
+
+    if static_state_batch is not None:
         env["C2W_STATIC_STATE_BATCH"] = str(static_state_batch)
+    return env
+
+
+def export_code2wav(repo_root: Path, out_dir: Path, static_state_batch: int | None) -> Path:
+    env = _clean_export_env(static_state_batch)
 
     cmd = [
         "conda",
