@@ -92,7 +92,7 @@ def run_ort_decode_loop(
     B, S = 1, seq_len
     position_ids_prefill = np.arange(0, S, dtype=np.int64)
     position_ids_prefill = np.broadcast_to(
-        position_ids_prefill.reshape(1, 1, -1), (B, 3, S)
+        position_ids_prefill.reshape(1, 1, -1, 1), (B, 3, S, 1)
     )
     feed = {
         "input_embeds": inputs_embeds,
@@ -135,7 +135,7 @@ def run_ort_decode_loop(
     if full_codec[0, 0] == codec_eos_id:
         eos_step = 0
     for step in range(max_steps - 1):
-        pos_step = np.full((B, 3, 1), current_pos, dtype=np.int64)
+        pos_step = np.full((B, 3, 1, 1), current_pos, dtype=np.int64)
         dec_feed = {
             "input_embeds": current_codec_sum,
             "position_ids": pos_step,

@@ -1407,13 +1407,12 @@ class TritonPythonModel:
                 pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
                 pb_utils.Tensor.from_dlpack("position_ids", pos_ids),
                 pb_utils.Tensor.from_dlpack("attention_bias", attention_bias.contiguous()),
-                pb_utils.Tensor.from_dlpack("past_seq_lens", past_seq_lens.contiguous()),
                 pb_utils.Tensor.from_dlpack("cache_position", cache_pos),
             ]
         except Exception as e:
             logger.error(
                 f"fused: from_dlpack input_embeds/position_ids/attention_bias/"
-                f"past_seq_lens/cache_position: {e}"
+                f"cache_position: {e}"
             )
             raise
 

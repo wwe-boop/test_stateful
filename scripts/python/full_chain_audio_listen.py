@@ -290,7 +290,7 @@ def main() -> None:
 
     B, S, _ = prefill_embeds.shape
     position_ids_1d = torch.arange(S, device=device, dtype=torch.int64)
-    position_ids_prefill = position_ids_1d.reshape(1, 1, -1).expand(B, 3, S)
+    position_ids_prefill = position_ids_1d.reshape(1, 1, -1, 1).expand(B, 3, S, 1)
 
     codec_eos_id = int(model.config.talker_config.codec_eos_token_id)
 

@@ -7,9 +7,11 @@ Print three lines: MIN, OPT, MAX (comma-separated, no spaces).
 from __future__ import annotations
 
 import sys
+import os
 
 
 def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
+    static_state_batch = os.getenv("C2W_STATIC_STATE_BATCH", "").strip()
     specs = []
     for i in range(n_c2w_layers):
         specs.append((f"past_kv_{i}_k", "1x16x1x64", "1x16x4x64", f"{bmax}x16x72x64"))
@@ -34,8 +36,13 @@ def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
         ("conv_state_16", "1x96x6"),
     ]
     for name, s in conv:
-        rest = s[2:]  # drop "1x"
-        specs.append((name, s, s, f"{bmax}x{rest}"))
+        if static_state_batch:
+            rest = s[2:]  # drop "1x"
+            fixed = f"{static_state_batch}x{rest}"
+            specs.append((name, fixed, fixed, fixed))
+        else:
+            rest = s[2:]
+            specs.append((name, s, s, f"{bmax}x{rest}"))
     tc = [
         ("transconv_overlap_0", "1x768x8"),
         ("transconv_overlap_1", "1x384x5"),
@@ -43,8 +50,13 @@ def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
         ("transconv_overlap_3", "1x96x3"),
     ]
     for name, s in tc:
-        rest = s[2:]
-        specs.append((name, s, s, f"{bmax}x{rest}"))
+        if static_state_batch:
+            rest = s[2:]
+            fixed = f"{static_state_batch}x{rest}"
+            specs.append((name, fixed, fixed, fixed))
+        else:
+            rest = s[2:]
+            specs.append((name, s, s, f"{bmax}x{rest}"))
     return specs
 
 
@@ -66,25 +78,22 @@ def main():
 
     parts_min = [
         f"input_embeds:1x1x{H}",
-        f"position_ids:1x3x1",
+        f"position_ids:1x3x1x1",
         "attention_bias:1x1x1x1",
-        "past_seq_lens:1",
         "cache_position:1x1",
         "c2w_attention_bias:1x1x1x2",
     ]
     parts_opt = [
         f"input_embeds:{Bopt}x1x{H}",
-        f"position_ids:{Bopt}x3x1",
+        f"position_ids:{Bopt}x3x1x1",
         f"attention_bias:{Bopt}x1x1x{int(opt_spast) + 1}",
-        f"past_seq_lens:{Bopt}",
         f"cache_position:{Bopt}x1",
         f"c2w_attention_bias:{Bopt}x1x1x5",
     ]
     parts_max = [
         f"input_embeds:{Bmax}x{max_in}x{H}",
-        f"position_ids:{Bmax}x3x{max_in}",
+        f"position_ids:{Bmax}x3x{max_in}x1",
         f"attention_bias:{Bmax}x1x{max_in}x{int(max_seq) + int(max_in)}",
-        f"past_seq_lens:{Bmax}",
         f"cache_position:{Bmax}x1",
         f"c2w_attention_bias:{Bmax}x1x1x73",
     ]

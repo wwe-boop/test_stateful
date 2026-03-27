@@ -56,7 +56,7 @@ def _run_unified_engine(
     # Prefill: S=8, S_past=1 (dummy)
     S_prefill = 8
     context.set_input_shape("input_embeds", (B, S_prefill, hidden_size))
-    context.set_input_shape("position_ids", (3, B, S_prefill))
+    context.set_input_shape("position_ids", (B, 3, S_prefill, 1))
     for i in range(num_layers):
         context.set_input_shape(f"past_kv_{i}_k", (B, kv_heads, 1, head_dim))
         context.set_input_shape(f"past_kv_{i}_v", (B, kv_heads, 1, head_dim))
@@ -68,7 +68,7 @@ def _run_unified_engine(
     S_past = S_prefill
     # Decode step
     context.set_input_shape("input_embeds", (B, 1, hidden_size))
-    context.set_input_shape("position_ids", (3, B, 1))
+    context.set_input_shape("position_ids", (B, 3, 1, 1))
     for i in range(num_layers):
         context.set_input_shape(f"past_kv_{i}_k", (B, kv_heads, S_past, head_dim))
         context.set_input_shape(f"past_kv_{i}_v", (B, kv_heads, S_past, head_dim))

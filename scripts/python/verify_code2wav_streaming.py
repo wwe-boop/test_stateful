@@ -106,7 +106,7 @@ def decode_streaming(
             )
             chunk = torch.cat([chunk, pad], dim=-1)
         cache_position = torch.arange(
-            frame_index, frame_index + CHUNK_T, device=device, dtype=torch.long
+            frame_index, frame_index + CHUNK_T, device=device, dtype=torch.float32
         )
         with torch.no_grad():
             out = wrapper(chunk, cache_position, *states)

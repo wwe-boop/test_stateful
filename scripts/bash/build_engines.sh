@@ -153,12 +153,12 @@ build_talker_unified_trt() {
 
     # Single engine: min/opt/max for input_embeds, position_ids, and all past_kv_{i}_k/v
     # All tensors sharing the "batch" dim must have the same batch value per profile.
-    # ONNX export shape: input_embeds [B,S,H], position_ids [B,3,S] (dim1=3 is the three token-type streams)
+    # ONNX export shape: input_embeds [B,S,H], position_ids [B,3,S,1] (dim1=3 is the three token-type streams)
     # min: batch=1, S=1, S_past=0 (prefill, no history); opt: batch=1, S=1, S_past=128 (decode hot path); max: batch=B, S=512, S_past=4096
     local OPT_BATCH=1 OPT_S_PAST=128
-    local unif_min="input_embeds:1x1x${H},position_ids:1x3x1"
-    local unif_opt="input_embeds:${OPT_BATCH}x1x${H},position_ids:${OPT_BATCH}x3x1"
-    local unif_max="input_embeds:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}x${H},position_ids:${MAX_BATCH_SIZE}x3x${MAX_INPUT_LEN}"
+    local unif_min="input_embeds:1x1x${H},position_ids:1x3x1x1"
+    local unif_opt="input_embeds:${OPT_BATCH}x1x${H},position_ids:${OPT_BATCH}x3x1x1"
+    local unif_max="input_embeds:${MAX_BATCH_SIZE}x${MAX_INPUT_LEN}x${H},position_ids:${MAX_BATCH_SIZE}x3x${MAX_INPUT_LEN}x1"
     local i=0
     while [ "$i" -lt "$NUM_LAYERS" ]; do
         unif_min="$unif_min,past_kv_${i}_k:1x${KV_HEADS}x0x${HEAD_DIM},past_kv_${i}_v:1x${KV_HEADS}x0x${HEAD_DIM}"
@@ -345,12 +345,14 @@ build_peripheral_engines() {
     if [ -f "$TOKENIZER_DIR/code2wav_decoder.onnx" ]; then
         log_info "Building code2wav_decoder.engine (streaming, chunk_T=4) ..."
         C2W_BATCH="${MAX_BATCH_SIZE:-8}"
-        # Dynamic: codes (batch), cache_position fixed [4], past_kv_* (batch + past_len 0..72), conv/transconv states (batch)
-        C2W_MIN="codes:1x16x4,cache_position:1x4"
-        C2W_OPT="codes:1x16x4,cache_position:1x4"
-        C2W_MAX="codes:${C2W_BATCH}x16x4,cache_position:${C2W_BATCH}x4"
+        # Dynamic: codes (batch), cache_position [B,4], c2w_attention_bias [B,1,4,past+4],
+        # past_kv_* (batch + past_len 1..72), conv/transconv states (batch).
+        C2W_MIN="codes:1x16x4,cache_position:1x4,c2w_attention_bias:1x1x4x5"
+        C2W_OPT="codes:1x16x4,cache_position:1x4,c2w_attention_bias:1x1x4x8"
+        C2W_MAX="codes:${C2W_BATCH}x16x4,cache_position:${C2W_BATCH}x4,c2w_attention_bias:${C2W_BATCH}x1x4x76"
+        local c2w_static_state_batch="${C2W_STATIC_STATE_BATCH:-}"
         for i in 0 1 2 3 4 5 6 7; do
-            C2W_MIN="${C2W_MIN},past_kv_${i}_k:1x16x0x64,past_kv_${i}_v:1x16x0x64"
+            C2W_MIN="${C2W_MIN},past_kv_${i}_k:1x16x1x64,past_kv_${i}_v:1x16x1x64"
             C2W_OPT="${C2W_OPT},past_kv_${i}_k:1x16x4x64,past_kv_${i}_v:1x16x4x64"
             C2W_MAX="${C2W_MAX},past_kv_${i}_k:${C2W_BATCH}x16x72x64,past_kv_${i}_v:${C2W_BATCH}x16x72x64"
         done
@@ -361,16 +363,23 @@ build_peripheral_engines() {
             transconv_overlap_0:1x768x8 transconv_overlap_1:1x384x5 transconv_overlap_2:1x192x4 transconv_overlap_3:1x96x3; do
             n="${name%%:*}"
             s="${name#*:}"
-            C2W_MIN="${C2W_MIN},${n}:${s}"
-            C2W_OPT="${C2W_OPT},${n}:${s}"
-            C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
+            if [ -n "$c2w_static_state_batch" ]; then
+                fixed="${c2w_static_state_batch}x${s#1x}"
+                C2W_MIN="${C2W_MIN},${n}:${fixed}"
+                C2W_OPT="${C2W_OPT},${n}:${fixed}"
+                C2W_MAX="${C2W_MAX},${n}:${fixed}"
+            else
+                C2W_MIN="${C2W_MIN},${n}:${s}"
+                C2W_OPT="${C2W_OPT},${n}:${s}"
+                C2W_MAX="${C2W_MAX},${n}:${C2W_BATCH}x${s#1x}"
+            fi
         done
-        # Input order: codes (int64), cache_position (int64), then 37 float tensors.
+        # Input order: codes (int64), cache_position (fp32), c2w_attention_bias (float), then 37 state float tensors.
         # Output order: 38 float tensors (wav + present_kv + new_conv_state + new_transconv_overlap).
-        # Do NOT use generic bf16:chw for all inputs — codes/cache_position must stay int64.
+        # Do NOT use generic bf16:chw for all inputs — codes stays int64 and cache_position stays fp32.
         local io_fmt
         io_fmt=$(_trtexec_io_format)
-        local c2w_io_in="int64:chw,int64:chw"
+        local c2w_io_in="int64:chw,fp32:chw,${io_fmt}"
         local i=0
         while [ $i -lt 37 ]; do c2w_io_in="${c2w_io_in},${io_fmt}"; i=$((i+1)); done
         local c2w_io_out=""

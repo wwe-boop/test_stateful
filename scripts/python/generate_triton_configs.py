@@ -194,7 +194,7 @@ def render_talker_unified_trt(talker: Dict[str, Any], engine_dtype: str) -> str:
         f"  {{ name: \"input_embeds\"  data_type: {ft}  dims: [ -1, -1, {H} ] }}",
         "]",
         "input [",
-        '  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1 ] }',
+        '  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1, 1 ] }',
         "]",
     ]
     for i in range(nl):
@@ -314,16 +314,13 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         f"  {{ name: \"input_embeds\"  data_type: {io_ft}  dims: [ -1, -1, {H} ] }}",
         "]",
         "input [",
-        '  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1 ] }',
+        '  { name: "position_ids"  data_type: TYPE_INT64  dims: [ -1, 3, -1, 1 ] }',
         "]",
         "input [",
         f"  {{ name: \"attention_bias\"  data_type: {io_ft}  dims: [ -1, 1, -1, -1 ] }}",
         "]",
         "input [",
-        '  { name: "past_seq_lens"  data_type: TYPE_INT64  dims: [ -1 ] }',
-        "]",
-        "input [",
-        '  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 1 ] }',
+        '  { name: "cache_position"  data_type: TYPE_FP32  dims: [ -1, 1 ] }',
         "]",
     ]
     for i in range(nl):
@@ -402,7 +399,7 @@ input [
   { name: "codes"  data_type: TYPE_INT64  dims: [ -1, 16, 4 ] }
 ]
 input [
-  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 4 ] }
+  { name: "cache_position"  data_type: TYPE_FP32  dims: [ -1, 4 ] }
 ]
 
 instance_group [
@@ -419,7 +416,7 @@ instance_group [
         '  { name: "codes"  data_type: TYPE_INT64  dims: [ -1, 16, 4 ] }',
         "]",
         "input [",
-        '  { name: "cache_position"  data_type: TYPE_INT64  dims: [ -1, 4 ] }',
+        '  { name: "cache_position"  data_type: TYPE_FP32  dims: [ -1, 4 ] }',
         "]",
     ]
     for i in range(8):

@@ -77,12 +77,12 @@ def _create_initial_c2w(manifest: Dict[str, Any]) -> List[np.ndarray]:
 
 
 def _position_ids_prefill(S: int) -> np.ndarray:
-    pos = np.arange(S, dtype=np.int64).reshape(1, 1, -1)
-    return np.broadcast_to(pos, (1, 3, S))
+    pos = np.arange(S, dtype=np.int64).reshape(1, 1, -1, 1)
+    return np.broadcast_to(pos, (1, 3, S, 1))
 
 
 def _position_ids_decode(pos_scalar: int) -> np.ndarray:
-    return np.full((1, 3, 1), pos_scalar, dtype=np.int64)
+    return np.full((1, 3, 1, 1), pos_scalar, dtype=np.int64)
 
 
 def _run_fused_onnx_session(
@@ -145,8 +145,7 @@ def run_fused_onnx_loop(
             "input_embeds": inp_emb.detach().cpu().float().numpy(),
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
             "attention_bias": np.zeros((B, 1, seq, past_len + seq), dtype=np.float32),
-            "past_seq_lens": np.full((B,), past_len, dtype=np.int64),
-            "cache_position": cache_pos.detach().cpu().numpy().astype(np.int64),
+            "cache_position": cache_pos.detach().cpu().numpy().astype(np.float32),
         }
         if past_kv is None:
             pk = _build_past_kv_empty(B, num_layers, num_kv_heads, head_dim)
@@ -207,7 +206,7 @@ def run_fused_onnx_loop(
         next_embed = codec_sum + pad_embed
     next_embed = next_embed.to(dtype=torch.float32)
 
-    position_id = torch.full((B, 3, 1), S, device=device, dtype=torch.int64)
+    position_id = torch.full((B, 3, 1, 1), S, device=device, dtype=torch.int64)
     frame_idx = 1
 
     past_kv: List[torch.Tensor] = []
@@ -258,7 +257,7 @@ def run_fused_onnx_loop(
         text_idx += 1
         next_embed = (codec_sum + text_add).to(dtype=torch.float32)
         position_id = torch.full(
-            (B, 3, 1), S + step, device=device, dtype=torch.int64
+            (B, 3, 1, 1), S + step, device=device, dtype=torch.int64
         )
         frame_idx += 1
 
@@ -348,8 +347,7 @@ def run_fused_triton_loop(
             "input_embeds": inp_emb.detach().cpu().float().numpy(),
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
             "attention_bias": np.zeros((B, 1, seq, past_len + seq), dtype=np.float32),
-            "past_seq_lens": np.full((B,), past_len, dtype=np.int64),
-            "cache_position": cache_pos.detach().cpu().numpy().astype(np.int64),
+            "cache_position": cache_pos.detach().cpu().numpy().astype(np.float32),
         }
         if past_kv is None:
             feed.update(_build_past_kv_empty(B, num_layers, num_kv_heads, head_dim))
@@ -400,7 +398,7 @@ def run_fused_triton_loop(
         next_embed = codec_sum + pad_embed
     next_embed = next_embed.to(dtype=torch.float32)
 
-    position_id = torch.full((B, 3, 1), S, device=device, dtype=torch.int64)
+    position_id = torch.full((B, 3, 1, 1), S, device=device, dtype=torch.int64)
     frame_idx = 1
 
     past_kv: List[torch.Tensor] = []
@@ -440,7 +438,7 @@ def run_fused_triton_loop(
         text_idx += 1
         next_embed = (codec_sum + text_add).to(dtype=torch.float32)
         position_id = torch.full(
-            (B, 3, 1), S + step, device=device, dtype=torch.int64
+            (B, 3, 1, 1), S + step, device=device, dtype=torch.int64
         )
         frame_idx += 1
 
@@ -568,7 +566,7 @@ def main():
 
     B, S, _ = prefill_embeds.shape
     position_ids_1d = torch.arange(S, device=device, dtype=torch.int64)
-    position_ids_prefill = position_ids_1d.reshape(1, 1, -1).expand(B, 3, S)
+    position_ids_prefill = position_ids_1d.reshape(1, 1, -1, 1).expand(B, 3, S, 1)
 
     codec_eos_id = int(model.config.talker_config.codec_eos_token_id)
 

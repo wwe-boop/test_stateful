@@ -58,6 +58,165 @@ def build_codec_embedding_sum_from_model(model, device, dtype=torch.float32):
     return CodecEmbeddingSum.from_model(model, dtype=dtype).to(device).eval()
 
 
+def _rotate_half_export(x: torch.Tensor, half_dim: int) -> torch.Tensor:
+    x1 = x[..., :half_dim]
+    x2 = x[..., half_dim:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _repeat_kv_export(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    hidden_states = hidden_states.reshape(batch, num_kv_heads, 1, seq_len, head_dim)
+    hidden_states = hidden_states.expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+
+def _build_talker_rotary_embeddings_export(
+    rotary_emb: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    inv_freq = rotary_emb.inv_freq.to(device=hidden_states.device, dtype=torch.float32).reshape(1, 1, 1, -1)
+    if position_ids.dim() == 4:
+        pos = position_ids
+    else:
+        pos = position_ids.unsqueeze(-1)
+
+    device_type = (
+        hidden_states.device.type
+        if isinstance(hidden_states.device.type, str) and hidden_states.device.type != "mps"
+        else "cpu"
+    )
+    with torch.autocast(device_type=device_type, enabled=False):
+        freqs = pos * inv_freq
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos() * rotary_emb.attention_scaling
+        sin = emb.sin() * rotary_emb.attention_scaling
+    return cos, sin
+
+
+def _mix_talker_multimodal_rope_export(
+    rope_tensor: torch.Tensor,
+    mrope_section: List[int],
+    interleaved: bool,
+) -> torch.Tensor:
+    if interleaved:
+        half_dim = sum(mrope_section)
+        prefix = []
+        modality_num = len(mrope_section)
+        half = rope_tensor[..., :half_dim]
+        for idx in range(half_dim):
+            src_modality = 0
+            for modality in range(1, modality_num):
+                end_idx = mrope_section[modality] * modality_num
+                if idx >= modality and idx < end_idx and ((idx - modality) % modality_num == 0):
+                    src_modality = modality
+                    break
+            prefix.append(half[:, src_modality, :, idx : idx + 1])
+        mixed_half = torch.cat(prefix, dim=-1)
+        return torch.cat((mixed_half, mixed_half), dim=-1)
+
+    sections = list(mrope_section) * 2
+    offset = 0
+    chunks = []
+    for idx, section in enumerate(sections):
+        chunk = rope_tensor.narrow(-1, offset, section)
+        chunks.append(chunk[:, idx % len(mrope_section), :, :])
+        offset += section
+    return torch.cat(chunks, dim=-1)
+
+
+def _apply_talker_multimodal_rotary_pos_emb_export(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rope_scaling: dict,
+    half_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    mrope_section = list(rope_scaling["mrope_section"])
+    interleaved = bool(rope_scaling["interleaved"])
+    cos_mix = _mix_talker_multimodal_rope_export(cos, mrope_section, interleaved).unsqueeze(1)
+    sin_mix = _mix_talker_multimodal_rope_export(sin, mrope_section, interleaved).unsqueeze(1)
+    query_states = (query_states * cos_mix) + (_rotate_half_export(query_states, half_dim) * sin_mix)
+    key_states = (key_states * cos_mix) + (_rotate_half_export(key_states, half_dim) * sin_mix)
+    return query_states, key_states
+
+
+def _run_talker_attention_export(
+    attn_module: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    cache: UnifiedKVCache,
+    cache_position: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    del cache_position
+    batch = hidden_states.shape[0]
+    seq_len = hidden_states.shape[1]
+    num_heads = attn_module.q_proj.out_features // attn_module.head_dim
+    num_kv_heads = attn_module.k_proj.out_features // attn_module.head_dim
+
+    query_states = attn_module.q_proj(hidden_states).reshape(batch, seq_len, num_heads, attn_module.head_dim)
+    key_states = attn_module.k_proj(hidden_states).reshape(batch, seq_len, num_kv_heads, attn_module.head_dim)
+    value_states = attn_module.v_proj(hidden_states).reshape(batch, seq_len, num_kv_heads, attn_module.head_dim)
+
+    query_states = attn_module.q_norm(query_states).transpose(1, 2)
+    key_states = attn_module.k_norm(key_states).transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = _apply_talker_multimodal_rotary_pos_emb_export(
+        query_states,
+        key_states,
+        cos,
+        sin,
+        attn_module.rope_scaling,
+        attn_module.head_dim // 2,
+    )
+    key_states, value_states = cache.update(key_states, value_states, attn_module.layer_idx, cache_kwargs=None)
+
+    key_states = _repeat_kv_export(key_states, attn_module.num_key_value_groups)
+    value_states = _repeat_kv_export(value_states, attn_module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn_module.scaling
+    attn_weights = attn_weights + attention_mask
+    attn_weights = torch.softmax(attn_weights, dim=-1)
+
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, attn_module.o_proj.in_features)
+    return attn_module.o_proj(attn_output)
+
+
+def _run_talker_layer_export(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    cache: UnifiedKVCache,
+    cache_position: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+    hidden_states = _run_talker_attention_export(
+        layer.self_attn,
+        hidden_states,
+        attention_mask,
+        cache,
+        cache_position,
+        position_embeddings,
+    )
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = layer.post_attention_layernorm(hidden_states)
+    hidden_states = layer.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states
+
+
 class TalkerUnifiedONNX(nn.Module):
     """Talker backbone for both prefill and decode: single path with dynamic S and S_past."""
 
@@ -79,19 +238,20 @@ class TalkerUnifiedONNX(nn.Module):
         device = input_embeds.device
         dtype = input_embeds.dtype
         n = self.num_layers
-        if position_ids.dim() == 3 and position_ids.size(0) != 3:
-            position_ids = position_ids.permute(1, 0, 2)
         attention_bias = None
         past_seq_lens = None
         if len(inputs) == 2 * n:
             past_key_values = inputs
+        elif len(inputs) == 1 + 2 * n:
+            attention_bias = inputs[0]
+            past_key_values = inputs[1:]
         elif len(inputs) == 2 + 2 * n:
             attention_bias = inputs[0]
             past_seq_lens = inputs[1]
             past_key_values = inputs[2:]
         else:
             raise ValueError(
-                f"Expected {2 * n} or {2 + 2 * n} extra tensors, got {len(inputs)}"
+                f"Expected {2 * n}, {1 + 2 * n}, or {2 + 2 * n} extra tensors, got {len(inputs)}"
             )
         past_list = [
             (past_key_values[2 * i], past_key_values[2 * i + 1])
@@ -101,7 +261,11 @@ class TalkerUnifiedONNX(nn.Module):
         S_past = cache.get_seq_length()
         S_total = S_past + S
 
-        position_embeddings = self.rotary_emb(input_embeds, position_ids)
+        position_embeddings = _build_talker_rotary_embeddings_export(
+            self.rotary_emb,
+            input_embeds,
+            position_ids,
+        )
 
         row_idx = torch.arange(S, device=device, dtype=torch.long).unsqueeze(1) + S_past
         col_idx = torch.arange(S_total, device=device, dtype=torch.long).unsqueeze(0)
@@ -109,30 +273,26 @@ class TalkerUnifiedONNX(nn.Module):
         causal_mask = (col_idx > row_idx).to(dtype=dtype) * neg_val
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, S, S_total)
         if attention_bias is not None:
-            causal_mask = causal_mask + attention_bias.to(device=device, dtype=dtype)
+            causal_mask = causal_mask + attention_bias
         if past_seq_lens is not None:
             # Keep past_seq_lens as a live ONNX input for BLS bookkeeping while
             # letting attention_bias carry the actual padded-key masking semantics.
             causal_mask = causal_mask + (
-                past_seq_lens.to(device=device, dtype=dtype).sum() * 0.0
+                past_seq_lens.narrow(0, 0, 1).to(device=device, dtype=dtype).reshape(1, 1, 1, 1) * 0.0
             )
 
-        text_position_ids = position_ids[0] if position_ids.dim() == 3 else position_ids
         cache_position = torch.arange(S_past, S_past + S, device=device, dtype=torch.long)
 
         hidden = input_embeds
         for layer in self.layers:
-            layer_out = layer(
+            hidden = _run_talker_layer_export(
+                layer,
                 hidden,
-                attention_mask=causal_mask,
-                position_ids=text_position_ids,
-                past_key_values=cache,
-                output_attentions=False,
-                use_cache=True,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
+                causal_mask,
+                cache,
+                cache_position,
+                position_embeddings,
             )
-            hidden = layer_out[0]
 
         hidden = self.norm(hidden)
         logits = self.codec_head(hidden)

@@ -46,7 +46,7 @@ def _export_talker_backbone_onnx(
 
     B, one, S_past = 1, 1, 0
     dummy_embeds = torch.randn(B, one, hidden_size, device=device, dtype=ONNX_EXPORT_DTYPE)
-    position_ids = torch.full((B, 3, one), S_past, device=device, dtype=torch.long)
+    position_ids = torch.full((B, 3, one, 1), S_past, device=device, dtype=torch.long)
 
     past_list = []
     for _ in range(num_layers):

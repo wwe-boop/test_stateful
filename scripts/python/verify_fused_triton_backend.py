@@ -168,7 +168,11 @@ def main() -> int:
     trailing = plan.trailing
     pad_embed = weights.tts_pad_embed
     batch, seq, _ = inputs_embeds.shape
-    position_ids = torch.arange(seq, device=device, dtype=torch.int64).reshape(1, 1, -1).expand(batch, 3, seq)
+    position_ids = (
+        torch.arange(seq, device=device, dtype=torch.int64)
+        .reshape(1, 1, -1, 1)
+        .expand(batch, 3, seq, 1)
+    )
 
     num_layers = int(manifest["talker"]["num_layers"])
     num_kv_heads = int(manifest["talker"]["num_kv_heads"])
@@ -207,8 +211,7 @@ def main() -> int:
             "input_embeds": inp_emb.detach().cpu().float().numpy().astype(np.float32),
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
             "attention_bias": np.zeros((batch, 1, cur_seq, past_len + cur_seq), dtype=np.float32),
-            "past_seq_lens": np.full((batch,), past_len, dtype=np.int64),
-            "cache_position": cache_pos.detach().cpu().numpy().astype(np.int64),
+            "cache_position": cache_pos.detach().cpu().numpy().astype(np.float32),
         }
         if past_kv is None:
             for i in range(num_layers):
@@ -276,7 +279,7 @@ def main() -> int:
     next_trt = torch.from_numpy(trt_out["codec_sum"].copy()).to(device, dtype=torch.float32) + trailing[0]
 
     for step in range(1, args.steps + 1):
-        pos = torch.full((batch, 3, 1), seq + step - 1, device=device, dtype=torch.int64)
+        pos = torch.full((batch, 3, 1, 1), seq + step - 1, device=device, dtype=torch.int64)
         cache = torch.full((batch, 1), step, device=device, dtype=torch.int64)
         ort_out = run_ort(build_feed(next_ort, pos, cache, past_ort, c2w_ort))
         trt_out = run_triton(build_feed(next_trt, pos, cache, past_trt, c2w_trt))

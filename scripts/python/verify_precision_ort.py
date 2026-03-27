@@ -119,11 +119,11 @@ def main():
     output_names = [out.name for out in session.get_outputs()]
 
     # Prefill: match ref (no past): position_ids 0..S-1, past_kv length 0
-    # ONNX input position_ids shape: (B, 3, S) per export_04
+    # ONNX input position_ids shape: (B, 3, S, 1) for multimodal RoPE export.
     B, S = 1, seq_len
     position_ids_prefill = np.arange(0, S, dtype=np.int64)
     position_ids_prefill = np.broadcast_to(
-        position_ids_prefill.reshape(1, 1, -1), (B, 3, S)
+        position_ids_prefill.reshape(1, 1, -1, 1), (B, 3, S, 1)
     )
 
     feed = {
@@ -188,7 +188,7 @@ def main():
     current_pos = S
 
     for step in range(n_steps):
-        pos_step = np.full((B, 3, 1), current_pos, dtype=np.int64)
+        pos_step = np.full((B, 3, 1, 1), current_pos, dtype=np.int64)
         dec_feed = {
             "input_embeds": current_codec_sum,
             "position_ids": pos_step,

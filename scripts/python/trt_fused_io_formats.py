@@ -4,7 +4,8 @@
 Build trtexec --inputIOFormats / --outputIOFormats for talker_code2wav_fused.onnx.
 
 I/O order must match export_09_talker_code2wav_fused.py (input_names / output_names).
-Integer tensors use int64:chw; float tensors use {fp32|fp16|bf16}:chw from manifest
+Integer tensors use int64:chw; float tensors use {fp32|fp16|bf16}:chw from manifest.
+`cache_position` is forced to fp32 to avoid a TensorRT/Myelin cast fusion bug in fused code2wav.
 triton_io_float_dtype.
 """
 
@@ -74,9 +75,9 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
     fp_spec = f"{ft}:chw"
     i64 = "int64:chw"
 
-    # Inputs: input_embeds, position_ids, attention_bias, past_seq_lens, cache_position,
+    # Inputs: input_embeds, position_ids, attention_bias, cache_position(fp32),
     # c2w_attention_bias, past_kv_* x 2*nl, c2w_*
-    in_parts: List[str] = [fp_spec, i64, fp_spec, i64, i64, fp_spec]
+    in_parts: List[str] = [fp_spec, i64, fp_spec, "fp32:chw", fp_spec]
     in_parts.extend([fp_spec] * (2 * nl))
     in_parts.extend([fp_spec] * len(c2w_in))
 

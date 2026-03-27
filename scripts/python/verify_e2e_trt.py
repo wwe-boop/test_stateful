@@ -167,7 +167,7 @@ def main():
     engine, context = _load_trt_engine(str(engine_path), device)
     logger.info(f"Engine loaded in {time.time() - t0:.1f}s")
 
-    # Prefill: input_embeds [1, S, H], position_ids [3, 1, S], dummy past_kv [1, kv, 1, hd]
+    # Prefill: input_embeds [1, S, H], position_ids [1, 3, S, 1], dummy past_kv [1, kv, 1, hd]
     S = seq_len
     B = 1
     inp_emb = torch.from_numpy(inputs_embeds).to(device=device, dtype=torch.bfloat16)
@@ -180,7 +180,7 @@ def main():
             logger.error("Ref hidden size does not match engine H")
             sys.exit(1)
     position_ids_prefill = torch.arange(1, S + 1, device=device, dtype=torch.int64)
-    position_ids_prefill = position_ids_prefill.unsqueeze(0).unsqueeze(0).expand(3, B, S)
+    position_ids_prefill = position_ids_prefill.reshape(1, 1, S, 1).expand(B, 3, S, 1)
 
     feed = {
         "input_embeds": inp_emb,
@@ -239,7 +239,7 @@ def main():
 
     for step in range(n_steps):
         pos_step = torch.full(
-            (3, B, 1), current_pos, device=device, dtype=torch.int64
+            (B, 3, 1, 1), current_pos, device=device, dtype=torch.int64
         )
         dec_feed = {
             "input_embeds": current_codec_sum,
