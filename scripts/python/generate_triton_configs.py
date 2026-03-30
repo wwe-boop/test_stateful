@@ -357,7 +357,7 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
     parts.extend(
         [
             "output [",
-            f'  {{ name: "wav"  data_type: {io_ft}  dims: [ -1, 1, {_FUSED_WAV_SAMPLES_PER_FRAME} ] }}',
+            f'  {{ name: "wav"  data_type: {io_ft}  dims: [ -1, {_FUSED_WAV_SAMPLES_PER_FRAME} ] }}',
             "]",
             "output [",
             f'  {{ name: "codec_sum"  data_type: {io_ft}  dims: [ -1, 1, {H} ] }}',
@@ -454,7 +454,7 @@ instance_group [
         parts.append(f'  {{ name: "{name}"  data_type: {ft}  dims: [ {_dims_pbtxt((a, b, c))} ] }}')
         parts.append("]")
     parts.append("output [")
-    parts.append(f'  {{ name: "wav"  data_type: {ft}  dims: [ -1, 1, 7680 ] }}')
+    parts.append(f'  {{ name: "wav"  data_type: {ft}  dims: [ -1, 7680 ] }}')
     parts.append("]")
     for i in range(8):
         parts.append("output [")

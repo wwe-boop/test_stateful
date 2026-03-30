@@ -778,7 +778,10 @@ class Code2WavStreamingWrapper(nn.Module):
         wav, conv_states[16] = streaming_causal_conv(
             self.decoder.decoder[6], hidden, conv_states[16]
         )
-        # wav = wav.clamp(min=-1, max=1)
+        # fix myelin issue by clamp
+        wav = wav.reshape(B, -1)
+        # now we can clamp without myelin issue
+        wav = wav.clamp(min=-1, max=1)
 
         # Pack new states
         new_kv = []
