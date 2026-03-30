@@ -8,25 +8,38 @@
 
 ---
 
-## 0. 当前实现状态（2026-03-25）
+## 0. 当前实现状态（2026-03-30）
 
 | 项目 | 当前状态 |
 |------|---------|
-| `talker_code2wav_fused` 导出 | **已可用**。当前导图已包含 `attention_bias` / `past_seq_lens` / `cache_position`，为 padding+mask batching 预留接口 |
-| TensorRT 编译 | **已恢复可编译**。当前 fused 图可编译 `FP16/BF16/FP32` engine，但“能编过”不等于“数值可上线” |
+| `talker_code2wav_fused` 导出 | **已可用**。导图包含 `attention_bias` / `past_seq_lens` / `cache_position`，支持 padding+mask batching |
+| TensorRT 编译 | **已恢复可编译**。fused 图可编译 `FP16/BF16/FP32` engine |
 | 纯流式推理 | **已可用**。融合图负责 prefill + decode，decode 上限按 `engine_max_decode_len` 控制 |
-| 长文本 rollover | **已接回到 orchestrator**。接近 decode 上限时优先按句读/空白切段，段间重启 session |
-| Prefix KV cache | **已接回到 orchestrator**。当前走“不改引擎图”的安全方案：先缓存稳定前缀的 Talker KV，再以剩余 request-specific prefill 继续推理 |
-| Prefix KV cache 适用范围 | `custom_voice`、`voice_design`、`voice_clone_xvec` 已纳入；`voice_clone_icl` 暂未做跨请求复用，因为 ref text / ref codec 与当前文本在 prefill 中仍耦合 |
-| 多路 padding+mask 拼 batch | **接口已接入，生产未闭环**。图上已支持 `attention_bias/past_seq_lens`，orchestrator 也已具备 padding/mask 工具，但 continuous batching 仍未完成全链验证 |
-| Scheduler 接入 | **基础设施已落代码**。当前可构造 heterogeneous past 长度批次所需的 padding 与 mask；是否作为生产默认路径仍取决于 fused TRT 数值稳定性 |
-| TRT 数值验证 | **当前最大阻塞点**。direct backend 验证表明：`FP16` step0 即严重发散，`BF16` 显著改善但后续 decode 仍会分叉，`FP32` step0 几乎完全对齐但后续 CP group 仍有偏差 |
-| 当前主嫌疑 | **已收缩到 fused TRT 的 `code predictor unroll / argmax / codec_sum` 路径**；BLS 不是当前随机噪声音频的主因 |
+| 长文本 rollover | **已可用**。预切分 + 运行时动态切分（见下）；KV 触顶时强制段间 rollover，`RatioTracker` 溢出紧急修正 |
+| Prefix KV cache | **已实现**（`enable_prefix_kv_cache` 默认开启；`PREFIX_KV_CACHE_MAX_ENTRIES` 默认 16）。段间命中 prefix 时跳过整段 prefill，仅 request 段走 fused |
+| Continuous Batching | **已实现**。Orchestrator 采用 vLLM backend 三线程模式：execute 投递 / engine decode loop / response sender；多路 padding+mask 拼 batch decode |
+| Session 管理 + 流控 | **Phase 2**。`FlowState`: IDLE / ACTIVE / DONE；**已移除 PAUSED**。流式 init 且无首包文本时 `slot_id=-1`（不占 batch slot），首段文本到达时再分配 slot；pad 阶段不再 PAUSE，直至 EOS 或 `request_timeout` |
+| 流式文本输入 | **已实现**。Gateway init/append_text/text_complete；引擎侧 IDLE 可多次 `append`，`text_segments` 动态 extend；ACTIVE 时新文本追加为未来段 |
+| RatioTracker | **已实现**。`audio_steps/text_tokens` EMA（`RATIO_INITIAL` 等环境变量 / config）；`capabilities` 返回 `ratio_ema`；段末 EOS 更新，KV 溢出 `update_overflow` |
+| 贪婪 BPE 缓冲 | **模块已提供** `greedy_tokenizer.py`（稳定前缀切分）；当前主路径仍以拼接缓冲文本后 `split_text_for_token_budget` 规划为主，便于与 PrefillBuilder 对齐 |
+| 段间音色 | **预留** `last_segment_codec_tail`（logits 尾）；Qwen3-TTS 已有 speaker 嵌入锚定，后续可按听测注入 acoustic context |
+| Legacy 路径 | **已删除**。仅保留 fused pipeline (talker_code2wav_fused) |
+| TRT 数值验证 | **仍为阻塞点**。`BF16` 显著优于 `FP16`，主要剩余偏差在 `code predictor unroll / argmax / codec_sum` 路径 |
+
+### 0.1 文本切分与三层防御（备忘）
+
+- **阶段1 / 阶段2**：每步 `next_embed = codec_sum + text_embed`；文本耗尽后使用 `tts_pad_embed` 直至模型输出 codec EOS（阶段2 仍为有效音频合成，不可随意截断）。
+- **Audio/text 比**：`ratio ≈ decode 步数 / 本段 trailing text token 数`，由 `RatioTracker` 在线 EMA；预切分 budget ≈ `(engine_max_decode_len - rollover_margin) / ratio_ema`。
+- **第1层 — 预切分**：`_plan_text_segments` + `text_segmenter.split_text_for_token_budget`，标点优先。
+- **第2层 — 动态切分**：decode 中若剩余 KV 不足以覆盖估算的剩余 decode 步数，则在标点处切分 `current_segment_text`，插入下一段并 `reset_decode_state` + `_activate_next_segment`（重 prefill 当前段缩短后的文本）。
+- **第3层 — KV 兜底**：`past_len > engine_max_decode_len` 时强制段间 rollover，`RatioTracker.update_overflow`。
+- **学术参考**：流式长文本与 bounded context 可参考 arXiv:2603.06444（prosodic boundary + sliding window）；在线调度与 KV 约束可参考 arXiv:2504.11320（Nested WAIT）。
 
 **当前结论**：
-- 当前项目已经从“导图/编译恢复”进入“fused TRT 语义与精度收敛”阶段。
-- Prefix cache、长文本分段、scheduler 接口可以继续保留，但不能替代 engine/backend 层的数值闭环。
-- 下一阶段的核心不是继续堆 BLS 复杂度，而是把 `code_predictor_unrolled` 子图的 TRT 偏差单独钉死。
+- Orchestrator BLS 已完成 continuous batching 与 Phase 2 流控（无 PAUSE、ratio 预算、动态切分、prefix KV 默认启用）。
+- 下一阶段核心仍是 fused TRT 数值收敛（code_predictor_unrolled 子图）。
+
+> **说明**：下文第 9–11 节等仍可能含 `WAITING` / `PAUSED` 等历史流控描述，实现以本节 **§0 / §0.1** 为准。
 
 ---
 
