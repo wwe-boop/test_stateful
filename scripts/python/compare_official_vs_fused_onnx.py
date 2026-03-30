@@ -57,6 +57,13 @@ logger = logging.getLogger("compare_official_fused_onnx")
 OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 FUSED_CHUNK_T = 1
 
+# ORT CPU runs the FP32 ONNX graph; BF16-trained models accumulate numerical drift
+# in KV cache across decode steps, causing silence after ~8 steps.  Consecutive
+# near-silent frames trigger an early stop so the output is partial rather than
+# a long silent tail.
+SILENCE_THRESHOLD = 0.002
+SILENCE_PATIENCE = 3
+
 
 def _non_streaming_for_variant(variant: str) -> bool:
     return "design" in variant.lower()
@@ -218,6 +225,7 @@ def run_fused_onnx_loop(
 
     position_id = torch.full((B, 3, 1, 1), S, device=device, dtype=torch.int64)
     frame_idx = 1
+    silent_streak = 0
 
     past_kv: List[torch.Tensor] = []
     for i in range(num_layers):
@@ -239,8 +247,6 @@ def run_fused_onnx_loop(
         feed = _to_feed(next_embed, position_id, cache_pos, past_kv, new_c2w)
         out = _run_fused_onnx_session(sess, input_names, output_names, feed)
 
-        # Check EOS before appending wav: the EOS step still runs Code2Wav on codec ids that
-        # may be EOS/special (often clamped into vocoder range), producing a click/buzz tail.
         logits = torch.from_numpy(_get("logits")).to(device)
         logit_eos = (
             int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
@@ -256,6 +262,22 @@ def run_fused_onnx_loop(
             break
 
         wav = _get("wav")
+        wav_max = float(np.abs(wav).max())
+        if wav_max < SILENCE_THRESHOLD:
+            silent_streak += 1
+            if silent_streak >= SILENCE_PATIENCE:
+                logger.warning(
+                    "fused ORT: %d consecutive silent frames (wav_max=%.6f) at step %d — "
+                    "FP32 precision drift likely; stopping early. "
+                    "Use Triton TRT (BF16) for correct audio.",
+                    silent_streak,
+                    wav_max,
+                    step,
+                )
+                break
+        else:
+            silent_streak = 0
+
         wav_chunks.append(wav.reshape(-1))
         codec_sum = torch.from_numpy(_get("codec_sum")).to(device)
 

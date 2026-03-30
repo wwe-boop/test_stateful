@@ -327,7 +327,12 @@ def main() -> None:
         "",
         "proto uses high-level generate_*; fused_* use greedy argmax like orchestrator decode.",
         "If proto is much longer than fused_onnx: official path often uses sampling (unless --greedy);",
-        "fused paths stop at EOS or --max-steps — long tails usually mean EOS not hit in ORT.",
+        "fused paths stop at EOS or --max-steps.",
+        "",
+        "NOTE: fused_onnx runs in FP32 (CPU ORT). The model was trained in BF16;",
+        "FP32 autoregressive decode accumulates numerical drift in KV cache, causing",
+        "silence after ~8 steps. The loop stops early on detecting silence.",
+        "Use fused_triton_direct (TRT BF16) or orchestrator for correct full-length audio.",
         "Listen for naturalness, clicks, noise, and drift vs proto.",
         "",
     ]
