@@ -627,6 +627,14 @@ class Code2WavStreamingWrapper(nn.Module):
         setattr(cfg, "_attn_implementation", "eager")
 
     def _setup_direct_quantizer_decode(self) -> None:
+        def _upsert_buffer(name: str, value: torch.Tensor) -> None:
+            if name in self._buffers:
+                self._buffers[name] = value
+                return
+            if hasattr(self, name):
+                delattr(self, name)
+            self.register_buffer(name, value, persistent=False)
+
         quantizer = getattr(self.decoder, "quantizer", None)
         if quantizer is None:
             self._use_direct_quantizer_decode = False
@@ -645,14 +653,14 @@ class Code2WavStreamingWrapper(nn.Module):
             self._use_direct_quantizer_decode = False
             return
 
-        self.register_buffer("_rvq_first_table", first_table, persistent=False)
+        _upsert_buffer("_rvq_first_table", first_table)
         if rest_table is not None:
-            self.register_buffer("_rvq_rest_table", rest_table, persistent=False)
+            _upsert_buffer("_rvq_rest_table", rest_table)
         self._rvq_first_proj = first_proj
         self._rvq_rest_proj = rest_proj
-        self.register_buffer("_idx_sem", torch.arange(0, n_sem, dtype=torch.long), persistent=False)
+        _upsert_buffer("_idx_sem", torch.arange(0, n_sem, dtype=torch.long))
         if n_aco > 0:
-            self.register_buffer("_idx_aco", torch.arange(n_sem, n_sem + n_aco, dtype=torch.long), persistent=False)
+            _upsert_buffer("_idx_aco", torch.arange(n_sem, n_sem + n_aco, dtype=torch.long))
 
     @staticmethod
     def _decode_rvq_from_table(

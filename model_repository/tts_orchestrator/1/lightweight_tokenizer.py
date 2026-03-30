@@ -1,14 +1,16 @@
 """
 Lightweight text tokenizer for TTS Orchestrator.
 
-Uses only the `tokenizers` library (Rust backend); no torch/transformers.
+Uses the `tokenizers` library (Rust backend, ~5 MB) with special-token
+registration from tokenizer_config.json. No torch/transformers required.
+
 Interface: callable(text, return_tensors="pt") -> {"input_ids": np.ndarray int64}.
 """
 
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
@@ -25,18 +27,64 @@ def _parse_merges(merges_path: Path) -> list:
                 continue
             parts = line.split()
             if len(parts) >= 2:
-                # merges.txt often uses space as separator; first token might contain \u0120 (space)
                 merges.append((parts[0], parts[1]))
     return merges
+
+
+def _load_added_tokens(root: Path) -> List[Any]:
+    """
+    Parse added_tokens_decoder from tokenizer_config.json and return a list
+    of tokenizers.AddedToken objects for special-token registration.
+    """
+    try:
+        from tokenizers import AddedToken
+    except ImportError:
+        return []
+
+    cfg_path = root / "tokenizer_config.json"
+    if not cfg_path.is_file():
+        return []
+
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return []
+
+    decoder = cfg.get("added_tokens_decoder", {})
+    if not decoder:
+        return []
+
+    tokens = []
+    for _tid_str, info in sorted(decoder.items(), key=lambda x: int(x[0])):
+        content = info.get("content", "")
+        if not content:
+            continue
+        tokens.append(
+            AddedToken(
+                content,
+                special=info.get("special", False),
+                normalized=info.get("normalized", False),
+                lstrip=info.get("lstrip", False),
+                rstrip=info.get("rstrip", False),
+                single_word=info.get("single_word", False),
+            )
+        )
+    return tokens
 
 
 def load_lightweight_tokenizer(tokenizer_dir: str) -> Optional[Any]:
     """
     Load a BPE tokenizer from tokenizer_dir using only the tokenizers library.
 
-    Tries: 1) tokenizer.json (single file); 2) vocab.json + merges.txt.
-    Returns an object with __call__(text, return_tensors="pt") -> {"input_ids": np.ndarray},
-    or None if loading fails.
+    Strategy:
+      1) tokenizer.json (single file, already includes special tokens)
+      2) vocab.json + merges.txt, then register special tokens from
+         tokenizer_config.json so that <|im_start|>, <|im_end|> etc. are
+         recognized as single tokens instead of being split into sub-pieces.
+
+    Returns an object with __call__(text, return_tensors="pt") ->
+    {"input_ids": np.ndarray [1, S] int64}, or None if loading fails.
     """
     root = Path(tokenizer_dir)
     if not root.is_dir():
@@ -45,11 +93,12 @@ def load_lightweight_tokenizer(tokenizer_dir: str) -> Optional[Any]:
     try:
         from tokenizers import Tokenizer
         from tokenizers.models import BPE
+        from tokenizers.pre_tokenizers import ByteLevel
     except ImportError:
         logger.debug("tokenizers not available, skip lightweight load")
         return None
 
-    # 1) Prefer single-file tokenizer.json (same format tokenizers uses natively)
+    # 1) Prefer single-file tokenizer.json (already embeds special tokens)
     tokenizer_json = root / "tokenizer.json"
     if tokenizer_json.is_file():
         try:
@@ -58,7 +107,7 @@ def load_lightweight_tokenizer(tokenizer_dir: str) -> Optional[Any]:
         except Exception as e:
             logger.debug("tokenizer.json load failed: %s", e)
 
-    # 2) Build from vocab.json + merges.txt
+    # 2) Build from vocab.json + merges.txt + tokenizer_config.json
     vocab_path = root / "vocab.json"
     merges_path = root / "merges.txt"
     if not vocab_path.is_file() or not merges_path.is_file():
@@ -71,7 +120,16 @@ def load_lightweight_tokenizer(tokenizer_dir: str) -> Optional[Any]:
         merges = _parse_merges(merges_path)
         bpe = BPE(vocab=vocab, merges=merges, unk_token=None)
         tok = Tokenizer(bpe)
-        # GPT2/Qwen often use byte-level; default BPE tokenizer is still correct for encode
+        tok.pre_tokenizer = ByteLevel(add_prefix_space=False)
+
+        added_tokens = _load_added_tokens(root)
+        if added_tokens:
+            tok.add_special_tokens(added_tokens)
+            logger.info(
+                "Registered %d special tokens from tokenizer_config.json",
+                len(added_tokens),
+            )
+
         return _WrapTokenizer(tok)
     except Exception as e:
         logger.debug("BPE from vocab+merges failed: %s", e)

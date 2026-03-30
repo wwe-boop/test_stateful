@@ -104,12 +104,25 @@ def _split_c2w(
     sliding_window: int,
 ) -> List[torch.Tensor]:
     states: List[torch.Tensor] = []
+    kv_max = max(1, sliding_window - 1)
     for name in c2w_out_names:
         t = torch.from_numpy(out[name].copy()).to(device, dtype=torch.float32)
-        if t.dim() >= 4 and t.shape[2] > sliding_window:
-            t = t[:, :, -sliding_window:, :].contiguous()
+        if t.dim() >= 4 and ("past_kv" in name or "present_kv" in name) and t.shape[2] > kv_max:
+            t = t[:, :, -kv_max:, :].contiguous()
         states.append(t)
     return states
+
+
+def _build_c2w_attention_bias(
+    batch: int,
+    chunk_t: int,
+    c2w_past_len: int,
+    sliding_window: int,
+) -> np.ndarray:
+    key_total = min(c2w_past_len + chunk_t, sliding_window)
+    if key_total <= 0:
+        key_total = 1
+    return np.zeros((batch, 1, chunk_t, key_total), dtype=np.float32)
 
 
 def main() -> int:
@@ -212,6 +225,12 @@ def main() -> int:
             "position_ids": pos_ids.detach().cpu().numpy().astype(np.int64),
             "attention_bias": np.zeros((batch, 1, cur_seq, past_len + cur_seq), dtype=np.float32),
             "cache_position": cache_pos.detach().cpu().numpy().astype(np.float32),
+            "c2w_attention_bias": _build_c2w_attention_bias(
+                batch=batch,
+                chunk_t=int(cache_pos.shape[1]),
+                c2w_past_len=int(c2w_states[0].shape[2]) if c2w_states else 0,
+                sliding_window=args.code2wav_sliding_window,
+            ),
         }
         if past_kv is None:
             for i in range(num_layers):

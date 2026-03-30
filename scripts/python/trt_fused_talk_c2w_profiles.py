@@ -12,8 +12,8 @@ import sys
 def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
     specs = []
     for i in range(n_c2w_layers):
-        specs.append((f"past_kv_{i}_k", "1x16x1x64", "1x16x4x64", f"{bmax}x16x72x64"))
-        specs.append((f"past_kv_{i}_v", "1x16x1x64", "1x16x4x64", f"{bmax}x16x72x64"))
+        specs.append((f"past_kv_{i}_k", "1x16x1x64", "1x16x4x64", f"{bmax}x16x71x64"))
+        specs.append((f"past_kv_{i}_v", "1x16x1x64", "1x16x4x64", f"{bmax}x16x71x64"))
     conv = [
         ("conv_state_0", "1x512x2"),
         ("conv_state_1", "1x1024x6"),
@@ -83,7 +83,7 @@ def main():
         f"position_ids:{Bmax}x3x{max_in}x1",
         f"attention_bias:{Bmax}x1x{max_in}x{int(max_seq) + int(max_in)}",
         f"cache_position:{Bmax}x1",
-        f"c2w_attention_bias:{Bmax}x1x1x73",
+        f"c2w_attention_bias:{Bmax}x1x1x72",
     ]
 
     for i in range(nl):

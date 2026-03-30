@@ -123,6 +123,19 @@ class _FusedBatchSession:
     done: bool = False
 
 class TritonPythonModel:
+    def _is_codec_eos(
+        self,
+        logits: torch.Tensor,
+        full_codec: torch.Tensor,
+    ) -> bool:
+        codec_eos_id = int(self.weights.codec_eos_id)
+        logit_eos = int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
+        fc0 = int(full_codec[0, 0].item()) if full_codec.numel() > 0 else -1
+        return logit_eos or (fc0 == codec_eos_id)
+
+    def _is_logit_eos(self, logits: torch.Tensor) -> bool:
+        codec_eos_id = int(self.weights.codec_eos_id)
+        return int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
 
     def initialize(self, args):
         self.model_config = json.loads(args["model_config"])
@@ -248,6 +261,9 @@ class TritonPythonModel:
         if self._use_fused_decode:
             self._talker_backend, self._talker_dtype = _dtype_from_pbtxt(fused_cfg)
             self._code2wav_dtype = self._talker_dtype
+            # Fused TRT path: disable prefix-KV cache until cache contract is fully
+            # aligned with fused prefill semantics (avoids early-EOS regressions).
+            self.enable_prefix_kv_cache = False
             # Manifest I/O dtype (export_09 / generate_triton_configs) must drive Python tensors:
             # config.pbtxt scan can miss BF16 if the on-disk file differs from assemble output, and
             # c2w_* TRT bindings require the same dtype as talker floats (see triton_io_float_dtype).
@@ -559,15 +575,14 @@ class TritonPythonModel:
                 )
             )
             self._send_fused_wav(session.response_sender, wav)
-            codec_eos_id = self.weights.codec_eos_id
-            if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+            if self._is_logit_eos(logits):
                 logger.info("EOS at segment %d step 0", session.segment_idx)
                 session.segment_idx += 1
                 continue
 
             text_add = plan.trailing[0] if plan.trailing else self._tts_pad_embed_torch
             session.trailing_text = plan.trailing
-            session.next_embed = (codec_sum + text_add).to(self._talker_dtype)
+            session.next_embed = (codec_sum + text_add).to(torch.float32)
             session.text_idx = 1
             session.kv_tensors = kv_tensors
             session.c2w_states = c2w_states
@@ -688,10 +703,9 @@ class TritonPythonModel:
             row_states = [t[row_idx : row_idx + 1].clone().contiguous() for t in c2w_states]
             split_c2w.append(row_states)
 
-        codec_eos_id = self.weights.codec_eos_id
         for row_idx, session in enumerate(sessions):
             row_logits = logits[row_idx : row_idx + 1]
-            eos = int(row_logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
+            eos = self._is_logit_eos(row_logits)
             if not eos:
                 self._send_fused_wav(session.response_sender, wav[row_idx : row_idx + 1])
                 text_add = (
@@ -702,7 +716,7 @@ class TritonPythonModel:
                 session.text_idx += 1
                 session.next_embed = (
                     codec_sum[row_idx : row_idx + 1] + text_add
-                ).to(self._talker_dtype)
+                ).to(torch.float32)
                 session.kv_tensors = split_kv[row_idx]
                 session.c2w_states = split_c2w[row_idx]
                 session.past_len = new_past_lens[row_idx]
@@ -1113,7 +1127,6 @@ class TritonPythonModel:
         initial_past_kv_tensors=None,
     ):
         """Prefill + decode via talker_code2wav_fused (chunk_T=1 wav per step)."""
-        codec_eos_id = self.weights.codec_eos_id
         c2w_states = self._create_code2wav_initial_states()
         cache_pos = torch.zeros(B, FUSED_CHUNK_T, device=self.device, dtype=torch.int64)
 
@@ -1127,18 +1140,17 @@ class TritonPythonModel:
 
         self._send_fused_wav(response_sender, wav)
 
-        if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+        if self._is_logit_eos(logits):
             logger.info("EOS at step 0")
             if send_terminal_marker:
                 self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
             return
 
         text_idx = 0
-        dt = self._talker_dtype
         next_embed = (
-            (codec_sum + trailing_text[text_idx]).to(dt)
+            (codec_sum + trailing_text[text_idx]).to(torch.float32)
             if trailing_text
-            else (codec_sum + self._tts_pad_embed_torch).to(dt)
+            else (codec_sum + self._tts_pad_embed_torch).to(torch.float32)
         )
         text_idx += 1
         position_id = torch.full((B, 3, 1), S, device=self.device, dtype=torch.int64)
@@ -1168,7 +1180,7 @@ class TritonPythonModel:
             logger.debug(f"fused step {step}: {(time.perf_counter() - t0) * 1000:.1f}ms")
             # Do not stream the EOS frame's wav: codec logits target EOS while Code2Wav still
             # runs on clamped/special indices, often audible as a click or buzz at the tail.
-            if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+            if self._is_logit_eos(logits):
                 logger.info(f"EOS at step {step}")
                 break
 
@@ -1180,7 +1192,7 @@ class TritonPythonModel:
                 else self._tts_pad_embed_torch
             )
             text_idx += 1
-            next_embed = (codec_sum + text_add).to(self._talker_dtype)
+            next_embed = (codec_sum + text_add).to(torch.float32)
             position_id = torch.full((B, 3, 1), S + step, device=self.device, dtype=torch.int64)
             frame_idx += 1
 
@@ -1213,13 +1225,12 @@ class TritonPythonModel:
             inputs_embeds, position_ids, initial_past_kv_tensors
         )
         logger.debug(f"talker prefill: {(time.perf_counter() - t0) * 1000:.1f}ms")
-        codec_eos_id = self.weights.codec_eos_id
         codec_frame_buffer = []
         code2wav_states = self._create_code2wav_initial_states()
         frame_index = 0
         text_idx = 0
 
-        if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+        if self._is_codec_eos(logits, full_codec):
             logger.info("EOS at step 0")
             if send_terminal_marker:
                 self._send_audio_chunk(response_sender, np.zeros(1, dtype=np.float32), is_final=True)
@@ -1254,7 +1265,7 @@ class TritonPythonModel:
             logger.debug(f"talker step {step}: {(time.perf_counter() - t0) * 1000:.1f}ms")
             codec_frame_buffer.append(self._full_codec_to_frame(full_codec))
 
-            if int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id:
+            if self._is_codec_eos(logits, full_codec):
                 logger.info(f"EOS at step {step}")
                 break
 
@@ -1285,6 +1296,8 @@ class TritonPythonModel:
         # TRT: BF16; ONNX: FP32 (set in initialize from talker_unified config.pbtxt)
         inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
+        if pos_ids.dim() == 3:
+            pos_ids = pos_ids.unsqueeze(-1).contiguous()
         expected_batch = int(input_embeds.shape[0])
         try:
             inputs = [
@@ -1344,10 +1357,10 @@ class TritonPythonModel:
             # Force full copy + dtype: TRT returns BF16; fallback/triton path may yield FP32.
             # cpu().numpy() route guarantees we get correct dtype on device.
             k = torch.from_numpy(k.cpu().float().numpy()).to(
-                device=self.device, dtype=self._talker_dtype
+                device=self.device, dtype=torch.float32
             ).contiguous()
             v = torch.from_numpy(v.cpu().float().numpy()).to(
-                device=self.device, dtype=self._talker_dtype
+                device=self.device, dtype=torch.float32
             ).contiguous()
             kv_tensors.append(k)
             kv_tensors.append(v)
@@ -1367,9 +1380,12 @@ class TritonPythonModel:
         """BLS talker_code2wav_fused: prefill or one decode step with chunk_T=1 wav."""
         inp_emb = input_embeds.contiguous().to(self._talker_dtype)
         pos_ids = position_ids.contiguous()
-        cache_pos = cache_position.contiguous()
+        if pos_ids.dim() == 3:
+            pos_ids = pos_ids.unsqueeze(-1).contiguous()
+        cache_pos = cache_position.to(device=self.device, dtype=torch.float32).contiguous()
         batch = int(input_embeds.shape[0])
         seq = int(input_embeds.shape[1])
+        chunk_t = int(cache_pos.shape[1])
         use_dummy_past_kv = past_kv_tensors is None
 
         if use_dummy_past_kv:
@@ -1414,6 +1430,21 @@ class TritonPythonModel:
                 f"fused: from_dlpack input_embeds/position_ids/attention_bias/"
                 f"cache_position: {e}"
             )
+            raise
+
+        c2w_past_len = int(c2w_states[0].shape[2]) if c2w_states else 0
+        c2w_key_total = min(c2w_past_len + chunk_t, self.code2wav_sliding_window)
+        if c2w_key_total <= 0:
+            c2w_key_total = 1
+        c2w_attention_bias = torch.zeros(
+            (batch, 1, chunk_t, c2w_key_total),
+            device=self.device,
+            dtype=self._code2wav_dtype,
+        )
+        try:
+            inputs.append(pb_utils.Tensor.from_dlpack("c2w_attention_bias", c2w_attention_bias.contiguous()))
+        except Exception as e:
+            logger.error(f"fused: from_dlpack c2w_attention_bias: {e}")
             raise
 
         if use_dummy_past_kv:
@@ -1491,11 +1522,15 @@ class TritonPythonModel:
             k = self._maybe_fix_trt_batch_axis(k, batch)
             v = self._maybe_fix_trt_batch_axis(v, batch)
             k = torch.from_numpy(k.cpu().float().numpy()).to(
-                device=self.device, dtype=self._talker_dtype
+                device=self.device, dtype=torch.float32
             ).contiguous()
             v = torch.from_numpy(v.cpu().float().numpy()).to(
-                device=self.device, dtype=self._talker_dtype
+                device=self.device, dtype=torch.float32
             ).contiguous()
+            if use_dummy_past_kv and k.shape[2] > 0:
+                # Drop the dummy prefill slot so downstream decode sees true past_len=0 semantics.
+                k = k[:, :, 1:, :].contiguous()
+                v = v[:, :, 1:, :].contiguous()
             kv_tensors.append(k)
             kv_tensors.append(v)
 
@@ -1505,7 +1540,7 @@ class TritonPythonModel:
             t = self._maybe_fix_trt_batch_axis(t, batch)
             t = self._clip_code2wav_state_window(
                 out_name,
-                t.to(device=self.device, dtype=self._code2wav_dtype).contiguous(),
+                t.to(device=self.device, dtype=torch.float32).contiguous(),
             )
             new_c2w.append(t)
 
@@ -1566,9 +1601,14 @@ class TritonPythonModel:
             return tensor
         if "past_kv" not in name and "present_kv" not in name:
             return tensor
-        if tensor.shape[2] <= self.code2wav_sliding_window:
+        max_kv_t = self.code2wav_sliding_window
+        # Fused TRT profile keeps c2w past_kv max at sliding_window-1 so that
+        # c2w_attention_bias key_total = past_kv + chunk_t stays within window.
+        if name.startswith("c2w_"):
+            max_kv_t = max(1, self.code2wav_sliding_window - 1)
+        if tensor.shape[2] <= max_kv_t:
             return tensor
-        return tensor[:, :, -self.code2wav_sliding_window :, :].contiguous()
+        return tensor[:, :, -max_kv_t:, :].contiguous()
 
     def _tensor_from_response_torch(self, response, name: str) -> torch.Tensor:
         """Get output tensor by name and return torch on GPU (zero-copy via DLPack when possible)."""
@@ -1690,7 +1730,7 @@ class TritonPythonModel:
                 codes = codes.unsqueeze(0)
             codes = codes.contiguous()
             cache_position = torch.arange(
-                frame_index, frame_index + CODE2WAV_CHUNK_T, device=self.device, dtype=torch.int64
+                frame_index, frame_index + CODE2WAV_CHUNK_T, device=self.device, dtype=torch.float32
             )
             wav_np, code2wav_states = self._bls_code2wav_streaming(codes, cache_position, code2wav_states)
             self._send_audio_chunk(response_sender, wav_np, is_final=False)
@@ -1710,7 +1750,7 @@ class TritonPythonModel:
                 codes = codes.unsqueeze(0)
             codes = codes.contiguous()
             cache_position = torch.arange(
-                frame_index, frame_index + CODE2WAV_CHUNK_T, device=self.device, dtype=torch.int64
+                frame_index, frame_index + CODE2WAV_CHUNK_T, device=self.device, dtype=torch.float32
             )
             wav_np, _ = self._bls_code2wav_streaming(codes, cache_position, code2wav_states)
             valid_samples = n * SAMPLES_PER_CODEC_FRAME
@@ -1728,6 +1768,7 @@ class TritonPythonModel:
         """Stateful code2wav: codes [1, 16, 4], cache_position [4], 37 states -> wav [7680], 37 new states. Uses DLPack for GPU tensors."""
         # code2wav expects TYPE_INT64 for 'codes'; talker may return full_codec as BF16 in TRT mode.
         codes = codes.to(device=self.device, dtype=torch.int64).contiguous()
+        cache_position = cache_position.to(device=self.device, dtype=torch.float32).contiguous()
         try:
             inputs = [
                 pb_utils.Tensor.from_dlpack("codes", codes.contiguous()),
