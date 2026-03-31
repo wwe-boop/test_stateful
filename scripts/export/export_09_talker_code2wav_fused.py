@@ -46,7 +46,7 @@ from code2wav_streaming import (
     NUM_TRANSCONV,
     num_code2wav_hidden_layers,
 )
-from talker_unified_modules import build_talker_unified_fused_module
+from talker_unified_modules import build_talker_unified_fused_module, LOGITS_TOPK
 from triton_manifest_io import build_manifest_for_export
 
 from utils import (
@@ -86,6 +86,10 @@ class TalkerCode2WavFusedONNX(nn.Module):
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         attention_bias: torch.Tensor,
+        token_counts: torch.Tensor,
+        gumbel_noise: torch.Tensor,
+        temperature: torch.Tensor,
+        penalty: torch.Tensor,
         cache_position: torch.Tensor,
         c2w_attention_bias: torch.Tensor,
         *inputs: torch.Tensor,
@@ -93,23 +97,26 @@ class TalkerCode2WavFusedONNX(nn.Module):
         """
         inputs: past_kv_* (talker) then code2wav state tensors (layout from decoder).
         cache_position: [B, FUSED_CHUNK_T] fp32 (absolute frame indices for this chunk).
+        token_counts: [B, V] int64 — per-token generation frequency.
+        gumbel_noise: [B, K] fp32 — external Gumbel noise for sampling.
+        temperature: [B, 1] fp32 — sampling temperature (1.0 = greedy).
+        penalty: [B, 1] fp32 — repetition penalty coefficient (e.g. 1.05).
         """
         n = self.num_layers
         past_kv = inputs[: 2 * n]
         code2wav_states = inputs[2 * n :]
 
-        codec_sum, full_codec, hidden, logits, *present_kv = self.talker_fused(
-            input_embeds, position_ids, attention_bias, *past_kv
+        codec_sum, full_codec, hidden, logits, updated_token_counts, *present_kv = self.talker_fused(
+            input_embeds, position_ids, token_counts, gumbel_noise, temperature, penalty,
+            attention_bias, *past_kv
         )
-        # Vocoder quantizer tables are 2048 rows per codebook; talker may emit specials (e.g. EOS)
-        # outside this range — clamp so Gather in decoder stays in-bounds (matches safe decode path).
         _cb = 2048
         fc = full_codec.long().clamp(0, _cb - 1)
         codes = fc.unsqueeze(-1)
         c2w_out = self.code2wav(codes, cache_position, c2w_attention_bias, *code2wav_states)
         wav = c2w_out[0]
         new_c2w = c2w_out[1:]
-        return (wav, codec_sum, full_codec, hidden, logits, *present_kv, *new_c2w)
+        return (wav, codec_sum, full_codec, hidden, logits, updated_token_counts, *present_kv, *new_c2w)
 
 
 def _export_talker_code2wav_fused_onnx(
@@ -130,15 +137,19 @@ def _export_talker_code2wav_fused_onnx(
     talker_fused, num_layers, hidden_size, num_kv_heads, head_dim = build_talker_unified_fused_module(
         model, device=device
     )
+    vocab_size = model.talker.model.config.vocab_size
     fused = TalkerCode2WavFusedONNX(talker_fused, code2wav).to(device).eval()
 
-    # Semantics aligned with export_05: [B, 1, H] + past length S_past; position triple = S_past.
-    # Layout (B, 3, 1, 1) keeps the RoPE singleton dim outside the graph to avoid
-    # TRT/Myelin rank-lifting around Unsqueeze on dynamic inputs.
     B, one, S_past = 1, 1, 0
     dummy_embeds = torch.randn(B, one, hidden_size, device=device, dtype=ONNX_EXPORT_DTYPE)
     position_ids = torch.full((B, 3, one, 1), S_past, device=device, dtype=torch.long)
     attention_bias = torch.zeros(B, 1, one, S_past + one, device=device, dtype=ONNX_EXPORT_DTYPE)
+
+    dummy_token_counts = torch.zeros(B, vocab_size, device=device, dtype=torch.int64)
+    dummy_gumbel_noise = torch.zeros(B, LOGITS_TOPK, device=device, dtype=torch.float32)
+    dummy_temperature = torch.ones(B, 1, device=device, dtype=torch.float32)
+    dummy_penalty = torch.full((B, 1), 1.05, device=device, dtype=torch.float32)
+
     past_list = []
     for _ in range(num_layers):
         past_list.append(
@@ -148,10 +159,7 @@ def _export_talker_code2wav_fused_onnx(
             torch.zeros(B, num_kv_heads, S_past, head_dim, device=device, dtype=ONNX_EXPORT_DTYPE)
         )
 
-    # First fused frame index in the vocoder stream (chunk_T=1).
     cache_position = torch.zeros(B, FUSED_CHUNK_T, device=device, dtype=torch.float32)
-    # Code2wav states: use past_kv_len>0 for trace only (export_06 pattern). Zero-length KV
-    # tensors are often dropped from the ONNX graph; runtime still uses S_past=0 via dynamic axes.
     TRACE_C2W_PAST_LEN = 1
     c2w_attention_bias = torch.zeros(
         B, 1, FUSED_CHUNK_T, TRACE_C2W_PAST_LEN + FUSED_CHUNK_T, device=device, dtype=ONNX_EXPORT_DTYPE
@@ -175,6 +183,10 @@ def _export_talker_code2wav_fused_onnx(
         dummy_embeds,
         position_ids,
         attention_bias,
+        dummy_token_counts,
+        dummy_gumbel_noise,
+        dummy_temperature,
+        dummy_penalty,
         cache_position,
         c2w_attention_bias,
         *past_list,
@@ -188,6 +200,10 @@ def _export_talker_code2wav_fused_onnx(
         "input_embeds",
         "position_ids",
         "attention_bias",
+        "token_counts",
+        "gumbel_noise",
+        "temperature",
+        "penalty",
         "cache_position",
         "c2w_attention_bias",
     ]
@@ -197,7 +213,7 @@ def _export_talker_code2wav_fused_onnx(
     for name, _ in state_shapes_cold:
         input_names.append(f"c2w_{name}")
 
-    output_names = ["wav", "codec_sum", "full_codec", "hidden", "logits"]
+    output_names = ["wav", "codec_sum", "full_codec", "hidden", "logits", "updated_token_counts"]
     for i in range(num_layers):
         output_names.append(f"present_kv_{i}_k")
         output_names.append(f"present_kv_{i}_v")
@@ -214,6 +230,10 @@ def _export_talker_code2wav_fused_onnx(
         "input_embeds": {0: "batch", 1: "seq"},
         "position_ids": {0: "batch", 1: "three", 2: "seq"},
         "attention_bias": {0: "batch", 2: "seq", 3: "key_total"},
+        "token_counts": {0: "batch"},
+        "gumbel_noise": {0: "batch"},
+        "temperature": {0: "batch"},
+        "penalty": {0: "batch"},
         "cache_position": {0: "batch", 1: "chunk_t"},
         "c2w_attention_bias": {0: "batch", 2: "chunk_t", 3: "c2w_key_total"},
         "wav": {0: "batch"},
@@ -221,6 +241,7 @@ def _export_talker_code2wav_fused_onnx(
         "full_codec": {0: "batch"},
         "hidden": {0: "batch", 1: "seq"},
         "logits": {0: "batch", 1: "seq"},
+        "updated_token_counts": {0: "batch"},
     }
     for i in range(num_layers):
         dynamic_axes[f"past_kv_{i}_k"] = {0: "batch", 2: "S_past"}
@@ -294,6 +315,10 @@ def _export_talker_code2wav_fused_onnx(
     cpu_embeds = dummy_embeds.cpu()
     cpu_pos = position_ids.cpu()
     cpu_bias = attention_bias.cpu()
+    cpu_tc = dummy_token_counts.cpu()
+    cpu_gn = dummy_gumbel_noise.cpu()
+    cpu_temp = dummy_temperature.cpu()
+    cpu_pen = dummy_penalty.cpu()
     cpu_cache = cache_position.cpu()
     cpu_c2w_bias = c2w_attention_bias.cpu()
     cpu_past = [t.cpu() for t in past_list]
@@ -304,6 +329,10 @@ def _export_talker_code2wav_fused_onnx(
             cpu_embeds,
             cpu_pos,
             cpu_bias,
+            cpu_tc,
+            cpu_gn,
+            cpu_temp,
+            cpu_pen,
             cpu_cache,
             cpu_c2w_bias,
             *cpu_past,
@@ -313,10 +342,14 @@ def _export_talker_code2wav_fused_onnx(
         "input_embeds": to_numpy(cpu_embeds),
         "position_ids": cpu_pos.numpy(),
         "attention_bias": to_numpy(cpu_bias),
+        "token_counts": cpu_tc.numpy(),
+        "gumbel_noise": cpu_gn.numpy(),
+        "temperature": cpu_temp.numpy(),
+        "penalty": cpu_pen.numpy(),
         "cache_position": cpu_cache.numpy(),
         "c2w_attention_bias": to_numpy(cpu_c2w_bias),
     }
-    off = 5
+    off = 9
     for i, t in enumerate(cpu_past):
         test_inputs[input_names[off + i]] = to_numpy(t)
     off += len(cpu_past)
@@ -326,13 +359,16 @@ def _export_talker_code2wav_fused_onnx(
     torch_outputs = {output_names[i]: to_numpy(cpu_out[i]) for i in range(len(output_names))}
     ok = verify_onnx(onnx_path, test_inputs, torch_outputs, atol=2e-3, rtol=1e-2)
 
-    # Case-2: alternate prefill/decode setting (B=1, non-zero logical past with explicit bias)
     B2, S_past2 = 1, 4
     c2w_past2 = 5
     cpu_embeds2 = torch.randn(B2, one, hidden_size, dtype=ONNX_EXPORT_DTYPE)
     cpu_pos2 = torch.full((B2, 3, one, 1), S_past2, dtype=torch.long)
     cpu_bias2 = torch.zeros(B2, 1, one, S_past2 + one, dtype=ONNX_EXPORT_DTYPE)
     cpu_bias2[0, :, :, :2] = -1.0e4
+    cpu_tc2 = torch.zeros(B2, vocab_size, dtype=torch.int64)
+    cpu_gn2 = torch.zeros(B2, LOGITS_TOPK, dtype=torch.float32)
+    cpu_temp2 = torch.ones(B2, 1, dtype=torch.float32)
+    cpu_pen2 = torch.full((B2, 1), 1.05, dtype=torch.float32)
     cpu_cache2 = torch.zeros(B2, FUSED_CHUNK_T, dtype=torch.float32)
     cpu_c2w_bias2 = torch.zeros(B2, 1, FUSED_CHUNK_T, c2w_past2 + FUSED_CHUNK_T, dtype=ONNX_EXPORT_DTYPE)
     cpu_c2w_bias2[0, :, :, :3] = -1.0e4
@@ -352,6 +388,10 @@ def _export_talker_code2wav_fused_onnx(
             cpu_embeds2,
             cpu_pos2,
             cpu_bias2,
+            cpu_tc2,
+            cpu_gn2,
+            cpu_temp2,
+            cpu_pen2,
             cpu_cache2,
             cpu_c2w_bias2,
             *cpu_past2,
@@ -361,10 +401,14 @@ def _export_talker_code2wav_fused_onnx(
         "input_embeds": to_numpy(cpu_embeds2),
         "position_ids": cpu_pos2.numpy(),
         "attention_bias": to_numpy(cpu_bias2),
+        "token_counts": cpu_tc2.numpy(),
+        "gumbel_noise": cpu_gn2.numpy(),
+        "temperature": cpu_temp2.numpy(),
+        "penalty": cpu_pen2.numpy(),
         "cache_position": cpu_cache2.numpy(),
         "c2w_attention_bias": to_numpy(cpu_c2w_bias2),
     }
-    off = 5
+    off = 9
     for i, t in enumerate(cpu_past2):
         test_inputs2[input_names[off + i]] = to_numpy(t)
     off += len(cpu_past2)

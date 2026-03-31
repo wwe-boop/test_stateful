@@ -12,11 +12,14 @@ from typing import List, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 if TYPE_CHECKING:
     pass
 
 from utils import CodePredictorUnrolled
+
+LOGITS_TOPK = 50
 
 
 class UnifiedKVCache:
@@ -306,24 +309,47 @@ class TalkerUnifiedONNX(nn.Module):
 
 
 class TalkerUnifiedFusedONNX(nn.Module):
-    """Talker (prefill or decode) + argmax + CP 15-step + Codec Embedding Sum."""
+    """Talker (prefill or decode) + logits processing + CP 15-step + Codec Embedding Sum.
+
+    Logits processing pipeline (compiled into ONNX/TRT):
+      1. suppress_tokens — static const mask, zero runtime cost
+      2. repetition_penalty — element-wise via token_counts vector
+      3. top-K=50 — TRT-optimized TopK kernel
+      4. temperature + Gumbel-Max — deterministic inside graph, noise from outside
+      5. one-hot counts update — auto-regressive state
+    """
 
     def __init__(
         self,
         talker_unified: TalkerUnifiedONNX,
         code_predictor_unrolled: CodePredictorUnrolled,
         codec_embedding_sum: nn.Module,
+        vocab_size: int = 3072,
+        codec_eos_token_id: int = 2150,
     ):
         super().__init__()
         self.talker_unified = talker_unified
         self.cp = code_predictor_unrolled
         self.codec_sum = codec_embedding_sum
         self.num_layers = talker_unified.num_layers
+        self.vocab_size = vocab_size
+
+        suppress_ids = [
+            i for i in range(vocab_size - 1024, vocab_size)
+            if i != codec_eos_token_id
+        ]
+        mask = torch.zeros(vocab_size, dtype=torch.bool)
+        mask[suppress_ids] = True
+        self.register_buffer("suppress_mask", mask)
 
     def forward(
         self,
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
+        token_counts: torch.Tensor,
+        gumbel_noise: torch.Tensor,
+        temperature: torch.Tensor,
+        penalty: torch.Tensor,
         *inputs: torch.Tensor,
     ) -> Tuple[torch.Tensor, ...]:
         talker_out = self.talker_unified(input_embeds, position_ids, *inputs)
@@ -331,14 +357,30 @@ class TalkerUnifiedFusedONNX(nn.Module):
         logits = talker_out[1]
         present_kv = list(talker_out[2:])
 
-        codec_token_0 = logits[:, -1, :].argmax(dim=-1)
+        g0 = logits[:, -1, :].clone()
+
+        g0 = g0.masked_fill(self.suppress_mask, -1e9)
+
+        has_appeared = (token_counts > 0)
+        penalized = torch.where(g0 > 0, g0 / penalty, g0 * penalty)
+        g0 = torch.where(has_appeared, penalized, g0)
+
+        topk_vals, topk_idx = g0.topk(LOGITS_TOPK, dim=-1)
+
+        topk_vals = topk_vals / temperature
+        selected = (topk_vals + gumbel_noise).argmax(dim=-1)
+        codec_token_0 = topk_idx.gather(1, selected.unsqueeze(1)).squeeze(1)
+
+        one_hot = F.one_hot(codec_token_0, self.vocab_size).to(token_counts.dtype)
+        updated_token_counts = token_counts + one_hot
+
         cp_tokens = self.cp(hidden[:, -1:, :], codec_token_0)
         full_codec = torch.cat(
             [codec_token_0.unsqueeze(1), cp_tokens.long()], dim=1
         )
         codec_sum = self.codec_sum(full_codec).unsqueeze(1)
 
-        return (codec_sum, full_codec, hidden, logits, *present_kv)
+        return (codec_sum, full_codec, hidden, logits, updated_token_counts, *present_kv)
 
 
 def build_talker_backbone_module(model, device: str = "cpu") -> Tuple[TalkerUnifiedONNX, int, int, int, int]:
@@ -379,7 +421,14 @@ def build_talker_unified_fused_module(model, device: str = "cpu") -> Tuple[Talke
 
     codec_sum_module = build_codec_embedding_sum_from_model(model, device)
 
-    fused = TalkerUnifiedFusedONNX(backbone, cp_unrolled, codec_sum_module).to(device).eval()
+    vocab_size = talker_config.vocab_size
+    codec_eos_token_id = getattr(talker_config, "codec_eos_token_id", 2150)
+
+    fused = TalkerUnifiedFusedONNX(
+        backbone, cp_unrolled, codec_sum_module,
+        vocab_size=vocab_size,
+        codec_eos_token_id=codec_eos_token_id,
+    ).to(device).eval()
 
     num_layers = talker_config.num_hidden_layers
     hidden_size = talker_config.hidden_size

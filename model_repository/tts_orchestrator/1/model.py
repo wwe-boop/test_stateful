@@ -87,45 +87,31 @@ class TritonPythonModel:
         codec_eos_id = int(self.weights.codec_eos_id)
         return int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
 
-    @torch.no_grad()
-    def _sample_codec_sum(
+    def _is_codec_eos(self, full_codec: torch.Tensor) -> bool:
+        codec_eos_id = int(self.weights.codec_eos_id)
+        return int(full_codec[:, 0].item()) == codec_eos_id
+
+    def _build_sampling_inputs(
         self,
-        logits: torch.Tensor,
-        full_codec: torch.Tensor,
-        codec_sum: torch.Tensor,
-    ) -> torch.Tensor:
-        """Replace group-0 argmax contribution in codec_sum with a sampled token.
+        batch: int,
+        token_counts: torch.Tensor,
+    ) -> tuple:
+        """Build engine-side sampling inputs: token_counts, gumbel_noise, temperature, penalty."""
+        if self._do_sample:
+            u = torch.rand(batch, 50, device=self.device, dtype=torch.float32).clamp(1e-8, 1.0)
+            gumbel_noise = -torch.log(-torch.log(u))
+        else:
+            gumbel_noise = torch.zeros(batch, 50, device=self.device, dtype=torch.float32)
 
-        This prevents autoregressive degeneration (silence loops) during pad
-        phase while keeping the current step's wav output clean (argmax-based).
-        """
-        if not self._sampling_enabled:
-            return codec_sum
-
-        g0_logits = logits[:, -1, :].float()
-        batch_size = g0_logits.shape[0]
-
-        scaled = g0_logits / self._temperature
-        if self._top_k > 0:
-            k = min(self._top_k, scaled.shape[-1])
-            topk_vals, _ = scaled.topk(k, dim=-1)
-            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-
-        probs = torch.softmax(scaled, dim=-1)
-        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
-
-        argmax_tokens = full_codec[:, 0].long()
-        c3d = self.weights.codec_embeddings_3d
-        new_codec_sum = codec_sum.clone()
-
-        for b in range(batch_size):
-            s_tok = int(sampled[b].item())
-            a_tok = int(argmax_tokens[b].item())
-            if s_tok != a_tok and s_tok < c3d.shape[1] and a_tok < c3d.shape[1]:
-                delta = (c3d[0, s_tok] - c3d[0, a_tok]).to(codec_sum.dtype)
-                new_codec_sum[b, 0, :] += delta
-
-        return new_codec_sum
+        temperature = torch.full(
+            (batch, 1), self._temperature if self._do_sample else 1.0,
+            device=self.device, dtype=torch.float32,
+        )
+        penalty = torch.full(
+            (batch, 1), self._repetition_penalty,
+            device=self.device, dtype=torch.float32,
+        )
+        return token_counts.contiguous(), gumbel_noise, temperature, penalty
 
     # ── Lifecycle ──
 
@@ -183,8 +169,12 @@ class TritonPythonModel:
             os.environ.get("CODE2WAV_SLIDING_WINDOW", "72")))
         self._temperature = float(params.get("temperature", {}).get(
             "string_value", os.environ.get("TEMPERATURE", "0.9")))
-        self._top_k = int(params.get("top_k", {}).get(
-            "string_value", os.environ.get("TOP_K", "0")))
+        self._repetition_penalty = float(params.get("repetition_penalty", {}).get(
+            "string_value", os.environ.get("REPETITION_PENALTY", "1.05")))
+        self._do_sample = params.get("do_sample", {}).get(
+            "string_value",
+            os.environ.get("DO_SAMPLE", "1"),
+        ).strip().lower() not in ("0", "false", "no")
         self.request_timeout_sec = float(params.get("request_timeout_sec", {}).get(
             "string_value", "120"))
         self.max_batch_slots = int(params.get("max_batch_slots", {}).get(
@@ -203,10 +193,7 @@ class TritonPythonModel:
         self.head_dim = talker_h // talker_heads if talker_heads else 128
 
         self._tts_pad_embed_torch = self.weights.tts_pad_embed
-        self._sampling_enabled = (
-            self._temperature > 0
-            and self.weights.codec_embeddings_3d is not None
-        )
+        self._vocab_size = int(self.weights.config.get("talker_vocab_size", 3072))
 
         logger.info(f"Loading tokenizer from {tokenizer_dir} ...")
         from lightweight_tokenizer import load_lightweight_tokenizer
@@ -347,7 +334,8 @@ class TritonPythonModel:
             f"code2wav_sliding_window={self.code2wav_sliding_window}, "
             f"max_batch_slots={self.max_batch_slots}, "
             f"ratio_ema={self._ratio_tracker.ema}, "
-            f"sampling={self._sampling_enabled} (temp={self._temperature}, top_k={self._top_k})"
+            f"do_sample={self._do_sample}, temp={self._temperature}, "
+            f"penalty={self._repetition_penalty}"
         )
 
     # ── Execute (producer — enqueue and return immediately) ──
@@ -973,26 +961,29 @@ class TritonPythonModel:
                 device=self.device,
                 dtype=torch.int64,
             )
-            wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
+            init_tc = torch.zeros(1, self._vocab_size, device=self.device, dtype=torch.int64)
+            tc, gn, temp, pen = self._build_sampling_inputs(1, init_tc)
+            wav, codec_sum, full_codec, logits, updated_tc, kv_tensors, c2w_states = (
                 self._bls_talker_code2wav_fused(
                     inputs_embeds,
                     position_ids,
                     cache_pos,
+                    tc, gn, temp, pen,
                     initial_past_kv_tensors,
                     self._create_code2wav_initial_states(),
                 )
             )
             self._enqueue_fused_wav(session.response_sender, wav)
-            if self._is_logit_eos(logits):
+            if self._is_codec_eos(full_codec):
                 logger.info("EOS at segment %d step 0", session.segment_idx)
                 session.segment_idx += 1
                 continue
 
-            sampled_cs = self._sample_codec_sum(logits, full_codec, codec_sum)
             text_add = plan.trailing[0] if plan.trailing else self._tts_pad_embed_torch
             session.trailing_text = plan.trailing
             session.current_segment_text = seg_text
-            session.next_embed = (sampled_cs + text_add).to(torch.float32)
+            session.next_embed = (codec_sum + text_add).to(torch.float32)
+            session.token_counts = updated_tc
             session.text_idx = 1
             session.kv_tensors = kv_tensors
             session.c2w_states = c2w_states
@@ -1108,18 +1099,33 @@ class TritonPythonModel:
                 ).contiguous()
             )
 
-        wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
+        batch_size = len(sessions)
+        batched_tc = torch.cat(
+            [
+                (session.token_counts if session.token_counts is not None
+                 else torch.zeros(1, self._vocab_size, device=self.device, dtype=torch.int64))
+                for session in sessions
+            ],
+            dim=0,
+        )
+        batched_tc, batched_gn, batched_temp, batched_pen = self._build_sampling_inputs(
+            batch_size, batched_tc,
+        )
+        wav, codec_sum, full_codec, logits, updated_tc, kv_tensors, c2w_states = (
             self._bls_talker_code2wav_fused(
                 batched_input,
                 batched_pos,
                 batched_cache_pos,
+                batched_tc,
+                batched_gn,
+                batched_temp,
+                batched_pen,
                 batched_past_kv,
                 batched_c2w_states,
                 attention_bias_override=batched_attention,
                 past_seq_lens_override=past_seq_lens,
             )
         )
-        sampled_codec_sum = self._sample_codec_sum(logits, full_codec, codec_sum)
         seq = int(batched_input.shape[1])
         new_past_lens = [session.past_len + seq for session in sessions]
         original_past_lens = [session.past_len for session in sessions]
@@ -1136,7 +1142,8 @@ class TritonPythonModel:
 
         for row_idx, session in enumerate(sessions):
             row_logits = logits[row_idx : row_idx + 1]
-            eos = self._is_logit_eos(row_logits)
+            row_fc = full_codec[row_idx : row_idx + 1]
+            eos = self._is_codec_eos(row_fc)
 
             if eos or new_past_lens[row_idx] > max_kv_len:
                 total_steps = new_past_lens[row_idx] - session.segment_start_past_len
@@ -1176,7 +1183,8 @@ class TritonPythonModel:
                 self._enqueue_fused_wav(session.response_sender, row_wav)
             elif not session.text_complete:
                 self._enqueue_fused_wav(session.response_sender, row_wav)
-                session.last_codec_sum = sampled_codec_sum[row_idx : row_idx + 1].clone()
+                session.last_codec_sum = codec_sum[row_idx : row_idx + 1].clone()
+                session.token_counts = updated_tc[row_idx : row_idx + 1].clone()
                 session.kv_tensors = split_kv[row_idx]
                 session.c2w_states = split_c2w[row_idx]
                 session.past_len = new_past_lens[row_idx]
@@ -1227,8 +1235,9 @@ class TritonPythonModel:
                     continue
 
             session.next_embed = (
-                sampled_codec_sum[row_idx : row_idx + 1] + text_add
+                codec_sum[row_idx : row_idx + 1] + text_add
             ).to(torch.float32)
+            session.token_counts = updated_tc[row_idx : row_idx + 1].clone()
             session.kv_tensors = split_kv[row_idx]
             session.c2w_states = split_c2w[row_idx]
             session.past_len = new_past_lens[row_idx]
@@ -1420,10 +1429,13 @@ class TritonPythonModel:
 
         try:
             cache_pos = torch.zeros(batch, FUSED_CHUNK_T, device=self.device, dtype=torch.int64)
-            _, _, _, _, kv_tensors, _ = self._bls_talker_code2wav_fused(
+            init_tc = torch.zeros(batch, self._vocab_size, device=self.device, dtype=torch.int64)
+            tc, gn, temp, pen = self._build_sampling_inputs(batch, init_tc)
+            _, _, _, _, _, kv_tensors, _ = self._bls_talker_code2wav_fused(
                 prefix_embeds,
                 prefix_position_ids,
                 cache_pos,
+                tc, gn, temp, pen,
                 None,
                 self._create_code2wav_initial_states(),
             )
@@ -1553,6 +1565,10 @@ class TritonPythonModel:
         input_embeds: torch.Tensor,
         position_ids: torch.Tensor,
         cache_position: torch.Tensor,
+        token_counts: torch.Tensor,
+        gumbel_noise: torch.Tensor,
+        temperature: torch.Tensor,
+        penalty: torch.Tensor,
         past_kv_tensors,
         c2w_states: list,
         attention_bias_override: Optional[torch.Tensor] = None,
@@ -1603,12 +1619,16 @@ class TritonPythonModel:
                 pb_utils.Tensor.from_dlpack("input_embeds", inp_emb),
                 pb_utils.Tensor.from_dlpack("position_ids", pos_ids),
                 pb_utils.Tensor.from_dlpack("attention_bias", attention_bias.contiguous()),
+                pb_utils.Tensor.from_dlpack("token_counts", token_counts.contiguous()),
+                pb_utils.Tensor.from_dlpack("gumbel_noise", gumbel_noise.contiguous()),
+                pb_utils.Tensor.from_dlpack("temperature", temperature.contiguous()),
+                pb_utils.Tensor.from_dlpack("penalty", penalty.contiguous()),
                 pb_utils.Tensor.from_dlpack("cache_position", cache_pos),
             ]
         except Exception as e:
             logger.error(
                 f"fused: from_dlpack input_embeds/position_ids/attention_bias/"
-                f"cache_position: {e}"
+                f"token_counts/gumbel_noise/temperature/penalty/cache_position: {e}"
             )
             raise
 
@@ -1669,7 +1689,7 @@ class TritonPythonModel:
                 inputs, in_name, st, self._code2wav_dtype, "fused"
             )
 
-        out_names = ["wav", "codec_sum", "full_codec", "logits"]
+        out_names = ["wav", "codec_sum", "full_codec", "logits", "updated_token_counts"]
         for i in range(self.num_layers):
             out_names.append(f"present_kv_{i}_k")
             out_names.append(f"present_kv_{i}_v")
@@ -1690,10 +1710,12 @@ class TritonPythonModel:
         codec_sum = self._tensor_from_response_torch(response, "codec_sum")
         full_codec = self._tensor_from_response_torch(response, "full_codec")
         logits = self._tensor_from_response_torch(response, "logits")
+        updated_tc = self._tensor_from_response_torch(response, "updated_token_counts")
         wav = self._maybe_fix_trt_batch_axis(wav, batch)
         codec_sum = self._maybe_fix_trt_batch_axis(codec_sum, batch)
         full_codec = self._maybe_fix_trt_batch_axis(full_codec, batch)
         logits = self._maybe_fix_trt_batch_axis(logits, batch)
+        updated_tc = self._maybe_fix_trt_batch_axis(updated_tc, batch)
 
         kv_tensors = []
         for i in range(self.num_layers):
@@ -1723,7 +1745,7 @@ class TritonPythonModel:
             )
             new_c2w.append(t)
 
-        return wav, codec_sum, full_codec, logits, kv_tensors, new_c2w
+        return wav, codec_sum, full_codec, logits, updated_tc, kv_tensors, new_c2w
 
     def _maybe_fix_trt_batch_axis(
         self,

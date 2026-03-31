@@ -75,14 +75,20 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
     fp_spec = f"{ft}:chw"
     i64 = "int64:chw"
 
-    # Inputs: input_embeds, position_ids, attention_bias, cache_position(fp32),
-    # c2w_attention_bias, past_kv_* x 2*nl, c2w_*
-    in_parts: List[str] = [fp_spec, i64, fp_spec, "fp32:chw", fp_spec]
+    # Inputs: input_embeds, position_ids, attention_bias,
+    # token_counts(int64), gumbel_noise(fp32), temperature(fp32), penalty(fp32),
+    # cache_position(fp32), c2w_attention_bias, past_kv_* x 2*nl, c2w_*
+    in_parts: List[str] = [
+        fp_spec, i64, fp_spec,
+        i64, "fp32:chw", "fp32:chw", "fp32:chw",
+        "fp32:chw", fp_spec,
+    ]
     in_parts.extend([fp_spec] * (2 * nl))
     in_parts.extend([fp_spec] * len(c2w_in))
 
-    # Outputs: wav, codec_sum, full_codec, hidden, logits, present_kv x 2*nl, c2w outs
-    out_parts: List[str] = [fp_spec, fp_spec, i64, fp_spec, fp_spec]
+    # Outputs: wav, codec_sum, full_codec, hidden, logits,
+    # updated_token_counts(int64), present_kv x 2*nl, c2w outs
+    out_parts: List[str] = [fp_spec, fp_spec, i64, fp_spec, fp_spec, i64]
     out_parts.extend([fp_spec] * (2 * nl))
     out_parts.extend([fp_spec] * len(c2w_out))
 

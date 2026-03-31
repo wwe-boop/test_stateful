@@ -81,6 +81,9 @@ class TTSSession:
     # Saved codec_sum for streaming decode resumption (KV-preserved IDLE → ACTIVE)
     last_codec_sum: Optional[Any] = None
 
+    # Token frequency counts for engine-side repetition penalty [1, V] int64
+    token_counts: Optional[Any] = None
+
     # Whether this session was created as a streaming session (action=init)
     is_streaming: bool = False
 
@@ -163,6 +166,7 @@ class TTSSession:
         self.frame_idx = 0
         self.segment_start_past_len = 0
         self.last_codec_sum = None
+        self.token_counts = None
         self.pad_consecutive_silence = 0
 
 

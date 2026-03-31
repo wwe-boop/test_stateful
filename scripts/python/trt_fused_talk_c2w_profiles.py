@@ -48,6 +48,10 @@ def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
     return specs
 
 
+LOGITS_TOPK = 50
+VOCAB_SIZE = 3072
+
+
 def main():
     if len(sys.argv) < 6:
         print(
@@ -63,11 +67,17 @@ def main():
     nl = int(NL)
     Bopt = "1"
     opt_spast = "128"
+    V = VOCAB_SIZE
+    K = LOGITS_TOPK
 
     parts_min = [
         f"input_embeds:1x1x{H}",
         f"position_ids:1x3x1x1",
         "attention_bias:1x1x1x1",
+        f"token_counts:1x{V}",
+        f"gumbel_noise:1x{K}",
+        "temperature:1x1",
+        "penalty:1x1",
         "cache_position:1x1",
         "c2w_attention_bias:1x1x1x2",
     ]
@@ -75,6 +85,10 @@ def main():
         f"input_embeds:{Bopt}x1x{H}",
         f"position_ids:{Bopt}x3x1x1",
         f"attention_bias:{Bopt}x1x1x{int(opt_spast) + 1}",
+        f"token_counts:{Bopt}x{V}",
+        f"gumbel_noise:{Bopt}x{K}",
+        f"temperature:{Bopt}x1",
+        f"penalty:{Bopt}x1",
         f"cache_position:{Bopt}x1",
         f"c2w_attention_bias:{Bopt}x1x1x5",
     ]
@@ -82,6 +96,10 @@ def main():
         f"input_embeds:{Bmax}x{max_in}x{H}",
         f"position_ids:{Bmax}x3x{max_in}x1",
         f"attention_bias:{Bmax}x1x{max_in}x{int(max_seq) + int(max_in)}",
+        f"token_counts:{Bmax}x{V}",
+        f"gumbel_noise:{Bmax}x{K}",
+        f"temperature:{Bmax}x1",
+        f"penalty:{Bmax}x1",
         f"cache_position:{Bmax}x1",
         f"c2w_attention_bias:{Bmax}x1x1x72",
     ]
