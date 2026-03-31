@@ -279,9 +279,14 @@ class PrefillBuilder:
         ref_codes: Optional[torch.Tensor] = None,
         ref_text: Optional[str] = None,
         ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        include_eos: bool = True,
     ) -> PrefillPlan:
         """
         Build prefill inputs_embeds and trailing_text_hidden queue.
+
+        Args:
+            include_eos: if False, omit tts_eos_embed from trailing (for streaming
+                sessions where more text is expected).
 
         Returns:
             PrefillPlan:
@@ -509,9 +514,15 @@ class PrefillBuilder:
             mid = input_ids[:, 4:-5] if input_ids.shape[1] > 9 else input_ids[:, :0]
             if mid.shape[1] > 0:
                 mid_embed = w.text_embed(mid)
-                trailing_text_hidden = torch.cat([mid_embed, w.tts_eos_embed], dim=1)
+                if include_eos:
+                    trailing_text_hidden = torch.cat([mid_embed, w.tts_eos_embed], dim=1)
+                else:
+                    trailing_text_hidden = mid_embed
             else:
-                trailing_text_hidden = w.tts_eos_embed
+                if include_eos:
+                    trailing_text_hidden = w.tts_eos_embed
+                else:
+                    trailing_text_hidden = torch.zeros(1, 0, w.hidden_size, device=device, dtype=torch.bfloat16)
             n_trailing = trailing_text_hidden.shape[1]
             trailing = [
                 trailing_text_hidden[:, i : i + 1, :].clone()
@@ -546,7 +557,7 @@ class PrefillBuilder:
 
         logger.info(
             f"Prefill built: task={task_type.value}, non_streaming={non_streaming_mode}, "
-            f"shape={tuple(prefill.shape)}, trailing={len(trailing)}"
+            f"shape={tuple(prefill.shape)}, trailing={len(trailing)}, include_eos={include_eos}"
         )
         return PrefillPlan(
             prefill_embeds=prefill,
@@ -555,3 +566,35 @@ class PrefillBuilder:
             cacheable_prefix_embeds=cacheable_prefix_embeds,
             request_prefill_embeds=request_prefill_embeds,
         )
+
+    def build_trailing_embeds(
+        self,
+        text: str,
+        include_eos: bool = True,
+    ) -> list[torch.Tensor]:
+        """Convert raw text to trailing text hidden embeddings (list of [1,1,H]).
+
+        Used for streaming text continuation — no prefill, just new trailing tokens
+        to append to an existing decode loop.
+        """
+        w = self.w
+        device = w.device
+        assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=text)
+        input_ids_np = self.tokenizer(assistant_text, return_tensors="pt")["input_ids"]
+        if not isinstance(input_ids_np, np.ndarray):
+            input_ids_np = np.asarray(input_ids_np, dtype=np.int64)
+        if input_ids_np.ndim == 1:
+            input_ids_np = input_ids_np.reshape(1, -1)
+        input_ids = torch.as_tensor(input_ids_np, device=device, dtype=torch.int64)
+
+        text_tokens = input_ids[:, 3:-5] if input_ids.shape[1] > 8 else input_ids[:, 3:4]
+        if text_tokens.shape[1] > 0:
+            text_embed = w.text_embed(text_tokens)
+            if include_eos:
+                text_embed = torch.cat([text_embed, w.tts_eos_embed], dim=1)
+        else:
+            if include_eos:
+                text_embed = w.tts_eos_embed
+            else:
+                return []
+        return [text_embed[:, i:i+1, :].clone() for i in range(text_embed.shape[1])]

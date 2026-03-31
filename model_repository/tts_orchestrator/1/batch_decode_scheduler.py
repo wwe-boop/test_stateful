@@ -35,6 +35,22 @@ def group_by_c2w_past_len(tickets: List[FusedDecodeTicket[T]]) -> Dict[int, List
     return dict(groups)
 
 
+def _apply_causal_mask(bias: torch.Tensor, past_len: int, seq: int) -> torch.Tensor:
+    """Apply lower-triangular causal mask to the new-token region of an attention bias.
+
+    For seq == 1 (decode) this is a no-op.  For seq > 1 (prefill) token i
+    may only attend to past positions and new positions 0..i (not future).
+    """
+    if seq <= 1:
+        return bias
+    causal = torch.triu(
+        torch.full((seq, seq), float("-inf"), device=bias.device, dtype=bias.dtype),
+        diagonal=1,
+    )
+    bias[:, :, :, past_len:past_len + seq] += causal.unsqueeze(0).unsqueeze(0)
+    return bias
+
+
 def zeros_attention_bias(
     batch: int,
     seq: int,
@@ -43,7 +59,8 @@ def zeros_attention_bias(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     total = past_len + seq
-    return torch.zeros(batch, 1, seq, total, device=device, dtype=dtype)
+    bias = torch.zeros(batch, 1, seq, total, device=device, dtype=dtype)
+    return _apply_causal_mask(bias, past_len, seq)
 
 
 def padded_attention_bias(
@@ -56,13 +73,12 @@ def padded_attention_bias(
     batch = int(past_seq_lens.shape[0])
     total = int(padded_past_len) + int(seq)
     bias = torch.zeros(batch, 1, seq, total, device=device, dtype=dtype)
-    if padded_past_len <= 0:
-        return bias
-    for row, effective_len in enumerate(past_seq_lens.tolist()):
-        eff = int(effective_len)
-        if eff < padded_past_len:
-            bias[row, 0, :, eff:padded_past_len] = float("-inf")
-    return bias
+    if padded_past_len > 0:
+        for row, effective_len in enumerate(past_seq_lens.tolist()):
+            eff = int(effective_len)
+            if eff < padded_past_len:
+                bias[row, 0, :, eff:padded_past_len] = float("-inf")
+    return _apply_causal_mask(bias, padded_past_len, seq)
 
 
 def uniform_past_seq_lens(batch: int, past_len: int, device: torch.device) -> torch.Tensor:

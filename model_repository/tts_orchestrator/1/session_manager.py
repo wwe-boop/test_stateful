@@ -78,6 +78,15 @@ class TTSSession:
     # Optional: last frame logits tail for optional cross-segment acoustic continuity
     last_segment_codec_tail: Optional[Any] = None
 
+    # Saved codec_sum for streaming decode resumption (KV-preserved IDLE → ACTIVE)
+    last_codec_sum: Optional[Any] = None
+
+    # Whether this session was created as a streaming session (action=init)
+    is_streaming: bool = False
+
+    # Whether tts_eos_embed has been injected into trailing for streaming sessions
+    _eos_injected: bool = False
+
     # Flow control
     flow_state: FlowState = FlowState.PENDING
     prefilled: bool = False
@@ -136,6 +145,11 @@ class TTSSession:
         now = now or time.monotonic()
         return (now - self.created_at) * 1000 > self.max_idle_ms
 
+    @property
+    def has_preserved_kv(self) -> bool:
+        """True when session went IDLE but kept its KV cache for streaming resumption."""
+        return self.kv_tensors is not None and self.last_codec_sum is not None
+
     def reset_decode_state(self) -> None:
         self.kv_tensors = None
         self.c2w_states = None
@@ -145,6 +159,7 @@ class TTSSession:
         self.past_len = 0
         self.frame_idx = 0
         self.segment_start_past_len = 0
+        self.last_codec_sum = None
 
 
 class SessionManager:

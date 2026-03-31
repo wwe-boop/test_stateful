@@ -482,6 +482,7 @@ class TritonPythonModel:
             ref_text=ref_text,
             text_segments=text_segments,
             request_start=time.monotonic(),
+            is_streaming=is_streaming,
         )
         if not is_streaming and text.strip():
             session.mark_text_complete()
@@ -641,28 +642,61 @@ class TritonPythonModel:
                     if session.flow_state == FlowState.ACTIVE:
                         did_work = True
 
-                # 4. ACTIVE streaming: append more text as future segments
+                # 4. ACTIVE streaming: extend trailing in-flight (KV-continuous)
                 for session in list(self._session_mgr.get_active()):
                     if session.has_pending_text():
                         chunks = session.drain_text_buffer()
                         extra = "".join(chunks)
                         if extra.strip():
-                            session.text_segments.extend(
-                                self._plan_text_segments(
-                                    text=extra,
-                                    task_type=session.task_type,
-                                    language=session.language,
-                                    speaker=session.speaker,
-                                    instruct=session.instruct,
-                                    spk_embedding=session.spk_embedding,
-                                    ref_codes=session.ref_codes,
-                                    ref_codec_sum_vec=session.ref_codec_sum_vec,
-                                    ref_text=session.ref_text,
+                            if session.is_streaming and session.trailing_text is not None:
+                                include_eos = session.text_complete
+                                new_embeds = self.prefill_builder.build_trailing_embeds(
+                                    extra, include_eos=include_eos,
                                 )
-                            )
-                            logger.info(
-                                f"[Engine] Session {session.session_id} extended segments (+planned)"
-                            )
+                                if new_embeds:
+                                    session.trailing_text.extend(new_embeds)
+                                    if include_eos:
+                                        session._eos_injected = True
+                                    logger.info(
+                                        "[Engine] Session %s trailing extended +%d tokens "
+                                        "(total=%d, eos=%s)",
+                                        session.session_id, len(new_embeds),
+                                        len(session.trailing_text), include_eos,
+                                    )
+                            else:
+                                session.text_segments.extend(
+                                    self._plan_text_segments(
+                                        text=extra,
+                                        task_type=session.task_type,
+                                        language=session.language,
+                                        speaker=session.speaker,
+                                        instruct=session.instruct,
+                                        spk_embedding=session.spk_embedding,
+                                        ref_codes=session.ref_codes,
+                                        ref_codec_sum_vec=session.ref_codec_sum_vec,
+                                        ref_text=session.ref_text,
+                                    )
+                                )
+                                logger.info(
+                                    f"[Engine] Session {session.session_id} extended segments (+planned)"
+                                )
+
+                    # Inject eos when text_complete is signaled for a streaming
+                    # session whose trailing was built without eos.
+                    if (
+                        session.is_streaming
+                        and session.text_complete
+                        and session.trailing_text is not None
+                        and not getattr(session, '_eos_injected', False)
+                    ):
+                        session.trailing_text.append(
+                            self.prefill_builder.w.tts_eos_embed.clone()
+                        )
+                        session._eos_injected = True
+                        logger.info(
+                            "[Engine] Injected eos for session %s (trailing=%d)",
+                            session.session_id, len(session.trailing_text),
+                        )
 
                 # 5. Batch decode all ACTIVE sessions
                 generating = self._session_mgr.get_active()
@@ -733,13 +767,76 @@ class TritonPythonModel:
             logger.info("[Engine] Decode loop stopped")
 
     def _try_activate_waiting_session(self, session: TTSSession):
-        """IDLE session: accumulate text, plan segments, allocate slot, prefill."""
+        """IDLE session: accumulate text, plan segments, allocate slot, prefill.
+
+        If the session went IDLE with KV preserved (streaming pause), resume
+        the decode loop directly by injecting new trailing text embeddings
+        instead of doing a full re-prefill.
+        """
         if session.flow_state != FlowState.IDLE:
             return
-        if not session.text_segments and not session.has_pending_text():
+
+        has_pending = session.has_pending_text()
+        has_segments = bool(session.text_segments and session.segment_idx < len(session.text_segments))
+
+        # --- Streaming resume path: KV preserved, inject new trailing ---
+        if session.has_preserved_kv and (has_pending or session.text_complete):
+            if has_pending:
+                chunks = session.drain_text_buffer()
+                new_text = "".join(chunks)
+                if new_text.strip():
+                    include_eos = session.text_complete
+                    new_trailing = self.prefill_builder.build_trailing_embeds(
+                        new_text, include_eos=include_eos,
+                    )
+                    if new_trailing:
+                        text_add = new_trailing[0]
+                        session.trailing_text = new_trailing
+                        session.text_idx = 1
+                        session.next_embed = (
+                            session.last_codec_sum + text_add
+                        ).to(torch.float32)
+                        session.last_codec_sum = None
+                        session.flow_state = FlowState.ACTIVE
+                        logger.info(
+                            "Streaming resume: sid=%s ACTIVE (KV preserved, "
+                            "past_len=%d, new_trailing=%d, eos=%s)",
+                            session.session_id, session.past_len,
+                            len(new_trailing), include_eos,
+                        )
+                        return
+                elif session.text_complete:
+                    pass  # fall through to text_complete-only path below
+                else:
+                    return
+
+            if session.text_complete:
+                # No new text but text_complete signaled: inject eos and resume
+                eos_trailing = [self.prefill_builder.w.tts_eos_embed.clone()]
+                text_add = eos_trailing[0]
+                session.trailing_text = eos_trailing
+                session.text_idx = 1
+                session.next_embed = (
+                    session.last_codec_sum + text_add
+                ).to(torch.float32)
+                session.last_codec_sum = None
+                session.flow_state = FlowState.ACTIVE
+                logger.info(
+                    "Streaming resume (eos only): sid=%s ACTIVE (past_len=%d)",
+                    session.session_id, session.past_len,
+                )
+                return
             return
 
-        if not session.text_segments:
+        # Session with preserved KV but no text yet: stay IDLE until text arrives.
+        if session.has_preserved_kv:
+            return
+
+        # --- Normal path: plan segments and prefill ---
+        if not has_segments and not has_pending:
+            return
+
+        if not has_segments:
             chunks = session.drain_text_buffer()
             if not chunks:
                 return
@@ -759,8 +856,7 @@ class TritonPythonModel:
             )
             if not session.text_segments:
                 return
-        elif session.has_pending_text():
-            # More text arrived after initial planning (streaming)
+        elif has_pending:
             chunks = session.drain_text_buffer()
             extra = "".join(chunks)
             if extra.strip():
@@ -795,6 +891,9 @@ class TritonPythonModel:
         """Prefill the next segment and transition to ACTIVE."""
         while session.segment_idx < len(session.text_segments):
             seg_text = session.text_segments[session.segment_idx]
+            is_last_known_segment = (session.segment_idx == len(session.text_segments) - 1)
+            streaming_may_continue = session.is_streaming and not session.text_complete
+            include_eos = not (streaming_may_continue and is_last_known_segment)
             plan = self.prefill_builder.build_plan(
                 task_type=session.task_type,
                 text=seg_text,
@@ -805,6 +904,7 @@ class TritonPythonModel:
                 ref_codes=session.ref_codes,
                 ref_codec_sum_vec=session.ref_codec_sum_vec,
                 ref_text=session.ref_text,
+                include_eos=include_eos,
             )
             (
                 inputs_embeds,
@@ -844,6 +944,7 @@ class TritonPythonModel:
             session.c2w_states = c2w_states
             session.past_len = effective_prompt_len
             session.segment_start_past_len = effective_prompt_len
+            session._eos_injected = include_eos
             session.frame_idx = 1
             session.flow_state = FlowState.ACTIVE
             session.prefilled = True
@@ -1012,10 +1113,25 @@ class TritonPythonModel:
             if self._maybe_dynamic_split_session(session, new_past_lens[row_idx]):
                 continue
 
-            # Flow control: consume text or pad (no PAUSE; pad until EOS or text_complete)
+            # Flow control: consume text, pause for streaming, or pad until EOS
             if session.text_idx < len(session.trailing_text):
                 text_add = session.trailing_text[session.text_idx]
                 session.text_idx += 1
+            elif not session.text_complete:
+                # Streaming text exhausted but more expected: pause decode,
+                # PRESERVE KV cache so we can resume without re-prefill.
+                session.last_codec_sum = codec_sum[row_idx : row_idx + 1].clone()
+                session.kv_tensors = split_kv[row_idx]
+                session.c2w_states = split_c2w[row_idx]
+                session.past_len = new_past_lens[row_idx]
+                session.frame_idx += 1
+                session.flow_state = FlowState.IDLE
+                session.next_embed = None
+                logger.info(
+                    "Streaming pause: sid=%s IDLE with KV preserved (past_len=%d, frame=%d)",
+                    session.session_id, session.past_len, session.frame_idx,
+                )
+                continue
             else:
                 text_add = self._tts_pad_embed_torch
                 trailing_len = len(session.trailing_text)
