@@ -51,6 +51,10 @@ class TaskType(Enum):
     VOICE_DESIGN = "voice_design"
 
 
+FALLBACK_SPEAKER = "vivian"
+DEFAULT_SPEAKER = "vivian"
+
+
 @dataclass
 class PrefillPlan:
     prefill_embeds: torch.Tensor
@@ -58,6 +62,7 @@ class PrefillPlan:
     prefix_cache_key: Optional[str] = None
     cacheable_prefix_embeds: Optional[torch.Tensor] = None
     request_prefill_embeds: Optional[torch.Tensor] = None
+    warnings: list = None
 
 
 def parse_task_type(task_type_str: str, x_vector_only: bool = False) -> TaskType:
@@ -336,12 +341,37 @@ class PrefillBuilder:
 
         # Speaker embed
         speaker_embed = None
+        plan_warnings: list[str] = []
         if task_type == TaskType.CUSTOM_VOICE and speaker:
             spk_id_val = w.spk_id_map.get(speaker.lower())
             if spk_id_val is not None:
                 speaker_embed = w.codec_embed(
                     torch.tensor([[spk_id_val]], device=device, dtype=torch.int64)
                 )
+            else:
+                available = sorted(w.spk_id_map.keys())
+                fallback = FALLBACK_SPEAKER
+                fb_id = w.spk_id_map.get(fallback)
+                warn_msg = (
+                    f"Speaker '{speaker}' not found. "
+                    f"Available: {available}. "
+                    f"Using fallback speaker '{fallback}'."
+                )
+                logger.warning(warn_msg)
+                plan_warnings.append(warn_msg)
+                if fb_id is not None:
+                    speaker_embed = w.codec_embed(
+                        torch.tensor([[fb_id]], device=device, dtype=torch.int64)
+                    )
+                    speaker = fallback
+        elif task_type == TaskType.CUSTOM_VOICE and not speaker:
+            default_id = w.spk_id_map.get(DEFAULT_SPEAKER)
+            if default_id is not None:
+                speaker_embed = w.codec_embed(
+                    torch.tensor([[default_id]], device=device, dtype=torch.int64)
+                )
+                speaker = DEFAULT_SPEAKER
+                logger.info("No speaker specified, using default '%s'", DEFAULT_SPEAKER)
         elif task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
             if spk_embedding is not None:
                 speaker_embed = spk_embedding.reshape(1, 1, -1)
@@ -565,6 +595,7 @@ class PrefillBuilder:
             prefix_cache_key=prefix_cache_key,
             cacheable_prefix_embeds=cacheable_prefix_embeds,
             request_prefill_embeds=request_prefill_embeds,
+            warnings=plan_warnings if plan_warnings else None,
         )
 
     def build_trailing_embeds(

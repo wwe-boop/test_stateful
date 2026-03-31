@@ -42,6 +42,7 @@ class TTSResult:
     total_samples: int = 0
     error: Optional[str] = None
     audio: Optional[np.ndarray] = None
+    warnings: list = field(default_factory=list)
 
     @property
     def duration_sec(self) -> float:
@@ -76,6 +77,7 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
 
     chunks = []
     errors = []
+    warnings = []
     done = threading.Event()
     first_ts = [None]
 
@@ -88,6 +90,12 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
             return
         if result is None:
             return
+        warn = result.as_numpy("warning")
+        if warn is not None and warn.size > 0:
+            w_str = warn.flatten()[0]
+            if isinstance(w_str, bytes):
+                w_str = w_str.decode("utf-8")
+            warnings.append(w_str)
         if first_ts[0] is None:
             first_ts[0] = time.perf_counter()
         audio = result.as_numpy("audio_chunk")
@@ -110,6 +118,7 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
 
     if errors:
         result.error = errors[0]
+    result.warnings = warnings
     result.total_ms = elapsed * 1000
     result.first_chunk_ms = (first_ts[0] - t0) * 1000 if first_ts[0] else None
     result.num_chunks = len(chunks)
@@ -135,6 +144,7 @@ def _send_streaming_request(
     client = grpcclient_mod.InferenceServerClient(url=triton_url)
     audio_chunks = []
     errors = []
+    warnings = []
     done = threading.Event()
     first_ts = [None]
 
@@ -146,6 +156,12 @@ def _send_streaming_request(
             return
         if result is None:
             return
+        warn = result.as_numpy("warning")
+        if warn is not None and warn.size > 0:
+            w_str = warn.flatten()[0]
+            if isinstance(w_str, bytes):
+                w_str = w_str.decode("utf-8")
+            warnings.append(w_str)
         if first_ts[0] is None:
             first_ts[0] = time.perf_counter()
         audio = result.as_numpy("audio_chunk")
@@ -194,6 +210,7 @@ def _send_streaming_request(
 
     if errors:
         result.error = errors[0]
+    result.warnings = warnings
     result.total_ms = elapsed * 1000
     result.first_chunk_ms = (first_ts[0] - t0) * 1000 if first_ts[0] else None
     result.num_chunks = len(audio_chunks)
@@ -219,6 +236,9 @@ def _print_result(result: TTSResult, label: str = ""):
     if result.error:
         print(f"{prefix} ERROR: {result.error}")
         return
+    if result.warnings:
+        for w in result.warnings:
+            print(f"{prefix} WARNING: {w}")
     fc = f"{result.first_chunk_ms:.0f}ms" if result.first_chunk_ms is not None else "N/A"
     print(
         f"{prefix} session={result.session_id}"
@@ -315,7 +335,7 @@ def test_single_smoke(triton_url: str, output_dir: Path):
     result = _send_request(client, grpcclient_mod, {
         "text": "你好，这是单路测试。",
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
     })
     _print_result(result, "single")
     if result.audio is not None and result.audio.size > 0:
@@ -341,7 +361,7 @@ def test_streaming_text(triton_url: str, output_dir: Path):
         "action": "init",
         "session_id": session_id,
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "text": "你好，这是流式文本输入测试。",
     }
     text_chunks = [
@@ -379,7 +399,7 @@ def test_concurrent(triton_url: str, concurrency: int, output_dir: Path):
         return _send_request(client, grpcclient_mod, {
             "text": text,
             "task_type": "custom_voice",
-            "speaker": "zhitian",
+            "speaker": "Serena",
             "session_id": f"concurrent-{idx}",
         })
 
@@ -425,7 +445,7 @@ def test_long_text(triton_url: str, output_dir: Path):
     r1 = _send_request(client, grpcclient_mod, {
         "text": LONG_TEXT,
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "session_id": "longtext-medium",
     }, timeout=180)
     _print_result(r1, "medium-long")
@@ -441,7 +461,7 @@ def test_long_text(triton_url: str, output_dir: Path):
     r2 = _send_request(client2, grpcclient_mod, {
         "text": VERY_LONG_TEXT,
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "session_id": "longtext-verylong",
     }, timeout=300)
     _print_result(r2, "very-long")
@@ -466,7 +486,7 @@ def test_long_text(triton_url: str, output_dir: Path):
     r3 = _send_streaming_request(
         triton_url, grpcclient_mod,
         {"action": "init", "session_id": sid, "task_type": "custom_voice",
-         "speaker": "zhitian", "text": ""},
+         "speaker": "Serena", "text": ""},
         sentences, chunk_delay_ms=300, timeout=180,
     )
     _print_result(r3, "stream-long")
@@ -495,7 +515,7 @@ def test_badcases(triton_url: str, output_dir: Path):
     r = _send_request(client_a, grpcclient_mod, {
         "text": "",
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "session_id": "badcase-empty",
     }, timeout=15)
     expected_error = r.error is not None
@@ -510,7 +530,7 @@ def test_badcases(triton_url: str, output_dir: Path):
     r = _send_request(client_b, grpcclient_mod, {
         "text": "   \n\t  ",
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "session_id": "badcase-whitespace",
     }, timeout=15)
     expected_error = r.error is not None
@@ -539,7 +559,7 @@ def test_badcases(triton_url: str, output_dir: Path):
     r = _send_streaming_request(
         triton_url, grpcclient_mod,
         {"action": "init", "session_id": sid, "task_type": "custom_voice",
-         "speaker": "zhitian", "text": ""},
+         "speaker": "Serena", "text": ""},
         [],  # no text chunks
         chunk_delay_ms=100, timeout=15,
     )
@@ -570,7 +590,7 @@ def test_badcases(triton_url: str, output_dir: Path):
     r = _send_request(client_f, grpcclient_mod, {
         "text": "好",
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "session_id": "badcase-single-char",
     }, timeout=30)
     ok = r.error is None and r.total_samples > 0
@@ -587,7 +607,7 @@ def test_badcases(triton_url: str, output_dir: Path):
     r = _send_request(client_g, grpcclient_mod, {
         "text": "。。。！！！",
         "task_type": "custom_voice",
-        "speaker": "zhitian",
+        "speaker": "Serena",
         "session_id": "badcase-punctuation",
     }, timeout=30)
     _print_result(r, "punctuation")
@@ -599,7 +619,7 @@ def test_badcases(triton_url: str, output_dir: Path):
     r = _send_streaming_request(
         triton_url, grpcclient_mod,
         {"action": "init", "session_id": sid, "task_type": "custom_voice",
-         "speaker": "zhitian", "text": ""},
+         "speaker": "Serena", "text": ""},
         ["你好，", "这是一个", "慢速输入的测试。"],
         chunk_delay_ms=1000, timeout=60,
     )
@@ -610,6 +630,26 @@ def test_badcases(triton_url: str, output_dir: Path):
         out_path = str(output_dir / "test5h_slow_stream.wav")
         _save_wav(r.audio, out_path)
     results.append(("5h_slow_stream", ok, r))
+
+    # 5i: invalid speaker name (should return warning + fallback audio)
+    print("\n  --- 5i: Invalid speaker name (should warn + use fallback) ---")
+    client_i = grpcclient_mod.InferenceServerClient(url=triton_url)
+    r = _send_request(client_i, grpcclient_mod, {
+        "text": "这是一个无效说话人测试。",
+        "task_type": "custom_voice",
+        "speaker": "zhitian",
+        "session_id": "badcase-invalid-speaker",
+    }, timeout=30)
+    got_warning = len(r.warnings) > 0
+    got_audio = r.error is None and r.total_samples > 0
+    ok = got_warning and got_audio
+    print(f"  Got warning: {got_warning}, got audio: {got_audio} -> "
+          f"{'PASS' if ok else 'FAIL'}")
+    _print_result(r, "invalid-speaker")
+    if r.audio is not None and r.audio.size > 0:
+        out_path = str(output_dir / "test5i_invalid_speaker.wav")
+        _save_wav(r.audio, out_path)
+    results.append(("5i_invalid_speaker", ok, r))
 
     # Summary
     print("\n  ── BadCase Summary ──")

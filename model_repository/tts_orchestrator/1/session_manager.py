@@ -87,6 +87,9 @@ class TTSSession:
     # Whether tts_eos_embed has been injected into trailing for streaming sessions
     _eos_injected: bool = False
 
+    # Pad-phase silence detection: consecutive silent frames during pad phase
+    pad_consecutive_silence: int = 0
+
     # Flow control
     flow_state: FlowState = FlowState.PENDING
     prefilled: bool = False
@@ -160,6 +163,7 @@ class TTSSession:
         self.frame_idx = 0
         self.segment_start_past_len = 0
         self.last_codec_sum = None
+        self.pad_consecutive_silence = 0
 
 
 class SessionManager:

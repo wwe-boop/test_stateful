@@ -87,6 +87,46 @@ class TritonPythonModel:
         codec_eos_id = int(self.weights.codec_eos_id)
         return int(logits[:, -1, :].float().argmax(dim=-1).item()) == codec_eos_id
 
+    @torch.no_grad()
+    def _sample_codec_sum(
+        self,
+        logits: torch.Tensor,
+        full_codec: torch.Tensor,
+        codec_sum: torch.Tensor,
+    ) -> torch.Tensor:
+        """Replace group-0 argmax contribution in codec_sum with a sampled token.
+
+        This prevents autoregressive degeneration (silence loops) during pad
+        phase while keeping the current step's wav output clean (argmax-based).
+        """
+        if not self._sampling_enabled:
+            return codec_sum
+
+        g0_logits = logits[:, -1, :].float()
+        batch_size = g0_logits.shape[0]
+
+        scaled = g0_logits / self._temperature
+        if self._top_k > 0:
+            k = min(self._top_k, scaled.shape[-1])
+            topk_vals, _ = scaled.topk(k, dim=-1)
+            scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+
+        probs = torch.softmax(scaled, dim=-1)
+        sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        argmax_tokens = full_codec[:, 0].long()
+        c3d = self.weights.codec_embeddings_3d
+        new_codec_sum = codec_sum.clone()
+
+        for b in range(batch_size):
+            s_tok = int(sampled[b].item())
+            a_tok = int(argmax_tokens[b].item())
+            if s_tok != a_tok and s_tok < c3d.shape[1] and a_tok < c3d.shape[1]:
+                delta = (c3d[0, s_tok] - c3d[0, a_tok]).to(codec_sum.dtype)
+                new_codec_sum[b, 0, :] += delta
+
+        return new_codec_sum
+
     # ── Lifecycle ──
 
     def initialize(self, args):
@@ -114,7 +154,7 @@ class TritonPythonModel:
         self.rollover_margin = int(params.get("rollover_margin", {}).get(
             "string_value", os.environ.get("ROLLOVER_MARGIN", "64")))
         self._max_pad_steps = int(params.get("max_pad_steps", {}).get(
-            "string_value", os.environ.get("MAX_PAD_STEPS", "120")))
+            "string_value", os.environ.get("MAX_PAD_STEPS", "500")))
         self.enable_text_rollover = params.get("enable_text_rollover", {}).get(
             "string_value",
             os.environ.get("ENABLE_TEXT_ROLLOVER", "1"),
@@ -141,6 +181,10 @@ class TritonPythonModel:
         self.code2wav_sliding_window = int(params.get("code2wav_sliding_window", {}).get(
             "string_value",
             os.environ.get("CODE2WAV_SLIDING_WINDOW", "72")))
+        self._temperature = float(params.get("temperature", {}).get(
+            "string_value", os.environ.get("TEMPERATURE", "0.9")))
+        self._top_k = int(params.get("top_k", {}).get(
+            "string_value", os.environ.get("TOP_K", "0")))
         self.request_timeout_sec = float(params.get("request_timeout_sec", {}).get(
             "string_value", "120"))
         self.max_batch_slots = int(params.get("max_batch_slots", {}).get(
@@ -159,6 +203,10 @@ class TritonPythonModel:
         self.head_dim = talker_h // talker_heads if talker_heads else 128
 
         self._tts_pad_embed_torch = self.weights.tts_pad_embed
+        self._sampling_enabled = (
+            self._temperature > 0
+            and self.weights.codec_embeddings_3d is not None
+        )
 
         logger.info(f"Loading tokenizer from {tokenizer_dir} ...")
         from lightweight_tokenizer import load_lightweight_tokenizer
@@ -298,7 +346,8 @@ class TritonPythonModel:
             f"text_rollover={self.enable_text_rollover}, "
             f"code2wav_sliding_window={self.code2wav_sliding_window}, "
             f"max_batch_slots={self.max_batch_slots}, "
-            f"ratio_ema={self._ratio_tracker.ema}"
+            f"ratio_ema={self._ratio_tracker.ema}, "
+            f"sampling={self._sampling_enabled} (temp={self._temperature}, top_k={self._top_k})"
         )
 
     # ── Execute (producer — enqueue and return immediately) ──
@@ -906,6 +955,10 @@ class TritonPythonModel:
                 ref_text=session.ref_text,
                 include_eos=include_eos,
             )
+            if plan.warnings:
+                for w_msg in plan.warnings:
+                    self._enqueue_warning(session.response_sender, w_msg)
+
             (
                 inputs_embeds,
                 position_ids,
@@ -920,7 +973,7 @@ class TritonPythonModel:
                 device=self.device,
                 dtype=torch.int64,
             )
-            wav, codec_sum, _, logits, kv_tensors, c2w_states = (
+            wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
                 self._bls_talker_code2wav_fused(
                     inputs_embeds,
                     position_ids,
@@ -935,10 +988,11 @@ class TritonPythonModel:
                 session.segment_idx += 1
                 continue
 
+            sampled_cs = self._sample_codec_sum(logits, full_codec, codec_sum)
             text_add = plan.trailing[0] if plan.trailing else self._tts_pad_embed_torch
             session.trailing_text = plan.trailing
             session.current_segment_text = seg_text
-            session.next_embed = (codec_sum + text_add).to(torch.float32)
+            session.next_embed = (sampled_cs + text_add).to(torch.float32)
             session.text_idx = 1
             session.kv_tensors = kv_tensors
             session.c2w_states = c2w_states
@@ -1054,7 +1108,7 @@ class TritonPythonModel:
                 ).contiguous()
             )
 
-        wav, codec_sum, _, logits, kv_tensors, c2w_states = (
+        wav, codec_sum, full_codec, logits, kv_tensors, c2w_states = (
             self._bls_talker_code2wav_fused(
                 batched_input,
                 batched_pos,
@@ -1065,6 +1119,7 @@ class TritonPythonModel:
                 past_seq_lens_override=past_seq_lens,
             )
         )
+        sampled_codec_sum = self._sample_codec_sum(logits, full_codec, codec_sum)
         seq = int(batched_input.shape[1])
         new_past_lens = [session.past_len + seq for session in sessions]
         original_past_lens = [session.past_len for session in sessions]
@@ -1107,20 +1162,21 @@ class TritonPythonModel:
                 self._activate_next_segment(session)
                 continue
 
-            self._enqueue_fused_wav(session.response_sender, wav[row_idx : row_idx + 1])
+            row_wav = wav[row_idx : row_idx + 1]
 
             # Layer 2: dynamic split if KV budget for remaining text is insufficient
             if self._maybe_dynamic_split_session(session, new_past_lens[row_idx]):
+                self._enqueue_fused_wav(session.response_sender, row_wav)
                 continue
 
             # Flow control: consume text, pause for streaming, or pad until EOS
             if session.text_idx < len(session.trailing_text):
                 text_add = session.trailing_text[session.text_idx]
                 session.text_idx += 1
+                self._enqueue_fused_wav(session.response_sender, row_wav)
             elif not session.text_complete:
-                # Streaming text exhausted but more expected: pause decode,
-                # PRESERVE KV cache so we can resume without re-prefill.
-                session.last_codec_sum = codec_sum[row_idx : row_idx + 1].clone()
+                self._enqueue_fused_wav(session.response_sender, row_wav)
+                session.last_codec_sum = sampled_codec_sum[row_idx : row_idx + 1].clone()
                 session.kv_tensors = split_kv[row_idx]
                 session.c2w_states = split_c2w[row_idx]
                 session.past_len = new_past_lens[row_idx]
@@ -1136,10 +1192,27 @@ class TritonPythonModel:
                 text_add = self._tts_pad_embed_torch
                 trailing_len = len(session.trailing_text)
                 pad_steps = session.frame_idx - trailing_len
-                if pad_steps > self._max_pad_steps:
+
+                rms = float(row_wav.float().pow(2).mean().sqrt().item())
+                if rms < 5e-4:
+                    session.pad_consecutive_silence += 1
+                else:
+                    session.pad_consecutive_silence = 0
+                self._enqueue_fused_wav(session.response_sender, row_wav)
+
+                pad_silence_limit = max(10, min(trailing_len // 2, 30))
+                should_rollover = (
+                    pad_steps > self._max_pad_steps
+                    or session.pad_consecutive_silence > pad_silence_limit
+                )
+                if should_rollover:
+                    reason = "PAD_SILENCE" if session.pad_consecutive_silence > pad_silence_limit else "PAD_TIMEOUT"
                     logger.warning(
-                        "Pad phase timeout for session %s: pad_steps=%d > max=%d, forcing segment rollover",
-                        session.session_id, pad_steps, self._max_pad_steps,
+                        "Pad phase %s for session %s: pad_steps=%d silence_run=%d "
+                        "(limit=%d, silence_limit=%d), forcing segment rollover",
+                        reason, session.session_id, pad_steps,
+                        session.pad_consecutive_silence,
+                        self._max_pad_steps, pad_silence_limit,
                     )
                     total_steps = new_past_lens[row_idx] - session.segment_start_past_len
                     tt = max(1, trailing_len)
@@ -1154,7 +1227,7 @@ class TritonPythonModel:
                     continue
 
             session.next_embed = (
-                codec_sum[row_idx : row_idx + 1] + text_add
+                sampled_codec_sum[row_idx : row_idx + 1] + text_add
             ).to(torch.float32)
             session.kv_tensors = split_kv[row_idx]
             session.c2w_states = split_c2w[row_idx]
@@ -1229,6 +1302,17 @@ class TritonPythonModel:
     def _enqueue_fused_wav(self, response_sender, wav: torch.Tensor):
         w = wav.reshape(-1) if wav.dim() == 3 else wav.flatten()
         self._enqueue_audio_chunk(response_sender, w.cpu().float().numpy(), is_final=False)
+
+    def _enqueue_warning(self, response_sender, warning_msg: str):
+        audio = np.zeros(1, dtype=np.float32)
+        response = pb_utils.InferenceResponse(
+            output_tensors=[
+                pb_utils.Tensor("audio_chunk", audio),
+                pb_utils.Tensor("is_final", np.array([False], dtype=bool)),
+                pb_utils.Tensor("warning", np.array([warning_msg], dtype=object)),
+            ],
+        )
+        self._response_queue.put((response_sender, response, 0))
 
     def _enqueue_error(self, response_sender, error_msg: str):
         audio = np.zeros(1, dtype=np.float32)
@@ -1356,7 +1440,7 @@ class TritonPythonModel:
             return max(16, self.engine_max_prefill_len - max(16, self.rollover_margin // 2))
         kv_budget = max(1, self.engine_max_decode_len - max(16, self.rollover_margin))
         raw = self._ratio_tracker.text_budget(kv_budget)
-        return max(16, int(raw * 0.8))
+        return max(16, int(raw * 0.9))
 
     def _segment_within_limits(
         self,

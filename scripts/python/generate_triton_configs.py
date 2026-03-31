@@ -524,6 +524,11 @@ output [
     name: "is_final"
     data_type: TYPE_BOOL
     dims: [ 1 ]
+  }},
+  {{
+    name: "warning"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
   }}
 ]
 

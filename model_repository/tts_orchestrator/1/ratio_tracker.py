@@ -16,11 +16,11 @@ class RatioTracker:
 
     def __init__(
         self,
-        initial: float = 3.5,
+        initial: float = 5.0,
         alpha: float = 0.1,
         overflow_alpha: float = 0.5,
         min_ratio: float = 2.0,
-        max_ratio: float = 6.0,
+        max_ratio: float = 10.0,
     ) -> None:
         self.ema = float(initial)
         self.alpha = float(alpha)
