@@ -496,6 +496,30 @@ def test_long_text(triton_url: str, output_dir: Path):
         print(f"  Saved: {out_path}")
     results.append(r3)
 
+    # 4d: story — very long narrative from file (~2000 chars)
+    story_path = Path(__file__).resolve().parents[2] / "tests" / "cases" / "story.txt"
+    if story_path.is_file():
+        print("\n  --- 4d: Story (long narrative) ---")
+        story_text = story_path.read_text(encoding="utf-8").strip()
+        print(f"  Story length: {len(story_text)} chars")
+        client4 = grpcclient_mod.InferenceServerClient(url=triton_url)
+        r4 = _send_request(client4, grpcclient_mod, {
+            "text": story_text,
+            "task_type": "custom_voice",
+            "speaker": "Serena",
+            "session_id": "longtext-story",
+        }, timeout=600)
+        _print_result(r4, "story")
+        if r4.audio is not None and r4.audio.size > 0:
+            out_path = str(output_dir / "test4d_story.wav")
+            _save_wav(r4.audio, out_path)
+            print(f"  Saved: {out_path}")
+            print(f"  Audio duration: {r4.duration_sec:.2f}s "
+                  f"(~{len(story_text)} chars)")
+        results.append(r4)
+    else:
+        print(f"\n  --- 4d: Story SKIPPED (not found: {story_path}) ---")
+
     return results
 
 
