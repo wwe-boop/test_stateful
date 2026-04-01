@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import queue
-import re
 import sys
 import threading
 import time
@@ -66,6 +65,8 @@ from session_manager import (
     TTSSession,
     generate_session_id,
 )
+from decode_fsm import DecodePhase, DecodeSessionFSM
+import mlfq_scheduler as mlfq
 from text_segmenter import split_text_for_token_budget
 
 SAMPLES_PER_CODEC_FRAME = 1920
@@ -179,6 +180,13 @@ class TritonPythonModel:
             "string_value", "120"))
         self.max_batch_slots = int(params.get("max_batch_slots", {}).get(
             "string_value", os.environ.get("MAX_BATCH_SLOTS", "8")))
+        self._segment_token_budget = int(params.get("segment_token_budget", {}).get(
+            "string_value", os.environ.get("SEGMENT_TOKEN_BUDGET", "300")))
+        self._silence_max_n = int(params.get("silence_max_n", {}).get(
+            "string_value", os.environ.get("SILENCE_MAX_N", "80")))
+        self._min_pad_steps_before_silence_abort = int(params.get("min_pad_steps_before_silence_abort", {}).get(
+            "string_value", os.environ.get("MIN_PAD_STEPS_BEFORE_SILENCE_ABORT", "4")))
+        self._engine_global_step = 0
 
         from prefill_builder import EmbeddingWeights, PrefillBuilder, parse_task_type
         self._parse_task_type = parse_task_type
@@ -521,6 +529,7 @@ class TritonPythonModel:
             request_start=time.monotonic(),
             is_streaming=is_streaming,
         )
+        mlfq.on_session_created(session)
         if not is_streaming and text.strip():
             session.mark_text_complete()
         self._session_mgr.add(session)
@@ -570,63 +579,90 @@ class TritonPythonModel:
             if not ref_audio or not (ref_audio if isinstance(ref_audio, str) else "").strip():
                 raise ValueError("Request field 'ref_audio' (base64) is required for voice_clone task_type")
 
-    def _punctuation_char_cut(self, text: str, target: int) -> int:
-        """Largest cut position <= target at a punctuation boundary (fallback: target)."""
-        if not text or target <= 0:
+    def _dynamic_silence_limit(self, remaining_steps: int) -> int:
+        max_n = self._silence_max_n
+        if remaining_steps <= 0:
             return 0
-        target = min(target, len(text))
-        best = 0
-        for m in re.finditer(r"[。！？!?；;：:\n，,、]", text):
-            if m.end() <= target:
-                best = m.end()
-        return best if best > 0 else target
+        return max(1, min(max_n, int(remaining_steps * max_n / 200.0)))
 
-    def _maybe_dynamic_split_session(self, session: TTSSession, new_past_len: int) -> bool:
-        """If remaining KV cannot fit estimated decode for rest of segment, split text and re-prefill head."""
-        tr = session.trailing_text
-        if not tr or not session.current_segment_text:
-            return False
-        if session.text_idx >= len(tr):
-            return False
-        if session.text_idx < 3:
-            return False
-        remaining_kv = self.engine_max_decode_len - new_past_len
-        remaining_text = len(tr) - session.text_idx
-        if remaining_text <= 0:
-            return False
-        session_ratio = (new_past_len - session.segment_start_past_len) / max(
-            session.text_idx, 1
-        )
-        est = self._ratio_tracker.estimate_remaining_steps(remaining_text, session_ratio)
-        if est <= remaining_kv:
-            return False
-        seg = session.current_segment_text.strip()
-        if len(seg) < 2:
-            return False
-        approx = max(1, int(len(seg) * session.text_idx / max(len(tr), 1)))
-        cut = self._punctuation_char_cut(
-            seg, approx + len(seg) // max(remaining_text * 2, 1)
-        )
-        head = seg[:cut].strip()
-        tail = seg[cut:].strip()
-        if len(head) < 1 or len(tail) < 1:
-            return False
-        session.text_segments[session.segment_idx] = head
-        session.text_segments.insert(session.segment_idx + 1, tail)
-        session.reset_decode_state()
-        logger.info(
-            "[Engine] Dynamic split session %s at char %d (head_len=%d tail_len=%d)",
-            session.session_id,
-            cut,
-            len(head),
-            len(tail),
-        )
+    @staticmethod
+    def _snap_cut_to_punct(text: str, raw_cut: int) -> int:
+        """Snap *raw_cut* backward to just after the nearest L1 punctuation.
+
+        Searches text[:raw_cut] from right to left for '。！？!?\\n'.
+        Returns the position right after the punctuation (so head = text[:pos]).
+        Falls back to raw_cut if no punctuation is found in the first half.
+        """
+        search_end = raw_cut
+        search_start = max(0, raw_cut // 3)
+        for i in range(search_end - 1, search_start - 1, -1):
+            if text[i] in "。！？!?\n":
+                return i + 1
+        return raw_cut
+
+    def _split_segment_at_text_idx(self, session: TTSSession, row_logits: torch.Tensor):
+        """Split current segment: head = consumed text, tail = remainder (new segment)."""
+        offsets = session.trailing_token_char_offsets or []
+        seg = session.current_segment_text or ""
+        trailing_len = len(session.trailing_text or [])
+        if offsets and session.text_idx < len(offsets):
+            cut_char = offsets[session.text_idx]
+        else:
+            approx_ratio = len(seg) / max(trailing_len, 1)
+            cut_char = min(len(seg), int(session.text_idx * approx_ratio))
+        head = seg[:cut_char].strip()
+        tail = seg[cut_char:].strip()
         try:
-            self._activate_next_segment(session)
-        except Exception as e:
-            logger.error("Dynamic split re-activate failed: %s", e)
-            return False
-        return True
+            session.last_segment_codec_tail = row_logits[:, -1, :].detach().cpu()
+        except Exception:
+            session.last_segment_codec_tail = None
+        if tail:
+            session.text_segments.insert(session.segment_idx + 1, tail)
+        if head:
+            session.text_segments[session.segment_idx] = head
+        mlfq.on_segment_boundary(session)
+        session.segment_idx += 1
+        session.reset_decode_state()
+        self._activate_next_segment(session)
+        return cut_char, len(head), len(tail)
+
+    def _snapshot_session_checkpoint(self, session: TTSSession, codec_sum: torch.Tensor) -> None:
+        if session.kv_tensors is None or session.c2w_states is None:
+            return
+        session.kv_checkpoint = [t.clone().contiguous() for t in session.kv_tensors]
+        session.c2w_checkpoint = [t.clone().contiguous() for t in session.c2w_states]
+        session.checkpoint_past_len = int(session.past_len)
+        session.checkpoint_codec_sum = codec_sum.clone().contiguous()
+
+    def _apply_kv_rollback(self, session: TTSSession) -> None:
+        """Restore talker KV + code2wav to post-prefill snapshot; keep text_idx."""
+        if (
+            session.kv_checkpoint is None
+            or session.c2w_checkpoint is None
+            or session.checkpoint_codec_sum is None
+        ):
+            logger.error("KV rollback missing checkpoint for session %s", session.session_id)
+            return
+        session.kv_tensors = [t.clone().contiguous() for t in session.kv_checkpoint]
+        session.c2w_states = [t.clone().contiguous() for t in session.c2w_checkpoint]
+        session.past_len = int(session.checkpoint_past_len)
+        session.frame_idx = 1
+        session.pad_consecutive_silence = 0
+        session.token_counts = torch.zeros(
+            1, self._vocab_size, device=self.device, dtype=torch.int64,
+        )
+        tr = session.trailing_text or []
+        if session.fsm:
+            session.fsm.on_kv_rollback_done(
+                session.checkpoint_past_len, self._ratio_tracker.ema,
+                trailing_len=len(tr),
+            )
+        if not tr:
+            session.next_embed = None
+            return
+        ti = max(0, min(session.text_idx - 1, len(tr) - 1))
+        text_add = tr[ti]
+        session.next_embed = (session.checkpoint_codec_sum + text_add).to(torch.float32)
 
     # ── Engine thread (consumer — continuous decode loop) ──
 
@@ -691,7 +727,29 @@ class TritonPythonModel:
                                     extra, include_eos=include_eos,
                                 )
                                 if new_embeds:
+                                    base = len(session.current_segment_text)
+                                    session.current_segment_text += extra
+                                    ext_off = self.prefill_builder.build_trailing_char_offsets(
+                                        extra, include_eos=include_eos,
+                                    )
+                                    session.trailing_token_char_offsets.extend(
+                                        [base + int(o) for o in ext_off]
+                                    )
                                     session.trailing_text.extend(new_embeds)
+                                    if session.fsm and session.fsm.phase == DecodePhase.PHASE_B:
+                                        session.fsm.trailing_char_offsets = (
+                                            session.trailing_token_char_offsets
+                                        )
+                                        session.fsm.segment_text = session.current_segment_text
+                                        session.fsm.restart_phase_a_after_extend(
+                                            session.past_len, self._ratio_tracker.ema,
+                                            trailing_len=len(session.trailing_text or []),
+                                        )
+                                    elif session.fsm:
+                                        session.fsm.trailing_char_offsets = (
+                                            session.trailing_token_char_offsets
+                                        )
+                                        session.fsm.segment_text = session.current_segment_text
                                     if include_eos:
                                         session._eos_injected = True
                                     logger.info(
@@ -729,6 +787,11 @@ class TritonPythonModel:
                         session.trailing_text.append(
                             self.prefill_builder.w.tts_eos_embed.clone()
                         )
+                        session.trailing_token_char_offsets.append(
+                            len(session.current_segment_text)
+                        )
+                        if session.fsm:
+                            session.fsm.trailing_char_offsets = session.trailing_token_char_offsets
                         session._eos_injected = True
                         logger.info(
                             "[Engine] Injected eos for session %s (trailing=%d)",
@@ -761,6 +824,15 @@ class TritonPythonModel:
                         self._finish_session(session)
 
                     if ready:
+                        self._engine_global_step += 1
+                        mlfq.global_aging(
+                            self._session_mgr.get_active(),
+                            self._engine_global_step,
+                        )
+                        ready = mlfq.order_ready_sessions(
+                            ready,
+                            self._engine_global_step,
+                        )
                         tickets = [
                             FusedDecodeTicket(
                                 payload=session,
@@ -827,9 +899,28 @@ class TritonPythonModel:
                         new_text, include_eos=include_eos,
                     )
                     if new_trailing:
+                        self._snapshot_session_checkpoint(session, session.last_codec_sum)
                         text_add = new_trailing[0]
                         session.trailing_text = new_trailing
                         session.text_idx = 1
+                        session.current_segment_text = new_text.strip()
+                        session.trailing_token_char_offsets = (
+                            self.prefill_builder.build_trailing_char_offsets(
+                                new_text.strip(), include_eos=include_eos,
+                            )
+                        )
+                        session.fsm = DecodeSessionFSM(
+                            engine_max_decode_len=self.engine_max_decode_len,
+                            rollover_margin=self.rollover_margin,
+                            max_pad_steps=self._max_pad_steps,
+                        )
+                        session.fsm.on_prefill_done(
+                            session.checkpoint_past_len,
+                            session.trailing_token_char_offsets,
+                            session.current_segment_text,
+                            self._ratio_tracker.ema,
+                            trailing_len=len(session.trailing_text or []),
+                        )
                         session.next_embed = (
                             session.last_codec_sum + text_add
                         ).to(torch.float32)
@@ -849,10 +940,25 @@ class TritonPythonModel:
 
             if session.text_complete:
                 # No new text but text_complete signaled: inject eos and resume
+                self._snapshot_session_checkpoint(session, session.last_codec_sum)
                 eos_trailing = [self.prefill_builder.w.tts_eos_embed.clone()]
                 text_add = eos_trailing[0]
                 session.trailing_text = eos_trailing
                 session.text_idx = 1
+                session.trailing_token_char_offsets = [0]
+                session.current_segment_text = session.current_segment_text or ""
+                session.fsm = DecodeSessionFSM(
+                    engine_max_decode_len=self.engine_max_decode_len,
+                    rollover_margin=self.rollover_margin,
+                    max_pad_steps=self._max_pad_steps,
+                )
+                session.fsm.on_prefill_done(
+                    session.checkpoint_past_len,
+                    session.trailing_token_char_offsets,
+                    session.current_segment_text,
+                    self._ratio_tracker.ema,
+                    trailing_len=len(session.trailing_text or []),
+                )
                 session.next_embed = (
                     session.last_codec_sum + text_add
                 ).to(torch.float32)
@@ -993,6 +1099,20 @@ class TritonPythonModel:
             session.frame_idx = 1
             session.flow_state = FlowState.ACTIVE
             session.prefilled = True
+            self._snapshot_session_checkpoint(session, codec_sum)
+            session.trailing_token_char_offsets = list(plan.trailing_token_char_offsets or [])
+            session.fsm = DecodeSessionFSM(
+                engine_max_decode_len=self.engine_max_decode_len,
+                rollover_margin=self.rollover_margin,
+                max_pad_steps=self._max_pad_steps,
+            )
+            session.fsm.on_prefill_done(
+                session.checkpoint_past_len,
+                session.trailing_token_char_offsets,
+                seg_text,
+                self._ratio_tracker.ema,
+                trailing_len=len(plan.trailing),
+            )
             logger.info(
                 "Activate segment %d/%d: sid=%s chars=%d, prompt=%d, trailing=%d, prefix_cache=%s",
                 session.segment_idx + 1,
@@ -1144,50 +1264,116 @@ class TritonPythonModel:
             row_logits = logits[row_idx : row_idx + 1]
             row_fc = full_codec[row_idx : row_idx + 1]
             eos = self._is_codec_eos(row_fc)
+            row_wav = wav[row_idx : row_idx + 1]
+            row_cs = codec_sum[row_idx : row_idx + 1]
+            new_len = new_past_lens[row_idx]
+            fsm = session.fsm
+            tr = session.trailing_text or []
+            trailing_len = len(tr)
 
-            if eos or new_past_lens[row_idx] > max_kv_len:
-                total_steps = new_past_lens[row_idx] - session.segment_start_past_len
-                trailing_len = len(session.trailing_text) if session.trailing_text else 0
+            def _end_segment_naturally() -> None:
+                total_steps = new_len - session.segment_start_past_len
                 tt = max(1, min(session.text_idx, trailing_len))
-                reason = "EOS" if eos else "KV_OVERFLOW"
-                logger.info(
-                    "Segment end [%s]: sid=%s total_steps=%d text_idx=%d trailing_len=%d tt=%d ratio=%.2f",
-                    reason, session.session_id, total_steps, session.text_idx, trailing_len, tt,
-                    total_steps / tt if tt > 0 else 0,
-                )
-                if new_past_lens[row_idx] > max_kv_len:
-                    logger.warning("KV cache limit for session %s, forcing segment rollover", session.session_id)
-                    self._ratio_tracker.update_overflow(total_steps, tt)
-                else:
-                    self._ratio_tracker.update(total_steps, tt)
+                self._ratio_tracker.update(total_steps, tt)
                 try:
                     session.last_segment_codec_tail = row_logits[:, -1, :].detach().cpu()
                 except Exception:
                     session.last_segment_codec_tail = None
+                mlfq.on_segment_boundary(session)
                 session.segment_idx += 1
                 session.reset_decode_state()
                 self._activate_next_segment(session)
+
+            # Hard KV overflow
+            if new_len > max_kv_len:
+                total_steps = new_len - session.segment_start_past_len
+                tt = max(1, min(session.text_idx, trailing_len))
+                orig_text_idx_kv = session.text_idx
+                self._ratio_tracker.update_overflow(total_steps, tt)
+                cut, h, t = self._split_segment_at_text_idx(session, row_logits)
+                logger.warning(
+                    "KV overflow sid=%s steps=%d text_idx=%d/%d — "
+                    "split at char %d (head=%d tail=%d)",
+                    session.session_id, total_steps, orig_text_idx_kv, trailing_len,
+                    cut, h, t,
+                )
+                mlfq.on_decode_step_done(session)
                 continue
 
-            row_wav = wav[row_idx : row_idx + 1]
+            # Codec EOS handling
+            if eos:
+                in_phase_a = fsm and fsm.phase == DecodePhase.PHASE_A
+                if in_phase_a and session.text_idx < trailing_len:
+                    session._spurious_eos_count += 1
+                    max_spurious = max(10, trailing_len // 2)
+                    if session._spurious_eos_count > max_spurious:
+                        logger.warning(
+                            "Too many spurious Codec EOS (%d) in Phase A sid=%s "
+                            "text_idx=%d/%d — forcing Phase B",
+                            session._spurious_eos_count,
+                            session.session_id, session.text_idx, trailing_len,
+                        )
+                        if fsm:
+                            fsm.enter_phase_b("spurious_eos_limit")
+                    else:
+                        if session._spurious_eos_count <= 3:
+                            logger.info(
+                                "Ignoring spurious Codec EOS in Phase A sid=%s "
+                                "text_idx=%d/%d frame=%d (count=%d)",
+                                session.session_id, session.text_idx, trailing_len,
+                                session.frame_idx, session._spurious_eos_count,
+                            )
+                        eos = False
 
-            # Layer 2: dynamic split if KV budget for remaining text is insufficient
-            if self._maybe_dynamic_split_session(session, new_past_lens[row_idx]):
-                self._enqueue_fused_wav(session.response_sender, row_wav)
+            if eos:
+                total_steps = new_len - session.segment_start_past_len
+                tt = max(1, min(session.text_idx, trailing_len))
+                if session.text_idx < trailing_len:
+                    orig_text_idx = session.text_idx
+                    fsm_phase = fsm.phase.value if fsm else "no_fsm"
+                    self._ratio_tracker.update(total_steps, tt)
+                    cut, h, t = self._split_segment_at_text_idx(session, row_logits)
+                    logger.info(
+                        "Codec EOS with unconsumed trailing sid=%s text_idx=%d/%d steps=%d "
+                        "fsm_phase=%s frame=%d — split at char %d (head=%d tail=%d)",
+                        session.session_id, orig_text_idx, trailing_len,
+                        total_steps, fsm_phase, session.frame_idx,
+                        cut, h, t,
+                    )
+                    mlfq.on_decode_step_done(session)
+                    continue
+                logger.info(
+                    "Segment EOS sid=%s steps=%d text_idx=%d trailing_len=%d",
+                    session.session_id, total_steps, session.text_idx, trailing_len,
+                )
+                _end_segment_naturally()
+                mlfq.on_decode_step_done(session)
                 continue
 
-            # Flow control: consume text, pause for streaming, or pad until EOS
-            if session.text_idx < len(session.trailing_text):
-                text_add = session.trailing_text[session.text_idx]
+            if fsm and fsm.phase == DecodePhase.PHASE_A and session.text_idx >= trailing_len:
+                fsm.enter_phase_b("trailing_exhausted")
+
+            if (
+                session.text_idx < trailing_len
+                and (fsm is None or fsm.phase == DecodePhase.PHASE_A)
+            ):
+                text_add = tr[session.text_idx]
                 session.text_idx += 1
+                if fsm:
+                    fsm.note_phase_a_step()
+                    if fsm.should_enter_phase_b_after_consuming_token(
+                        session.text_idx, trailing_len,
+                    ):
+                        fsm.enter_phase_b("fsm_threshold")
                 self._enqueue_fused_wav(session.response_sender, row_wav)
-            elif not session.text_complete:
+            elif session.text_idx >= trailing_len and not session.text_complete:
                 self._enqueue_fused_wav(session.response_sender, row_wav)
-                session.last_codec_sum = codec_sum[row_idx : row_idx + 1].clone()
+                session.last_codec_sum = row_cs.clone()
+                self._snapshot_session_checkpoint(session, row_cs)
                 session.token_counts = updated_tc[row_idx : row_idx + 1].clone()
                 session.kv_tensors = split_kv[row_idx]
                 session.c2w_states = split_c2w[row_idx]
-                session.past_len = new_past_lens[row_idx]
+                session.past_len = new_len
                 session.frame_idx += 1
                 session.flow_state = FlowState.IDLE
                 session.next_embed = None
@@ -1195,53 +1381,72 @@ class TritonPythonModel:
                     "Streaming pause: sid=%s IDLE with KV preserved (past_len=%d, frame=%d)",
                     session.session_id, session.past_len, session.frame_idx,
                 )
+                mlfq.on_decode_step_done(session)
                 continue
             else:
-                text_add = self._tts_pad_embed_torch
-                trailing_len = len(session.trailing_text)
+                if fsm and not fsm.phase_b_eos_injected:
+                    text_add = self.prefill_builder.w.tts_eos_embed.clone()
+                    fsm.phase_b_eos_injected = True
+                else:
+                    text_add = self._tts_pad_embed_torch
                 pad_steps = session.frame_idx - trailing_len
+                has_unconsumed = session.text_idx < trailing_len
 
                 rms = float(row_wav.float().pow(2).mean().sqrt().item())
-                if rms < 5e-4:
+                is_silent = rms < 5e-4
+                if is_silent:
                     session.pad_consecutive_silence += 1
                 else:
                     session.pad_consecutive_silence = 0
+
                 self._enqueue_fused_wav(session.response_sender, row_wav)
 
-                pad_silence_limit = max(10, min(trailing_len // 2, 30))
-                should_rollover = (
-                    pad_steps > self._max_pad_steps
-                    or session.pad_consecutive_silence > pad_silence_limit
-                )
+                rem_kv = max_kv_len - new_len
+                pad_silence_limit = self._dynamic_silence_limit(rem_kv)
+                pad_mature = pad_steps >= self._min_pad_steps_before_silence_abort
+                silence_abort = pad_mature and session.pad_consecutive_silence > pad_silence_limit
+                timeout_abort = pad_steps > self._max_pad_steps
+                should_rollover = timeout_abort or silence_abort
                 if should_rollover:
-                    reason = "PAD_SILENCE" if session.pad_consecutive_silence > pad_silence_limit else "PAD_TIMEOUT"
+                    reason = (
+                        "PAD_SILENCE" if silence_abort else "PAD_TIMEOUT"
+                    )
                     logger.warning(
                         "Pad phase %s for session %s: pad_steps=%d silence_run=%d "
-                        "(limit=%d, silence_limit=%d), forcing segment rollover",
+                        "(limit=%d, silence_limit=%d, rem_kv=%d)",
                         reason, session.session_id, pad_steps,
                         session.pad_consecutive_silence,
-                        self._max_pad_steps, pad_silence_limit,
+                        self._max_pad_steps, pad_silence_limit, rem_kv,
                     )
-                    total_steps = new_past_lens[row_idx] - session.segment_start_past_len
+                    total_steps = new_len - session.segment_start_past_len
                     tt = max(1, trailing_len)
                     self._ratio_tracker.update_overflow(total_steps, tt)
+                    if has_unconsumed:
+                        cut, h, t = self._split_segment_at_text_idx(session, row_logits)
+                        logger.warning(
+                            "Pad %s split sid=%s at char %d (head=%d tail=%d)",
+                            reason, session.session_id, cut, h, t,
+                        )
+                        mlfq.on_decode_step_done(session)
+                        continue
                     try:
                         session.last_segment_codec_tail = row_logits[:, -1, :].detach().cpu()
                     except Exception:
                         session.last_segment_codec_tail = None
+                    mlfq.on_segment_boundary(session)
                     session.segment_idx += 1
                     session.reset_decode_state()
                     self._activate_next_segment(session)
+                    mlfq.on_decode_step_done(session)
                     continue
 
-            session.next_embed = (
-                codec_sum[row_idx : row_idx + 1] + text_add
-            ).to(torch.float32)
+            session.next_embed = (row_cs + text_add).to(torch.float32)
             session.token_counts = updated_tc[row_idx : row_idx + 1].clone()
             session.kv_tensors = split_kv[row_idx]
             session.c2w_states = split_c2w[row_idx]
-            session.past_len = new_past_lens[row_idx]
+            session.past_len = new_len
             session.frame_idx += 1
+            mlfq.on_decode_step_done(session)
 
     def _split_batched_kv_rows(
         self,
@@ -1450,9 +1655,10 @@ class TritonPythonModel:
     def _segment_budget_for_task(self, task_type) -> int:
         if task_type.value == "voice_design":
             return max(16, self.engine_max_prefill_len - max(16, self.rollover_margin // 2))
-        kv_budget = max(1, self.engine_max_decode_len - max(16, self.rollover_margin))
-        raw = self._ratio_tracker.text_budget(kv_budget)
-        return max(16, int(raw * 0.9))
+        remaining = max(1, self.engine_max_decode_len - max(4, self.rollover_margin // 4))
+        phase_a_cap = max(8, int(remaining / (self._ratio_tracker.ema + 1.0)))
+        safe_budget = min(self._segment_token_budget, phase_a_cap)
+        return max(16, safe_budget)
 
     def _segment_within_limits(
         self,
@@ -1486,12 +1692,7 @@ class TritonPythonModel:
         ):
             input_len = int(plan.request_prefill_embeds.shape[1])
         trailing_len = int(len(plan.trailing))
-        kv_budget = max(1, self.engine_max_decode_len - max(16, self.rollover_margin))
-        decode_budget = self._ratio_tracker.text_budget(kv_budget)
-        total_budget = self.engine_max_prefill_len + self.engine_max_decode_len - max(16, self.rollover_margin // 2)
-        within = input_len <= self.engine_max_prefill_len and prefill_len <= total_budget
-        if task_type.value != "voice_design":
-            within = within and trailing_len <= decode_budget
+        within = input_len <= self.engine_max_prefill_len
         return within, input_len, trailing_len
 
     def _plan_text_segments(

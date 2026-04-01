@@ -20,7 +20,7 @@ All tensor ops use torch; no BLS for embedders. Tokenizer remains lightweight (t
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -63,6 +63,7 @@ class PrefillPlan:
     cacheable_prefix_embeds: Optional[torch.Tensor] = None
     request_prefill_embeds: Optional[torch.Tensor] = None
     warnings: list = None
+    trailing_token_char_offsets: list = field(default_factory=list)
 
 
 def parse_task_type(task_type_str: str, x_vector_only: bool = False) -> TaskType:
@@ -212,6 +213,50 @@ class PrefillBuilder:
         self.w = weights
         self.tokenizer = tokenizer
 
+    def _compute_trailing_char_offsets(
+        self,
+        user_text: str,
+        first_text_in_prefill: bool,
+        include_eos_row: bool,
+    ) -> list:
+        """Map each trailing text row (and optional eos row) to a char index in user_text."""
+        enc_fn = getattr(self.tokenizer, "encode_with_offsets", None)
+        if enc_fn is None:
+            return []
+        assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=user_text)
+        try:
+            _ids, offsets = enc_fn(assistant_text)
+        except Exception:
+            return []
+        # offsets from tokenizers are byte offsets; build a byte→char lookup
+        text_bytes = assistant_text.encode("utf-8")
+        byte_to_char = []
+        for ci, ch in enumerate(assistant_text):
+            ch_bytes = ch.encode("utf-8")
+            for _ in ch_bytes:
+                byte_to_char.append(ci)
+        byte_to_char.append(len(assistant_text))
+        prefix = "<|im_start|>assistant\n"
+        base_char = len(prefix)
+        n = len(offsets)
+        if n <= 8:
+            start_tok = 3
+        else:
+            start_tok = 4 if first_text_in_prefill else 3
+        end_tok = n - 5
+        if end_tok <= start_tok:
+            return []
+        out: list[int] = []
+        for ti in range(start_tok, end_tok):
+            if ti < len(offsets):
+                s, _e = offsets[ti]
+                char_pos = byte_to_char[min(s, len(byte_to_char) - 1)]
+                user_char = max(0, min(len(user_text), char_pos - base_char))
+                out.append(user_char)
+        if include_eos_row:
+            out.append(len(user_text))
+        return out
+
     def build(
         self,
         task_type: TaskType,
@@ -303,6 +348,7 @@ class PrefillBuilder:
         w = self.w
         device = w.device
         non_streaming_mode = (task_type == TaskType.VOICE_DESIGN)
+        char_offsets: list[int] = []
 
         # Tokenize with official format (includes trailing \n<|im_start|>assistant\n)
         assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=text)
@@ -461,6 +507,7 @@ class PrefillBuilder:
                 icl_embed = text_embed_icl + codec_embed_icl
                 trailing = [w.tts_pad_embed]
             prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
+            char_offsets = []
 
         elif (
             task_type == TaskType.VOICE_CLONE_ICL
@@ -506,6 +553,7 @@ class PrefillBuilder:
                 icl_embed = text_embed_icl + codec_embed_icl
                 trailing = [w.tts_pad_embed]
             prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
+            char_offsets = []
 
         elif non_streaming_mode:
             # Official L2203-2227: fold ALL text into prefill
@@ -537,6 +585,7 @@ class PrefillBuilder:
                 dim=1,
             )
             trailing = [w.tts_pad_embed.clone()]
+            char_offsets = []
 
         else:
             # Streaming mode (official L2228-2232)
@@ -558,6 +607,7 @@ class PrefillBuilder:
                 trailing_text_hidden[:, i : i + 1, :].clone()
                 for i in range(n_trailing)
             ]
+            char_offsets = self._compute_trailing_char_offsets(text, True, include_eos)
 
         prefix_cache_key = None
         cacheable_prefix_embeds = None
@@ -596,6 +646,7 @@ class PrefillBuilder:
             cacheable_prefix_embeds=cacheable_prefix_embeds,
             request_prefill_embeds=request_prefill_embeds,
             warnings=plan_warnings if plan_warnings else None,
+            trailing_token_char_offsets=char_offsets,
         )
 
     def build_trailing_embeds(
@@ -629,3 +680,7 @@ class PrefillBuilder:
             else:
                 return []
         return [text_embed[:, i:i+1, :].clone() for i in range(text_embed.shape[1])]
+
+    def build_trailing_char_offsets(self, text: str, include_eos: bool = True) -> list[int]:
+        """Char offsets aligned with :meth:`build_trailing_embeds` rows."""
+        return self._compute_trailing_char_offsets(text, False, include_eos)

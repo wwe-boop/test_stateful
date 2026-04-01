@@ -142,6 +142,11 @@ class _WrapTokenizer:
     def __init__(self, tokenizer: Any):
         self._tok = tokenizer
 
+    def encode_with_offsets(self, text: str):
+        """Return token ids and (char_start, char_end) pairs for each token."""
+        enc = self._tok.encode(text)
+        return enc.ids, enc.offsets
+
     def __call__(
         self,
         text: str,

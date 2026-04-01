@@ -8,14 +8,21 @@ PrefillBuilder so token-budget decisions stay aligned with runtime behavior.
 
 from __future__ import annotations
 
-import re
 from typing import Any, List
 
 import numpy as np
 
 OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
-_FRAGMENT_BOUNDARY_RE = re.compile(r"(?<=[。！？!?；;：:\n])|(?<=[，,、])|(?<=\s)")
+# Phase-A punctuation tiers (L2 includes L1; L3 includes L2 + dash/ellipsis).
+PUNCT_LEVEL_1 = set("。！？!?\n")
+PUNCT_LEVEL_2 = PUNCT_LEVEL_1 | set("，,；;、：:")
+PUNCT_LEVEL_3 = PUNCT_LEVEL_2 | set("—…\u2014\u2026")
+
+_QUOTE_OPEN = set('"\u201c')
+_QUOTE_CLOSE = set('"\u201d')
+
+_DEFAULT_QUOTE_LOOKAHEAD_CHARS = 120
 
 
 def assistant_token_count(text: str, tokenizer: Any) -> int:
@@ -28,6 +35,50 @@ def assistant_token_count(text: str, tokenizer: Any) -> int:
     if arr.ndim == 1:
         return int(arr.shape[0])
     return int(arr.shape[-1])
+
+
+def find_quote_aware_presplit_cut(
+    text: str,
+    max_chars: int,
+    lookahead: int = _DEFAULT_QUOTE_LOOKAHEAD_CHARS,
+) -> int:
+    """
+    Return exclusive cut index for coarse pre-segmentation.
+
+    Prefers strong punctuation (L1) outside paired quotes; scans up to
+    max_chars + lookahead. Falls back to max_chars or first L1 inside quotes.
+    """
+    if not text:
+        return 0
+    n = len(text)
+    max_chars = min(max(max_chars, 1), n)
+    lim = min(n, max_chars + max(16, lookahead))
+    in_quote = False
+    best_le_max: int = -1
+    for i in range(lim):
+        ch = text[i]
+        if ch in _QUOTE_OPEN:
+            in_quote = True
+        elif ch in _QUOTE_CLOSE:
+            in_quote = False
+        if ch in PUNCT_LEVEL_1:
+            cut = i + 1
+            if cut <= max_chars and not in_quote:
+                best_le_max = cut
+            elif cut <= max_chars and in_quote and best_le_max < 0:
+                best_le_max = cut
+    if best_le_max > 0:
+        return best_le_max
+    in_quote = False
+    for i in range(max_chars, lim):
+        ch = text[i]
+        if ch in _QUOTE_OPEN:
+            in_quote = True
+        elif ch in _QUOTE_CLOSE:
+            in_quote = False
+        if not in_quote and ch in PUNCT_LEVEL_1:
+            return i + 1
+    return max_chars
 
 
 def _largest_prefix_within_budget(text: str, tokenizer: Any, max_tokens: int) -> int:
@@ -54,6 +105,7 @@ def _hard_split_fragment(text: str, tokenizer: Any, max_tokens: int) -> List[str
             parts.append(remain)
             break
         cut = _largest_prefix_within_budget(remain, tokenizer, max_tokens)
+        cut = find_quote_aware_presplit_cut(remain, cut)
         piece = remain[:cut].strip()
         if not piece:
             piece = remain[:1]
@@ -65,12 +117,10 @@ def _hard_split_fragment(text: str, tokenizer: Any, max_tokens: int) -> List[str
 
 def split_text_for_token_budget(text: str, tokenizer: Any, max_tokens: int) -> List[str]:
     """
-    Greedily pack punctuation-delimited fragments under ``max_tokens``.
+    Pack text into segments under ``max_tokens`` (assistant format).
 
-    Preference order:
-    1. Strong punctuation/newline boundaries already present in the text
-    2. Weak punctuation / whitespace boundaries
-    3. Hard split by longest prefix within budget
+    Uses quote-aware coarse cuts near the token-derived char bound, then the
+    legacy fragment packing for leftovers.
     """
     text = (text or "").strip()
     if not text:
@@ -78,32 +128,29 @@ def split_text_for_token_budget(text: str, tokenizer: Any, max_tokens: int) -> L
     if max_tokens <= 0 or assistant_token_count(text, tokenizer) <= max_tokens:
         return [text]
 
-    fragments = [frag for frag in _FRAGMENT_BOUNDARY_RE.split(text) if frag]
     segments: List[str] = []
-    current = ""
+    remain = text
+    while remain:
+        if assistant_token_count(remain, tokenizer) <= max_tokens:
+            segments.append(remain)
+            break
+        char_hi = _largest_prefix_within_budget(remain, tokenizer, max_tokens)
+        cut = find_quote_aware_presplit_cut(remain, char_hi)
+        if cut <= 0:
+            cut = min(len(remain), char_hi)
+        piece = remain[:cut].strip()
+        if not piece:
+            piece = remain[:1]
+            cut = 1
+        segments.append(piece)
+        remain = remain[cut:].lstrip()
 
-    for raw_fragment in fragments:
-        fragment = raw_fragment if current else raw_fragment.lstrip()
-        if not fragment:
+    merged: List[str] = []
+    for seg in segments:
+        if not seg:
             continue
-
-        candidate = (current + fragment).strip()
-        if candidate and assistant_token_count(candidate, tokenizer) <= max_tokens:
-            current = current + fragment
+        if assistant_token_count(seg, tokenizer) <= max_tokens:
+            merged.append(seg)
             continue
-
-        if current.strip():
-            segments.append(current.strip())
-            current = ""
-            fragment = raw_fragment.lstrip()
-
-        if fragment and assistant_token_count(fragment.strip(), tokenizer) <= max_tokens:
-            current = fragment
-            continue
-
-        segments.extend(_hard_split_fragment(fragment, tokenizer, max_tokens))
-
-    if current.strip():
-        segments.append(current.strip())
-
-    return [seg for seg in segments if seg]
+        merged.extend(_hard_split_fragment(seg, tokenizer, max_tokens))
+    return [s for s in merged if s]

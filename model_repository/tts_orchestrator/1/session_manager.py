@@ -93,6 +93,18 @@ class TTSSession:
     # Pad-phase silence detection: consecutive silent frames during pad phase
     pad_consecutive_silence: int = 0
 
+    # Spurious Codec EOS counter (reset per segment)
+    _spurious_eos_count: int = 0
+
+    # Decode FSM + KV checkpoint (post-prefill snapshot for multi-round segments)
+    fsm: Any = None
+    kv_checkpoint: Any = None
+    c2w_checkpoint: Any = None
+    checkpoint_past_len: int = 0
+    checkpoint_codec_sum: Any = None
+    trailing_token_char_offsets: List[int] = field(default_factory=list)
+    mlfq_meta: Any = None
+
     # Flow control
     flow_state: FlowState = FlowState.PENDING
     prefilled: bool = False
@@ -168,6 +180,13 @@ class TTSSession:
         self.last_codec_sum = None
         self.token_counts = None
         self.pad_consecutive_silence = 0
+        self.fsm = None
+        self.kv_checkpoint = None
+        self.c2w_checkpoint = None
+        self.checkpoint_past_len = 0
+        self.checkpoint_codec_sum = None
+        self.trailing_token_char_offsets = []
+        self._spurious_eos_count = 0
 
 
 class SessionManager:
