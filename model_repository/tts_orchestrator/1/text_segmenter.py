@@ -47,6 +47,10 @@ def find_quote_aware_presplit_cut(
 
     Prefers strong punctuation (L1) outside paired quotes; scans up to
     max_chars + lookahead. Falls back to max_chars or first L1 inside quotes.
+
+    After a closing quote, the first L1 punctuation is treated as a strong
+    boundary — the scan stops extending ``best_le_max`` beyond that point so
+    short sentences following a quoted block stay in the next segment.
     """
     if not text:
         return 0
@@ -55,16 +59,26 @@ def find_quote_aware_presplit_cut(
     lim = min(n, max_chars + max(16, lookahead))
     in_quote = False
     best_le_max: int = -1
+    just_closed_quote = False
     for i in range(lim):
         ch = text[i]
         if ch in _QUOTE_OPEN:
             in_quote = True
+            just_closed_quote = False
         elif ch in _QUOTE_CLOSE:
             in_quote = False
+            just_closed_quote = True
+        elif not ch.isspace():
+            just_closed_quote = False
         if ch in PUNCT_LEVEL_1:
             cut = i + 1
             if cut <= max_chars and not in_quote:
+                if just_closed_quote and best_le_max > 0:
+                    best_le_max = cut
+                    break
                 best_le_max = cut
+                if just_closed_quote:
+                    break
             elif cut <= max_chars and in_quote and best_le_max < 0:
                 best_le_max = cut
     if best_le_max > 0:

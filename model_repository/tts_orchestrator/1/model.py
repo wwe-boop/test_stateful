@@ -1756,7 +1756,15 @@ class TritonPythonModel:
             pending = refined + pending
 
         if len(planned) > 1:
-            logger.info("Long-text rollover planned: %d segments", len(planned))
+            previews = [
+                f"[{i+1}] {len(s)}ch: {repr(s[:20])}...{repr(s[-15:])}"
+                for i, s in enumerate(planned)
+            ]
+            logger.info(
+                "Long-text rollover planned: %d segments\n  %s",
+                len(planned),
+                "\n  ".join(previews),
+            )
         return planned
 
     # ── BLS inference calls (fused pipeline only) ──
