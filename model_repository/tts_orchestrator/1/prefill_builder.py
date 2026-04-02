@@ -29,6 +29,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from text_segmenter import normalize_tts_text
+
 logger = logging.getLogger("prefill_builder")
 
 
@@ -347,6 +349,7 @@ class PrefillBuilder:
         """
         w = self.w
         device = w.device
+        text = normalize_tts_text(text)
         non_streaming_mode = (task_type == TaskType.VOICE_DESIGN)
         char_offsets: list[int] = []
 
@@ -659,6 +662,7 @@ class PrefillBuilder:
         Used for streaming text continuation — no prefill, just new trailing tokens
         to append to an existing decode loop.
         """
+        text = normalize_tts_text(text)
         w = self.w
         device = w.device
         assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=text)
@@ -683,4 +687,5 @@ class PrefillBuilder:
 
     def build_trailing_char_offsets(self, text: str, include_eos: bool = True) -> list[int]:
         """Char offsets aligned with :meth:`build_trailing_embeds` rows."""
+        text = normalize_tts_text(text)
         return self._compute_trailing_char_offsets(text, False, include_eos)

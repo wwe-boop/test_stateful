@@ -81,6 +81,54 @@ def padded_attention_bias(
     return _apply_causal_mask(bias, padded_past_len, seq)
 
 
+def prefill_padded_attention_bias(
+    input_seq_lens: torch.Tensor,
+    padded_seq_len: int,
+    past_seq_lens: torch.Tensor,
+    padded_past_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Attention bias for batched prefill with variable input sequence lengths.
+
+    Extends ``padded_attention_bias`` with input-side padding masks so that
+    padding key positions are masked for all queries and padding query
+    positions are fully masked.
+    """
+    batch = int(input_seq_lens.shape[0])
+    total = padded_past_len + padded_seq_len
+    bias = torch.zeros(batch, 1, padded_seq_len, total, device=device, dtype=dtype)
+
+    # Past-KV padding mask (same as padded_attention_bias)
+    if padded_past_len > 0:
+        for row in range(batch):
+            eff_past = int(past_seq_lens[row].item())
+            if eff_past < padded_past_len:
+                bias[row, 0, :, eff_past:padded_past_len] = float("-inf")
+
+    # Causal mask over the input region
+    if padded_seq_len > 1:
+        causal = torch.triu(
+            torch.full(
+                (padded_seq_len, padded_seq_len),
+                float("-inf"),
+                device=device,
+                dtype=dtype,
+            ),
+            diagonal=1,
+        )
+        bias[:, :, :, padded_past_len:] += causal.unsqueeze(0).unsqueeze(0)
+
+    # Input-side padding mask
+    for row in range(batch):
+        eff_seq = int(input_seq_lens[row].item())
+        if eff_seq < padded_seq_len:
+            bias[row, 0, :, padded_past_len + eff_seq:] = float("-inf")
+            bias[row, 0, eff_seq:, :] = float("-inf")
+
+    return bias
+
+
 def uniform_past_seq_lens(batch: int, past_len: int, device: torch.device) -> torch.Tensor:
     return torch.full((batch,), past_len, device=device, dtype=torch.long)
 

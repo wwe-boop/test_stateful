@@ -208,7 +208,7 @@ assemble_model_repo() {
     local orch_py_dir="$repo_root/model_repository/tts_orchestrator/1"
     if [ -d "$orch_py_dir" ]; then
         for pyf in model.py batch_decode_scheduler.py text_segmenter.py prefill_builder.py audio_utils.py \
-            lightweight_tokenizer.py session_manager.py; do
+            lightweight_tokenizer.py session_manager.py decode_fsm.py ratio_tracker.py mlfq_scheduler.py; do
             if [ -f "$orch_py_dir/$pyf" ]; then
                 cp "$orch_py_dir/$pyf" "$repo_dir/tts_orchestrator/1/$pyf"
             fi

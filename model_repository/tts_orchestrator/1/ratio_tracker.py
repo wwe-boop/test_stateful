@@ -2,11 +2,13 @@
 EMA tracker for audio decode steps / text token ratio (Phase 2 orchestrator).
 
 Used to estimate how many text tokens fit per segment under KV cache limits.
+Supports per-speaker tracking via SpeakerRatioRegistry.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Dict, Optional
 
 logger = logging.getLogger("tts_orchestrator.ratio_tracker")
 
@@ -16,12 +18,13 @@ class RatioTracker:
 
     def __init__(
         self,
-        initial: float = 5.0,
+        initial: float = 5.5,
         alpha: float = 0.1,
         overflow_alpha: float = 0.5,
         min_ratio: float = 2.0,
         max_ratio: float = 10.0,
     ) -> None:
+        self.initial = float(initial)
         self.ema = float(initial)
         self.alpha = float(alpha)
         self.overflow_alpha = float(overflow_alpha)
@@ -81,3 +84,40 @@ class RatioTracker:
         if session_ratio > 0:
             effective = max(self.ema, session_ratio * safety)
         return int(remaining_text_tokens * effective)
+
+
+class SpeakerRatioRegistry:
+    """Per-speaker EMA ratio tracking.
+
+    Each unique speaker_key (e.g. "Chelsie_zh") gets its own RatioTracker.
+    Cold-start speakers inherit the global tracker's current EMA.
+    """
+
+    def __init__(self, global_tracker: RatioTracker, max_speakers: int = 64) -> None:
+        self._global = global_tracker
+        self._max_speakers = max_speakers
+        self._trackers: Dict[str, RatioTracker] = {}
+
+    def get(self, speaker_key: Optional[str] = None) -> RatioTracker:
+        """Return the tracker for *speaker_key*, creating one if needed."""
+        if not speaker_key:
+            return self._global
+        if speaker_key in self._trackers:
+            return self._trackers[speaker_key]
+        if len(self._trackers) >= self._max_speakers:
+            oldest = next(iter(self._trackers))
+            del self._trackers[oldest]
+        tracker = RatioTracker(
+            initial=self._global.ema,
+            alpha=self._global.alpha,
+            overflow_alpha=self._global.overflow_alpha,
+            min_ratio=self._global.min_ratio,
+            max_ratio=self._global.max_ratio,
+        )
+        self._trackers[speaker_key] = tracker
+        logger.info(
+            "SpeakerRatioRegistry: created tracker for %s (initial=%.2f)",
+            speaker_key,
+            tracker.ema,
+        )
+        return tracker
