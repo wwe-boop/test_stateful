@@ -134,7 +134,6 @@ class EngineLoop:
         self._max_batch = max_batch_size
 
         self._groups: Dict[str, EngineSessionGroup] = {}
-        # Flat index for fast slot→segment lookup during result processing
         self._seg_by_slot: Dict[int, EngineSegment] = {}
 
         self._running = False
@@ -217,8 +216,6 @@ class EngineLoop:
             group.segments[req.segment_idx] = seg
             if req.result_queue is not None:
                 group.result_queue = req.result_queue
-            if req.token_ids:
-                pass  # first token handled during prefill
             logger.debug("New segment: %s seg=%d prio=%s",
                          req.session_id, req.segment_idx, req.priority.name)
 
@@ -341,10 +338,18 @@ class EngineLoop:
             if group is None:
                 continue
 
-            if i < len(output.split_kv) and output.split_kv[i]:
-                slot.kv_tensors = output.split_kv[i]
-            if i < len(output.split_c2w) and output.split_c2w[i]:
-                slot.c2w_states = [t for t in output.split_c2w[i] if t is not None]
+            if output.split_talker_kv[i] is not None:
+                slot.talker_kv = output.split_talker_kv[i]
+            if output.split_c2w_kv[i] is not None:
+                slot.c2w_kv = output.split_c2w_kv[i]
+            if output.split_c2w_conv[i]:
+                slot.c2w_conv_states = [
+                    t for t in output.split_c2w_conv[i] if t is not None
+                ]
+            if output.split_c2w_transconv[i]:
+                slot.c2w_transconv_states = [
+                    t for t in output.split_c2w_transconv[i] if t is not None
+                ]
             if output.updated_tc is not None:
                 slot.token_counts = output.updated_tc[i:i+1].clone()
             slot.past_len += 1
@@ -409,8 +414,6 @@ class EngineLoop:
         if not all_done:
             return
 
-        # More segments may arrive from the frontend; only finish when
-        # the frontend has sent TEXT_COMPLETE for the last segment.
         has_pending = any(
             not s.text_complete for s in group.segments.values()
             if s.state != "done"

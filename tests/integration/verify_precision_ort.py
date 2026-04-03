@@ -7,7 +7,7 @@ and compares logits / codec_token_0 / full_codec against e2e_trt_ref.npz.
 If ORT FP32 matches PyTorch, precision issues are in TRT/BF16; if not, issue is in ONNX export.
 
 Usage (host, conda with onnxruntime):
-  python scripts/python/verify_precision_ort.py \\
+  python tests/integration/verify_precision_ort.py \\
     --onnx workspace/exported/design-1.7b/talker_unified.onnx \\
     --ref workspace/exported/design-1.7b/e2e_trt_ref.npz \\
     [--steps 200] [--model-dir workspace/exported/design-1.7b]
@@ -68,7 +68,7 @@ def main():
         logger.error(f"ONNX not found: {onnx_path}")
         sys.exit(1)
     if not ref_file.exists():
-        logger.error(f"Reference not found: {ref_file}. Run verify_e2e_trt_ref.py first.")
+        logger.error(f"Reference not found: {ref_file}. Run tests/integration/verify_e2e_trt_ref.py first.")
         sys.exit(1)
 
     model_dir = Path(args.model_dir) if args.model_dir else ref_file.parent

@@ -16,8 +16,8 @@ Runs on HOST with conda env (qwen3-tts).
 
 Usage:
   conda activate qwen3-tts
-  python scripts/python/verify_e2e.py --variant design-1.7b --steps 10
-  python scripts/python/verify_e2e.py --variant design-1.7b --steps 50 --text "Hello world"
+  python tests/integration/verify_e2e.py --variant design-1.7b --steps 10
+  python tests/integration/verify_e2e.py --variant design-1.7b --steps 50 --text "Hello world"
 """
 
 import argparse

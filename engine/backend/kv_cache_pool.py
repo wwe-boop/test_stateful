@@ -4,9 +4,11 @@ Instead of dynamically allocating KV tensors per session (which causes
 fragmentation and OOM under 64-session load), we pre-allocate a fixed
 pool and assign slots.
 
-Memory layout per slot:
-    talker:  num_layers × 2 (K+V) × [1, kv_heads, max_seq_len, head_dim]
-    c2w:     num_c2w_states × [1, ...]  (variable shapes per state)
+Memory layout per slot (packed tensor format):
+    talker_kv:  [1, num_layers*2, kv_heads, cur_len, head_dim]  (single packed tensor)
+    c2w_kv:     [1, n_c2w_layers*2, c2w_kv_heads, cur_len, c2w_head_dim]
+    c2w_conv:   17 tensors with heterogeneous shapes (static except batch)
+    c2w_transconv: 4 tensors with heterogeneous shapes (static except batch)
 
 Total Talker KV per slot (example, 1.7B model):
     28 layers × 2 × 8 heads × 64 dim × 2048 max_seq × 2 bytes (bf16)
@@ -28,30 +30,49 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     """Model architecture parameters for KV cache sizing."""
+    # Talker
     num_layers: int = 28
     kv_heads: int = 8
     head_dim: int = 64
     max_seq_len: int = 2048
     hidden_size: int = 1536
     dtype: torch.dtype = torch.bfloat16
-    num_c2w_states: int = 37
-    code2wav_sliding_window: int = 256
     codec_vocab_size: int = 2176
+
+    # Code2Wav
+    n_c2w_layers: int = 8
+    c2w_kv_heads: int = 16
+    c2w_head_dim: int = 64
+    c2w_sliding_window: int = 72
+    n_c2w_conv_states: int = 17
+    n_c2w_transconv_states: int = 4
+
+    @property
+    def num_c2w_states(self) -> int:
+        return 2 * self.n_c2w_layers + self.n_c2w_conv_states + self.n_c2w_transconv_states
 
 
 @dataclass
 class SlotKVState:
-    """GPU-side state for one session slot."""
+    """GPU-side state for one session slot.
+
+    Uses packed KV tensors: single [1, L*2, H, S, D] per cache type
+    instead of lists of per-layer tensors.  This reduces TRT I/O binding
+    count from ~201 to ~61.
+    """
     slot_id: int
     session_id: Optional[str] = None
     is_free: bool = True
 
-    # Talker KV: list of 2*num_layers tensors, each [1, kv_heads, cur_len, head_dim]
-    kv_tensors: Optional[list[torch.Tensor]] = None
+    # Talker KV: [1, num_layers*2, kv_heads, cur_len, head_dim]
+    talker_kv: Optional[torch.Tensor] = None
     past_len: int = 0
 
-    # Code2Wav state: list of tensors (shapes vary per state)
-    c2w_states: Optional[list[torch.Tensor]] = None
+    # Code2Wav KV: [1, n_c2w*2, c2w_kv_heads, cur_len, c2w_head_dim]
+    c2w_kv: Optional[torch.Tensor] = None
+    # Conv/transconv states: heterogeneous shapes, kept as lists
+    c2w_conv_states: Optional[list[torch.Tensor]] = None
+    c2w_transconv_states: Optional[list[torch.Tensor]] = None
     frame_idx: int = 0
 
     # Decode tracking
@@ -62,6 +83,10 @@ class SlotKVState:
     trailing: list = field(default_factory=list)
     text_idx: int = 0
 
+    @property
+    def has_c2w_states(self) -> bool:
+        return self.c2w_kv is not None
+
 
 class KVCachePool:
     """Manages a fixed pool of KV cache slots on GPU.
@@ -69,6 +94,11 @@ class KVCachePool:
     Slots are lazily initialized: KV tensors are only allocated when
     a session first does prefill.  On release, tensors are zeroed
     (not freed) to avoid reallocation.
+
+    Pre-allocated pool mode (when enabled):
+        A single contiguous tensor per cache type is pre-allocated for all
+        slots.  Slots index into this tensor by slot_id, eliminating
+        per-step pad+cat overhead during batch assembly.
     """
 
     def __init__(
@@ -76,21 +106,42 @@ class KVCachePool:
         max_slots: int,
         config: ModelConfig,
         device: torch.device,
+        *,
+        preallocate: bool = True,
     ):
         self._max_slots = max_slots
         self._config = config
         self._device = device
+        self._preallocate = preallocate
 
         self._slots: list[SlotKVState] = [
             SlotKVState(slot_id=i) for i in range(max_slots)
         ]
         self._free_slots: list[int] = list(range(max_slots))
 
+        self._talker_kv_pool: Optional[torch.Tensor] = None
+        self._c2w_kv_pool: Optional[torch.Tensor] = None
+
+        if preallocate:
+            self._init_pool_tensors()
+
         logger.info(
-            "KV pool initialized: %d slots, ~%.1f MB/slot (talker KV only), device=%s",
-            max_slots,
-            self._estimate_slot_mb(),
-            device,
+            "KV pool initialized: %d slots, ~%.1f MB/slot (talker KV), "
+            "preallocated=%s, device=%s",
+            max_slots, self._estimate_slot_mb(), preallocate, device,
+        )
+
+    def _init_pool_tensors(self) -> None:
+        c = self._config
+        self._talker_kv_pool = torch.zeros(
+            self._max_slots, c.num_layers * 2, c.kv_heads,
+            c.max_seq_len, c.head_dim,
+            device=self._device, dtype=c.dtype,
+        )
+        self._c2w_kv_pool = torch.zeros(
+            self._max_slots, c.n_c2w_layers * 2, c.c2w_kv_heads,
+            c.c2w_sliding_window, c.c2w_head_dim,
+            device=self._device, dtype=c.dtype,
         )
 
     def _estimate_slot_mb(self) -> float:
@@ -123,6 +174,9 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.next_embed = None
+        if self._preallocate and self._talker_kv_pool is not None:
+            self._talker_kv_pool[slot_id].zero_()
+            self._c2w_kv_pool[slot_id].zero_()
         logger.debug("Allocated slot %d for session %s", slot_id, session_id)
         return slot
 
@@ -137,6 +191,10 @@ class KVCachePool:
         slot.trailing = []
         slot.next_embed = None
         slot.token_counts = None
+        slot.talker_kv = None
+        slot.c2w_kv = None
+        slot.c2w_conv_states = None
+        slot.c2w_transconv_states = None
         self._free_slots.append(slot_id)
         logger.debug("Released slot %d (free: %d)", slot_id, len(self._free_slots))
 
@@ -159,11 +217,7 @@ class KVCachePool:
         Called once at first prefill. Creates empty tensors that will be
         populated by the TRT engine's present_kv outputs.
         """
-        if slot.kv_tensors is not None:
-            return
         c = self._config
-        slot.kv_tensors = []
-        slot.c2w_states = []
         slot.token_counts = torch.zeros(
             1, c.codec_vocab_size, device=self._device, dtype=torch.int64,
         )
@@ -174,3 +228,64 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.next_embed = None
+
+    # ------------------------------------------------------------------
+    # Pre-allocated pool batch helpers
+    # ------------------------------------------------------------------
+
+    def gather_talker_kv(
+        self, slot_ids: list[int], max_past_len: int,
+    ) -> torch.Tensor:
+        """Gather talker KV for a batch from the pre-allocated pool.
+
+        Returns [B, L*2, H, max_past_len, D] without any pad+cat.
+        """
+        if self._talker_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        ids = torch.tensor(slot_ids, device=self._device, dtype=torch.long)
+        return self._talker_kv_pool[ids, :, :, :max_past_len, :].contiguous()
+
+    def scatter_talker_kv(
+        self,
+        slot_ids: list[int],
+        present_kv: torch.Tensor,
+        original_past_lens: list[int],
+        padded_past_len: int,
+        seq: int,
+    ) -> None:
+        """Write decode output KV back to the pre-allocated pool.
+
+        Handles de-padding for heterogeneous past lengths.
+        """
+        if self._talker_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        uniform = len(set(original_past_lens)) <= 1
+        for i, (slot_id, orig_pl) in enumerate(zip(slot_ids, original_past_lens)):
+            new_total = orig_pl + seq
+            if uniform or orig_pl >= padded_past_len:
+                self._talker_kv_pool[slot_id, :, :, :new_total, :] = \
+                    present_kv[i, :, :, :new_total, :]
+            else:
+                self._talker_kv_pool[slot_id, :, :, :orig_pl, :] = \
+                    present_kv[i, :, :, :orig_pl, :]
+                self._talker_kv_pool[slot_id, :, :, orig_pl:new_total, :] = \
+                    present_kv[i, :, :, padded_past_len:padded_past_len + seq, :]
+
+    def gather_c2w_kv(
+        self, slot_ids: list[int], max_c2w_len: int,
+    ) -> torch.Tensor:
+        """Gather C2W KV from the pre-allocated pool."""
+        if self._c2w_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        ids = torch.tensor(slot_ids, device=self._device, dtype=torch.long)
+        return self._c2w_kv_pool[ids, :, :, :max_c2w_len, :].contiguous()
+
+    def scatter_c2w_kv(
+        self, slot_ids: list[int], present_kv: torch.Tensor,
+    ) -> None:
+        """Write C2W KV back to the pool (sliding window, uniform length)."""
+        if self._c2w_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        s_len = present_kv.shape[3]
+        for i, slot_id in enumerate(slot_ids):
+            self._c2w_kv_pool[slot_id, :, :, :s_len, :] = present_kv[i]

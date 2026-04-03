@@ -6,8 +6,8 @@ Runs full decode loop (Talker prefill + N steps of Talker→CP→codec_sum→Tal
 and saves reference data for comparison with container-side TRT pipeline (verify_e2e_trt.py).
 
 Usage (host, conda activate qwen3-tts):
-  python scripts/python/verify_e2e_trt_ref.py --variant design-1.7b --steps 50
-  python scripts/python/verify_e2e_trt_ref.py --variant design-1.7b --steps 1000  # long sequence
+  python tests/integration/verify_e2e_trt_ref.py --variant design-1.7b --steps 50
+  python tests/integration/verify_e2e_trt_ref.py --variant design-1.7b --steps 1000  # long sequence
 """
 
 import argparse

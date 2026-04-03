@@ -7,8 +7,8 @@ Loads talker_unified.engine from a variant export dir, runs one prefill
 No PyTorch reference required.
 
 Usage:
-  python scripts/python/verify_trt_talker.py --variant design-1.7b [--steps 5]
-  python scripts/python/verify_trt_talker.py --engine-dir workspace/exported/design-1.7b [--steps 5]
+  python tests/integration/verify_trt_talker.py --variant design-1.7b [--steps 5]
+  python tests/integration/verify_trt_talker.py --engine-dir workspace/exported/design-1.7b [--steps 5]
 """
 
 import argparse
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_engine(engine_path: Path):

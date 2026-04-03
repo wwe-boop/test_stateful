@@ -10,9 +10,9 @@ Two goals:
 
 Usage:
   conda activate qwen3-tts
-  python scripts/python/verify_multi_variant.py
-  python scripts/python/verify_multi_variant.py --size 1.7b   # only 1.7B variants
-  python scripts/python/verify_multi_variant.py --size 0.6b   # only 0.6B variants
+  python tests/integration/verify_multi_variant.py
+  python tests/integration/verify_multi_variant.py --size 1.7b   # only 1.7B variants
+  python tests/integration/verify_multi_variant.py --size 0.6b   # only 0.6B variants
 """
 
 import argparse

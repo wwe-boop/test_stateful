@@ -16,7 +16,7 @@
 ## 1. 生成复现 ONNX
 
 ```bash
-python scripts/python/repro_myelin_stride_mismatch/build_repro_onnx.py \
+python tests/repro/repro_myelin_stride_mismatch/build_repro_onnx.py \
   --out-root /tmp/myelin_repro_case
 ```
 
@@ -28,14 +28,14 @@ python scripts/python/repro_myelin_stride_mismatch/build_repro_onnx.py \
 ## 2. 运行 fail + pass
 
 ```bash
-bash scripts/python/repro_myelin_stride_mismatch/run_repro.sh both /tmp/myelin_repro_case
+bash tests/repro/repro_myelin_stride_mismatch/run_repro.sh both /tmp/myelin_repro_case
 ```
 
 也可单独跑：
 
 ```bash
-bash scripts/python/repro_myelin_stride_mismatch/run_repro.sh fail /tmp/myelin_repro_case
-bash scripts/python/repro_myelin_stride_mismatch/run_repro.sh pass /tmp/myelin_repro_case
+bash tests/repro/repro_myelin_stride_mismatch/run_repro.sh fail /tmp/myelin_repro_case
+bash tests/repro/repro_myelin_stride_mismatch/run_repro.sh pass /tmp/myelin_repro_case
 ```
 
 日志位置：
@@ -46,7 +46,7 @@ bash scripts/python/repro_myelin_stride_mismatch/run_repro.sh pass /tmp/myelin_r
 ## 2.5 一条命令的“净化环境”最小链路（推荐）
 
 ```bash
-bash scripts/python/repro_myelin_stride_mismatch/minimal_pipeline.sh \
+bash tests/repro/repro_myelin_stride_mismatch/minimal_pipeline.sh \
   /tmp/myelin_repro_minimal both
 ```
 
@@ -56,7 +56,7 @@ bash scripts/python/repro_myelin_stride_mismatch/minimal_pipeline.sh \
 ## 2.6 一条命令的“冻结环境”链路（用于提 bug）
 
 ```bash
-bash scripts/python/repro_myelin_stride_mismatch/frozen_pipeline.sh \
+bash tests/repro/repro_myelin_stride_mismatch/frozen_pipeline.sh \
   /tmp/myelin_repro_frozen both
 ```
 
@@ -100,7 +100,7 @@ bash scripts/python/repro_myelin_stride_mismatch/frozen_pipeline.sh \
 如果你要给 NVIDIA 提交“手工搭建的小图”而不是业务图裁剪版，可用下面脚本自动搜索：
 
 ```bash
-python scripts/python/repro_myelin_stride_mismatch/search_pytorch_repro.py \
+python tests/repro/repro_myelin_stride_mismatch/search_pytorch_repro.py \
   --out-root /tmp/myelin_pytorch_search \
   --max-nodes 50 \
   --max-trials 64

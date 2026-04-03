@@ -1,14 +1,16 @@
-"""Batched decode helpers: KV padding, attention bias, KV split.
+"""Batched decode helpers for packed KV tensors.
 
-Migrated from model_repository/tts_orchestrator/1/batch_decode_scheduler.py.
-Pure torch — no Triton, no pb_utils.
+Packed format: single [B, L*2, H, S, D] tensor per cache type instead of
+2*L individual [B, H, S, D] tensors.  Reduces TRT I/O binding count from
+~201 to ~61 and eliminates Python-loop overhead in batch assembly.
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import torch
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +60,9 @@ def padded_attention_bias(
     total = int(padded_past_len) + int(seq)
     bias = torch.zeros(batch, 1, seq, total, device=device, dtype=dtype)
     if padded_past_len > 0:
-        for row, effective_len in enumerate(past_seq_lens.tolist()):
-            eff = int(effective_len)
-            if eff < padded_past_len:
-                bias[row, 0, :, eff:padded_past_len] = float("-inf")
+        positions = torch.arange(padded_past_len, device=device).unsqueeze(0)
+        mask = positions >= past_seq_lens.unsqueeze(1)
+        bias[:, 0, :, :padded_past_len].masked_fill_(mask.unsqueeze(1), float("-inf"))
     return _apply_causal_mask(bias, padded_past_len, seq)
 
 
@@ -72,88 +73,85 @@ def uniform_past_seq_lens(
 
 
 # ---------------------------------------------------------------------------
-# KV cache padding and splitting
+# Packed KV cache padding and splitting
 # ---------------------------------------------------------------------------
 
-def pad_talker_past_kv(
-    session_kv: Sequence[Sequence[torch.Tensor]],
+def pad_packed_kv(
+    session_kv: Sequence[torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Pad heterogeneous KV caches to max length and batch them.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad heterogeneous packed KV caches to max length and batch them.
 
     Args:
-        session_kv: list of per-session KV lists.
-            Each inner list has 2*num_layers tensors [K0, V0, K1, V1, ...].
-            Each tensor shape: [1, kv_heads, seq_len, head_dim].
+        session_kv: list of per-session packed KV tensors.
+            Each tensor shape: [1, L*2, H, seq_len_i, D].
 
     Returns:
-        (batched_kv, past_seq_lens) where batched_kv tensors have shape
-        [B, kv_heads, padded_past_len, head_dim].
+        (batched_kv, past_seq_lens) where batched_kv has shape
+        [B, L*2, H, padded_past_len, D].
     """
     if not session_kv:
-        return [], torch.empty((0,), device=device, dtype=torch.long)
-
-    num_tensors = len(session_kv[0])
-    if any(len(kv_row) != num_tensors for kv_row in session_kv):
-        raise ValueError("all session_kv rows must have the same tensor count")
+        return torch.empty(0, device=device, dtype=dtype), \
+               torch.empty((0,), device=device, dtype=torch.long)
 
     past_seq_lens = torch.tensor(
-        [int(kv_row[0].shape[2]) for kv_row in session_kv],
-        device=device,
-        dtype=torch.long,
+        [int(kv.shape[3]) for kv in session_kv],
+        device=device, dtype=torch.long,
     )
     padded_past_len = int(past_seq_lens.max().item())
-    batched: list[torch.Tensor] = []
 
-    for tensor_idx in range(num_tensors):
-        rows = []
-        for kv_row in session_kv:
-            tensor = kv_row[tensor_idx].to(device=device, dtype=dtype).contiguous()
-            cur_len = int(tensor.shape[2])
-            if cur_len < padded_past_len:
-                pad_shape = list(tensor.shape)
-                pad_shape[2] = padded_past_len - cur_len
-                pad = torch.zeros(*pad_shape, device=device, dtype=dtype)
-                tensor = torch.cat([tensor, pad], dim=2)
-            rows.append(tensor)
-        batched.append(torch.cat(rows, dim=0).contiguous())
+    if len(set(int(kv.shape[3]) for kv in session_kv)) == 1:
+        batched = torch.cat(
+            [kv.to(device=device, dtype=dtype) for kv in session_kv], dim=0,
+        ).contiguous()
+        return batched, past_seq_lens
 
-    return batched, past_seq_lens
+    padded = []
+    for kv in session_kv:
+        kv = kv.to(device=device, dtype=dtype)
+        cur_len = int(kv.shape[3])
+        if cur_len < padded_past_len:
+            # F.pad pads from last dim backwards: (D_right, D_left, S_right, S_left, ...)
+            # We pad dim=3 (S) on the right only.
+            kv = F.pad(kv, (0, 0, 0, padded_past_len - cur_len))
+        padded.append(kv)
+
+    return torch.cat(padded, dim=0).contiguous(), past_seq_lens
 
 
-def split_batched_kv(
-    batched_kv_tensors: list[torch.Tensor],
+def split_packed_kv(
+    present_kv: torch.Tensor,
     original_past_lens: list[int],
     padded_past_len: int,
     seq: int,
-) -> list[list[torch.Tensor]]:
-    """Extract per-session KV from padded batch output.
+) -> list[torch.Tensor]:
+    """Extract per-session packed KV from padded batch output.
 
-    After a batch decode step, the TRT engine returns batched KV with
-    padded_past_len + seq positions.  We strip the padding to get each
-    session's actual KV.
+    Args:
+        present_kv: [B, L*2, H, padded_past_len + seq, D]
+        original_past_lens: actual past length per session before this step
+        padded_past_len: the padded dimension used for batching
+        seq: number of new tokens (typically 1 for decode)
+
+    Returns:
+        list of [1, L*2, H, actual_past_len + seq, D] tensors per session.
     """
     uniform = len(set(original_past_lens)) <= 1
 
     if uniform:
-        rows: list[list[torch.Tensor]] = []
-        for row_idx in range(len(original_past_lens)):
-            rows.append([t[row_idx : row_idx + 1] for t in batched_kv_tensors])
-        return rows
+        return [present_kv[i:i + 1] for i in range(present_kv.shape[0])]
 
-    rows = []
-    for row_idx, orig_pl in enumerate(original_past_lens):
-        row: list[torch.Tensor] = []
-        needs_depad = orig_pl < padded_past_len
-        for tensor in batched_kv_tensors:
-            t = tensor[row_idx : row_idx + 1]
-            if needs_depad:
-                real_past = t[:, :, :orig_pl, :]
-                new_part = t[:, :, padded_past_len : padded_past_len + seq, :]
-                t = torch.cat([real_past, new_part], dim=2).contiguous()
-            else:
-                t = t[:, :, : orig_pl + seq, :].clone().contiguous()
-            row.append(t)
-        rows.append(row)
-    return rows
+    results = []
+    for i, orig_pl in enumerate(original_past_lens):
+        if orig_pl >= padded_past_len:
+            results.append(
+                present_kv[i:i + 1, :, :, :orig_pl + seq, :].contiguous()
+            )
+        else:
+            real_past = present_kv[i:i + 1, :, :, :orig_pl, :]
+            new_part = present_kv[i:i + 1, :, :, padded_past_len:padded_past_len + seq, :]
+            results.append(
+                torch.cat([real_past, new_part], dim=3).contiguous()
+            )
+    return results

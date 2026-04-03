@@ -5,7 +5,7 @@ Sends a VoiceDesign request and collects streaming audio chunks.
 Saves the result as a WAV file for playback verification.
 
 Usage:
-    python scripts/python/test_triton_tts.py [--text "..."] [--output output.wav]
+    python tests/e2e/test_triton_tts.py [--text "..."] [--output output.wav]
 """
 
 import argparse

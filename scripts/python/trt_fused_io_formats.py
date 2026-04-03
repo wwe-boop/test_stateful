@@ -3,10 +3,12 @@
 """
 Build trtexec --inputIOFormats / --outputIOFormats for talker_code2wav_fused.onnx.
 
+Packed KV format: talker_past_kv and c2w_past_kv are each a single 5-D tensor.
+Conv/transconv states remain individual I/O.
+
 I/O order must match export_09_talker_code2wav_fused.py (input_names / output_names).
 Integer tensors use int64:chw; float tensors use {fp32|fp16|bf16}:chw from manifest.
-`cache_position` is forced to fp32 to avoid a TensorRT/Myelin cast fusion bug in fused code2wav.
-triton_io_float_dtype.
+`cache_position` is forced to fp32 to avoid a TensorRT/Myelin cast fusion bug.
 """
 
 from __future__ import annotations
@@ -61,35 +63,53 @@ def trtexec_precision_args(engine_dtype: str) -> List[str]:
 def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str, str]:
     """
     Return (input_io_formats, output_io_formats) comma-separated for trtexec.
+
+    Packed KV layout:
+        Inputs:  input_embeds, position_ids(i64), attention_bias,
+                 token_counts(i64), gumbel_noise(fp32), temperature(fp32), penalty(fp32),
+                 cache_position(fp32), c2w_attention_bias,
+                 talker_past_kv, c2w_past_kv,
+                 c2w_conv_state_* (17), c2w_transconv_overlap_* (4)
+
+        Outputs: wav, codec_sum, full_codec(i64), hidden, logits,
+                 updated_token_counts(i64),
+                 talker_present_kv, c2w_present_kv,
+                 c2w_new_conv_state_* (17), c2w_new_transconv_overlap_* (4)
     """
-    talker = manifest.get("talker") or {}
-    nl = int(talker.get("num_layers", 28))
     c2w = manifest.get("code2wav_fused") or {}
     c2w_in = list(c2w.get("c2w_state_input_names") or [])
     c2w_out = list(c2w.get("c2w_state_output_names") or [])
-    if not c2w_in or not c2w_out:
-        raise ValueError("manifest missing code2wav_fused I/O name lists")
 
     raw_io = manifest.get("triton_io_float_dtype") or manifest.get("onnx_io_dtype") or "fp32"
     ft = _normalize_float_io_token(str(raw_io))
     fp_spec = f"{ft}:chw"
     i64 = "int64:chw"
 
-    # Inputs: input_embeds, position_ids, attention_bias,
-    # token_counts(int64), gumbel_noise(fp32), temperature(fp32), penalty(fp32),
-    # cache_position(fp32), c2w_attention_bias, past_kv_* x 2*nl, c2w_*
     in_parts: List[str] = [
-        fp_spec, i64, fp_spec,
-        i64, "fp32:chw", "fp32:chw", "fp32:chw",
-        "fp32:chw", fp_spec,
+        fp_spec,        # input_embeds
+        i64,            # position_ids
+        fp_spec,        # attention_bias
+        i64,            # token_counts
+        "fp32:chw",     # gumbel_noise
+        "fp32:chw",     # temperature
+        "fp32:chw",     # penalty
+        "fp32:chw",     # cache_position
+        fp_spec,        # c2w_attention_bias
+        fp_spec,        # talker_past_kv (packed)
+        fp_spec,        # c2w_past_kv (packed)
     ]
-    in_parts.extend([fp_spec] * (2 * nl))
     in_parts.extend([fp_spec] * len(c2w_in))
 
-    # Outputs: wav, codec_sum, full_codec, hidden, logits,
-    # updated_token_counts(int64), present_kv x 2*nl, c2w outs
-    out_parts: List[str] = [fp_spec, fp_spec, i64, fp_spec, fp_spec, i64]
-    out_parts.extend([fp_spec] * (2 * nl))
+    out_parts: List[str] = [
+        fp_spec,        # wav
+        fp_spec,        # codec_sum
+        i64,            # full_codec
+        fp_spec,        # hidden
+        fp_spec,        # logits
+        i64,            # updated_token_counts
+        fp_spec,        # talker_present_kv (packed)
+        fp_spec,        # c2w_present_kv (packed)
+    ]
     out_parts.extend([fp_spec] * len(c2w_out))
 
     return ",".join(in_parts), ",".join(out_parts)

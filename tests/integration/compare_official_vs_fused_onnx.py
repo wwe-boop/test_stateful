@@ -16,7 +16,7 @@ Prerequisites:
 
 Usage:
   conda activate qwen3-tts
-  python scripts/python/compare_official_vs_fused_onnx.py --variant custom-1.7b \\
+  python tests/integration/compare_official_vs_fused_onnx.py --variant custom-1.7b \\
       --text "你好，这是一段测试。" --speaker serena --max-steps 120
 """
 
@@ -34,6 +34,7 @@ import soundfile as sf
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "python"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "export"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "Qwen3-TTS"))

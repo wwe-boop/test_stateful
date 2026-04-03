@@ -3,10 +3,10 @@
 TRT E2E verification — Single talker_unified engine (prefill + decode).
 
 Loads talker_unified.engine built by trtexec, runs prefill + decode loop, comparing
-against FP32 PyTorch reference (e2e_trt_ref.npz from verify_e2e_trt_ref.py).
+against FP32 PyTorch reference (e2e_trt_ref.npz from tests/integration/verify_e2e_trt_ref.py).
 
 Usage (inside NGC container or host with TensorRT):
-  python3 verify_e2e_trt.py --model-dir /path/to/exported/variant [--ref-file /path/to/e2e_trt_ref.npz]
+  python3 tests/integration/verify_e2e_trt.py --model-dir /path/to/exported/variant [--ref-file /path/to/e2e_trt_ref.npz]
 """
 
 import argparse
@@ -121,7 +121,7 @@ def main():
     ref_file = args.ref_file or str(model_dir / "e2e_trt_ref.npz")
     if not os.path.exists(ref_file):
         logger.error(
-            f"Reference file not found: {ref_file}. Run verify_e2e_trt_ref.py on host first."
+            f"Reference file not found: {ref_file}. Run tests/integration/verify_e2e_trt_ref.py on host first."
         )
         sys.exit(1)
 

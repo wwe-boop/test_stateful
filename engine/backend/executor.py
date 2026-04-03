@@ -5,9 +5,14 @@ Replaces Triton BLS with direct TRT plan execution via torch, eliminating:
   - Triton scheduling latency (~0.3ms/step)
   - dlpack round-trip for every KV tensor
 
-Key optimisation: launch_decode_step() is asynchronous.  It enqueues CUDA
-kernels on a dedicated stream and returns a GPUFuture immediately, letting
-the caller process *previous* step results on CPU while GPU is busy.
+Key optimisations:
+  1. Packed KV tensors: 56 talker KV + 16 C2W KV bindings merged into
+     2 packed tensors, reducing TRT I/O binding from ~201 to ~61.
+  2. Pre-cached output metadata: dtype mapping and output buffer allocation
+     happen once at init, not per-step.
+  3. launch_decode_step() is asynchronous: enqueues CUDA kernels on a
+     dedicated stream and returns a GPUFuture, letting the caller process
+     previous step results on CPU while GPU is busy.
 """
 
 from __future__ import annotations
@@ -22,9 +27,9 @@ import torch
 import numpy as np
 
 from .batch_helper import (
-    pad_talker_past_kv,
+    pad_packed_kv,
     padded_attention_bias,
-    split_batched_kv,
+    split_packed_kv,
     uniform_past_seq_lens,
     zeros_attention_bias,
 )
@@ -43,9 +48,10 @@ _FUSED_DUMMY_PAST_LEN = 1
 class TRTEngine:
     """Thin wrapper around a TensorRT plan loaded via torch.
 
-    Supports two loading modes:
-      1. torch_tensorrt (preferred): loads .plan directly
-      2. tensorrt + torch: manual engine loading with zero-copy I/O
+    Optimisations over naive per-call binding:
+      - Output dtypes are cached once at load time.
+      - Output buffers are pre-allocated for common shapes and reused.
+      - Shapes are only set when they actually change.
     """
 
     def __init__(self, plan_path: str, device: torch.device):
@@ -53,6 +59,9 @@ class TRTEngine:
         self._device = device
         self._engine = None
         self._context = None
+        self._output_dtypes: Dict[str, torch.dtype] = {}
+        self._prev_input_shapes: Dict[str, tuple] = {}
+        self._output_buffers: Dict[str, torch.Tensor] = {}
 
     def load(self) -> None:
         """Load TRT engine from .plan file."""
@@ -73,8 +82,18 @@ class TRTEngine:
             raise RuntimeError(f"Failed to deserialize TRT engine: {plan_path}")
 
         self._context = self._engine.create_execution_context()
+        self._cache_output_dtypes()
         logger.info("Loaded TRT engine: %s (%d I/O tensors)",
                      plan_path.name, self._engine.num_io_tensors)
+
+    def _cache_output_dtypes(self) -> None:
+        """Cache output tensor dtypes once at load time."""
+        import tensorrt as trt
+        for i in range(self._engine.num_io_tensors):
+            name = self._engine.get_tensor_name(i)
+            if self._engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
+                dtype_trt = self._engine.get_tensor_dtype(name)
+                self._output_dtypes[name] = self._trt_to_torch_dtype(dtype_trt)
 
     def get_io_names(self) -> tuple[list[str], list[str]]:
         """Return (input_names, output_names)."""
@@ -98,24 +117,33 @@ class TRTEngine:
         """Execute inference on the given CUDA stream.
 
         Uses torch tensors directly — zero copy via data_ptr().
+        Skips set_input_shape for tensors whose shape hasn't changed.
+        Re-uses output buffers when shapes match previous call.
         """
-        import tensorrt as trt
-
         ctx = self._context
 
         for name, tensor in inputs.items():
             tensor = tensor.contiguous()
-            ctx.set_input_shape(name, tuple(tensor.shape))
+            shape = tuple(tensor.shape)
+            if self._prev_input_shapes.get(name) != shape:
+                ctx.set_input_shape(name, shape)
+                self._prev_input_shapes[name] = shape
             ctx.set_tensor_address(name, tensor.data_ptr())
 
         outputs = {}
         for name in output_names:
-            shape = ctx.get_tensor_shape(name)
-            dtype_trt = self._engine.get_tensor_dtype(name)
-            dtype_torch = self._trt_to_torch_dtype(dtype_trt)
-            out_tensor = torch.empty(
-                tuple(shape), dtype=dtype_torch, device=self._device,
-            )
+            shape = tuple(ctx.get_tensor_shape(name))
+            dtype_torch = self._output_dtypes.get(name, torch.float32)
+
+            existing = self._output_buffers.get(name)
+            if existing is not None and existing.shape == shape and existing.dtype == dtype_torch:
+                out_tensor = existing
+            else:
+                out_tensor = torch.empty(
+                    shape, dtype=dtype_torch, device=self._device,
+                )
+                self._output_buffers[name] = out_tensor
+
             ctx.set_tensor_address(name, out_tensor.data_ptr())
             outputs[name] = out_tensor
 
@@ -145,22 +173,18 @@ class TRTEngine:
 class GPUFuture:
     """Handle to async GPU work.  Call wait() to synchronize."""
     _compute_stream: Any = None
-    _c2w_stream: Any = None
     _raw: Dict[str, torch.Tensor] = field(default_factory=dict)
     _slots: List[SlotKVState] = field(default_factory=list)
     _original_past_lens: List[int] = field(default_factory=list)
     _padded_past_len: int = 0
     _seq: int = 1
-    _num_layers: int = 28
-    _num_c2w_states: int = 37
-    _c2w_state_output_names: List[str] = field(default_factory=list)
+    _c2w_conv_output_names: List[str] = field(default_factory=list)
+    _c2w_transconv_output_names: List[str] = field(default_factory=list)
 
     def wait(self) -> StepOutput:
         """Synchronize GPU and extract per-session results."""
         if self._compute_stream is not None:
             self._compute_stream.synchronize()
-        if self._c2w_stream is not None:
-            self._c2w_stream.synchronize()
 
         batch_size = len(self._slots)
         raw = self._raw
@@ -168,29 +192,35 @@ class GPUFuture:
         wav = raw.get("wav")
         codec_sum = raw.get("codec_sum")
         full_codec = raw.get("full_codec")
-        logits = raw.get("logits")
         updated_tc = raw.get("updated_token_counts")
 
-        kv_tensors = []
-        for i in range(self._num_layers):
-            k = raw.get(f"present_kv_{i}_k")
-            v = raw.get(f"present_kv_{i}_v")
-            if k is not None:
-                kv_tensors.append(k)
-            if v is not None:
-                kv_tensors.append(v)
+        talker_present_kv = raw.get("talker_present_kv")
+        c2w_present_kv = raw.get("c2w_present_kv")
 
-        split_kv = split_batched_kv(
-            kv_tensors, self._original_past_lens,
+        split_kv = split_packed_kv(
+            talker_present_kv, self._original_past_lens,
             self._padded_past_len, self._seq,
-        ) if kv_tensors else [[] for _ in self._slots]
+        ) if talker_present_kv is not None else [None] * batch_size
 
-        new_c2w = [raw.get(n) for n in self._c2w_state_output_names]
-        split_c2w = []
+        split_c2w_kv = []
+        if c2w_present_kv is not None:
+            for i in range(batch_size):
+                split_c2w_kv.append(c2w_present_kv[i:i + 1])
+        else:
+            split_c2w_kv = [None] * batch_size
+
+        split_c2w_conv = []
+        split_c2w_transconv = []
+        conv_tensors = [raw.get(n) for n in self._c2w_conv_output_names]
+        transconv_tensors = [raw.get(n) for n in self._c2w_transconv_output_names]
         for row_idx in range(batch_size):
-            split_c2w.append([
-                t[row_idx : row_idx + 1] if t is not None else None
-                for t in new_c2w
+            split_c2w_conv.append([
+                t[row_idx:row_idx + 1] if t is not None else None
+                for t in conv_tensors
+            ])
+            split_c2w_transconv.append([
+                t[row_idx:row_idx + 1] if t is not None else None
+                for t in transconv_tensors
             ])
 
         codec_eos_id = 2148
@@ -217,8 +247,10 @@ class GPUFuture:
             slots=self._slots,
             eos_flags=eos_flags,
             audio_chunks=audio_chunks,
-            split_kv=split_kv,
-            split_c2w=split_c2w,
+            split_talker_kv=split_kv,
+            split_c2w_kv=split_c2w_kv,
+            split_c2w_conv=split_c2w_conv,
+            split_c2w_transconv=split_c2w_transconv,
             codec_sum=codec_sum,
             updated_tc=updated_tc,
         )
@@ -230,8 +262,10 @@ class StepOutput:
     slots: List[SlotKVState]
     eos_flags: List[bool]
     audio_chunks: List[Optional[bytes]]
-    split_kv: List[List[torch.Tensor]]
-    split_c2w: List[List[Optional[torch.Tensor]]]
+    split_talker_kv: List[Optional[torch.Tensor]]
+    split_c2w_kv: List[Optional[torch.Tensor]]
+    split_c2w_conv: List[List[Optional[torch.Tensor]]]
+    split_c2w_transconv: List[List[Optional[torch.Tensor]]]
     codec_sum: Optional[torch.Tensor] = None
     updated_tc: Optional[torch.Tensor] = None
 
@@ -244,8 +278,7 @@ class Executor:
     """Manages TRT engines and CUDA streams for pipelined decode.
 
     CUDA stream layout:
-        compute_stream: Talker decode + Code Predictor
-        c2w_stream:     Code2Wav (can overlap with next Talker step)
+        compute_stream: fused Talker decode + Code2Wav in single engine call
     """
 
     def __init__(
@@ -266,14 +299,15 @@ class Executor:
         self._config = model_config or ModelConfig()
 
         self._compute_stream = torch.cuda.Stream(device=self._device)
-        self._c2w_stream = torch.cuda.Stream(device=self._device)
 
         self._fused_engine: Optional[TRTEngine] = None
-        self._embedding_weights = None  # EmbeddingWeights instance
+        self._embedding_weights = None
         self._kv_pool: Optional[KVCachePool] = None
 
-        self._c2w_state_input_names: list[str] = []
-        self._c2w_state_output_names: list[str] = []
+        self._c2w_conv_input_names: list[str] = []
+        self._c2w_conv_output_names: list[str] = []
+        self._c2w_transconv_input_names: list[str] = []
+        self._c2w_transconv_output_names: list[str] = []
         self._manifest: dict = {}
 
         logger.info(
@@ -311,19 +345,34 @@ class Executor:
         self._embedding_weights = weights
 
     def _discover_c2w_io_names(self) -> None:
-        """Detect c2w_* I/O names from the loaded TRT engine."""
+        """Detect c2w conv/transconv I/O names from the loaded TRT engine."""
         if self._fused_engine is None:
             return
         input_names, output_names = self._fused_engine.get_io_names()
-        self._c2w_state_input_names = sorted(
-            n for n in input_names if n.startswith("c2w_")
+        self._c2w_conv_input_names = sorted(
+            n for n in input_names
+            if n.startswith("c2w_conv_state_")
         )
-        self._c2w_state_output_names = sorted(
-            n for n in output_names if n.startswith("c2w_")
+        self._c2w_transconv_input_names = sorted(
+            n for n in input_names
+            if n.startswith("c2w_transconv_overlap_")
         )
-        logger.info("C2W states: %d inputs, %d outputs",
-                     len(self._c2w_state_input_names),
-                     len(self._c2w_state_output_names))
+        self._c2w_conv_output_names = sorted(
+            n for n in output_names
+            if n.startswith("c2w_new_conv_state_")
+        )
+        self._c2w_transconv_output_names = sorted(
+            n for n in output_names
+            if n.startswith("c2w_new_transconv_overlap_")
+        )
+        logger.info(
+            "C2W states: %d conv inputs, %d transconv inputs, "
+            "%d conv outputs, %d transconv outputs",
+            len(self._c2w_conv_input_names),
+            len(self._c2w_transconv_input_names),
+            len(self._c2w_conv_output_names),
+            len(self._c2w_transconv_output_names),
+        )
 
     @property
     def kv_pool(self) -> KVCachePool:
@@ -348,17 +397,18 @@ class Executor:
 
         if self._fused_engine is None:
             slot.past_len = int(prefill_embeds.shape[1])
-            slot.kv_tensors = []
-            slot.c2w_states = []
+            slot.talker_kv = None
+            slot.c2w_kv = None
+            slot.c2w_conv_states = []
+            slot.c2w_transconv_states = []
             return
 
-        batch = 1
         seq = int(prefill_embeds.shape[1])
 
         inputs = self._build_fused_inputs(
             input_embeds=prefill_embeds.to(self._config.dtype),
             slots=[slot],
-            past_kv_tensors=None,
+            batched_talker_kv=None,
             past_seq_lens=None,
             use_dummy_kv=True,
         )
@@ -370,21 +420,24 @@ class Executor:
 
         self._compute_stream.synchronize()
 
-        kv_tensors = []
-        for i in range(self._config.num_layers):
-            k = raw[f"present_kv_{i}_k"][:, :, 1:, :].contiguous()
-            v = raw[f"present_kv_{i}_v"][:, :, 1:, :].contiguous()
-            kv_tensors.append(k)
-            kv_tensors.append(v)
-
-        slot.kv_tensors = kv_tensors
+        talker_kv = raw.get("talker_present_kv")
+        if talker_kv is not None:
+            # Strip the dummy past_len=1 prefix
+            slot.talker_kv = talker_kv[:, :, :, 1:, :].contiguous()
         slot.past_len = seq
-        slot.frame_idx = 0
-        slot.c2w_states = [raw[n] for n in self._c2w_state_output_names]
-        slot.token_counts = raw.get("updated_token_counts",
-            torch.zeros(1, self._config.codec_vocab_size,
-                        device=self._device, dtype=torch.int64))
 
+        c2w_kv = raw.get("c2w_present_kv")
+        if c2w_kv is not None:
+            slot.c2w_kv = c2w_kv
+        slot.c2w_conv_states = [raw[n] for n in self._c2w_conv_output_names]
+        slot.c2w_transconv_states = [raw[n] for n in self._c2w_transconv_output_names]
+
+        slot.frame_idx = 0
+        slot.token_counts = raw.get(
+            "updated_token_counts",
+            torch.zeros(1, self._config.codec_vocab_size,
+                        device=self._device, dtype=torch.int64),
+        )
         codec_sum = raw.get("codec_sum")
         if codec_sum is not None:
             slot.next_embed = codec_sum
@@ -413,17 +466,17 @@ class Executor:
                 s.frame_idx += 1
             return GPUFuture(_slots=slots)
 
-        batched_past_kv, past_seq_lens = pad_talker_past_kv(
-            [s.kv_tensors for s in slots],
-            device=self._device,
-            dtype=self._config.dtype,
+        # Pad and batch talker KV
+        session_kv = [s.talker_kv for s in slots]
+        batched_talker_kv, past_seq_lens = pad_packed_kv(
+            session_kv, device=self._device, dtype=self._config.dtype,
         )
         padded_past_len = int(past_seq_lens.max().item()) if batch_size > 0 else 0
 
         inputs = self._build_fused_inputs(
             input_embeds=input_embeds,
             slots=slots,
-            past_kv_tensors=batched_past_kv,
+            batched_talker_kv=batched_talker_kv,
             past_seq_lens=past_seq_lens,
             use_dummy_kv=False,
         )
@@ -435,15 +488,13 @@ class Executor:
 
         return GPUFuture(
             _compute_stream=self._compute_stream,
-            _c2w_stream=self._c2w_stream,
             _raw=raw,
             _slots=slots,
             _original_past_lens=original_past_lens,
             _padded_past_len=padded_past_len,
             _seq=1,
-            _num_layers=self._config.num_layers,
-            _num_c2w_states=self._config.num_c2w_states,
-            _c2w_state_output_names=self._c2w_state_output_names,
+            _c2w_conv_output_names=self._c2w_conv_output_names,
+            _c2w_transconv_output_names=self._c2w_transconv_output_names,
         )
 
     # ------------------------------------------------------------------
@@ -454,11 +505,15 @@ class Executor:
         self,
         input_embeds: torch.Tensor,
         slots: List[SlotKVState],
-        past_kv_tensors: Optional[list[torch.Tensor]],
+        batched_talker_kv: Optional[torch.Tensor],
         past_seq_lens: Optional[torch.Tensor],
         use_dummy_kv: bool,
     ) -> Dict[str, torch.Tensor]:
-        """Build the full input dict for the fused TRT engine."""
+        """Build the full input dict for the fused TRT engine.
+
+        Uses packed KV format: single tensor per cache type.
+        """
+        cfg = self._config
         batch = int(input_embeds.shape[0])
         seq = int(input_embeds.shape[1])
 
@@ -467,13 +522,13 @@ class Executor:
                 past_seq_lens = uniform_past_seq_lens(batch, 0, self._device)
             attn_bias = padded_attention_bias(
                 past_seq_lens, seq, _FUSED_DUMMY_PAST_LEN,
-                self._device, self._config.dtype,
+                self._device, cfg.dtype,
             )
         else:
-            padded_past_len = int(past_kv_tensors[0].shape[2]) if past_kv_tensors else 0
+            padded_past_len = int(batched_talker_kv.shape[3]) if batched_talker_kv is not None else 0
             attn_bias = padded_attention_bias(
                 past_seq_lens, seq, padded_past_len,
-                self._device, self._config.dtype,
+                self._device, cfg.dtype,
             )
 
         position_ids = torch.stack([
@@ -488,12 +543,12 @@ class Executor:
 
         tc = torch.cat([
             s.token_counts if s.token_counts is not None
-            else torch.zeros(1, self._config.codec_vocab_size,
+            else torch.zeros(1, cfg.codec_vocab_size,
                              device=self._device, dtype=torch.int64)
             for s in slots
         ], dim=0)
 
-        gumbel = torch.rand(batch, self._config.codec_vocab_size,
+        gumbel = torch.rand(batch, cfg.codec_vocab_size,
                             device=self._device, dtype=torch.float32)
         gumbel = -(-gumbel.clamp(min=1e-8).log()).clamp(min=1e-8).log()
         temperature = torch.ones(batch, 1, device=self._device, dtype=torch.float32)
@@ -510,50 +565,72 @@ class Executor:
             "cache_position": cache_position.contiguous(),
         }
 
-        c2w_past_len = int(slots[0].c2w_states[0].shape[2]) if (
-            slots[0].c2w_states) else 0
-        c2w_key_total = min(c2w_past_len + FUSED_CHUNK_T,
-                            self._config.code2wav_sliding_window)
+        # --- Talker KV (packed) ---
+        if use_dummy_kv:
+            d["talker_past_kv"] = torch.zeros(
+                batch, cfg.num_layers * 2, cfg.kv_heads,
+                _FUSED_DUMMY_PAST_LEN, cfg.head_dim,
+                device=self._device, dtype=cfg.dtype,
+            )
+        else:
+            d["talker_past_kv"] = batched_talker_kv.contiguous()
+
+        # --- C2W KV (packed) ---
+        c2w_past_len = 0
+        if slots[0].c2w_kv is not None:
+            c2w_past_len = int(slots[0].c2w_kv.shape[3])
+        c2w_key_total = min(c2w_past_len + FUSED_CHUNK_T, cfg.c2w_sliding_window)
         if c2w_key_total <= 0:
             c2w_key_total = 1
+
         d["c2w_attention_bias"] = torch.zeros(
             batch, 1, FUSED_CHUNK_T, c2w_key_total,
-            device=self._device, dtype=self._config.dtype,
+            device=self._device, dtype=cfg.dtype,
         ).contiguous()
 
-        if use_dummy_kv:
-            for i in range(self._config.num_layers):
-                dummy = torch.zeros(
-                    batch, self._config.kv_heads, _FUSED_DUMMY_PAST_LEN,
-                    self._config.head_dim,
-                    device=self._device, dtype=self._config.dtype,
-                )
-                d[f"past_kv_{i}_k"] = dummy
-                d[f"past_kv_{i}_v"] = dummy.clone()
+        if slots[0].c2w_kv is not None:
+            if batch == 1:
+                d["c2w_past_kv"] = slots[0].c2w_kv.contiguous()
+            else:
+                d["c2w_past_kv"] = torch.cat(
+                    [s.c2w_kv for s in slots], dim=0,
+                ).contiguous()
         else:
-            for i in range(self._config.num_layers):
-                d[f"past_kv_{i}_k"] = past_kv_tensors[2 * i].contiguous()
-                d[f"past_kv_{i}_v"] = past_kv_tensors[2 * i + 1].contiguous()
+            d["c2w_past_kv"] = torch.zeros(
+                batch, cfg.n_c2w_layers * 2, cfg.c2w_kv_heads,
+                1, cfg.c2w_head_dim,
+                device=self._device, dtype=cfg.dtype,
+            )
 
-        if slots[0].c2w_states:
-            for in_name, st in zip(self._c2w_state_input_names, slots[0].c2w_states):
+        # --- C2W conv/transconv states (individual, heterogeneous shapes) ---
+        if slots[0].c2w_conv_states:
+            for idx, name in enumerate(self._c2w_conv_input_names):
                 if batch == 1:
-                    d[in_name] = st.contiguous()
+                    d[name] = slots[0].c2w_conv_states[idx].contiguous()
                 else:
-                    batched_st = torch.cat(
-                        [s.c2w_states[self._c2w_state_input_names.index(in_name)]
-                         for s in slots], dim=0,
+                    d[name] = torch.cat(
+                        [s.c2w_conv_states[idx] for s in slots], dim=0,
                     ).contiguous()
-                    d[in_name] = batched_st
+
+        if slots[0].c2w_transconv_states:
+            for idx, name in enumerate(self._c2w_transconv_input_names):
+                if batch == 1:
+                    d[name] = slots[0].c2w_transconv_states[idx].contiguous()
+                else:
+                    d[name] = torch.cat(
+                        [s.c2w_transconv_states[idx] for s in slots], dim=0,
+                    ).contiguous()
 
         return d
 
     def _build_output_names(self) -> List[str]:
-        names = ["wav", "codec_sum", "full_codec", "logits", "updated_token_counts"]
-        for i in range(self._config.num_layers):
-            names.append(f"present_kv_{i}_k")
-            names.append(f"present_kv_{i}_v")
-        names.extend(self._c2w_state_output_names)
+        names = [
+            "wav", "codec_sum", "full_codec", "logits",
+            "updated_token_counts",
+            "talker_present_kv", "c2w_present_kv",
+        ]
+        names.extend(self._c2w_conv_output_names)
+        names.extend(self._c2w_transconv_output_names)
         return names
 
     # ------------------------------------------------------------------

@@ -1,27 +1,17 @@
 """
-Unit tests for LightQwen3TTSTokenizer (model_repository_new tokenizer core).
+Unit tests for LightQwen3TTSTokenizer.
 Run: pytest tests/unit/test_tokenizer_core.py -v
 """
-import sys
-from pathlib import Path
-
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-CORE_DIR = REPO_ROOT / "model_repository_new" / "tts_orchestrator" / "1" / "tokenizer"
-if str(CORE_DIR) not in sys.path:
-    sys.path.insert(0, str(CORE_DIR))
-
-TOKENIZER_DIR = (
-    REPO_ROOT / "workspace" / "model_repository" / "tts_orchestrator" / "1" / "tokenizer"
-)
+from tests.paths import TOKENIZER_DIR, REPO_ROOT
+from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
 
 
 @pytest.fixture(scope="module")
 def tok():
     if not TOKENIZER_DIR.is_dir():
         pytest.skip(f"Tokenizer dir not found: {TOKENIZER_DIR}")
-    from core import LightQwen3TTSTokenizer
     return LightQwen3TTSTokenizer(str(TOKENIZER_DIR))
 
 
@@ -29,18 +19,15 @@ def tok():
 
 class TestConstruction:
     def test_invalid_dir_raises(self):
-        from core import LightQwen3TTSTokenizer
         with pytest.raises(ValueError, match="does not exist"):
             LightQwen3TTSTokenizer("/nonexistent/path")
 
     def test_missing_vocab_raises(self, tmp_path):
-        from core import LightQwen3TTSTokenizer
         (tmp_path / "merges.txt").write_text("#version: 0.2\n")
         with pytest.raises(ValueError, match="Vocab file"):
             LightQwen3TTSTokenizer(str(tmp_path))
 
     def test_missing_merges_raises(self, tmp_path):
-        from core import LightQwen3TTSTokenizer
         (tmp_path / "vocab.json").write_text("{}")
         with pytest.raises(ValueError, match="Merges file"):
             LightQwen3TTSTokenizer(str(tmp_path))

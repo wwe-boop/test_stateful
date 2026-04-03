@@ -11,7 +11,7 @@ when a batch-padded Triton deployment feeds extra pad tokens to the model.
 
 Usage:
     conda activate qwen3-tts
-    python scripts/python/pad_tolerance_experiment.py [--model-variant custom] [--seed 42]
+    python tests/integration/pad_tolerance_experiment.py [--model-variant custom] [--seed 42]
 """
 
 import argparse

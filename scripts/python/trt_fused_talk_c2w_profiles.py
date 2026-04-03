@@ -2,6 +2,9 @@
 """
 Emit trtexec --minShapes / --optShapes / --maxShapes for talker_code2wav_fused.onnx.
 Print three lines: MIN, OPT, MAX (comma-separated, no spaces).
+
+Packed KV format: talker KV and C2W KV are each a single 5-D tensor instead
+of 2*L individual tensors.  Conv/transconv states remain individual.
 """
 
 from __future__ import annotations
@@ -9,11 +12,9 @@ from __future__ import annotations
 import sys
 
 
-def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
+def c2w_conv_transconv_specs(bmax: str):
+    """Conv + transconv state shape specs (heterogeneous, batch-only dynamic)."""
     specs = []
-    for i in range(n_c2w_layers):
-        specs.append((f"past_kv_{i}_k", "1x16x1x64", "1x16x4x64", f"{bmax}x16x71x64"))
-        specs.append((f"past_kv_{i}_v", "1x16x1x64", "1x16x4x64", f"{bmax}x16x71x64"))
     conv = [
         ("conv_state_0", "1x512x2"),
         ("conv_state_1", "1x1024x6"),
@@ -50,6 +51,9 @@ def c2w_state_specs(bmax: str, n_c2w_layers: int = 8):
 
 LOGITS_TOPK = 50
 VOCAB_SIZE = 3072
+C2W_KV_HEADS = 16
+C2W_HEAD_DIM = 64
+C2W_SLIDING_WINDOW = 72
 
 
 def main():
@@ -70,6 +74,9 @@ def main():
     V = VOCAB_SIZE
     K = LOGITS_TOPK
 
+    # Packed talker KV: [B, num_layers*2, kv_heads, S_past, head_dim]
+    talker_kv_dim1 = nl * 2
+
     parts_min = [
         f"input_embeds:1x1x{H}",
         f"position_ids:1x3x1x1",
@@ -80,6 +87,8 @@ def main():
         "penalty:1x1",
         "cache_position:1x1",
         "c2w_attention_bias:1x1x1x2",
+        f"talker_past_kv:1x{talker_kv_dim1}x{KV}x0x{HD}",
+        f"c2w_past_kv:1x{n_c2w * 2}x{C2W_KV_HEADS}x1x{C2W_HEAD_DIM}",
     ]
     parts_opt = [
         f"input_embeds:{Bopt}x1x{H}",
@@ -91,6 +100,8 @@ def main():
         f"penalty:{Bopt}x1",
         f"cache_position:{Bopt}x1",
         f"c2w_attention_bias:{Bopt}x1x1x5",
+        f"talker_past_kv:{Bopt}x{talker_kv_dim1}x{KV}x{opt_spast}x{HD}",
+        f"c2w_past_kv:{Bopt}x{n_c2w * 2}x{C2W_KV_HEADS}x4x{C2W_HEAD_DIM}",
     ]
     parts_max = [
         f"input_embeds:{Bmax}x{max_in}x{H}",
@@ -101,18 +112,12 @@ def main():
         f"temperature:{Bmax}x1",
         f"penalty:{Bmax}x1",
         f"cache_position:{Bmax}x1",
-        f"c2w_attention_bias:{Bmax}x1x1x72",
+        f"c2w_attention_bias:{Bmax}x1x1x{C2W_SLIDING_WINDOW}",
+        f"talker_past_kv:{Bmax}x{talker_kv_dim1}x{KV}x{max_seq}x{HD}",
+        f"c2w_past_kv:{Bmax}x{n_c2w * 2}x{C2W_KV_HEADS}x{C2W_SLIDING_WINDOW - 1}x{C2W_HEAD_DIM}",
     ]
 
-    for i in range(nl):
-        parts_min.append(f"past_kv_{i}_k:1x{KV}x0x{HD}")
-        parts_min.append(f"past_kv_{i}_v:1x{KV}x0x{HD}")
-        parts_opt.append(f"past_kv_{i}_k:{Bopt}x{KV}x{opt_spast}x{HD}")
-        parts_opt.append(f"past_kv_{i}_v:{Bopt}x{KV}x{opt_spast}x{HD}")
-        parts_max.append(f"past_kv_{i}_k:{Bmax}x{KV}x{max_seq}x{HD}")
-        parts_max.append(f"past_kv_{i}_v:{Bmax}x{KV}x{max_seq}x{HD}")
-
-    for name, smin, sopt, smax in c2w_state_specs(Bmax, n_c2w_layers=n_c2w):
+    for name, smin, sopt, smax in c2w_conv_transconv_specs(Bmax):
         parts_min.append(f"c2w_{name}:{smin}")
         parts_opt.append(f"c2w_{name}:{sopt}")
         parts_max.append(f"c2w_{name}:{smax}")

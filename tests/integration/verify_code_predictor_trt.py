@@ -14,7 +14,7 @@ Requirements:
 
 Example (engine already built):
   conda activate qwen3-tts
-  python scripts/python/verify_code_predictor_trt.py \\
+  python tests/integration/verify_code_predictor_trt.py \\
     --variant-dir workspace/exported/custom-1.7b \\
     --engine workspace/exported/custom-1.7b/code_predictor_unrolled_bf16.engine \\
     --seed 42 --codec-token0 1500

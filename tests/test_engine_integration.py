@@ -18,19 +18,20 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from tests.paths import REPO_ROOT, TOKENIZER_DIR, WEIGHTS_DIR, VARIANT
+
 sys.path.insert(0, str(REPO_ROOT))
 
-TOKENIZER_DIR = (
-    REPO_ROOT / "workspace" / "models" / "Qwen3-TTS-12Hz-1.7B-CustomVoice"
-)
-WEIGHTS_DIR = REPO_ROOT / "workspace" / "exported" / "custom-1.7b" / "weights"
-
 logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s %(message)s")
+
+HAS_TOKENIZER = TOKENIZER_DIR.exists()
+SKIP_NO_TOKENIZER = pytest.mark.skipif(
+    not HAS_TOKENIZER,
+    reason=f"Tokenizer not found (variant={VARIANT}, path={TOKENIZER_DIR})",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +46,6 @@ class TestSpliter:
 
         assert Spliter.classify_punct_level("你好。") == 1
         assert Spliter.classify_punct_level("你好，") == 2
-        # L3 multi-char puncts (——, ……) are defined as 2-char strings in defines.py
-        # but classify_punct_level checks single chars, so they map to 0.
-        # Only single-char L3 entries (\n, \t etc) would match, but rstrip() removes them.
         assert Spliter.classify_punct_level("你好") == 0
         assert Spliter.classify_punct_level("hello!") == 1
 
@@ -158,10 +156,7 @@ class TestAudioReorder:
 # ---------------------------------------------------------------------------
 
 class TestTokenizer:
-    @pytest.mark.skipif(
-        not TOKENIZER_DIR.exists(),
-        reason=f"Tokenizer not found at {TOKENIZER_DIR}",
-    )
+    @SKIP_NO_TOKENIZER
     def test_encode_decode(self):
         from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
 
@@ -173,10 +168,7 @@ class TestTokenizer:
         assert len(ids2) == len(texts)
         assert any("。" in t for t in texts), f"Expected punct in texts: {texts}"
 
-    @pytest.mark.skipif(
-        not TOKENIZER_DIR.exists(),
-        reason=f"Tokenizer not found at {TOKENIZER_DIR}",
-    )
+    @SKIP_NO_TOKENIZER
     def test_spliter_with_real_tokenizer(self):
         """End-to-end: real tokenizer → Spliter → actions."""
         from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
@@ -204,19 +196,12 @@ class TestTokenizer:
 # ---------------------------------------------------------------------------
 
 class TestEngineIntegration:
-    """Test the full engine pipeline in stub (no-GPU) mode.
+    """Test the full engine pipeline in stub (no-GPU) mode."""
 
-    Uses a mock executor that returns EOS after N steps.
-    """
-
-    @pytest.mark.skipif(
-        not TOKENIZER_DIR.exists(),
-        reason=f"Tokenizer not found at {TOKENIZER_DIR}",
-    )
+    @SKIP_NO_TOKENIZER
     @pytest.mark.asyncio
     async def test_single_session_stub(self):
         """One session, streaming text, verify audio callback chain."""
-        import queue as stdlib_queue
         from engine.core.types import (
             EngineRequest, EngineResult, RequestType, ResultType,
         )
@@ -269,7 +254,6 @@ class TestEngineIntegration:
         for r in requests_sent:
             print(f"  {r.type.name} seg={r.segment_idx} tokens={r.token_ids}")
 
-        # Simulate engine sending back SESSION_DONE
         await session.result_queue.put(EngineResult(
             type=ResultType.SESSION_DONE,
             session_id="test-001",
@@ -279,10 +263,7 @@ class TestEngineIntegration:
         assert dispatcher.active_count == 0
         print("Session completed successfully")
 
-    @pytest.mark.skipif(
-        not TOKENIZER_DIR.exists(),
-        reason=f"Tokenizer not found at {TOKENIZER_DIR}",
-    )
+    @SKIP_NO_TOKENIZER
     @pytest.mark.asyncio
     async def test_multi_session_stub(self):
         """Multiple concurrent sessions."""
@@ -354,10 +335,7 @@ class TestEngineIntegration:
 # ---------------------------------------------------------------------------
 
 class TestPerformance:
-    @pytest.mark.skipif(
-        not TOKENIZER_DIR.exists(),
-        reason=f"Tokenizer not found at {TOKENIZER_DIR}",
-    )
+    @SKIP_NO_TOKENIZER
     def test_spliter_throughput(self):
         """Benchmark: how fast can the Spliter process tokens?"""
         import time

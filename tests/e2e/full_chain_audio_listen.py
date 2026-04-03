@@ -18,15 +18,15 @@ Prerequisites:
 
 Usage:
   cd /path/to/Qwen3-TTS-Triton && conda activate qwen3-tts
-  python scripts/python/full_chain_audio_listen.py \\
+  python tests/e2e/full_chain_audio_listen.py \\
       --variant custom-1.7b --text "你好，这是一段全链路听感对比。" --speaker serena \\
       --triton-url localhost:8001
 
   # Skip Triton (only local official + fused ORT):
-  python scripts/python/full_chain_audio_listen.py --variant custom-1.7b --skip-triton
+  python tests/e2e/full_chain_audio_listen.py --variant custom-1.7b --skip-triton
 
   # Longer passage (rollover stress: single orchestrator request; listen for cuts/glitches):
-  python scripts/python/full_chain_audio_listen.py --variant custom-1.7b --text-file ./my.txt
+  python tests/e2e/full_chain_audio_listen.py --variant custom-1.7b --text-file ./my.txt
 """
 
 from __future__ import annotations
