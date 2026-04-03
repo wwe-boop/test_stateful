@@ -33,24 +33,36 @@ the session goes IDLE.** Phase B only runs after EOS is consumed.
 ## State Diagram
 
 ```mermaid
-flowchart TD
-    Input["流式token"] --> IDLE["等待"]
-    IDLE -->|"文本开始S或文本"| Prefill["做prefill"]
-    IDLE -->|"文本结束E"| HALT["结束"]
-    IDLE -->|"流式文本结束信号"| HALT["结束"]
-    Prefill -->|"文本"| SA["累计token做判断"]
-    Prefill -->|"文本结束E"| IDLE
-    SA -->|"文本且阈值达到abcd条件"| SB0["填充文本结束E"]
-    SA -->|"文本且不满足abcd条件"| SA
-    SA -->|"文本结束E"| SB1
-    SA -->|"无文本"| SAIdle["SA等待"]
-    SAIdle -->|"文本"| SA
-    SAIdle -->|"文本结束E"| SA
-    SB0 --> SB1["填充pad"]
-    SB1 -->|"自然eos或静音eos"| IDLE
-    SB1 -->|"强制EOS"| SB2["更新估计参数"]
-    SB2 --> IDLE
+stateDiagram-v2
+    [*] --> IDLE
+
+    IDLE --> IDLE : 未知事件 / ()
+    IDLE --> IDLE : 文本开始信号 / reset_context()
+    IDLE --> HALT : 文本结束信号 / ()
+    IDLE --> PREFILL : 开始token / prefill()
+    IDLE --> IDLE : 结束token / ()
+    IDLE --> PREFILL : 正常token / prefill()
+    IDLE --> PREFILL : 标点token / prefill()
+
+    PREFILL --> TEXT_INPUTING : Always / ()
+
+    TEXT_INPUTING --> TEXT_INPUTING : 未知事件 / ()
+    TEXT_INPUTING --> TEXT_INPUTING : 文本开始信号 / ()
+    TEXT_INPUTING --> PAD_TEXT_EOS : 文本结束信号 / set_final()
+    TEXT_INPUTING --> TEXT_INPUTING : 开始token / ()
+    TEXT_INPUTING --> PAD_TEXT_NOP : 结束token / decode()
+    TEXT_INPUTING --> TEXT_INPUTING : 正常token [未超长] / decode()
+    TEXT_INPUTING --> PAD_TEXT_EOS : 正常token [超长] / decode()
+    TEXT_INPUTING --> TEXT_INPUTING : 标点token [不满足切分] / decode()
+    TEXT_INPUTING --> PAD_TEXT_EOS : 标点token [满足切分] / decode()
+
+    PAD_TEXT_EOS --> HALT : [is_final] / flush_eos()
+    PAD_TEXT_EOS --> IDLE : [else] / flush_eos()
+
+    PAD_TEXT_NOP --> HALT : [is_final] / flush_nop()
+    PAD_TEXT_NOP --> IDLE : [else] / flush_nop()
 ```
+'''
 
 ## State Descriptions
 

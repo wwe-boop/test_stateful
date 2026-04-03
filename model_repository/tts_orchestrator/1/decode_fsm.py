@@ -138,6 +138,7 @@ class DecodeSessionFSM:
         self.pad_consecutive_silence: int = 0
         self.phase_b_eos_injected: bool = False
         self.checkpoint_past_len: int = 0
+        self.prior_text_steps: int = 0
 
         # Char-offset + segment text for the punct lookup (set by orchestrator)
         self.trailing_char_offsets: List[int] = []
@@ -337,6 +338,13 @@ def _handle_sa(fsm: DecodeSessionFSM, event: StepEvent) -> StepAction:
 
         # Text complete (E already consumed in SA as trailing):
         # skip SB0, go directly to SB1 with PAD.
+        # Scale pad_emit_cutoff based on tokens consumed: longer segments
+        # need proportionally more pad steps for their trailing speech.
+        # prior_text_steps accounts for tokens consumed in earlier inline
+        # phases (before streaming IDLE → resume cycles).
+        effective_text = fsm.prior_text_steps + fsm.steps_in_phase_a
+        needed = int(effective_text * max(0, fsm.ratio_audio_per_text - 1.0))
+        fsm.pad_emit_cutoff = max(fsm.pad_emit_cutoff, needed)
         logger.info(
             "Phase A → SB1: steps=%d text_idx=%d/%d (E consumed, direct PAD)",
             fsm.steps_in_phase_a, event.text_idx, event.trailing_len,

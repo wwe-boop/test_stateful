@@ -164,7 +164,7 @@ class TritonPythonModel:
             min_ratio=float(params.get("ratio_min", {}).get(
                 "string_value", os.environ.get("RATIO_MIN", "2.0"))),
             max_ratio=float(params.get("ratio_max", {}).get(
-                "string_value", os.environ.get("RATIO_MAX", "15.0"))),
+                "string_value", os.environ.get("RATIO_MAX", "10.0"))),
         )
         self.code2wav_sliding_window = int(params.get("code2wav_sliding_window", {}).get(
             "string_value",
@@ -614,7 +614,12 @@ class TritonPythonModel:
         return raw_cut
 
     def _split_segment_at_text_idx(self, session: TTSSession, row_logits: torch.Tensor):
-        """Split current segment: head = consumed text, tail = remainder (new segment)."""
+        """Split current segment: head = consumed text, tail = remainder.
+
+        Uses KV rollback + trailing injection (same mechanism as streaming
+        resume) so the model retains its full prompt context.  Falls back
+        to the cold re-prefill path only when no checkpoint is available.
+        """
         offsets = session.trailing_token_char_offsets or []
         seg = session.current_segment_text or ""
         trailing_len = len(session.trailing_text or [])
@@ -623,22 +628,95 @@ class TritonPythonModel:
         else:
             approx_ratio = len(seg) / max(trailing_len, 1)
             cut_char = min(len(seg), int(session.text_idx * approx_ratio))
-        
-        # Snap the cut point to the nearest punctuation to avoid splitting mid-sentence
+
         cut_char = self._snap_cut_to_punct(seg, cut_char)
-        
+
         head = seg[:cut_char].strip()
         tail = seg[cut_char:].strip()
         try:
             session.last_segment_codec_tail = row_logits[:, -1, :].detach().cpu()
         except Exception:
             session.last_segment_codec_tail = None
-        if tail:
-            session.text_segments.insert(session.segment_idx + 1, tail)
+
+        if not tail:
+            # Nothing left — end segment normally
+            if head:
+                session.text_segments[session.segment_idx] = head
+            mlfq.on_segment_boundary(session)
+            session.segment_idx += 1
+            session.reset_decode_state()
+            self._activate_next_segment(session)
+            return cut_char, len(head), 0
+
+        # Update segment bookkeeping
         if head:
             session.text_segments[session.segment_idx] = head
+        session.text_segments.insert(session.segment_idx + 1, tail)
         mlfq.on_segment_boundary(session)
         session.segment_idx += 1
+
+        # --- KV rollback path: reuse checkpoint context ---
+        if (
+            session.kv_checkpoint is not None
+            and session.c2w_checkpoint is not None
+            and session.checkpoint_codec_sum is not None
+        ):
+            is_last_seg = session.segment_idx == len(session.text_segments) - 1
+            streaming_may_continue = session.is_streaming and not session.text_complete
+            include_eos = not (streaming_may_continue and is_last_seg)
+
+            new_trailing = self.prefill_builder.build_trailing_embeds(
+                tail, include_eos=include_eos,
+            )
+            if new_trailing:
+                session.kv_tensors = [t.clone().contiguous() for t in session.kv_checkpoint]
+                session.c2w_states = [t.clone().contiguous() for t in session.c2w_checkpoint]
+                session.past_len = int(session.checkpoint_past_len)
+                session.frame_idx = int(getattr(session, 'checkpoint_frame_idx', 1))
+                session.pad_consecutive_silence = 0
+                session.token_counts = torch.zeros(
+                    1, self._vocab_size, device=self.device, dtype=torch.int64,
+                )
+
+                text_add = new_trailing[0]
+                session.trailing_text = new_trailing
+                session.text_idx = 1
+                session._eos_injected = include_eos
+                session.current_segment_text = tail
+                session.trailing_token_char_offsets = (
+                    self.prefill_builder.build_trailing_char_offsets(
+                        tail, include_eos=include_eos,
+                    )
+                )
+                session.segment_start_past_len = session.past_len
+                session.fsm = self._make_fsm()
+                session.fsm.trailing_char_offsets = list(session.trailing_token_char_offsets)
+                session.fsm.segment_text = tail
+                session.fsm.enter_phase_a(
+                    session.past_len, self._ratio_tracker.ema,
+                )
+                session.next_embed = (
+                    session.checkpoint_codec_sum + text_add
+                ).to(torch.float32)
+                session.flow_state = FlowState.ACTIVE
+                logger.info(
+                    "Split → KV rollback: sid=%s seg=%d/%d tail=%dch "
+                    "past_len=%d trailing=%d eos=%s",
+                    session.session_id,
+                    session.segment_idx + 1,
+                    len(session.text_segments),
+                    len(tail),
+                    session.past_len,
+                    len(new_trailing),
+                    include_eos,
+                )
+                return cut_char, len(head), len(tail)
+
+        # --- Fallback: cold re-prefill (no checkpoint available) ---
+        logger.warning(
+            "Split → cold re-prefill (no checkpoint): sid=%s seg=%d tail=%dch",
+            session.session_id, session.segment_idx + 1, len(tail),
+        )
         session.reset_decode_state()
         self._activate_next_segment(session)
         return cut_char, len(head), len(tail)
@@ -923,6 +1001,9 @@ class TritonPythonModel:
                             )
                         )
                         session.fsm = self._make_fsm()
+                        session.fsm.prior_text_steps = getattr(
+                            session, '_prior_text_steps', 0,
+                        )
                         session.fsm.trailing_char_offsets = session.trailing_token_char_offsets
                         session.fsm.segment_text = session.current_segment_text
                         session.fsm.enter_phase_a(
@@ -956,6 +1037,9 @@ class TritonPythonModel:
                 session.trailing_token_char_offsets = [0]
                 session.current_segment_text = session.current_segment_text or ""
                 session.fsm = self._make_fsm()
+                session.fsm.prior_text_steps = getattr(
+                    session, '_prior_text_steps', 0,
+                )
                 session.fsm.trailing_char_offsets = session.trailing_token_char_offsets
                 session.fsm.segment_text = session.current_segment_text
                 session.fsm.enter_phase_a(
@@ -1690,6 +1774,8 @@ class TritonPythonModel:
             # Streaming idle: no text left but text_complete not set.
             # wav was already emitted (or not) by action.emit_wav above.
             if action.idle:
+                prior = getattr(session, '_prior_text_steps', 0)
+                session._prior_text_steps = prior + session.text_idx
                 session.last_codec_sum = row_cs.clone()
                 _save_session_state()
                 self._snapshot_session_checkpoint(session, row_cs)
@@ -2009,8 +2095,10 @@ class TritonPythonModel:
         ema = max(1.0, self._ratio_tracker.ema)
         ta_ratio = 0.70
         safe_budget = max(8, int(ta_ratio * effective / ema))
-        safe_budget = min(self._segment_token_budget, safe_budget)
-        return max(16, safe_budget)
+        min_budget = max(16, self._segment_token_budget // 4)
+        safe_budget = max(min_budget, min(self._segment_token_budget, safe_budget))
+        return safe_budget
+
 
     def _segment_within_limits(
         self,

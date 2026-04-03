@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, List, Optional
+
+from .core import FSM, Rule, ALWAYS
+from .state import SpliterState as St
+from .event import SpliterEvent, SpliterEventType as ET
+
+logger = logging.getLogger(__name__)
+
+_TRANSIENT = frozenset({St.PREFILL, St.PAD_TEXT_EOS, St.PAD_TEXT_NOP})
+
+# ---------------------------------------------------------------------------
+# Action results — returned to the caller via feed()
+# ---------------------------------------------------------------------------
+
+class ActionType(Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+    FLUSH_EOS = "flush_eos"
+    FLUSH_NOP = "flush_nop"
+
+
+@dataclass
+class ActionResult:
+    type: ActionType
+    token: int = -1
+
+
+# ---------------------------------------------------------------------------
+# Threshold computation — mirrors decode_fsm.py logic
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SplitThresholds:
+    """Three-tier punctuation thresholds + forced cut."""
+    a: int   # L1 only  (。！？)
+    b: int   # L1 + L2  (，；：)
+    c: int   # L1+L2+L3 (\n——)
+    d: int   # forced cut (= max_tokens)
+
+
+def compute_thresholds(
+    remaining_kv: int,
+    ema_ratio: float,
+    safety_margin: int = 8,
+    a_ratio: float = 0.70,
+    b_ratio: float = 0.80,
+    c_ratio: float = 0.90,
+) -> SplitThresholds:
+    """Compute split thresholds from remaining KV budget and EMA ratio.
+
+    phase_a_cap = remaining_kv / (ema_ratio + 1)
+    — the +1 accounts for the fact that each text token needs ~ema_ratio
+    audio decode steps *plus* the text step itself.
+    """
+    remaining = max(1, remaining_kv - max(4, safety_margin // 4))
+    denom = max(1.0, ema_ratio)
+    cap = max(8, int(remaining / denom))
+
+    a = max(6, int(cap * a_ratio))
+    b = max(a + 4, int(cap * b_ratio))
+    c = max(b + 4, int(cap * c_ratio))
+    d = max(c + 1, cap)
+
+    d = min(d, remaining - 2)
+    c = min(c, d - 1)
+    b = min(b, c - 1)
+    a = min(a, b - 1)
+
+    return SplitThresholds(
+        a=max(1, a), b=max(2, b), c=max(3, c), d=max(4, d),
+    )
+
+
+# ---------------------------------------------------------------------------
+# FSM design (mermaid reference)
+# ---------------------------------------------------------------------------
+'''
+Three-tier punctuation threshold state machine
+================================================
+
+The Driver uses 4 thresholds (a < b < c < d) computed from remaining
+KV budget and the EMA audio:text ratio.
+
+TEXT_INPUTING transitions on punctuation:
+  - token_count >= a  AND  punct_level == 1 (L1)  → split
+  - token_count >= b  AND  punct_level <= 2 (L2)  → split
+  - token_count >= c  AND  punct_level <= 3 (L3)  → split
+  - token_count >= d  (any token)                  → forced split
+
+```mermaid
+stateDiagram-v2
+    [*] --> IDLE
+
+    IDLE --> IDLE : unknown / ()
+    IDLE --> IDLE : START signal / reset_context()
+    IDLE --> HALT : END signal / ()
+    IDLE --> PREFILL : start/normal/punct token / prefill()
+    IDLE --> IDLE : end_token / ()
+
+    PREFILL --> TEXT_INPUTING : Always / ()
+
+    TEXT_INPUTING --> TEXT_INPUTING : unknown/START/start_token / ()
+    TEXT_INPUTING --> PAD_TEXT_EOS : END signal / set_final()
+    TEXT_INPUTING --> PAD_TEXT_NOP : end_token / decode()
+    TEXT_INPUTING --> PAD_TEXT_EOS : normal [>=d] / decode()
+    TEXT_INPUTING --> TEXT_INPUTING : normal [<d] / decode()
+    TEXT_INPUTING --> PAD_TEXT_EOS : punct [threshold met] / decode()
+    TEXT_INPUTING --> TEXT_INPUTING : punct [threshold not met] / decode()
+
+    PAD_TEXT_EOS --> PAD_TEXT_NOP : Always / ()
+
+    PAD_TEXT_NOP --> HALT : [is_final] / flush_nop()
+    PAD_TEXT_NOP --> IDLE : [else] / flush_nop()
+```
+'''
+
+
+# ---------------------------------------------------------------------------
+# StreamingDriver
+# ---------------------------------------------------------------------------
+
+class StreamingDriver:
+    """Token-driven FSM for streaming text segmentation with 3-tier thresholds.
+
+    The caller (Spliter) creates one Driver per segment with thresholds
+    computed from the current KV budget and EMA ratio.
+
+    Usage::
+
+        thresholds = compute_thresholds(remaining_kv=500, ema_ratio=5.0)
+        driver = StreamingDriver(thresholds)
+        for event in token_stream:
+            results = driver.feed(event)
+            ...
+    """
+
+    def __init__(self, thresholds: SplitThresholds) -> None:
+        self.thresholds = thresholds
+
+        self._is_final = False
+        self._token_count = 0
+
+        self._fsm = self._build_fsm()
+
+    # ---- internal punct logic ------------------------------------------
+
+    def _meets_split_threshold(self, e: SpliterEvent) -> bool:
+        tc = self._token_count
+        pl = e.punct_level
+        if pl == 1 and tc >= self.thresholds.a:
+            return True
+        if pl == 2 and tc >= self.thresholds.b:
+            return True
+        if pl == 3 and tc >= self.thresholds.c:
+            return True
+        return False
+
+    # ---- guards --------------------------------------------------------
+
+    def _evt(self, *types: ET) -> Callable[[SpliterEvent], bool]:
+        s = frozenset(types)
+        return lambda e: e.type in s
+
+    def _normal_overflow(self, e: SpliterEvent) -> bool:
+        return e.type == ET.NORMAL_TOKEN and self._token_count >= self.thresholds.d
+
+    def _normal_no_overflow(self, e: SpliterEvent) -> bool:
+        return e.type == ET.NORMAL_TOKEN and self._token_count < self.thresholds.d
+
+    def _punct_should_split(self, e: SpliterEvent) -> bool:
+        return (e.type == ET.PUNCTUATION_TOKEN
+                and self._meets_split_threshold(e))
+
+    def _punct_no_split(self, e: SpliterEvent) -> bool:
+        return (e.type == ET.PUNCTUATION_TOKEN
+                and not self._meets_split_threshold(e))
+
+    def _check_final(self, _e: SpliterEvent) -> bool:
+        return self._is_final
+
+    # ---- actions -------------------------------------------------------
+
+    def _nop(self, _e: SpliterEvent) -> None:
+        return None
+
+    def _reset_context(self, _e: SpliterEvent) -> None:
+        self._is_final = False
+        self._token_count = 0
+        return None
+
+    def _prefill(self, e: SpliterEvent) -> ActionResult:
+        self._token_count = 1
+        return ActionResult(ActionType.PREFILL, e.token)
+
+    def _set_final(self, _e: SpliterEvent) -> None:
+        self._is_final = True
+        return None
+
+    def _decode(self, e: SpliterEvent) -> ActionResult:
+        self._token_count += 1
+        return ActionResult(ActionType.DECODE, e.token)
+
+    def _flush_eos(self, _e: SpliterEvent) -> ActionResult:
+        self._token_count = 0
+        return ActionResult(ActionType.FLUSH_EOS)
+
+    def _flush_nop(self, _e: SpliterEvent) -> ActionResult:
+        self._token_count = 0
+        return ActionResult(ActionType.FLUSH_NOP)
+
+    # ---- FSM construction ----------------------------------------------
+
+    def _build_fsm(self) -> FSM:
+        table = {
+            St.IDLE: [
+                Rule(St.HALT,    guard=self._evt(ET.END),       action=self._nop,           name="idle→halt"),
+                Rule(St.IDLE,    guard=self._evt(ET.START),     action=self._reset_context,  name="idle:start"),
+                Rule(St.PREFILL, guard=self._evt(ET.START_TOKEN, ET.NORMAL_TOKEN, ET.PUNCTUATION_TOKEN),
+                                                                action=self._prefill,        name="idle→prefill"),
+                Rule(St.IDLE,    guard=self._evt(ET.END_TOKEN), action=self._nop,           name="idle:end_tok_ignore"),
+                Rule(St.IDLE,    guard=self._evt(ET.UNKNOWN),   action=self._nop,           name="idle:unknown"),
+            ],
+
+            St.PREFILL: [
+                Rule(St.TEXT_INPUTING, guard=ALWAYS, action=self._nop, name="prefill→input"),
+            ],
+
+            St.TEXT_INPUTING: [
+                Rule(St.PAD_TEXT_EOS,  guard=self._evt(ET.END),       action=self._set_final,  name="input→pad_eos(final)"),
+                Rule(St.PAD_TEXT_NOP,  guard=self._evt(ET.END_TOKEN), action=self._decode,     name="input→pad_nop"),
+                Rule(St.PAD_TEXT_EOS,  guard=self._normal_overflow,   action=self._decode,     name="input→pad_eos(overflow)"),
+                Rule(St.TEXT_INPUTING, guard=self._normal_no_overflow, action=self._decode,    name="input:normal"),
+                Rule(St.PAD_TEXT_EOS,  guard=self._punct_should_split, action=self._decode,   name="input→pad_eos(punct)"),
+                Rule(St.TEXT_INPUTING, guard=self._punct_no_split,    action=self._decode,     name="input:punct_acc"),
+                Rule(St.TEXT_INPUTING, guard=self._evt(ET.START_TOKEN, ET.START, ET.UNKNOWN),
+                                                                      action=self._nop,       name="input:ignore"),
+            ],
+
+            St.PAD_TEXT_EOS: [
+                Rule(St.HALT, guard=self._check_final, action=self._flush_eos, name="pad_eos→halt"),
+                Rule(St.IDLE, guard=ALWAYS,            action=self._flush_eos, name="pad_eos→idle"),
+            ],
+
+            St.PAD_TEXT_NOP: [
+                Rule(St.HALT, guard=self._check_final, action=self._flush_nop, name="pad_nop→halt"),
+                Rule(St.IDLE, guard=ALWAYS,            action=self._flush_nop, name="pad_nop→idle"),
+            ],
+        }
+
+        return FSM.from_table(initial=St.IDLE, table=table)
+
+    # ---- public API ----------------------------------------------------
+
+    @property
+    def state(self) -> St:
+        return self._fsm.state
+
+    @property
+    def is_final(self) -> bool:
+        return self._is_final
+
+    @property
+    def token_count(self) -> int:
+        return self._token_count
+
+    def feed(self, event: SpliterEvent) -> List[ActionResult]:
+        """Feed one event; returns action results (may traverse transient states)."""
+        results: List[ActionResult] = []
+        state, result = self._fsm.step(event)
+        if result is not None:
+            results.append(result)
+
+        while state in _TRANSIENT:
+            prev = state
+            state, result = self._fsm.step(event)
+            if result is not None:
+                results.append(result)
+            if state == prev:
+                break
+
+        return results
+
+    def reset(self) -> None:
+        """Reset FSM and all context to initial state."""
+        self._fsm.reset()
+        self._is_final = False
+        self._token_count = 0
+
+
+__all__ = ("StreamingDriver", "ActionType", "ActionResult",
+           "SplitThresholds", "compute_thresholds")

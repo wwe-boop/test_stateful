@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package tts;
+
+service TTSService {
+  // Bidirectional streaming: client sends text chunks, server sends audio chunks
+  rpc SynthesizeStream (stream SynthesizeRequest) returns (stream SynthesizeResponse);
+}
+
+message SynthesizeRequest {
+  oneof request {
+    InitRequest init = 1;
+    TextChunk text = 2;
+    TextComplete done = 3;
+    CancelRequest cancel = 4;
+  }
+}
+
+message InitRequest {
+  string session_id = 1;
+  string speaker = 2;        // speaker name (for custom_voice)
+  string task_type = 3;      // "custom_voice" | "voice_clone" | "voice_design"
+  string language = 4;       // "auto" | "zh" | "en" | ...
+  bytes ref_audio = 5;       // reference audio for voice clone
+  string ref_text = 6;       // reference text for voice clone
+}
+
+message TextChunk {
+  string text = 1;
+}
+
+message TextComplete {}
+
+message CancelRequest {}
+
+message SynthesizeResponse {
+  oneof response {
+    AudioChunk audio = 1;
+    StatusUpdate status = 2;
+  }
+}
+
+message AudioChunk {
+  bytes pcm_data = 1;        // float32 PCM samples
+  int32 sample_rate = 2;     // 24000
+}
+
+message StatusUpdate {
+  string event = 1;           // "session_started" | "segment_end" | "done" | "error"
+  string message = 2;
+  map<string, string> metrics = 3;
+}

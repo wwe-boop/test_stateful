@@ -1,0 +1,475 @@
+"""Prefill builder for the standalone engine.
+
+Migrated from model_repository/tts_orchestrator/1/prefill_builder.py.
+Removed all Triton/pb_utils dependencies. Uses EmbeddingWeights directly.
+
+The PrefillBuilder constructs:
+  - prefill_embeds [1, S, H]:  fed to Talker's first forward pass
+  - trailing list[[1,1,H]]:   one per text token, fed one-per-step during decode
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Re-export from original: ResizeMLP, EmbeddingWeights, TaskType, PrefillPlan
+# ---------------------------------------------------------------------------
+
+class ResizeMLP(nn.Module):
+    """text_hidden_size -> hidden_size projection."""
+
+    def __init__(self, input_size: int, intermediate_size: int, output_size: int, bias: bool = True):
+        super().__init__()
+        self.linear_fc1 = nn.Linear(input_size, intermediate_size, bias=bias)
+        self.linear_fc2 = nn.Linear(intermediate_size, output_size, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear_fc2(torch.nn.functional.silu(self.linear_fc1(x)))
+
+
+class TaskType(Enum):
+    VOICE_CLONE_ICL = "voice_clone_icl"
+    VOICE_CLONE_XVEC = "voice_clone_xvec"
+    CUSTOM_VOICE = "custom_voice"
+    VOICE_DESIGN = "voice_design"
+
+
+FALLBACK_SPEAKER = "vivian"
+DEFAULT_SPEAKER = "vivian"
+
+
+@dataclass
+class PrefillPlan:
+    prefill_embeds: torch.Tensor           # [1, S, H] bf16
+    trailing: list                          # list of [1, 1, H] bf16
+    prefix_cache_key: Optional[str] = None
+    cacheable_prefix_embeds: Optional[torch.Tensor] = None
+    request_prefill_embeds: Optional[torch.Tensor] = None
+    warnings: Optional[list] = None
+    trailing_token_char_offsets: list = field(default_factory=list)
+
+
+def parse_task_type(task_type_str: str, x_vector_only: bool = False) -> TaskType:
+    if task_type_str == "voice_clone":
+        return TaskType.VOICE_CLONE_XVEC if x_vector_only else TaskType.VOICE_CLONE_ICL
+    elif task_type_str == "custom_voice":
+        return TaskType.CUSTOM_VOICE
+    elif task_type_str == "voice_design":
+        return TaskType.VOICE_DESIGN
+    else:
+        raise ValueError(f"Unknown task_type: {task_type_str}")
+
+
+# ---------------------------------------------------------------------------
+# EmbeddingWeights — loads .pt weights, provides embed() on GPU
+# ---------------------------------------------------------------------------
+
+class EmbeddingWeights:
+    """Holds text/codec/special embeddings on GPU (BF16)."""
+
+    def __init__(self, weights_dir: str, device_id: int = 0):
+        weights_dir = Path(weights_dir)
+        with open(weights_dir / "config.json") as f:
+            self.config = json.load(f)
+
+        self.variant = self.config["variant"]
+        self.hidden_size = self.config["talker_hidden_size"]
+        self.text_hidden_size = self.config.get("talker_text_hidden_size", self.hidden_size)
+        self.vocab_size = self.config["talker_vocab_size"]
+        self.codec_eos_id = self.config["codec_eos_token_id"]
+        self.codec_bos_id = self.config["codec_bos_id"]
+        self.codec_pad_id = self.config["codec_pad_id"]
+        self.codec_nothink_id = self.config.get("codec_nothink_id", 2155)
+        self.codec_think_bos_id = self.config.get("codec_think_bos_id", 2156)
+        self.codec_think_eos_id = self.config.get("codec_think_eos_id", 2157)
+        self.codec_think_id = self.config.get("codec_think_id", 2154)
+        self.codec_language_id = self.config.get("codec_language_id", {})
+        self.spk_id_map = self.config.get("spk_id", {})
+
+        self.device = torch.device("cuda", device_id)
+        dtype = torch.bfloat16
+
+        text_emb_sd = torch.load(
+            weights_dir / "text_embedding.pt", map_location=self.device, weights_only=True,
+        )
+        weight = text_emb_sd["weight"]
+        self.text_embedding = nn.Embedding(weight.shape[0], weight.shape[1]).to(
+            device=self.device, dtype=dtype,
+        )
+        self.text_embedding.load_state_dict(
+            {k: v.to(device=self.device, dtype=dtype) for k, v in text_emb_sd.items()}
+        )
+        self.text_embedding.eval()
+
+        text_proj_sd = torch.load(
+            weights_dir / "text_projection.pt", map_location=self.device, weights_only=True,
+        )
+        in_size = text_proj_sd["linear_fc1.weight"].shape[1]
+        mid_size = text_proj_sd["linear_fc1.weight"].shape[0]
+        out_size = text_proj_sd["linear_fc2.weight"].shape[0]
+        self.text_projection = ResizeMLP(in_size, mid_size, out_size, bias=True).to(
+            device=self.device, dtype=dtype,
+        )
+        self.text_projection.load_state_dict(
+            {k: v.to(device=self.device, dtype=dtype) for k, v in text_proj_sd.items()}
+        )
+        self.text_projection.eval()
+
+        codec_data = torch.load(
+            weights_dir / "codec_embeddings.pt", map_location=self.device, weights_only=True,
+        )
+        talker_sd = codec_data["talker_codec_embedding"]
+        c_weight = talker_sd["weight"]
+        self.codec_embedding = nn.Embedding(c_weight.shape[0], c_weight.shape[1]).to(
+            device=self.device, dtype=dtype,
+        )
+        self.codec_embedding.load_state_dict(
+            {k: v.to(device=self.device, dtype=dtype) for k, v in talker_sd.items()}
+        )
+        self.codec_embedding.eval()
+
+        special = torch.load(
+            weights_dir / "special_embeddings.pt", map_location=self.device, weights_only=True,
+        )
+        self.tts_pad_embed = special["tts_pad_embed"].to(device=self.device, dtype=dtype)
+        self.tts_bos_embed = special["tts_bos_embed"].to(device=self.device, dtype=dtype)
+        self.tts_eos_embed = special["tts_eos_embed"].to(device=self.device, dtype=dtype)
+
+        path_3d = weights_dir / "codec_embeddings_3d.pt"
+        self.codec_embeddings_3d = None
+        if path_3d.exists():
+            self.codec_embeddings_3d = torch.load(
+                path_3d, map_location=self.device, weights_only=True,
+            ).to(device=self.device, dtype=dtype)
+
+        logger.info("Weights: variant=%s, hidden=%d, vocab=%d",
+                     self.variant, self.hidden_size, self.vocab_size)
+
+    def text_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.text_projection(self.text_embedding(token_ids))
+
+    def codec_embed(self, codec_ids: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            return self.codec_embedding(codec_ids)
+
+
+# ---------------------------------------------------------------------------
+# Normalize text (inlined from text_segmenter to avoid cross-dependency)
+# ---------------------------------------------------------------------------
+
+def normalize_tts_text(text: str) -> str:
+    """Basic text normalization for TTS input."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\t", " ")
+    import re
+    text = re.sub(r"\n{2,}", "\n", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# PrefillBuilder
+# ---------------------------------------------------------------------------
+
+OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+
+
+class PrefillBuilder:
+    """Build prefill inputs_embeds for Talker.
+
+    Exactly replicates the official model.generate() logic:
+      - Streaming mode: first text token in prefill, rest as trailing
+      - Non-streaming (VoiceDesign): all text folded into prefill
+      - ICL (voice clone): reference codec + text into prefill
+    """
+
+    def __init__(self, weights: EmbeddingWeights, tokenizer: Any):
+        self.w = weights
+        self.tokenizer = tokenizer
+
+    def build_plan(
+        self,
+        task_type: TaskType,
+        text: str,
+        language: str = "auto",
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        spk_embedding: Optional[torch.Tensor] = None,
+        ref_codes: Optional[torch.Tensor] = None,
+        ref_text: Optional[str] = None,
+        ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        include_eos: bool = True,
+    ) -> PrefillPlan:
+        w = self.w
+        device = w.device
+        text = normalize_tts_text(text)
+        non_streaming_mode = (task_type == TaskType.VOICE_DESIGN)
+
+        assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=text)
+        input_ids_np = self.tokenizer(assistant_text, return_tensors="pt")["input_ids"]
+        if not isinstance(input_ids_np, np.ndarray):
+            input_ids_np = np.asarray(input_ids_np, dtype=np.int64)
+        if input_ids_np.ndim == 1:
+            input_ids_np = input_ids_np.reshape(1, -1)
+        input_ids = torch.as_tensor(input_ids_np, device=device, dtype=torch.int64)
+
+        role_embed = w.text_embed(input_ids[:, :3])
+
+        if language == "auto" or language is None:
+            tag_ids = torch.tensor(
+                [[w.codec_nothink_id, w.codec_think_bos_id, w.codec_think_eos_id]],
+                device=device, dtype=torch.int64,
+            )
+        else:
+            lang_id = w.codec_language_id.get(language.lower(), w.codec_pad_id)
+            tag_ids = torch.tensor(
+                [[w.codec_think_id, w.codec_think_bos_id, lang_id, w.codec_think_eos_id]],
+                device=device, dtype=torch.int64,
+            )
+        codec_input_embedding_0 = w.codec_embed(tag_ids)
+
+        codec_input_embedding_1 = w.codec_embed(
+            torch.tensor([[w.codec_pad_id, w.codec_bos_id]], device=device, dtype=torch.int64)
+        )
+
+        speaker_embed = None
+        plan_warnings: list[str] = []
+
+        if task_type == TaskType.CUSTOM_VOICE and speaker:
+            spk_id_val = w.spk_id_map.get(speaker.lower())
+            if spk_id_val is not None:
+                speaker_embed = w.codec_embed(
+                    torch.tensor([[spk_id_val]], device=device, dtype=torch.int64)
+                )
+            else:
+                fb_id = w.spk_id_map.get(FALLBACK_SPEAKER)
+                warn_msg = f"Speaker '{speaker}' not found, using '{FALLBACK_SPEAKER}'"
+                logger.warning(warn_msg)
+                plan_warnings.append(warn_msg)
+                if fb_id is not None:
+                    speaker_embed = w.codec_embed(
+                        torch.tensor([[fb_id]], device=device, dtype=torch.int64)
+                    )
+                    speaker = FALLBACK_SPEAKER
+        elif task_type == TaskType.CUSTOM_VOICE and not speaker:
+            default_id = w.spk_id_map.get(DEFAULT_SPEAKER)
+            if default_id is not None:
+                speaker_embed = w.codec_embed(
+                    torch.tensor([[default_id]], device=device, dtype=torch.int64)
+                )
+                speaker = DEFAULT_SPEAKER
+        elif task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
+            if spk_embedding is not None:
+                speaker_embed = spk_embedding.reshape(1, 1, -1)
+
+        if speaker_embed is not None:
+            codec_input_embedding = torch.cat(
+                [codec_input_embedding_0, speaker_embed, codec_input_embedding_1], dim=1,
+            )
+        else:
+            codec_input_embedding = torch.cat(
+                [codec_input_embedding_0, codec_input_embedding_1], dim=1,
+            )
+
+        n_codec = codec_input_embedding.shape[1]
+        text_layer = torch.cat([
+            w.tts_pad_embed.expand(1, n_codec - 2, w.hidden_size),
+            w.tts_bos_embed,
+        ], dim=1)
+        dual_track = text_layer + codec_input_embedding[:, :-1]
+
+        instruct_embed = None
+        if instruct and task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN):
+            instruct_ids_np = self.tokenizer(instruct, return_tensors="pt")["input_ids"]
+            if not isinstance(instruct_ids_np, np.ndarray):
+                instruct_ids_np = np.asarray(instruct_ids_np, dtype=np.int64)
+            if instruct_ids_np.ndim == 1:
+                instruct_ids_np = instruct_ids_np.reshape(1, -1)
+            instruct_ids = torch.as_tensor(instruct_ids_np, device=device, dtype=torch.int64)
+            instruct_embed = w.text_embed(instruct_ids)
+
+        if instruct_embed is not None:
+            talker_input_embed = torch.cat([role_embed, instruct_embed, dual_track], dim=1)
+        else:
+            talker_input_embed = torch.cat([role_embed, dual_track], dim=1)
+
+        if input_ids.shape[1] > 3:
+            first_text_embed = w.text_embed(input_ids[:, 3:4])
+        else:
+            first_text_embed = w.tts_pad_embed
+        first_text_with_bos = first_text_embed + codec_input_embedding[:, -1:]
+        talker_input_embed = torch.cat([talker_input_embed, first_text_with_bos], dim=1)
+
+        # ---- ICL path ----
+        if task_type == TaskType.VOICE_CLONE_ICL and ref_codec_sum_vec is not None:
+            prefill, trailing = self._build_icl_path(
+                w, device, input_ids, talker_input_embed,
+                ref_codec_sum_vec, ref_text,
+            )
+            char_offsets = []
+
+        elif (task_type == TaskType.VOICE_CLONE_ICL
+              and ref_codes is not None and w.codec_embeddings_3d is not None):
+            T_ref, _ = ref_codes.shape
+            g_idx = torch.arange(16, device=device, dtype=torch.int64).reshape(1, -1).expand(T_ref, 16)
+            codec_sum_vec = w.codec_embeddings_3d[g_idx, ref_codes, :].sum(dim=(0, 1), keepdim=True)
+            prefill, trailing = self._build_icl_path(
+                w, device, input_ids, talker_input_embed,
+                codec_sum_vec, ref_text,
+            )
+            char_offsets = []
+
+        elif non_streaming_mode:
+            talker_input_embed = talker_input_embed[:, :-1]
+            text_part = input_ids[:, 3:-5]
+            n_text = text_part.shape[1]
+            text_embed = torch.cat([w.text_embed(text_part), w.tts_eos_embed], dim=1)
+            codec_pad_ids = torch.full((1, n_text + 1), w.codec_pad_id,
+                                       device=device, dtype=torch.int64)
+            codec_pad_embed = w.codec_embed(codec_pad_ids)
+            prefill = torch.cat([
+                talker_input_embed,
+                text_embed + codec_pad_embed,
+                w.tts_pad_embed + w.codec_embed(
+                    torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)),
+            ], dim=1)
+            trailing = [w.tts_pad_embed.clone()]
+            char_offsets = []
+
+        else:
+            # ---- Streaming mode ----
+            prefill = talker_input_embed
+            mid = input_ids[:, 4:-5] if input_ids.shape[1] > 9 else input_ids[:, :0]
+            if mid.shape[1] > 0:
+                mid_embed = w.text_embed(mid)
+                if include_eos:
+                    trailing_text = torch.cat([mid_embed, w.tts_eos_embed], dim=1)
+                else:
+                    trailing_text = mid_embed
+            else:
+                trailing_text = w.tts_eos_embed if include_eos else torch.zeros(
+                    1, 0, w.hidden_size, device=device, dtype=torch.bfloat16)
+            trailing = [trailing_text[:, i:i+1, :].clone() for i in range(trailing_text.shape[1])]
+            char_offsets = []
+
+        prefix_cache_key = None
+        cacheable_prefix_embeds = None
+        request_prefill_embeds = None
+        if task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN, TaskType.VOICE_CLONE_XVEC):
+            if non_streaming_mode:
+                cacheable_prefix_embeds = talker_input_embed.clone().contiguous()
+                request_prefill_embeds = prefill[:, cacheable_prefix_embeds.shape[1]:, :].clone().contiguous()
+            else:
+                cacheable_prefix_embeds = prefill[:, :-1, :].clone().contiguous()
+                request_prefill_embeds = prefill[:, -1:, :].clone().contiguous()
+            if cacheable_prefix_embeds.shape[1] > 0 and request_prefill_embeds.shape[1] > 0:
+                prefix_cache_key = self._prefix_cache_key(task_type, language, speaker, instruct, spk_embedding)
+            else:
+                cacheable_prefix_embeds = None
+                request_prefill_embeds = None
+
+        return PrefillPlan(
+            prefill_embeds=prefill,
+            trailing=trailing,
+            prefix_cache_key=prefix_cache_key,
+            cacheable_prefix_embeds=cacheable_prefix_embeds,
+            request_prefill_embeds=request_prefill_embeds,
+            warnings=plan_warnings or None,
+            trailing_token_char_offsets=char_offsets,
+        )
+
+    def _build_icl_path(self, w, device, input_ids, talker_input_embed,
+                         ref_codec_sum_vec, ref_text):
+        codec_sum_vec = ref_codec_sum_vec.to(device=device, dtype=torch.bfloat16)
+        if codec_sum_vec.dim() == 2:
+            codec_sum_vec = codec_sum_vec.unsqueeze(0)
+        codec_embed_icl = torch.cat([
+            w.codec_embed(torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)),
+            codec_sum_vec,
+        ], dim=1)
+
+        if ref_text and ref_text.strip():
+            ref_assistant = OFFICIAL_ASSISTANT_FMT.format(text=ref_text.strip())
+            ref_ids_np = self.tokenizer(ref_assistant, return_tensors="pt")["input_ids"]
+            if not isinstance(ref_ids_np, np.ndarray):
+                ref_ids_np = np.asarray(ref_ids_np, dtype=np.int64)
+            if ref_ids_np.ndim == 1:
+                ref_ids_np = ref_ids_np.reshape(1, -1)
+            ref_ids = torch.as_tensor(ref_ids_np, device=device, dtype=torch.int64)
+            ref_id = ref_ids[:, 3:-5] if ref_ids.shape[1] > 8 else ref_ids[:, :0]
+        else:
+            ref_id = input_ids[:, :0]
+
+        text_id = input_ids[:, 3:-5] if input_ids.shape[1] > 8 else input_ids[:, 3:4]
+        text_embed_icl = w.text_embed(torch.cat([ref_id, text_id], dim=1))
+        text_embed_icl = torch.cat([text_embed_icl, w.tts_eos_embed], dim=1)
+        text_lens = text_embed_icl.shape[1]
+        codec_lens = codec_embed_icl.shape[1]
+
+        if text_lens > codec_lens:
+            icl_embed = text_embed_icl[:, :codec_lens] + codec_embed_icl
+            trailing = [text_embed_icl[:, i:i+1] for i in range(codec_lens, text_lens)]
+        else:
+            pad_len = codec_lens - text_lens
+            if pad_len > 0:
+                text_embed_icl = torch.cat(
+                    [text_embed_icl] + [w.tts_pad_embed] * pad_len, dim=1)
+            icl_embed = text_embed_icl + codec_embed_icl
+            trailing = [w.tts_pad_embed]
+
+        prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
+        return prefill, trailing
+
+    def build_trailing_embeds(self, text: str, include_eos: bool = True) -> list[torch.Tensor]:
+        """Build trailing embeddings for streaming text continuation."""
+        text = normalize_tts_text(text)
+        w = self.w
+        device = w.device
+        assistant_text = OFFICIAL_ASSISTANT_FMT.format(text=text)
+        input_ids_np = self.tokenizer(assistant_text, return_tensors="pt")["input_ids"]
+        if not isinstance(input_ids_np, np.ndarray):
+            input_ids_np = np.asarray(input_ids_np, dtype=np.int64)
+        if input_ids_np.ndim == 1:
+            input_ids_np = input_ids_np.reshape(1, -1)
+        input_ids = torch.as_tensor(input_ids_np, device=device, dtype=torch.int64)
+
+        text_tokens = input_ids[:, 3:-5] if input_ids.shape[1] > 8 else input_ids[:, 3:4]
+        if text_tokens.shape[1] > 0:
+            text_embed = w.text_embed(text_tokens)
+            if include_eos:
+                text_embed = torch.cat([text_embed, w.tts_eos_embed], dim=1)
+        else:
+            if include_eos:
+                text_embed = w.tts_eos_embed
+            else:
+                return []
+        return [text_embed[:, i:i+1, :].clone() for i in range(text_embed.shape[1])]
+
+    def _prefix_cache_key(self, task_type, language, speaker, instruct, spk_embedding):
+        key_parts = [self.w.variant, task_type.value, (language or "auto").strip().lower(),
+                     (instruct or "").strip()]
+        if task_type == TaskType.CUSTOM_VOICE:
+            key_parts.append((speaker or "").strip().lower())
+        elif task_type == TaskType.VOICE_CLONE_XVEC:
+            if spk_embedding is None:
+                return None
+            arr = spk_embedding.detach().cpu().float().contiguous().numpy()
+            key_parts.append(hashlib.sha1(arr.tobytes()).hexdigest()[:16])
+        elif task_type != TaskType.VOICE_DESIGN:
+            return None
+        return "|".join(key_parts)
