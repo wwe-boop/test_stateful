@@ -1,13 +1,13 @@
 """
 L1 unit tests: lightweight_tokenizer (T1.1, T4.1 tokenizer consistency).
-Run from repo root: pytest tests/test_lightweight_tokenizer.py -v
+Run from repo root: pytest tests/unit/test_lightweight_tokenizer.py -v
 """
 import sys
 from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ORCH_1 = REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"
 if str(ORCH_1) not in sys.path:
     sys.path.insert(0, str(ORCH_1))

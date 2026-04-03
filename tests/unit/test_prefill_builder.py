@@ -1,7 +1,7 @@
 """
 L1 unit tests: EmbeddingWeights and PrefillBuilder (T1.3, T1.4, T4.2).
 Requires: workspace/exported/<variant>/weights/ with .pt from export_01_embeddings.py, and GPU.
-Run from repo root: pytest tests/test_prefill_builder.py -v
+Run from repo root: pytest tests/unit/test_prefill_builder.py -v
 """
 import sys
 from pathlib import Path
@@ -11,7 +11,7 @@ import pytest
 pytest.importorskip("torch")
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ORCH_1 = REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"
 if str(ORCH_1) not in sys.path:
     sys.path.insert(0, str(ORCH_1))

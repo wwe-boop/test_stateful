@@ -5,7 +5,7 @@ Unit test: ConvTranspose1d replacement equivalence.
    our understanding of ConvTranspose math.
 2. Conv1dInsertZeros vs ConvTranspose1d - verifies the patch used for TRT BF16.
 
-Run: pytest tests/test_conv1d_subpixel.py -v
+Run: pytest tests/unit/test_conv1d_subpixel.py -v
 """
 import sys
 from pathlib import Path
@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "export"))
 from utils import Conv1dInsertZeros
 

@@ -119,30 +119,39 @@ detect_phase_b_status() {
 }
 
 # ---------------------------------------------------------------------------
-#  detect_phase_c_status [container_name]
+#  detect_phase_c_status [repo_root] [container_name]
 #
-#  Checks if a Triton container is running + healthy.
+#  Checks if TTS service is running (standalone engine OR Triton container).
 #  Outputs: none | running | healthy
+#
+#  Checks standalone engine first (PID file), then Triton container.
 # ---------------------------------------------------------------------------
 detect_phase_c_status() {
-    local container_name="${1:-qwen3-tts-triton}"
+    local repo_root="${1:-$(git rev-parse --show-toplevel 2>/dev/null || echo ".")}"
+    local container_name="${2:-qwen3-tts-triton}"
 
-    if ! command -v docker &>/dev/null; then
-        echo "none"
+    # Check standalone engine first
+    local engine_st
+    engine_st=$(engine_status "$repo_root" 2>/dev/null || echo "none")
+    if [ "$engine_st" != "none" ]; then
+        echo "$engine_st"
         return 0
     fi
 
-    if ! docker ps -q --filter "name=$container_name" 2>/dev/null | grep -q .; then
-        echo "none"
-        return 0
+    # Check Triton container
+    if command -v docker &>/dev/null; then
+        if docker ps -q --filter "name=$container_name" 2>/dev/null | grep -q .; then
+            local http_port="${TRITON_HTTP_PORT:-8000}"
+            if curl -sf "http://localhost:${http_port}/v2/health/ready" &>/dev/null; then
+                echo "healthy"
+            else
+                echo "running"
+            fi
+            return 0
+        fi
     fi
 
-    local http_port="${TRITON_HTTP_PORT:-8000}"
-    if curl -sf "http://localhost:${http_port}/v2/health/ready" &>/dev/null; then
-        echo "healthy"
-    else
-        echo "running"
-    fi
+    echo "none"
     return 0
 }
 
@@ -230,7 +239,7 @@ print_status_summary() {
     local phase_a phase_b phase_c
     phase_a=$(detect_phase_a_status "$exported_dir" "$variant")
     phase_b=$(detect_phase_b_status "$exported_dir" "$variant")
-    phase_c=$(detect_phase_c_status)
+    phase_c=$(detect_phase_c_status "$repo_root")
 
     local pa_icon pb_icon pc_icon
     pa_icon=$(_status_icon "$phase_a")
@@ -256,14 +265,14 @@ print_status_summary() {
 
     echo ""
     echo -e "${_CLR_BLUE}╔══════════════════════════════════════════════════════════╗${_CLR_RESET}"
-    echo -e "${_CLR_BLUE}║       Qwen3-TTS Triton — Pipeline Status                ║${_CLR_RESET}"
+    echo -e "${_CLR_BLUE}║       Qwen3-TTS — Pipeline Status                        ║${_CLR_RESET}"
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  GPU:    $gpu_info"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Docker: $docker_info"
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase A (setup + export):     $pa_icon"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase B (TRT engines):        $pb_icon"
-    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C (Triton deployment):  $pc_icon"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C (deploy):             $pc_icon"
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
 
     # List available variants
@@ -299,7 +308,7 @@ detect_resume_point() {
     local phase_a phase_b phase_c
     phase_a=$(detect_phase_a_status "$exported_dir" "$variant")
     phase_b=$(detect_phase_b_status "$exported_dir" "$variant")
-    phase_c=$(detect_phase_c_status)
+    phase_c=$(detect_phase_c_status "$repo_root")
 
     if [ "$phase_c" = "healthy" ]; then
         echo "done"

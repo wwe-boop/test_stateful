@@ -8,14 +8,14 @@
 #    - tritonserver --help works
 #
 #  Run from repo root:
-#    bash tests/test_dockerfile_triton.sh
-#  Optional: BUILD_TAG=qwen3-tts-triton:26.01 bash tests/test_dockerfile_triton.sh
+#    bash tests/integration/test_dockerfile_triton.sh
+#  Optional: BUILD_TAG=qwen3-tts-triton:26.01 bash tests/integration/test_dockerfile_triton.sh
 # ===========================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 LIB_DIR="${REPO_ROOT}/scripts/bash/lib"
 source "${LIB_DIR}/logging.sh"
 source "${LIB_DIR}/utils.sh"

@@ -2,7 +2,7 @@
 
 ## 1. 测试范围
 
-E2E 测试位于 `tests/test_e2e.py`，通过 Triton gRPC 调用 `tts_orchestrator`，覆盖场景与错误处理（对应架构 T3.1、T3.3、T3.4）。
+E2E 测试位于 `tests/e2e/test_e2e.py`，通过 Triton gRPC 调用 `tts_orchestrator`，覆盖场景与错误处理（对应架构 T3.1、T3.3、T3.4）。
 
 | 用例 ID | 测试项 | 说明 |
 |--------|--------|------|
@@ -39,7 +39,7 @@ E2E 测试位于 `tests/test_e2e.py`，通过 Triton gRPC 调用 `tts_orchestrat
 ```bash
 # 确保 Triton 已起：bash scripts/bash/build_triton.sh run
 cd /path/to/Qwen3-TTS-Triton
-python -m pytest tests/test_e2e.py -v -s
+python -m pytest tests/e2e/test_e2e.py -v -s
 ```
 
 输出中会出现类似：

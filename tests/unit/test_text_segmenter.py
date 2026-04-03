@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ORCH_1 = REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"
 if str(ORCH_1) not in sys.path:
     sys.path.insert(0, str(ORCH_1))
@@ -166,7 +166,7 @@ class TestSplitTextForTokenBudget:
 # story.txt integration test (with real tokenizer)
 # ---------------------------------------------------------------------------
 
-STORY_PATH = REPO_ROOT / "tests" / "cases" / "story.txt"
+STORY_PATH = REPO_ROOT / "tests" / "data" / "story.txt"
 
 # Attempt to locate a real tokenizer directory
 _TOKENIZER_CANDIDATES = [

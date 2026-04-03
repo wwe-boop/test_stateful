@@ -1,6 +1,6 @@
 """
 L1 unit tests: audio_utils (T1.2).
-Run from repo root: pytest tests/test_audio_utils.py -v
+Run from repo root: pytest tests/unit/test_audio_utils.py -v
 """
 import base64
 import io
@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 ORCH_1 = REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"
 if str(ORCH_1) not in sys.path:
     sys.path.insert(0, str(ORCH_1))

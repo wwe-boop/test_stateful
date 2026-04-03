@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_PY = REPO_ROOT / "scripts" / "python"
 sys.path.insert(0, str(SCRIPTS_PY))
 
@@ -17,7 +17,7 @@ from trt_fused_io_formats import (  # noqa: E402
     trtexec_precision_args,
 )
 
-FIXTURE_MANIFEST = REPO_ROOT / "tests" / "fixtures" / "triton_manifest_custom_1_7b.json"
+FIXTURE_MANIFEST = REPO_ROOT / "tests" / "data" / "triton_manifest_custom_1_7b.json"
 
 
 def _load_fixture() -> dict:

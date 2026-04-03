@@ -1,5 +1,8 @@
 """
-Pytest conftest: add model_repository/tts_orchestrator/1 to path for imports.
+Pytest conftest: shared path setup for all test subdirectories.
+
+Adds model_repository/tts_orchestrator/1 to sys.path so orchestrator
+modules (prefill_builder, decode_fsm, etc.) are importable.
 """
 import sys
 from pathlib import Path
@@ -12,3 +15,4 @@ if ORCH_1.is_dir() and str(ORCH_1) not in sys.path:
 WORKSPACE_EXPORTED = REPO_ROOT / "workspace" / "exported"
 TOKENIZER_DIR = WORKSPACE_EXPORTED / "tokenizer" / "Qwen3-TTS-Tokenizer-12Hz"
 WEIGHTS_DIR_BASE = WORKSPACE_EXPORTED / "base-1.7b" / "weights"
+DATA_DIR = REPO_ROOT / "tests" / "data"

@@ -4,7 +4,7 @@ Offline tests for DecodeSessionFSM.
 Drives the FSM with simulated token sequences to verify state transitions
 without needing TRT engine or Triton runtime.
 
-Run: python -m pytest tests/test_decode_fsm.py -v
+Run: python -m pytest tests/unit/test_decode_fsm.py -v
 """
 
 import sys
@@ -12,7 +12,7 @@ import os
 import pytest
 
 sys.path.insert(0, os.path.join(
-    os.path.dirname(__file__), "..", "model_repository", "tts_orchestrator", "1",
+    os.path.dirname(__file__), "..", "..", "model_repository", "tts_orchestrator", "1",
 ))
 
 from decode_fsm import (

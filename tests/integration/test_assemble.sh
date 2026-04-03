@@ -9,14 +9,14 @@
 #    - Both: first_chunk_frames in tts_orchestrator config, weights/ .pt files
 #
 #  Run from repo root:
-#    bash tests/test_assemble.sh
+#    bash tests/integration/test_assemble.sh
 #  Requires: workspace/exported/<variant>/ with ONNX (and optionally .engine for trt).
 # ===========================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 VARIANT="${VARIANT:-base-1.7b}"
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_PY = REPO_ROOT / "scripts" / "python"
 sys.path.insert(0, str(SCRIPTS_PY))
 
@@ -23,7 +23,7 @@ from generate_triton_configs import (  # noqa: E402
 from triton_manifest_io import build_manifest_for_export, load_manifest  # noqa: E402
 
 
-FIXTURE_MANIFEST = REPO_ROOT / "tests" / "fixtures" / "triton_manifest_custom_1_7b.json"
+FIXTURE_MANIFEST = REPO_ROOT / "tests" / "data" / "triton_manifest_custom_1_7b.json"
 FIXTURE_LAYOUT = REPO_ROOT / "workspace" / "exported" / "custom-1.7b" / "code2wav_state_layout.json"
 
 

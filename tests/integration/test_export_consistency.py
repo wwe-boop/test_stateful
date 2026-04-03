@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("torch")
 import torch
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPORTED = REPO_ROOT / "workspace" / "exported"
 VARIANT = "base-1.7b"
 

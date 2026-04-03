@@ -1,13 +1,13 @@
 """
 Unit tests for LightQwen3TTSTokenizer (model_repository_new tokenizer core).
-Run: pytest tests/test_tokenizer_core.py -v
+Run: pytest tests/unit/test_tokenizer_core.py -v
 """
 import sys
 from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 CORE_DIR = REPO_ROOT / "model_repository_new" / "tts_orchestrator" / "1" / "tokenizer"
 if str(CORE_DIR) not in sys.path:
     sys.path.insert(0, str(CORE_DIR))

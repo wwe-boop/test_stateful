@@ -1,0 +1,329 @@
+#!/bin/bash
+# ===========================================================================
+#  engine.sh — Standalone TTS Engine lifecycle helpers
+#
+#  Functions: resolve_variant_model_dir, engine_start, engine_stop,
+#             engine_status, engine_health_check
+#  Depends:   lib/logging.sh, lib/utils.sh
+#
+#  Manages the standalone TTS engine server (python -m engine.server)
+#  as a background process with PID file tracking.
+# ===========================================================================
+
+[[ -n "${_LIB_ENGINE_LOADED:-}" ]] && return 0
+_LIB_ENGINE_LOADED=1
+
+_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${_LIB_DIR}/logging.sh"
+source "${_LIB_DIR}/utils.sh"
+
+ENGINE_GRPC_PORT="${ENGINE_GRPC_PORT:-50051}"
+
+# ---------------------------------------------------------------------------
+#  resolve_variant_model_dir <variant>
+#  Maps a variant name to the HuggingFace model directory name.
+#  Echoes the directory name (not full path) on success, returns 1 on failure.
+# ---------------------------------------------------------------------------
+resolve_variant_model_dir() {
+    local variant="$1"
+    case "$variant" in
+        design-1.7b) echo "Qwen3-TTS-12Hz-1.7B-VoiceDesign" ;;
+        custom-1.7b) echo "Qwen3-TTS-12Hz-1.7B-CustomVoice" ;;
+        base-1.7b)   echo "Qwen3-TTS-12Hz-1.7B-Base" ;;
+        custom-0.6b) echo "Qwen3-TTS-12Hz-0.6B-CustomVoice" ;;
+        base-0.6b)   echo "Qwen3-TTS-12Hz-0.6B-Base" ;;
+        *)
+            log_error "Unknown variant: $variant"
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+#  resolve_engine_paths <repo_root> <variant>
+#  Auto-discovers tokenizer, weights, and engine directories.
+#  Sets global variables: _ENGINE_TOKENIZER_DIR, _ENGINE_WEIGHTS_DIR,
+#  _ENGINE_DIR (TRT plan directory).
+#  Returns 1 if critical paths are missing.
+# ---------------------------------------------------------------------------
+resolve_engine_paths() {
+    local repo_root="$1"
+    local variant="$2"
+    local exported_dir="$repo_root/workspace/exported"
+    local models_dir="$repo_root/workspace/models"
+
+    # Tokenizer dir: workspace/models/<model_dir>
+    local model_dir_name
+    model_dir_name=$(resolve_variant_model_dir "$variant") || return 1
+    _ENGINE_TOKENIZER_DIR="$models_dir/$model_dir_name"
+    if [ ! -d "$_ENGINE_TOKENIZER_DIR" ]; then
+        log_error "Tokenizer directory not found: $_ENGINE_TOKENIZER_DIR"
+        log_error "Run Phase A first: autorun.sh setup"
+        return 1
+    fi
+
+    # Weights dir: workspace/exported/<variant>/weights
+    _ENGINE_WEIGHTS_DIR="$exported_dir/$variant/weights"
+    if [ ! -d "$_ENGINE_WEIGHTS_DIR" ]; then
+        log_error "Weights directory not found: $_ENGINE_WEIGHTS_DIR"
+        log_error "Run Phase A first: autorun.sh setup"
+        return 1
+    fi
+
+    # Engine dir (TRT plans): workspace/exported/<variant>/engines/talker_code2wav_fused
+    _ENGINE_DIR="$exported_dir/$variant/engines/talker_code2wav_fused"
+    if [ ! -d "$_ENGINE_DIR" ]; then
+        _ENGINE_DIR=""
+        log_warn "TRT engine directory not found, engine will run in stub/ONNX mode"
+    fi
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  engine_pid_file <repo_root>
+#  Returns the PID file path for the standalone engine.
+# ---------------------------------------------------------------------------
+engine_pid_file() {
+    echo "$1/workspace/.engine.pid"
+}
+
+# ---------------------------------------------------------------------------
+#  engine_log_file <repo_root>
+#  Returns the log file path for the standalone engine.
+# ---------------------------------------------------------------------------
+engine_log_file() {
+    echo "$1/workspace/engine.log"
+}
+
+# ---------------------------------------------------------------------------
+#  engine_start <repo_root> <variant> [options...]
+#
+#  Starts the standalone TTS engine server as a background process.
+#  Options:
+#    --port <N>            gRPC port (default: $ENGINE_GRPC_PORT)
+#    --device <N>          GPU device (default: 0)
+#    --max-batch <N>       Max batch size (default: 48)
+#    --max-sessions <N>    Max concurrent sessions (default: 128)
+#    --foreground          Run in foreground (don't daemonize)
+# ---------------------------------------------------------------------------
+engine_start() {
+    local repo_root="$1"
+    local variant="$2"
+    shift 2
+
+    local port="$ENGINE_GRPC_PORT"
+    local device=0
+    local max_batch=48
+    local max_sessions=128
+    local foreground=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)          port="$2"; shift 2 ;;
+            --device)        device="$2"; shift 2 ;;
+            --max-batch)     max_batch="$2"; shift 2 ;;
+            --max-sessions)  max_sessions="$2"; shift 2 ;;
+            --foreground)    foreground=true; shift ;;
+            *)               shift ;;
+        esac
+    done
+
+    local pid_file
+    pid_file=$(engine_pid_file "$repo_root")
+    local log_file
+    log_file=$(engine_log_file "$repo_root")
+
+    # Check if already running
+    if [ -f "$pid_file" ]; then
+        local old_pid
+        old_pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            log_warn "Engine already running (PID $old_pid)"
+            log_info "Stop first: deploy.sh stop"
+            return 1
+        fi
+        rm -f "$pid_file"
+    fi
+
+    resolve_engine_paths "$repo_root" "$variant" || return 1
+
+    log_step "Starting Standalone TTS Engine"
+    log_info "  Variant:      $variant"
+    log_info "  Tokenizer:    $_ENGINE_TOKENIZER_DIR"
+    log_info "  Weights:      $_ENGINE_WEIGHTS_DIR"
+    log_info "  TRT Engines:  ${_ENGINE_DIR:-stub mode}"
+    log_info "  GPU Device:   $device"
+    log_info "  Max Batch:    $max_batch"
+    log_info "  Max Sessions: $max_sessions"
+    log_info "  gRPC Port:    $port"
+
+    local cmd=(
+        python -m engine.server
+        --tokenizer-dir "$_ENGINE_TOKENIZER_DIR"
+        --weights-dir "$_ENGINE_WEIGHTS_DIR"
+        --device "$device"
+        --max-batch "$max_batch"
+        --max-sessions "$max_sessions"
+        --port "$port"
+    )
+
+    if [ -n "$_ENGINE_DIR" ]; then
+        cmd+=(--engine-dir "$_ENGINE_DIR")
+    fi
+
+    if $foreground; then
+        log_info "Running in foreground (Ctrl+C to stop)..."
+        cd "$repo_root" && exec "${cmd[@]}"
+    fi
+
+    mkdir -p "$(dirname "$log_file")"
+    cd "$repo_root" && nohup "${cmd[@]}" > "$log_file" 2>&1 &
+    local engine_pid=$!
+
+    echo "$engine_pid" > "$pid_file"
+    log_info "Engine started (PID $engine_pid)"
+    log_info "  Log file: $log_file"
+    log_info "  PID file: $pid_file"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  engine_stop <repo_root>
+#  Stops the standalone TTS engine gracefully (SIGTERM, then SIGKILL).
+# ---------------------------------------------------------------------------
+engine_stop() {
+    local repo_root="$1"
+    local pid_file
+    pid_file=$(engine_pid_file "$repo_root")
+
+    if [ ! -f "$pid_file" ]; then
+        log_info "No engine PID file found (not running?)"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    if [ -z "$pid" ]; then
+        rm -f "$pid_file"
+        log_info "Empty PID file, cleaned up"
+        return 0
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$pid_file"
+        log_info "Engine process (PID $pid) not running, cleaned up PID file"
+        return 0
+    fi
+
+    log_info "Stopping engine (PID $pid)..."
+    kill -TERM "$pid" 2>/dev/null
+
+    local elapsed=0
+    while [ "$elapsed" -lt 10 ]; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$pid_file"
+            log_info "Engine stopped gracefully"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    log_warn "Engine did not stop within 10s, sending SIGKILL..."
+    kill -9 "$pid" 2>/dev/null
+    sleep 1
+    rm -f "$pid_file"
+    log_info "Engine killed"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  engine_status <repo_root>
+#  Returns status: "none" | "running" | "healthy"
+# ---------------------------------------------------------------------------
+engine_status() {
+    local repo_root="$1"
+    local pid_file
+    pid_file=$(engine_pid_file "$repo_root")
+
+    if [ ! -f "$pid_file" ]; then
+        echo "none"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$pid_file"
+        echo "none"
+        return 0
+    fi
+
+    echo "running"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+#  engine_health_check <port> [timeout_sec]
+#  Waits for the engine gRPC port to become reachable.
+# ---------------------------------------------------------------------------
+engine_health_check() {
+    local port="${1:-$ENGINE_GRPC_PORT}"
+    local timeout="${2:-60}"
+    local elapsed=0
+    local interval=2
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if command -v grpc_health_probe &>/dev/null; then
+            if grpc_health_probe -addr "localhost:${port}" -connect-timeout 1s &>/dev/null; then
+                log_info "Engine healthy on port $port"
+                return 0
+            fi
+        else
+            # Fallback: check if port is open
+            if (echo >/dev/tcp/localhost/"$port") 2>/dev/null; then
+                log_info "Engine port $port is open (gRPC health probe not installed)"
+                return 0
+            fi
+        fi
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    log_error "Engine health check timed out after ${timeout}s"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+#  engine_show_status <repo_root>
+#  Prints detailed status info (for human consumption).
+# ---------------------------------------------------------------------------
+engine_show_status() {
+    local repo_root="$1"
+    local pid_file
+    pid_file=$(engine_pid_file "$repo_root")
+    local log_file
+    log_file=$(engine_log_file "$repo_root")
+    local status
+    status=$(engine_status "$repo_root")
+
+    case "$status" in
+        none)
+            log_info "Standalone engine: NOT RUNNING"
+            ;;
+        running|healthy)
+            local pid
+            pid=$(cat "$pid_file" 2>/dev/null)
+            log_info "Standalone engine: RUNNING (PID $pid)"
+            if [ -f "$log_file" ]; then
+                log_info "  Log file: $log_file"
+                log_info "  Last 5 lines:"
+                tail -5 "$log_file" 2>/dev/null | while IFS= read -r line; do
+                    echo "    $line"
+                done
+            fi
+            ;;
+    esac
+}

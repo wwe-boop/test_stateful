@@ -5,7 +5,7 @@
 #  Smart entry point that orchestrates all three build phases:
 #    Phase A (setup):  Environment + model export    → setup_env.sh
 #    Phase B (build):  TensorRT engine compilation    → build_engines.sh
-#    Phase C (deploy): Triton server deployment       → build_triton.sh
+#    Phase C (deploy): TTS service deployment          → deploy.sh
 #
 #  Usage:
 #    bash scripts/bash/autorun.sh                    # interactive mode
@@ -15,7 +15,7 @@
 #    bash scripts/bash/autorun.sh build [options]     # Phase B only
 #    bash scripts/bash/autorun.sh deploy [options]    # Phase C only
 #    bash scripts/bash/autorun.sh status              # show pipeline status
-#    bash scripts/bash/autorun.sh stop                # stop Triton server
+#    bash scripts/bash/autorun.sh stop                # stop TTS service
 #    bash scripts/bash/autorun.sh update-matrix       # update NGC compat matrix
 #
 #  Options:
@@ -38,9 +38,11 @@
 #      --image <uri>         Override NGC container image
 #      --dtype <type>        Engine precision: bf16|fp16|fp32 (default: bf16)
 #
-#    Phase C (forwarded to build_triton.sh):
-#      --grpc-port <port>    gRPC port (default: 8001)
-#      --http-port <port>    HTTP port (default: 8000)
+#    Phase C (forwarded to deploy.sh):
+#      --gateway <mode>      Gateway: standalone (default) | triton
+#      --port <port>         Standalone gRPC port (default: 50051)
+#      --grpc-port <port>    Triton gRPC port (default: 8001)
+#      --http-port <port>    Triton HTTP port (default: 8000)
 # ===========================================================================
 
 set -euo pipefail
@@ -80,6 +82,8 @@ ENGINE_DTYPE=""
 
 # Phase C forwarding
 DEPLOY_ARGS=()
+GATEWAY_MODE=""
+ENGINE_PORT=""
 GRPC_PORT=""
 HTTP_PORT=""
 
@@ -93,9 +97,9 @@ Commands:
   all               Full pipeline: setup → build → deploy (default)
   setup             Phase A only (environment + model export)
   build             Phase B only (TensorRT engine compilation)
-  deploy            Phase C only (Triton server deployment)
+  deploy            Phase C only (TTS service deployment)
   status            Show pipeline status
-  stop              Stop Triton server
+  stop              Stop TTS service
   update-matrix     Update NGC compatibility matrix from NVIDIA website
   help              Show this help
 
@@ -126,9 +130,11 @@ Phase B options (forwarded to build_engines.sh):
   --dtype <type>          Engine precision: bf16|fp16|fp32 (default: bf16)
                           Use fp32 if Triton reports dtype mismatch (e.g. TYPE_FP32 vs TYPE_BF16).
 
-Phase C options (forwarded to build_triton.sh):
-  --grpc-port <port>      gRPC port (default: 8001)
-  --http-port <port>      HTTP port (default: 8000)
+Phase C options (forwarded to deploy.sh):
+  --gateway <mode>        Gateway: standalone (default) | triton
+  --port <port>           Standalone gRPC port (default: 50051)
+  --grpc-port <port>      Triton gRPC port (default: 8001)
+  --http-port <port>      Triton HTTP port (default: 8000)
 
 Examples:
   autorun.sh                          # interactive guided setup
@@ -139,7 +145,8 @@ Examples:
   autorun.sh build -m custom-1.7b --dtype fp32    # Phase B with fp32
   autorun.sh build -m custom-1.7b --dtype fp16    # Phase B with fp16
   autorun.sh build --target-driver 575.57   # build for production driver
-  autorun.sh deploy                   # Phase C (start Triton)
+  autorun.sh deploy                   # Phase C (standalone engine)
+  autorun.sh deploy --gateway triton  # Phase C (Triton container)
   autorun.sh status                   # show pipeline status
   autorun.sh update-matrix            # fetch latest NGC compat data
 EOF
@@ -175,6 +182,8 @@ parse_args() {
             --dtype)            ENGINE_DTYPE="$2"; shift 2 ;;
 
             # Phase C
+            --gateway)          GATEWAY_MODE="$2"; shift 2 ;;
+            --port)             ENGINE_PORT="$2"; shift 2 ;;
             --grpc-port)        GRPC_PORT="$2"; shift 2 ;;
             --http-port)        HTTP_PORT="$2"; shift 2 ;;
 
@@ -244,11 +253,13 @@ build_forward_args() {
     if [ -n "$ENGINE_DTYPE" ]; then BUILD_ARGS+=(--dtype "$ENGINE_DTYPE"); fi
     if $DRY_RUN; then BUILD_ARGS+=(--dry-run); fi
 
-    # Phase C args
+    # Phase C args (forwarded to deploy.sh)
     DEPLOY_ARGS=()
     if [ -n "$VARIANT" ] && [[ "$VARIANT" != all* ]]; then
         DEPLOY_ARGS+=(--variant "$VARIANT")
     fi
+    if [ -n "$GATEWAY_MODE" ]; then DEPLOY_ARGS+=(--gateway "$GATEWAY_MODE"); fi
+    if [ -n "$ENGINE_PORT" ]; then DEPLOY_ARGS+=(--port "$ENGINE_PORT"); fi
     if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
     if [ -n "$GRPC_PORT" ]; then
         export TRITON_GRPC_PORT="$GRPC_PORT"
@@ -295,15 +306,15 @@ run_phase_b() {
 }
 
 run_phase_c() {
-    log_step "阶段 C: Triton 部署"
+    log_step "阶段 C: 部署 TTS 服务"
     echo ""
 
     if $DRY_RUN; then
-        log_info "[DRY RUN] Would run: bash build_triton.sh run ${DEPLOY_ARGS[*]}"
+        log_info "[DRY RUN] Would run: bash deploy.sh run ${DEPLOY_ARGS[*]}"
         return 0
     fi
 
-    bash "${SCRIPT_DIR}/build_triton.sh" run "${DEPLOY_ARGS[@]}" || {
+    bash "${SCRIPT_DIR}/deploy.sh" run "${DEPLOY_ARGS[@]}" || {
         log_error "Phase C 失败。"
         log_info  "请修正问题后重新执行: bash scripts/bash/autorun.sh deploy"
         return 1
@@ -322,7 +333,7 @@ cmd_all() {
     run_phase_c || exit 1
 
     echo ""
-    echo -e "${_CLR_GREEN}全部阶段完成！Triton 服务已运行。${_CLR_RESET}"
+    echo -e "${_CLR_GREEN}全部阶段完成！TTS 服务已运行。${_CLR_RESET}"
     echo ""
 }
 
@@ -337,7 +348,7 @@ cmd_build() {
 }
 
 cmd_deploy() {
-    show_run_banner "阶段 C" "Triton 部署"
+    show_run_banner "阶段 C" "部署 TTS 服务"
     run_phase_c || exit 1
 }
 
@@ -346,10 +357,9 @@ cmd_status() {
 }
 
 cmd_stop() {
-    local repo="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
-    local cname
-    cname=$(triton_resolve_container_name "$repo" "${CONTAINER_NAME:-qwen3-tts-triton}" "${VARIANT:-}")
-    triton_stop "$cname"
+    local stop_args=()
+    [ -n "$VARIANT" ] && stop_args+=(--variant "$VARIANT")
+    bash "${SCRIPT_DIR}/deploy.sh" stop "${stop_args[@]}"
 }
 
 cmd_update_matrix() {
@@ -390,7 +400,7 @@ interactive_mode() {
     echo "  [1] 完整流程  (setup → build → deploy)"
     echo "  [2] 环境配置  (阶段 A)"
     echo "  [3] 构建引擎  (阶段 B)"
-    echo "  [4] 部署 Triton  (阶段 C)"
+    echo "  [4] 部署服务    (阶段 C)"
 
     if [ "$resume_point" != "setup" ] && [ "$resume_point" != "done" ]; then
         echo "  [5] 从 $resume_point 恢复"
