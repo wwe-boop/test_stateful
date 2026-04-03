@@ -2,15 +2,32 @@
 
 Pipeline design for high GPU utilization:
 
-    While GPU executes step N,
-    CPU simultaneously processes results from step N-1
-    and prepares inputs for step N+1.
+    ┌─────────────────── Iteration K ───────────────────────────┐
+    │                                                           │
+    │  Phase 1 (CPU):  Process step K-1 output                  │
+    │     • scatter KV to pool                                  │
+    │     • compute next_embed from codec_sum                   │
+    │     • check EOS, send audio chunks                        │
+    │                                                           │
+    │  Phase 2 (CPU):  Prefill new sessions (rare, ~10ms each)  │
+    │     • runs on separate CUDA stream                        │
+    │     • only when new sessions arrive                       │
+    │                                                           │
+    │  Phase 3 (CPU→GPU):  Build & launch step K                │
+    │     • pool gather KV → batched tensor                     │
+    │     • launch TRT on compute_stream (non-blocking)         │
+    │                                                           │
+    │  Phase 4 (CPU ∥ GPU):  Housekeeping while GPU computes    │
+    │     • drain inbox                                         │
+    │     • evict idle slots                                    │
+    │     • check session timeouts                              │
+    │                                                           │
+    │  Phase 5 (sync):  wait GPU → prev_output for next iter    │
+    └───────────────────────────────────────────────────────────┘
 
-              time ────────────────────────────────────────────►
-    GPU:  ┌─step N─┐           ┌─step N+1─┐           ┌─step N+2─┐
-    CPU:  │(idle)  │ process   │(idle)     │ process   │
-          └────────┘ N-1+prep  └───────────┘ N+prep    └───────────┘
-                     N+1                     N+2
+    This ordering guarantees autoregressive correctness:
+    step K reads KV that includes step K-1's output (Phase 1 runs
+    BEFORE Phase 3).  CPU housekeeping overlaps with GPU compute.
 
 Level 2 pipelining:
     Multiple segments of the same session may decode in parallel.
@@ -19,6 +36,19 @@ Level 2 pipelining:
     segment_idx).
 
     Prefill priority: FIRST_SEGMENT > CONTINUATION > PREFETCHED.
+
+Scheduling:
+    MLFQ (Multi-Level Feedback Queue) dynamically assigns decode
+    priority per segment.  Anti-starvation aging boosts long-waiting
+    segments to prevent starvation.
+
+Slot management:
+    Idle slots past max_idle_sec are evicted.  Backpressure prevents
+    new sessions when the queue depth exceeds max_queue_size.
+
+Prefix KV caching:
+    System prompt KV tensors are cached across requests with the same
+    speaker/task configuration, eliminating redundant prefill GPU work.
 
 Thread safety:
     - Runs entirely in its own thread.
@@ -37,6 +67,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from ..core.mlfq import MLFQConfig, MLFQMeta, MLFQScheduler
 from ..core.types import (
     EngineRequest,
     EngineResult,
@@ -46,6 +77,7 @@ from ..core.types import (
 )
 from .executor import Executor, StepOutput
 from .kv_cache_pool import KVCachePool, SlotKVState
+from .prefix_cache import PrefixKVCache
 from .prefill import PrefillBuilder, PrefillPlan, TaskType, parse_task_type
 
 logger = logging.getLogger(__name__)
@@ -61,6 +93,7 @@ class EngineSegment:
         "session_id", "segment_idx", "slot", "state", "priority",
         "text_complete", "prefill_plan",
         "trailing_idx", "text_tokens_consumed", "decode_start_frame",
+        "mlfq_meta",
     )
 
     def __init__(
@@ -77,13 +110,14 @@ class EngineSegment:
         self.trailing_idx: int = 0
         self.text_tokens_consumed: int = 0
         self.decode_start_frame: int = 0
+        self.mlfq_meta: MLFQMeta = MLFQMeta()
 
 
 class EngineSessionGroup:
     """Groups all segments belonging to one session."""
     __slots__ = (
         "session_id", "request", "result_queue",
-        "segments", "text_complete_all",
+        "segments", "text_complete_all", "created_at",
     )
 
     def __init__(self, session_id: str, request: EngineRequest):
@@ -92,6 +126,7 @@ class EngineSessionGroup:
         self.result_queue: Optional[asyncio.Queue] = request.result_queue
         self.segments: Dict[int, EngineSegment] = {}
         self.text_complete_all: bool = False
+        self.created_at: float = time.monotonic()
 
     @property
     def active_slot_count(self) -> int:
@@ -126,18 +161,41 @@ class EngineLoop:
         prefill_builder: Optional[PrefillBuilder] = None,
         *,
         max_batch_size: int = 48,
+        mlfq_config: Optional[MLFQConfig] = None,
+        prefix_cache_max_entries: int = 16,
+        prefix_cache_max_len: int = 512,
+        max_idle_sec: float = 10.0,
+        max_queue_size: int = 256,
+        session_timeout_sec: float = 300.0,
     ):
         self._inbox = engine_inbox
         self._async_loop = async_loop
         self._executor = executor
         self._prefill_builder = prefill_builder
         self._max_batch = max_batch_size
+        self._max_idle_sec = max_idle_sec
+        self._max_queue_size = max_queue_size
+        self._session_timeout_sec = session_timeout_sec
 
         self._groups: Dict[str, EngineSessionGroup] = {}
         self._seg_by_slot: Dict[int, EngineSegment] = {}
 
+        self._mlfq = MLFQScheduler(mlfq_config or MLFQConfig())
+        self._prefix_cache = PrefixKVCache(
+            max_entries=prefix_cache_max_entries,
+            max_prefix_len=prefix_cache_max_len,
+        )
+
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._last_eviction_check: float = 0.0
+
+        self._total_steps: int = 0
+        self._total_prefills: int = 0
+        self._total_sessions: int = 0
+        self._total_eos: int = 0
+        self._total_timeouts: int = 0
+        self._total_evictions: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -165,21 +223,34 @@ class EngineLoop:
         prev_output: Optional[StepOutput] = None
 
         while self._running:
-            self._drain_inbox()
+            # --- Phase 1: Process previous step output (MUST run before
+            # building next inputs to satisfy autoregressive dependency) ---
+            if prev_output is not None:
+                self._process_step_output(prev_output)
+                prev_output = None
+
+            # --- Phase 2: Prefill new sessions (synchronous GPU work,
+            # uses dedicated prefill stream so it does not conflict with
+            # the decode compute stream) ---
             self._try_prefill_one()
 
-            active_slots = self._get_active_slots()
+            # --- Phase 3: Build & launch next decode step ---
+            active_slots = self._get_active_slots_mlfq()
             gpu_future = None
             if active_slots:
                 gpu_future = self._executor.launch_decode_step(active_slots)
 
-            if prev_output is not None:
-                self._process_step_output(prev_output)
+            # --- Phase 4: While GPU computes, do CPU housekeeping ---
+            self._drain_inbox()
+            self._try_evict_idle_slots()
+            self._try_timeout_sessions()
 
+            # --- Phase 5: Wait for GPU, store output for next iteration ---
             if gpu_future is not None:
                 prev_output = gpu_future.wait()
+                self._total_steps += 1
+                self._mlfq.tick(self._all_active_mlfq_metas())
             else:
-                prev_output = None
                 if not self._has_work():
                     time.sleep(0.001)
 
@@ -201,8 +272,24 @@ class EngineLoop:
 
     def _handle_request(self, req: EngineRequest) -> None:
         if req.type == RequestType.NEW_SESSION:
+            if len(self._groups) >= self._max_queue_size:
+                logger.warning(
+                    "Backpressure: rejecting session %s (active=%d >= limit=%d)",
+                    req.session_id, len(self._groups), self._max_queue_size,
+                )
+                if req.result_queue is not None:
+                    self._async_loop.call_soon_threadsafe(
+                        req.result_queue.put_nowait,
+                        EngineResult(
+                            type=ResultType.ERROR,
+                            session_id=req.session_id,
+                            error_msg="Server overloaded, please retry later",
+                        ),
+                    )
+                return
             group = EngineSessionGroup(req.session_id, req)
             self._groups[req.session_id] = group
+            self._total_sessions += 1
             logger.debug("New session group: %s", req.session_id)
 
         elif req.type == RequestType.START_SEGMENT:
@@ -244,7 +331,10 @@ class EngineLoop:
     # ------------------------------------------------------------------
 
     def _try_prefill_one(self) -> None:
-        """Run prefill for the highest-priority pending segment."""
+        """Run prefill for the highest-priority pending segment.
+
+        Uses prefix KV cache when available to skip redundant GPU work.
+        """
         kv_pool = self._executor.kv_pool
         if kv_pool is None or kv_pool.free_count == 0:
             return
@@ -270,6 +360,7 @@ class EngineLoop:
             return
         best.slot = slot
         self._seg_by_slot[slot.slot_id] = best
+        self._mlfq.on_segment_created(best.mlfq_meta)
 
         if self._prefill_builder is not None:
             task_type = parse_task_type(
@@ -283,7 +374,29 @@ class EngineLoop:
                 include_eos=False,
             )
             best.prefill_plan = plan
-            self._executor.prefill(slot, plan.prefill_embeds)
+
+            cached = self._prefix_cache.get(plan.prefix_cache_key)
+            if cached is not None and plan.request_prefill_embeds is not None:
+                slot.talker_kv = cached.talker_kv.clone()
+                slot.past_len = cached.prefix_len
+                self._executor.prefill(slot, plan.request_prefill_embeds)
+                logger.debug(
+                    "Prefix cache hit: skipped %d prefix tokens for %s",
+                    cached.prefix_len, best.session_id,
+                )
+            else:
+                self._executor.prefill(slot, plan.prefill_embeds)
+                if (
+                    plan.prefix_cache_key is not None
+                    and plan.cacheable_prefix_embeds is not None
+                    and slot.talker_kv is not None
+                ):
+                    prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
+                    prefix_kv = slot.talker_kv[:, :, :, :prefix_len, :].clone()
+                    self._prefix_cache.put(
+                        plan.prefix_cache_key, prefix_kv, prefix_len,
+                    )
+
             slot.trailing = plan.trailing
         else:
             self._executor.prefill(slot, torch.zeros(
@@ -292,6 +405,7 @@ class EngineLoop:
 
         best.state = "active"
         best.decode_start_frame = slot.frame_idx
+        self._total_prefills += 1
         self._send_result(best_group, EngineResult(
             type=ResultType.PREFILL_DONE,
             session_id=best.session_id,
@@ -302,34 +416,107 @@ class EngineLoop:
                      slot.slot_id, slot.past_len)
 
     # ------------------------------------------------------------------
-    # Decode batch
+    # Decode batch (MLFQ-ordered)
     # ------------------------------------------------------------------
 
-    def _get_active_slots(self) -> list[SlotKVState]:
-        slots = []
+    def _get_active_slots_mlfq(self) -> list[SlotKVState]:
+        """Build decode batch using MLFQ priority ordering."""
+        candidates: list[EngineSegment] = []
         for group in self._groups.values():
             for seg in group.segments.values():
                 if seg.state != "active" or seg.slot is None:
                     continue
                 slot = seg.slot
-
                 if slot.next_embed is None:
                     if slot.trailing and slot.text_idx < len(slot.trailing):
                         slot.next_embed = slot.trailing[slot.text_idx]
                         slot.text_idx += 1
                     else:
                         continue
+                candidates.append(seg)
 
-                slots.append(slot)
-                if len(slots) >= self._max_batch:
-                    return slots
-        return slots
+        if not candidates:
+            return []
+
+        ordered = self._mlfq.select_batch(
+            candidates, self._max_batch,
+            get_meta=lambda seg: seg.mlfq_meta,
+        )
+        return [seg.slot for seg in ordered]
+
+    def _all_active_mlfq_metas(self) -> list[MLFQMeta]:
+        """Collect all active segment MLFQ metas for aging."""
+        return [
+            seg.mlfq_meta
+            for group in self._groups.values()
+            for seg in group.segments.values()
+            if seg.state == "active"
+        ]
+
+    # ------------------------------------------------------------------
+    # Idle slot eviction
+    # ------------------------------------------------------------------
+
+    def _try_evict_idle_slots(self) -> None:
+        """Periodically check for idle slots and evict them."""
+        now = time.monotonic()
+        if now - self._last_eviction_check < 1.0:
+            return
+        self._last_eviction_check = now
+
+        kv_pool = self._executor.kv_pool
+        if kv_pool is None:
+            return
+
+        while True:
+            candidate = kv_pool.find_eviction_candidate(self._max_idle_sec)
+            if candidate is None:
+                break
+            evicted_session_key = kv_pool.force_evict(candidate.slot_id)
+            if evicted_session_key is None:
+                break
+
+            seg = self._seg_by_slot.pop(candidate.slot_id, None)
+            if seg is None:
+                continue
+
+            group = self._groups.get(seg.session_id)
+            if group is None:
+                continue
+
+            seg.state = "evicted"
+            seg.slot = None
+            self._send_result(group, EngineResult(
+                type=ResultType.ERROR,
+                session_id=seg.session_id,
+                segment_idx=seg.segment_idx,
+                error_msg=f"Slot evicted: idle > {self._max_idle_sec}s",
+            ))
+            self._total_evictions += 1
+            logger.warning(
+                "Evicted segment %s:%d due to idle timeout",
+                seg.session_id, seg.segment_idx,
+            )
 
     # ------------------------------------------------------------------
     # Result processing (runs while GPU does next step)
     # ------------------------------------------------------------------
 
     def _process_step_output(self, output: StepOutput) -> None:
+        kv_pool = self._executor.kv_pool
+        use_pool = kv_pool is not None and kv_pool._preallocate
+
+        # Batch-level KV scatter to pool (single operation, avoids per-slot split)
+        if use_pool and output.batch_talker_kv is not None:
+            slot_ids = [s.slot_id for s in output.slots]
+            kv_pool.scatter_talker_kv(
+                slot_ids, output.batch_talker_kv,
+                output.original_past_lens, output.padded_past_len, 1,
+            )
+        if use_pool and output.batch_c2w_kv is not None:
+            slot_ids = [s.slot_id for s in output.slots]
+            kv_pool.scatter_c2w_kv(slot_ids, output.batch_c2w_kv)
+
         for i, slot in enumerate(output.slots):
             seg = self._seg_by_slot.get(slot.slot_id)
             if seg is None:
@@ -338,10 +525,12 @@ class EngineLoop:
             if group is None:
                 continue
 
-            if output.split_talker_kv[i] is not None:
-                slot.talker_kv = output.split_talker_kv[i]
-            if output.split_c2w_kv[i] is not None:
-                slot.c2w_kv = output.split_c2w_kv[i]
+            if not use_pool:
+                if output.batch_talker_kv is not None:
+                    slot.talker_kv = output.batch_talker_kv[i:i+1]
+                if output.batch_c2w_kv is not None:
+                    slot.c2w_kv = output.batch_c2w_kv[i:i+1]
+
             if output.split_c2w_conv[i]:
                 slot.c2w_conv_states = [
                     t for t in output.split_c2w_conv[i] if t is not None
@@ -354,6 +543,8 @@ class EngineLoop:
                 slot.token_counts = output.updated_tc[i:i+1].clone()
             slot.past_len += 1
             slot.frame_idx += 1
+            slot.touch()
+            self._mlfq.on_step_done(seg.mlfq_meta)
 
             if output.codec_sum is not None:
                 text_add = torch.zeros_like(output.codec_sum[i:i+1])
@@ -380,6 +571,7 @@ class EngineLoop:
         self, group: EngineSessionGroup, seg: EngineSegment,
     ) -> None:
         """Handle EOS for one segment."""
+        self._total_eos += 1
         audio_steps = 0
         if seg.slot:
             audio_steps = seg.slot.frame_idx - seg.decode_start_frame
@@ -462,3 +654,55 @@ class EngineLoop:
             for group in self._groups.values()
             for seg in group.segments.values()
         )
+
+    # ------------------------------------------------------------------
+    # Session timeout
+    # ------------------------------------------------------------------
+
+    def _try_timeout_sessions(self) -> None:
+        """Cancel sessions that exceed the maximum allowed duration."""
+        if self._session_timeout_sec <= 0:
+            return
+        now = time.monotonic()
+        to_cancel: list[str] = []
+        for sid, group in self._groups.items():
+            if now - group.created_at > self._session_timeout_sec:
+                to_cancel.append(sid)
+        for sid in to_cancel:
+            group = self._groups.get(sid)
+            if group is None:
+                continue
+            self._total_timeouts += 1
+            self._send_result(group, EngineResult(
+                type=ResultType.ERROR,
+                session_id=sid,
+                error_msg=f"Session timeout ({self._session_timeout_sec}s exceeded)",
+            ))
+            self._remove_session(sid)
+            logger.warning("Session %s timed out", sid)
+
+    # ------------------------------------------------------------------
+    # Health / metrics (thread-safe read)
+    # ------------------------------------------------------------------
+
+    def health_stats(self) -> dict:
+        """Return a snapshot of engine health metrics.
+
+        Called from the asyncio thread; reads only atomic int/float fields
+        so no lock is needed.
+        """
+        kv_pool = self._executor.kv_pool
+        return {
+            "running": self._running,
+            "active_sessions": len(self._groups),
+            "active_slots": kv_pool.used_count if kv_pool else 0,
+            "free_slots": kv_pool.free_count if kv_pool else 0,
+            "pool_utilization": kv_pool.utilization if kv_pool else 0.0,
+            "total_steps": self._total_steps,
+            "total_prefills": self._total_prefills,
+            "total_sessions": self._total_sessions,
+            "total_eos": self._total_eos,
+            "total_evictions": self._total_evictions,
+            "total_timeouts": self._total_timeouts,
+            "prefix_cache_stats": self._prefix_cache.stats,
+        }

@@ -182,7 +182,11 @@ class GPUFuture:
     _c2w_transconv_output_names: List[str] = field(default_factory=list)
 
     def wait(self) -> StepOutput:
-        """Synchronize GPU and extract per-session results."""
+        """Synchronize GPU and extract results.
+
+        Returns batch-level KV tensors for pool scatter (no per-slot splitting).
+        Conv/transconv states are still split per-slot (heterogeneous shapes).
+        """
         if self._compute_stream is not None:
             self._compute_stream.synchronize()
 
@@ -193,21 +197,6 @@ class GPUFuture:
         codec_sum = raw.get("codec_sum")
         full_codec = raw.get("full_codec")
         updated_tc = raw.get("updated_token_counts")
-
-        talker_present_kv = raw.get("talker_present_kv")
-        c2w_present_kv = raw.get("c2w_present_kv")
-
-        split_kv = split_packed_kv(
-            talker_present_kv, self._original_past_lens,
-            self._padded_past_len, self._seq,
-        ) if talker_present_kv is not None else [None] * batch_size
-
-        split_c2w_kv = []
-        if c2w_present_kv is not None:
-            for i in range(batch_size):
-                split_c2w_kv.append(c2w_present_kv[i:i + 1])
-        else:
-            split_c2w_kv = [None] * batch_size
 
         split_c2w_conv = []
         split_c2w_transconv = []
@@ -247,8 +236,10 @@ class GPUFuture:
             slots=self._slots,
             eos_flags=eos_flags,
             audio_chunks=audio_chunks,
-            split_talker_kv=split_kv,
-            split_c2w_kv=split_c2w_kv,
+            batch_talker_kv=raw.get("talker_present_kv"),
+            batch_c2w_kv=raw.get("c2w_present_kv"),
+            original_past_lens=self._original_past_lens,
+            padded_past_len=self._padded_past_len,
             split_c2w_conv=split_c2w_conv,
             split_c2w_transconv=split_c2w_transconv,
             codec_sum=codec_sum,
@@ -258,14 +249,21 @@ class GPUFuture:
 
 @dataclass
 class StepOutput:
-    """Results from one decode step, already split per session."""
+    """Results from one decode step.
+
+    Talker/C2W KV are kept as batch-level tensors for direct pool scatter
+    (no per-slot splitting).  Conv/transconv states are split per-slot
+    because they have heterogeneous shapes.
+    """
     slots: List[SlotKVState]
     eos_flags: List[bool]
     audio_chunks: List[Optional[bytes]]
-    split_talker_kv: List[Optional[torch.Tensor]]
-    split_c2w_kv: List[Optional[torch.Tensor]]
-    split_c2w_conv: List[List[Optional[torch.Tensor]]]
-    split_c2w_transconv: List[List[Optional[torch.Tensor]]]
+    batch_talker_kv: Optional[torch.Tensor] = None
+    batch_c2w_kv: Optional[torch.Tensor] = None
+    original_past_lens: List[int] = field(default_factory=list)
+    padded_past_len: int = 0
+    split_c2w_conv: List[List[Optional[torch.Tensor]]] = field(default_factory=list)
+    split_c2w_transconv: List[List[Optional[torch.Tensor]]] = field(default_factory=list)
     codec_sum: Optional[torch.Tensor] = None
     updated_tc: Optional[torch.Tensor] = None
 
@@ -299,8 +297,10 @@ class Executor:
         self._config = model_config or ModelConfig()
 
         self._compute_stream = torch.cuda.Stream(device=self._device)
+        self._prefill_stream = torch.cuda.Stream(device=self._device)
 
         self._fused_engine: Optional[TRTEngine] = None
+        self._prefill_context = None
         self._embedding_weights = None
         self._kv_pool: Optional[KVCachePool] = None
 
@@ -327,6 +327,13 @@ class Executor:
             )
             self._fused_engine.load()
             self._discover_c2w_io_names()
+
+            try:
+                self._prefill_context = self._fused_engine._engine.create_execution_context()
+                logger.info("Created separate prefill execution context")
+            except Exception:
+                self._prefill_context = None
+                logger.info("Prefill shares execution context with decode")
         else:
             logger.warning("No TRT plan found, running in stub mode")
 
@@ -387,7 +394,14 @@ class Executor:
         slot: SlotKVState,
         prefill_embeds: torch.Tensor,
     ) -> None:
-        """Execute prefill for a single session.
+        """Execute prefill for a single session on the dedicated prefill stream.
+
+        Uses a separate CUDA stream so prefill does not block an
+        in-flight decode step.  When a separate TRT execution context is
+        available, prefill and decode can overlap on different streams.
+
+        Results are written directly to the pre-allocated KV pool via
+        scatter (no per-slot tensor references).
 
         Args:
             slot: the GPU slot to store resulting KV cache
@@ -397,8 +411,6 @@ class Executor:
 
         if self._fused_engine is None:
             slot.past_len = int(prefill_embeds.shape[1])
-            slot.talker_kv = None
-            slot.c2w_kv = None
             slot.c2w_conv_states = []
             slot.c2w_transconv_states = []
             return
@@ -415,19 +427,25 @@ class Executor:
 
         out_names = self._build_output_names()
 
-        with torch.cuda.stream(self._compute_stream):
-            raw = self._fused_engine.infer(inputs, out_names, self._compute_stream)
+        stream = self._prefill_stream
+        with torch.cuda.stream(stream):
+            raw = self._fused_engine.infer(inputs, out_names, stream)
 
-        self._compute_stream.synchronize()
+        stream.synchronize()
 
         talker_kv = raw.get("talker_present_kv")
         if talker_kv is not None:
-            # Strip the dummy past_len=1 prefix
-            slot.talker_kv = talker_kv[:, :, :, 1:, :].contiguous()
+            stripped = talker_kv[:, :, :, 1:, :].contiguous()
+            if self._kv_pool._preallocate:
+                self._kv_pool.scatter_prefill_kv(slot.slot_id, stripped, seq)
+            else:
+                slot.talker_kv = stripped
         slot.past_len = seq
 
         c2w_kv = raw.get("c2w_present_kv")
         if c2w_kv is not None:
+            if self._kv_pool._preallocate:
+                self._kv_pool.scatter_prefill_c2w_kv(slot.slot_id, c2w_kv)
             slot.c2w_kv = c2w_kv
         slot.c2w_conv_states = [raw[n] for n in self._c2w_conv_output_names]
         slot.c2w_transconv_states = [raw[n] for n in self._c2w_transconv_output_names]
@@ -449,6 +467,7 @@ class Executor:
     def launch_decode_step(self, slots: List[SlotKVState]) -> GPUFuture:
         """Launch one fused decode step for a batch.  Returns immediately.
 
+        Uses the pre-allocated KV pool for zero-copy gather (no pad+cat).
         The CUDA kernels run on self._compute_stream.  Call future.wait()
         to synchronize and get results.
         """
@@ -466,12 +485,25 @@ class Executor:
                 s.frame_idx += 1
             return GPUFuture(_slots=slots)
 
-        # Pad and batch talker KV
-        session_kv = [s.talker_kv for s in slots]
-        batched_talker_kv, past_seq_lens = pad_packed_kv(
-            session_kv, device=self._device, dtype=self._config.dtype,
-        )
-        padded_past_len = int(past_seq_lens.max().item()) if batch_size > 0 else 0
+        slot_ids = [s.slot_id for s in slots]
+        max_past_len = max(original_past_lens) if original_past_lens else 0
+        if max_past_len == 0:
+            max_past_len = 1
+
+        if self._kv_pool is not None and self._kv_pool._preallocate:
+            batched_talker_kv = self._kv_pool.gather_talker_kv(
+                slot_ids, max_past_len,
+            )
+            past_seq_lens = torch.tensor(
+                original_past_lens, device=self._device, dtype=torch.long,
+            )
+        else:
+            session_kv = [s.talker_kv for s in slots]
+            batched_talker_kv, past_seq_lens = pad_packed_kv(
+                session_kv, device=self._device, dtype=self._config.dtype,
+            )
+
+        padded_past_len = int(batched_talker_kv.shape[3]) if batched_talker_kv is not None else 0
 
         inputs = self._build_fused_inputs(
             input_embeds=input_embeds,
@@ -575,10 +607,16 @@ class Executor:
         else:
             d["talker_past_kv"] = batched_talker_kv.contiguous()
 
-        # --- C2W KV (packed) ---
+        # --- C2W KV (packed) with sliding window safety clamp ---
         c2w_past_len = 0
         if slots[0].c2w_kv is not None:
             c2w_past_len = int(slots[0].c2w_kv.shape[3])
+        if c2w_past_len > cfg.c2w_sliding_window:
+            logger.warning(
+                "C2W KV past_len %d exceeds sliding window %d, clamping",
+                c2w_past_len, cfg.c2w_sliding_window,
+            )
+            c2w_past_len = cfg.c2w_sliding_window
         c2w_key_total = min(c2w_past_len + FUSED_CHUNK_T, cfg.c2w_sliding_window)
         if c2w_key_total <= 0:
             c2w_key_total = 1
@@ -589,11 +627,16 @@ class Executor:
         ).contiguous()
 
         if slots[0].c2w_kv is not None:
+            def _clamp_c2w(kv: torch.Tensor) -> torch.Tensor:
+                if kv.shape[3] > cfg.c2w_sliding_window:
+                    return kv[:, :, :, -cfg.c2w_sliding_window:, :].contiguous()
+                return kv
+
             if batch == 1:
-                d["c2w_past_kv"] = slots[0].c2w_kv.contiguous()
+                d["c2w_past_kv"] = _clamp_c2w(slots[0].c2w_kv).contiguous()
             else:
                 d["c2w_past_kv"] = torch.cat(
-                    [s.c2w_kv for s in slots], dim=0,
+                    [_clamp_c2w(s.c2w_kv) for s in slots], dim=0,
                 ).contiguous()
         else:
             d["c2w_past_kv"] = torch.zeros(
@@ -634,12 +677,63 @@ class Executor:
         return names
 
     # ------------------------------------------------------------------
+    # Warmup
+    # ------------------------------------------------------------------
+
+    def warmup(self, n_rounds: int = 3) -> None:
+        """Run dummy inferences to warm up TRT engines and CUDA caches.
+
+        Triggers JIT compilation of TRT tactics and populates GPU L2 cache.
+        Runs on the compute stream with a temporary slot.
+        """
+        if self._fused_engine is None or self._kv_pool is None:
+            logger.info("Warmup skipped (no TRT engine)")
+            return
+
+        logger.info("Warmup: running %d rounds ...", n_rounds)
+        cfg = self._config
+        dummy_slot = self._kv_pool.allocate("__warmup__")
+        if dummy_slot is None:
+            logger.warning("Warmup skipped (no free slot)")
+            return
+
+        try:
+            dummy_embeds = torch.randn(
+                1, 4, cfg.hidden_size,
+                device=self._device, dtype=cfg.dtype,
+            )
+            self.prefill(dummy_slot, dummy_embeds)
+
+            dummy_slot.next_embed = torch.randn(
+                1, 1, cfg.hidden_size, device=self._device, dtype=torch.float32,
+            )
+
+            for i in range(n_rounds):
+                future = self.launch_decode_step([dummy_slot])
+                output = future.wait()
+                if self._kv_pool._preallocate and output.batch_talker_kv is not None:
+                    self._kv_pool.scatter_talker_kv(
+                        [dummy_slot.slot_id], output.batch_talker_kv,
+                        [dummy_slot.past_len], output.padded_past_len, 1,
+                    )
+                dummy_slot.past_len += 1
+                dummy_slot.frame_idx += 1
+                if output.codec_sum is not None:
+                    dummy_slot.next_embed = output.codec_sum[:1]
+
+            torch.cuda.synchronize(self._device)
+            logger.info("Warmup complete (%d rounds)", n_rounds)
+        finally:
+            self._kv_pool.release(dummy_slot.slot_id)
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
         """Release GPU resources."""
         self._fused_engine = None
+        self._prefill_context = None
         self._kv_pool = None
         torch.cuda.empty_cache()
         logger.info("Executor shutdown")

@@ -2,7 +2,7 @@
 """
 [Step 08] Export Talker Unified ONNX: backbone + argmax + CP + codec embedding sum.
 
-Outputs: codec_sum, full_codec, hidden, logits, present_kv_*.
+Outputs: codec_sum, full_codec, hidden, logits, updated_token_counts, present_kv_*.
 Same graph as historical talker_unified.onnx; depends on same checkpoint as step 07 (verification).
 """
 
@@ -15,7 +15,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from talker_unified_modules import build_talker_unified_fused_module
+from talker_unified_modules import build_talker_unified_fused_module, LOGITS_TOPK
 from utils import (
     setup_logging,
     resolve_model_path,
@@ -43,10 +43,16 @@ def _export_talker_unified_onnx(
     fused, num_layers, hidden_size, num_kv_heads, head_dim = build_talker_unified_fused_module(
         model, device=device
     )
+    vocab_size = fused.vocab_size
 
     B, one, S_past = 1, 1, 0
     dummy_embeds = torch.randn(B, one, hidden_size, device=device, dtype=ONNX_EXPORT_DTYPE)
     position_ids = torch.full((B, 3, one, 1), S_past, device=device, dtype=torch.long)
+
+    token_counts = torch.zeros(B, vocab_size, device=device, dtype=ONNX_EXPORT_DTYPE)
+    gumbel_noise = torch.zeros(B, LOGITS_TOPK, device=device, dtype=ONNX_EXPORT_DTYPE)
+    temperature = torch.ones(B, 1, device=device, dtype=ONNX_EXPORT_DTYPE)
+    penalty = torch.ones(B, 1, device=device, dtype=ONNX_EXPORT_DTYPE)
 
     past_list = []
     for _ in range(num_layers):
@@ -58,28 +64,29 @@ def _export_talker_unified_onnx(
         )
 
     with torch.no_grad():
-        out = fused(dummy_embeds, position_ids, *past_list)
+        out = fused(dummy_embeds, position_ids, token_counts, gumbel_noise, temperature, penalty, *past_list)
 
-    codec_sum, full_codec, hidden, logits = out[0], out[1], out[2], out[3]
+    codec_sum, full_codec, hidden, logits, updated_token_counts = out[0], out[1], out[2], out[3], out[4]
     ref_nan = torch.isnan(hidden).any().item() or torch.isnan(logits).any().item()
     if ref_nan:
         logger.warning("  PyTorch reference has NaN in hidden or logits (check causal_mask / RoPE)")
     for i in range(num_layers):
-        k, v = out[4 + 2 * i], out[5 + 2 * i]
+        k, v = out[5 + 2 * i], out[6 + 2 * i]
         if torch.isnan(k).any() or torch.isnan(v).any():
             logger.warning(f"  PyTorch reference has NaN in present_kv_{i}")
             break
     logger.info(
         f"  Unified shapes: codec_sum={codec_sum.shape}, full_codec={full_codec.shape}, "
-        f"hidden={hidden.shape}, logits={logits.shape}, present_kv layers={num_layers}"
+        f"hidden={hidden.shape}, logits={logits.shape}, "
+        f"updated_token_counts={updated_token_counts.shape}, present_kv layers={num_layers}"
     )
 
-    output_names = ["codec_sum", "full_codec", "hidden", "logits"]
+    output_names = ["codec_sum", "full_codec", "hidden", "logits", "updated_token_counts"]
     for i in range(num_layers):
         output_names.append(f"present_kv_{i}_k")
         output_names.append(f"present_kv_{i}_v")
 
-    input_names = ["input_embeds", "position_ids"]
+    input_names = ["input_embeds", "position_ids", "token_counts", "gumbel_noise", "temperature", "penalty"]
     for i in range(num_layers):
         input_names.append(f"past_kv_{i}_k")
         input_names.append(f"past_kv_{i}_v")
@@ -87,10 +94,15 @@ def _export_talker_unified_onnx(
     dynamic_axes = {
         "input_embeds": {0: "batch", 1: "seq"},
         "position_ids": {0: "batch", 1: "three", 2: "seq"},
+        "token_counts": {0: "batch"},
+        "gumbel_noise": {0: "batch"},
+        "temperature": {0: "batch"},
+        "penalty": {0: "batch"},
         "codec_sum": {0: "batch"},
         "full_codec": {0: "batch"},
         "hidden": {0: "batch", 1: "seq"},
         "logits": {0: "batch", 1: "seq"},
+        "updated_token_counts": {0: "batch"},
     }
     for i in range(num_layers):
         dynamic_axes[f"past_kv_{i}_k"] = {0: "batch", 2: "S_past"}
@@ -99,7 +111,7 @@ def _export_talker_unified_onnx(
         dynamic_axes[f"present_kv_{i}_v"] = {0: "batch", 2: "S_total"}
 
     onnx_path = str(output_dir / "talker_unified.onnx")
-    dummy_inputs = (dummy_embeds, position_ids, *past_list)
+    dummy_inputs = (dummy_embeds, position_ids, token_counts, gumbel_noise, temperature, penalty, *past_list)
     export_onnx(
         model=fused,
         dummy_inputs=dummy_inputs,
@@ -111,12 +123,17 @@ def _export_talker_unified_onnx(
         simplify=True,
     )
 
+    kv_input_offset = 6
     test_inputs = {
         "input_embeds": to_numpy(dummy_embeds),
         "position_ids": position_ids.cpu().numpy(),
+        "token_counts": to_numpy(token_counts),
+        "gumbel_noise": to_numpy(gumbel_noise),
+        "temperature": to_numpy(temperature),
+        "penalty": to_numpy(penalty),
     }
     for i, t in enumerate(past_list):
-        test_inputs[input_names[2 + i]] = to_numpy(t)
+        test_inputs[input_names[kv_input_offset + i]] = to_numpy(t)
     torch_outputs = {output_names[i]: to_numpy(out[i]) for i in range(len(output_names))}
     atol = 2e-3 if ONNX_EXPORT_DTYPE == torch.float32 else 1e-1
     ok = verify_onnx(onnx_path, test_inputs, torch_outputs, atol=atol, rtol=1e-2)

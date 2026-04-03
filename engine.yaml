@@ -1,0 +1,66 @@
+# =============================================================================
+# Qwen3-TTS Engine Configuration
+# =============================================================================
+# Priority: CLI args > ENGINE_* env vars > this file > built-in defaults.
+#
+# Environment variable override example:
+#   ENGINE_SCHEDULER_MAX_BATCH_SIZE=32  →  scheduler.max_batch_size = 32
+# =============================================================================
+
+model:
+  variant: custom-1.7b
+  # Architecture (auto-detected from weights if omitted)
+  num_layers: 28
+  hidden_size: 1536
+  kv_heads: 8
+  head_dim: 64
+  codec_vocab_size: 2176
+  n_c2w_layers: 8
+  c2w_kv_heads: 16
+  c2w_head_dim: 64
+  c2w_sliding_window: 72
+  n_c2w_conv_states: 17
+  n_c2w_transconv_states: 4
+  dtype: bf16
+
+paths:
+  tokenizer_dir: ""    # /path/to/tokenizer
+  weights_dir: ""      # /path/to/embedding weights (.pt)
+  engine_dir: ""       # /path/to/TRT engine (model.plan)
+
+server:
+  port: 50051
+  health_port: 8080              # HTTP health/metrics endpoint (0 to disable)
+  max_sessions: 128
+  request_timeout_sec: 120.0
+  warmup_rounds: 3               # dummy inferences at startup to warm TRT cache
+
+scheduler:
+  max_batch_size: 48
+  max_seq_len: 2048
+  # MLFQ dynamic priority
+  mlfq_q1_threshold: 50     # steps before demotion Q0→Q1
+  mlfq_q2_threshold: 200    # steps before demotion Q1→Q2
+  mlfq_aging_interval: 100  # steps before anti-starvation boost
+  mlfq_starvation_limit: 50 # max consecutive skips before force-schedule
+  # Slot management
+  max_idle_sec: 10.0         # evict slots idle longer than this
+  max_queue_size: 256        # backpressure: reject new sessions beyond this
+  session_timeout_sec: 300.0 # force-cancel sessions exceeding this duration
+
+prefix_cache:
+  enabled: true
+  max_entries: 16            # number of distinct prefix KV entries to cache
+  max_prefix_len: 512        # max token length for a cached prefix
+
+spliter:
+  ema_ratio_initial: 5.5
+  ema_alpha: 0.1
+  ema_overflow_alpha: 0.5
+  max_concurrent_segments: 2
+  prefill_len: 12
+
+sampling:
+  temperature: 1.0
+  repetition_penalty: 1.05
+  top_k: 50

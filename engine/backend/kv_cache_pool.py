@@ -14,11 +14,17 @@ Total Talker KV per slot (example, 1.7B model):
     28 layers × 2 × 8 heads × 64 dim × 2048 max_seq × 2 bytes (bf16)
     = 28 × 2 × 8 × 64 × 2048 × 2 = ~115 MB/slot
     64 slots = ~7.2 GB (fits on 24GB GPU with model weights)
+
+Slot eviction:
+    When the pool is full and a new session needs a slot, the pool can
+    evict the least-recently-active slot.  The evicted session receives an
+    error result and is cleaned up by the engine loop.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -83,9 +89,20 @@ class SlotKVState:
     trailing: list = field(default_factory=list)
     text_idx: int = 0
 
+    # Activity tracking for eviction
+    last_active_time: float = field(default_factory=time.monotonic)
+
     @property
     def has_c2w_states(self) -> bool:
         return self.c2w_kv is not None
+
+    def touch(self) -> None:
+        """Update activity timestamp (call on each decode step)."""
+        self.last_active_time = time.monotonic()
+
+    @property
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self.last_active_time
 
 
 class KVCachePool:
@@ -174,6 +191,7 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.next_embed = None
+        slot.last_active_time = time.monotonic()
         if self._preallocate and self._talker_kv_pool is not None:
             self._talker_kv_pool[slot_id].zero_()
             self._c2w_kv_pool[slot_id].zero_()
@@ -228,6 +246,29 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.next_embed = None
+
+    def scatter_prefill_kv(
+        self, slot_id: int, kv: torch.Tensor, seq_len: int,
+    ) -> None:
+        """Write prefill KV output directly to the pool.
+
+        Args:
+            slot_id: target slot
+            kv: [1, L*2, H, seq_len, D] from TRT prefill output
+            seq_len: number of tokens produced by prefill
+        """
+        if self._talker_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        self._talker_kv_pool[slot_id, :, :, :seq_len, :] = kv[0, :, :, :seq_len, :]
+
+    def scatter_prefill_c2w_kv(
+        self, slot_id: int, kv: torch.Tensor,
+    ) -> None:
+        """Write prefill C2W KV output directly to the pool."""
+        if self._c2w_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        s_len = kv.shape[3]
+        self._c2w_kv_pool[slot_id, :, :, :s_len, :] = kv[0]
 
     # ------------------------------------------------------------------
     # Pre-allocated pool batch helpers
@@ -289,3 +330,47 @@ class KVCachePool:
         s_len = present_kv.shape[3]
         for i, slot_id in enumerate(slot_ids):
             self._c2w_kv_pool[slot_id, :, :, :s_len, :] = present_kv[i]
+
+    # ------------------------------------------------------------------
+    # Slot eviction
+    # ------------------------------------------------------------------
+
+    def find_eviction_candidate(
+        self, max_idle_sec: float = 10.0,
+    ) -> Optional[SlotKVState]:
+        """Find the least-recently-active occupied slot that exceeds idle limit.
+
+        Returns None if all slots are either free or within the idle window.
+        """
+        best: Optional[SlotKVState] = None
+        for slot in self._slots:
+            if slot.is_free:
+                continue
+            if slot.idle_seconds < max_idle_sec:
+                continue
+            if best is None or slot.idle_seconds > best.idle_seconds:
+                best = slot
+        return best
+
+    def force_evict(self, slot_id: int) -> Optional[str]:
+        """Force-release a slot, returning the evicted session_id.
+
+        The caller is responsible for notifying the evicted session.
+        """
+        slot = self._slots[slot_id]
+        if slot.is_free:
+            return None
+        evicted_session = slot.session_id
+        logger.warning(
+            "Force-evicting slot %d (session=%s, idle=%.1fs, past_len=%d)",
+            slot_id, evicted_session, slot.idle_seconds, slot.past_len,
+        )
+        self.release(slot_id)
+        return evicted_session
+
+    @property
+    def utilization(self) -> float:
+        """Pool utilization ratio [0, 1]."""
+        if self._max_slots == 0:
+            return 0.0
+        return self.used_count / self._max_slots
