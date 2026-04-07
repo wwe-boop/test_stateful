@@ -186,16 +186,15 @@ class Spliter:
         Returns list of segments, each segment is [(token_id, text, punct_level), ...].
 
         Algorithm:
-          1. Greedy scan; when token_count >= threshold_a and token is L1 punct → split.
+          1. Greedy scan; L1 punct (。！？) always triggers a split.
           2. If threshold_d is reached without a qualifying L1 split, look back
-             for the LAST L1 punct in the current segment and split there
-             (even if it was before threshold_a).  This maximises natural
-             sentence boundaries.
+             for the LAST L1 punct in the current segment and split there.
+             This maximises natural sentence boundaries.
           3. If no L1 punct at all, force-cut at threshold_d.
 
-        Invariant: when the segment is short enough to have a qualifying L1
-        boundary, pre-split matches exactly what the Driver would choose
-        (global optimal = local optimal).
+        L1 always splits to ensure each sub-sentence is fully available
+        before prefill, avoiding pad_embed interruptions that degrade
+        audio quality.
         """
         if not tokens:
             return []
@@ -213,7 +212,7 @@ class Spliter:
             if pl == 1:
                 last_l1_in_current = n - 1
 
-            if pl == 1 and n >= th.a:
+            if pl == 1:
                 segments.append(current)
                 current = []
                 last_l1_in_current = -1

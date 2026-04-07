@@ -79,7 +79,15 @@ class TRTEngine:
 
         self._engine = runtime.deserialize_cuda_engine(engine_bytes)
         if self._engine is None:
-            raise RuntimeError(f"Failed to deserialize TRT engine: {plan_path}")
+            raise RuntimeError(
+                f"Failed to deserialize TRT engine: {plan_path}. "
+                "TensorRT plan files are not compatible across different TRT "
+                "library versions. Phase B builds engines with trtexec inside the "
+                "NGC Triton image (e.g. libnvinfer 10.15.x for tritonserver:26.02); "
+                "install a matching Python tensorrt, e.g. "
+                "`pip install 'tensorrt==10.15.1.29'`, or rebuild engines after "
+                "changing TensorRT."
+            )
 
         self._context = self._engine.create_execution_context()
         self._cache_output_dtypes()
@@ -113,21 +121,37 @@ class TRTEngine:
         inputs: Dict[str, torch.Tensor],
         output_names: List[str],
         stream: torch.cuda.Stream,
+        output_overrides: Optional[Dict[str, torch.Tensor]] = None,
+        context=None,
     ) -> Dict[str, torch.Tensor]:
         """Execute inference on the given CUDA stream.
 
         Uses torch tensors directly — zero copy via data_ptr().
         Skips set_input_shape for tensors whose shape hasn't changed.
         Re-uses output buffers when shapes match previous call.
+
+        Args:
+            output_overrides: pre-allocated tensors to use for specific outputs
+                instead of the internal buffer cache.  TRT writes directly into
+                these tensors — the caller owns them and must ensure they are not
+                aliased with any input tensor.
+            context: optional TRT execution context to use instead of the
+                default one.  When provided, shape caching and output buffer
+                reuse are disabled to avoid cross-context state conflicts
+                (e.g. separate prefill context overlapping with decode).
         """
-        ctx = self._context
+        ctx = context if context is not None else self._context
+        use_cache = context is None
 
         for name, tensor in inputs.items():
             tensor = tensor.contiguous()
             shape = tuple(tensor.shape)
-            if self._prev_input_shapes.get(name) != shape:
+            if use_cache:
+                if self._prev_input_shapes.get(name) != shape:
+                    ctx.set_input_shape(name, shape)
+                    self._prev_input_shapes[name] = shape
+            else:
                 ctx.set_input_shape(name, shape)
-                self._prev_input_shapes[name] = shape
             ctx.set_tensor_address(name, tensor.data_ptr())
 
         outputs = {}
@@ -135,14 +159,22 @@ class TRTEngine:
             shape = tuple(ctx.get_tensor_shape(name))
             dtype_torch = self._output_dtypes.get(name, torch.float32)
 
-            existing = self._output_buffers.get(name)
-            if existing is not None and existing.shape == shape and existing.dtype == dtype_torch:
-                out_tensor = existing
+            override = output_overrides.get(name) if output_overrides else None
+            if override is not None and override.shape == shape and override.dtype == dtype_torch:
+                out_tensor = override
+            elif use_cache:
+                existing = self._output_buffers.get(name)
+                if existing is not None and existing.shape == shape and existing.dtype == dtype_torch:
+                    out_tensor = existing
+                else:
+                    out_tensor = torch.empty(
+                        shape, dtype=dtype_torch, device=self._device,
+                    )
+                    self._output_buffers[name] = out_tensor
             else:
                 out_tensor = torch.empty(
                     shape, dtype=dtype_torch, device=self._device,
                 )
-                self._output_buffers[name] = out_tensor
 
             ctx.set_tensor_address(name, out_tensor.data_ptr())
             outputs[name] = out_tensor
@@ -180,6 +212,8 @@ class GPUFuture:
     _seq: int = 1
     _c2w_conv_output_names: List[str] = field(default_factory=list)
     _c2w_transconv_output_names: List[str] = field(default_factory=list)
+    _codec_eos_id: int = 2150
+    _used_pingpong: bool = False
 
     def wait(self) -> StepOutput:
         """Synchronize GPU and extract results.
@@ -212,7 +246,7 @@ class GPUFuture:
                 for t in transconv_tensors
             ])
 
-        codec_eos_id = 2148
+        codec_eos_id = self._codec_eos_id
         eos_flags = []
         audio_chunks = []
         if full_codec is not None:
@@ -244,6 +278,7 @@ class GPUFuture:
             split_c2w_transconv=split_c2w_transconv,
             codec_sum=codec_sum,
             updated_tc=updated_tc,
+            used_pingpong=self._used_pingpong,
         )
 
 
@@ -254,6 +289,10 @@ class StepOutput:
     Talker/C2W KV are kept as batch-level tensors for direct pool scatter
     (no per-slot splitting).  Conv/transconv states are split per-slot
     because they have heterogeneous shapes.
+
+    When ``used_pingpong`` is True, TRT wrote conv/transconv outputs
+    directly into each slot's write buffers.  The engine loop only needs
+    to call ``slot.flip_c2w_buffers()`` — no copy or clone required.
     """
     slots: List[SlotKVState]
     eos_flags: List[bool]
@@ -266,6 +305,7 @@ class StepOutput:
     split_c2w_transconv: List[List[Optional[torch.Tensor]]] = field(default_factory=list)
     codec_sum: Optional[torch.Tensor] = None
     updated_tc: Optional[torch.Tensor] = None
+    used_pingpong: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +326,7 @@ class Executor:
         weights_dir: str = "",
         device_id: int = 0,
         max_batch_size: int = 48,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 512,
         model_config: Optional[ModelConfig] = None,
     ):
         self._engine_dir = Path(engine_dir) if engine_dir else None
@@ -303,6 +343,7 @@ class Executor:
         self._prefill_context = None
         self._embedding_weights = None
         self._kv_pool: Optional[KVCachePool] = None
+        self._codec_eos_id: int = 2150
 
         self._c2w_conv_input_names: list[str] = []
         self._c2w_conv_output_names: list[str] = []
@@ -321,9 +362,17 @@ class Executor:
 
     def load(self) -> None:
         """Load TRT engines, embedding weights, and initialize KV pool."""
-        if self._engine_dir and (self._engine_dir / "model.plan").exists():
+        fused_plan: Optional[Path] = None
+        if self._engine_dir:
+            mp = self._engine_dir / "model.plan"
+            te = self._engine_dir / "talker_code2wav_fused.engine"
+            if mp.exists():
+                fused_plan = mp
+            elif te.exists():
+                fused_plan = te
+        if self._engine_dir and fused_plan is not None:
             self._fused_engine = TRTEngine(
-                str(self._engine_dir / "model.plan"), self._device,
+                str(fused_plan), self._device,
             )
             self._fused_engine.load()
             self._discover_c2w_io_names()
@@ -350,9 +399,16 @@ class Executor:
 
     def set_embedding_weights(self, weights) -> None:
         self._embedding_weights = weights
+        if hasattr(weights, 'codec_eos_id'):
+            self._codec_eos_id = int(weights.codec_eos_id)
+            logger.info("codec_eos_id set to %d from weights", self._codec_eos_id)
 
     def _discover_c2w_io_names(self) -> None:
-        """Detect c2w conv/transconv I/O names from the loaded TRT engine."""
+        """Detect c2w conv/transconv I/O names from the loaded TRT engine.
+
+        Also caches the static shape (batch=1) for each state tensor so
+        we can create zero-initialized dummies for the first prefill call.
+        """
         if self._fused_engine is None:
             return
         input_names, output_names = self._fused_engine.get_io_names()
@@ -372,6 +428,17 @@ class Executor:
             n for n in output_names
             if n.startswith("c2w_new_transconv_overlap_")
         )
+
+        eng = self._fused_engine._engine
+        self._c2w_conv_shapes: list[tuple[int, ...]] = []
+        for name in self._c2w_conv_input_names:
+            shape = eng.get_tensor_shape(name)
+            self._c2w_conv_shapes.append(tuple(1 if d == -1 else d for d in shape))
+        self._c2w_transconv_shapes: list[tuple[int, ...]] = []
+        for name in self._c2w_transconv_input_names:
+            shape = eng.get_tensor_shape(name)
+            self._c2w_transconv_shapes.append(tuple(1 if d == -1 else d for d in shape))
+
         logger.info(
             "C2W states: %d conv inputs, %d transconv inputs, "
             "%d conv outputs, %d transconv outputs",
@@ -385,6 +452,20 @@ class Executor:
     def kv_pool(self) -> KVCachePool:
         return self._kv_pool
 
+    def make_zero_conv_states(self) -> list[torch.Tensor]:
+        """Create zero-initialized C2W conv states for one slot."""
+        return [
+            torch.zeros(shape, device=self._device, dtype=self._config.dtype)
+            for shape in self._c2w_conv_shapes
+        ]
+
+    def make_zero_transconv_states(self) -> list[torch.Tensor]:
+        """Create zero-initialized C2W transconv states for one slot."""
+        return [
+            torch.zeros(shape, device=self._device, dtype=self._config.dtype)
+            for shape in self._c2w_transconv_shapes
+        ]
+
     # ------------------------------------------------------------------
     # Prefill
     # ------------------------------------------------------------------
@@ -393,7 +474,7 @@ class Executor:
         self,
         slot: SlotKVState,
         prefill_embeds: torch.Tensor,
-    ) -> None:
+    ) -> tuple[Optional[bytes], bool]:
         """Execute prefill for a single session on the dedicated prefill stream.
 
         Uses a separate CUDA stream so prefill does not block an
@@ -406,6 +487,10 @@ class Executor:
         Args:
             slot: the GPU slot to store resulting KV cache
             prefill_embeds: [1, S, H] bfloat16
+
+        Returns:
+            (prefill_audio_bytes, prefill_eos): wav bytes from prefill step
+            and whether the first codec token is EOS.
         """
         self._kv_pool.init_kv_tensors(slot)
 
@@ -413,7 +498,7 @@ class Executor:
             slot.past_len = int(prefill_embeds.shape[1])
             slot.c2w_conv_states = []
             slot.c2w_transconv_states = []
-            return
+            return None, False
 
         seq = int(prefill_embeds.shape[1])
 
@@ -428,8 +513,11 @@ class Executor:
         out_names = self._build_output_names()
 
         stream = self._prefill_stream
+        prefill_ctx = self._prefill_context
         with torch.cuda.stream(stream):
-            raw = self._fused_engine.infer(inputs, out_names, stream)
+            raw = self._fused_engine.infer(
+                inputs, out_names, stream, context=prefill_ctx,
+            )
 
         stream.synchronize()
 
@@ -444,13 +532,15 @@ class Executor:
 
         c2w_kv = raw.get("c2w_present_kv")
         if c2w_kv is not None:
+            c2w_kv = c2w_kv[:, :, :, 1:, :].contiguous()
             if self._kv_pool._preallocate:
                 self._kv_pool.scatter_prefill_c2w_kv(slot.slot_id, c2w_kv)
             slot.c2w_kv = c2w_kv
-        slot.c2w_conv_states = [raw[n] for n in self._c2w_conv_output_names]
-        slot.c2w_transconv_states = [raw[n] for n in self._c2w_transconv_output_names]
+        slot.c2w_conv_states = [raw[n].clone() for n in self._c2w_conv_output_names]
+        slot.c2w_transconv_states = [raw[n].clone() for n in self._c2w_transconv_output_names]
+        slot.init_pingpong_buffers()
 
-        slot.frame_idx = 0
+        slot.frame_idx = 1
         slot.token_counts = raw.get(
             "updated_token_counts",
             torch.zeros(1, self._config.codec_vocab_size,
@@ -459,6 +549,16 @@ class Executor:
         codec_sum = raw.get("codec_sum")
         if codec_sum is not None:
             slot.next_embed = codec_sum
+
+        wav = raw.get("wav")
+        full_codec = raw.get("full_codec")
+        prefill_audio: Optional[bytes] = None
+        prefill_eos = False
+        if wav is not None:
+            prefill_audio = wav.cpu().float().reshape(-1).numpy().tobytes()
+        if full_codec is not None and int(full_codec[0, 0].item()) == self._codec_eos_id:
+            prefill_eos = True
+        return prefill_audio, prefill_eos
 
     # ------------------------------------------------------------------
     # Decode step (async / pipelined)
@@ -515,8 +615,15 @@ class Executor:
 
         out_names = self._build_output_names()
 
+        # Build ping-pong output overrides: TRT writes directly into
+        # each slot's write buffers, avoiding post-step clone/copy.
+        output_overrides = self._build_pingpong_overrides(slots)
+
         with torch.cuda.stream(self._compute_stream):
-            raw = self._fused_engine.infer(inputs, out_names, self._compute_stream)
+            raw = self._fused_engine.infer(
+                inputs, out_names, self._compute_stream,
+                output_overrides=output_overrides,
+            )
 
         return GPUFuture(
             _compute_stream=self._compute_stream,
@@ -527,7 +634,36 @@ class Executor:
             _seq=1,
             _c2w_conv_output_names=self._c2w_conv_output_names,
             _c2w_transconv_output_names=self._c2w_transconv_output_names,
+            _codec_eos_id=self._codec_eos_id,
+            _used_pingpong=output_overrides is not None,
         )
+
+    def _build_pingpong_overrides(
+        self, slots: List[SlotKVState],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """Build output_overrides dict for ping-pong zero-copy.
+
+        For batch=1: TRT writes directly into the slot's write buffer.
+            After the step, flip_c2w_buffers() swaps read↔write — zero copy.
+        For batch>1: returns None (no overrides).  TRT writes to its own
+            internal buffer; the engine loop then uses copy_c2w_and_flip()
+            to scatter results into each slot's pre-allocated write buffer
+            and flip — avoids per-step allocation while supporting
+            heterogeneous slot ordering.
+        """
+        if len(slots) != 1:
+            return None
+
+        slot = slots[0]
+        if not slot.pingpong_ready:
+            return None
+
+        overrides: Dict[str, torch.Tensor] = {}
+        for idx, name in enumerate(self._c2w_conv_output_names):
+            overrides[name] = slot._c2w_conv_write[idx]
+        for idx, name in enumerate(self._c2w_transconv_output_names):
+            overrides[name] = slot._c2w_transconv_write[idx]
+        return overrides
 
     # ------------------------------------------------------------------
     # Input / output name builders
@@ -564,7 +700,9 @@ class Executor:
             )
 
         position_ids = torch.stack([
-            torch.full((3, seq), s.past_len, device=self._device, dtype=torch.int64)
+            torch.arange(s.past_len, s.past_len + seq,
+                         device=self._device, dtype=torch.int64)
+            .unsqueeze(0).expand(3, seq)
             for s in slots
         ], dim=0).unsqueeze(-1)
 
@@ -580,7 +718,7 @@ class Executor:
             for s in slots
         ], dim=0)
 
-        gumbel = torch.rand(batch, cfg.codec_vocab_size,
+        gumbel = torch.rand(batch, cfg.logits_topk,
                             device=self._device, dtype=torch.float32)
         gumbel = -(-gumbel.clamp(min=1e-8).log()).clamp(min=1e-8).log()
         temperature = torch.ones(batch, 1, device=self._device, dtype=torch.float32)
@@ -608,67 +746,105 @@ class Executor:
             d["talker_past_kv"] = batched_talker_kv.contiguous()
 
         # --- C2W KV (packed) with sliding window safety clamp ---
-        c2w_past_len = 0
-        if slots[0].c2w_kv is not None:
-            c2w_past_len = int(slots[0].c2w_kv.shape[3])
-        if c2w_past_len > cfg.c2w_sliding_window:
-            logger.warning(
-                "C2W KV past_len %d exceeds sliding window %d, clamping",
-                c2w_past_len, cfg.c2w_sliding_window,
-            )
-            c2w_past_len = cfg.c2w_sliding_window
-        c2w_key_total = min(c2w_past_len + FUSED_CHUNK_T, cfg.c2w_sliding_window)
-        if c2w_key_total <= 0:
-            c2w_key_total = 1
+        # Relationship: c2w_attention_bias key_dim = c2w_past_len + FUSED_CHUNK_T
+        # TRT profile max for c2w_past_kv dim3 = c2w_sliding_window - FUSED_CHUNK_T
+        # because attention key_total = past + chunk_T <= c2w_sliding_window.
+        # Different slots may be at different decode steps, so c2w_kv lengths
+        # can differ.  We pad to the max length and mask padding in attn bias.
+        c2w_window = cfg.c2w_sliding_window
+        c2w_max_past = c2w_window - FUSED_CHUNK_T
 
-        d["c2w_attention_bias"] = torch.zeros(
+        per_slot_c2w_lens = []
+        for s in slots:
+            if s.c2w_kv is not None:
+                per_slot_c2w_lens.append(
+                    min(int(s.c2w_kv.shape[3]), c2w_max_past)
+                )
+            else:
+                per_slot_c2w_lens.append(0)
+        c2w_past_len = max(per_slot_c2w_lens) if per_slot_c2w_lens else 0
+        if c2w_past_len < 1:
+            c2w_past_len = 1
+
+        c2w_key_total = c2w_past_len + FUSED_CHUNK_T
+
+        c2w_attn = torch.zeros(
             batch, 1, FUSED_CHUNK_T, c2w_key_total,
             device=self._device, dtype=cfg.dtype,
-        ).contiguous()
+        )
+        for bi, sl in enumerate(per_slot_c2w_lens):
+            pad_cols = c2w_past_len - sl
+            if pad_cols > 0:
+                c2w_attn[bi, :, :, :pad_cols] = float("-inf")
+        d["c2w_attention_bias"] = c2w_attn.contiguous()
 
-        if slots[0].c2w_kv is not None:
-            def _clamp_c2w(kv: torch.Tensor) -> torch.Tensor:
-                if kv.shape[3] > cfg.c2w_sliding_window:
-                    return kv[:, :, :, -cfg.c2w_sliding_window:, :].contiguous()
-                return kv
-
-            if batch == 1:
-                d["c2w_past_kv"] = _clamp_c2w(slots[0].c2w_kv).contiguous()
+        c2w_d1 = cfg.n_c2w_layers * 2
+        c2w_d2 = cfg.c2w_kv_heads
+        c2w_head = cfg.c2w_head_dim
+        if batch == 1:
+            s = slots[0]
+            if s.c2w_kv is not None:
+                kv = s.c2w_kv
+                if kv.shape[3] > c2w_max_past:
+                    kv = kv[:, :, :, -c2w_max_past:, :]
             else:
-                d["c2w_past_kv"] = torch.cat(
-                    [_clamp_c2w(s.c2w_kv) for s in slots], dim=0,
-                ).contiguous()
+                kv = torch.zeros(
+                    1, c2w_d1, c2w_d2, c2w_past_len, c2w_head,
+                    device=self._device, dtype=cfg.dtype,
+                )
+            d["c2w_past_kv"] = kv.contiguous()
         else:
-            d["c2w_past_kv"] = torch.zeros(
-                batch, cfg.n_c2w_layers * 2, cfg.c2w_kv_heads,
-                1, cfg.c2w_head_dim,
-                device=self._device, dtype=cfg.dtype,
-            )
+            padded = []
+            for s, sl in zip(slots, per_slot_c2w_lens):
+                if s.c2w_kv is not None:
+                    kv = s.c2w_kv
+                    if kv.shape[3] > c2w_max_past:
+                        kv = kv[:, :, :, -c2w_max_past:, :]
+                else:
+                    kv = torch.zeros(
+                        1, c2w_d1, c2w_d2, 0, c2w_head,
+                        device=self._device, dtype=cfg.dtype,
+                    )
+                pad_cols = c2w_past_len - sl
+                if pad_cols > 0:
+                    kv = torch.nn.functional.pad(kv, (0, 0, pad_cols, 0))
+                padded.append(kv)
+            d["c2w_past_kv"] = torch.cat(padded, dim=0).contiguous()
 
         # --- C2W conv/transconv states (individual, heterogeneous shapes) ---
-        if slots[0].c2w_conv_states:
-            for idx, name in enumerate(self._c2w_conv_input_names):
+        has_conv = bool(slots[0].c2w_conv_states)
+        for idx, name in enumerate(self._c2w_conv_input_names):
+            if has_conv:
                 if batch == 1:
                     d[name] = slots[0].c2w_conv_states[idx].contiguous()
                 else:
                     d[name] = torch.cat(
                         [s.c2w_conv_states[idx] for s in slots], dim=0,
                     ).contiguous()
+            else:
+                shape = list(self._c2w_conv_shapes[idx])
+                shape[0] = batch
+                d[name] = torch.zeros(shape, device=self._device, dtype=cfg.dtype)
 
-        if slots[0].c2w_transconv_states:
-            for idx, name in enumerate(self._c2w_transconv_input_names):
+        has_transconv = bool(slots[0].c2w_transconv_states)
+        for idx, name in enumerate(self._c2w_transconv_input_names):
+            if has_transconv:
                 if batch == 1:
                     d[name] = slots[0].c2w_transconv_states[idx].contiguous()
                 else:
                     d[name] = torch.cat(
                         [s.c2w_transconv_states[idx] for s in slots], dim=0,
                     ).contiguous()
+            else:
+                shape = list(self._c2w_transconv_shapes[idx])
+                shape[0] = batch
+                d[name] = torch.zeros(shape, device=self._device, dtype=cfg.dtype)
 
         return d
 
     def _build_output_names(self) -> List[str]:
         names = [
-            "wav", "codec_sum", "full_codec", "logits",
+            "wav", "codec_sum", "full_codec", "hidden", "logits",
             "updated_token_counts",
             "talker_present_kv", "c2w_present_kv",
         ]
@@ -702,7 +878,7 @@ class Executor:
                 1, 4, cfg.hidden_size,
                 device=self._device, dtype=cfg.dtype,
             )
-            self.prefill(dummy_slot, dummy_embeds)
+            _ = self.prefill(dummy_slot, dummy_embeds)
 
             dummy_slot.next_embed = torch.randn(
                 1, 1, cfg.hidden_size, device=self._device, dtype=torch.float32,
@@ -716,6 +892,8 @@ class Executor:
                         [dummy_slot.slot_id], output.batch_talker_kv,
                         [dummy_slot.past_len], output.padded_past_len, 1,
                     )
+                if output.used_pingpong and dummy_slot.pingpong_ready:
+                    dummy_slot.flip_c2w_buffers()
                 dummy_slot.past_len += 1
                 dummy_slot.frame_idx += 1
                 if output.codec_sum is not None:

@@ -36,7 +36,9 @@ import queue
 import signal
 from typing import AsyncIterator, Optional
 
-from .config import EngineConfig, load_config, to_model_config
+from .config import (
+    EngineConfig, ModelArchConfig, load_config, load_model_manifest, to_model_config,
+)
 from .core.mlfq import MLFQConfig
 from .core.types import EngineResult, ResultType
 from .frontend.dispatcher import Dispatcher
@@ -54,6 +56,7 @@ class TTSEngine:
     def __init__(
         self,
         config: Optional[EngineConfig] = None,
+        model_arch: Optional[ModelArchConfig] = None,
         *,
         tokenizer_dir: str = "",
         weights_dir: str = "",
@@ -61,9 +64,10 @@ class TTSEngine:
         device_id: int = 0,
         max_batch_size: int = 48,
         max_sessions: int = 128,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 512,
     ):
         self._cfg = config or EngineConfig()
+        self._model_arch = model_arch or ModelArchConfig()
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -76,7 +80,7 @@ class TTSEngine:
         self._device_id = device_id
         self._max_batch = max_batch_size if max_batch_size != 48 else self._cfg.scheduler.max_batch_size
         self._max_sessions = max_sessions if max_sessions != 128 else self._cfg.server.max_sessions
-        self._max_seq_len = max_seq_len if max_seq_len != 2048 else self._cfg.scheduler.max_seq_len
+        self._max_seq_len = max_seq_len if max_seq_len != 512 else self._cfg.scheduler.max_seq_len
 
         self._tokenizer: Optional[LightQwen3TTSTokenizer] = None
         self._dispatcher: Optional[Dispatcher] = None
@@ -106,7 +110,7 @@ class TTSEngine:
             max_concurrent_segments=sc.max_concurrent_segments,
         )
 
-        model_config = to_model_config(self._cfg)
+        model_config = to_model_config(self._model_arch, self._cfg)
         self._executor = Executor(
             engine_dir=self._engine_dir,
             weights_dir=self._weights_dir,
@@ -124,7 +128,7 @@ class TTSEngine:
             try:
                 emb_weights = EmbeddingWeights(self._weights_dir, self._device_id)
                 self._executor.set_embedding_weights(emb_weights)
-                prefill_builder = PrefillBuilder(emb_weights, self._tokenizer.tokenizer)
+                prefill_builder = PrefillBuilder(emb_weights, self._tokenizer)
                 logger.info("PrefillBuilder loaded from %s", self._weights_dir)
             except Exception as e:
                 logger.warning("Could not load embedding weights: %s", e)
@@ -242,8 +246,8 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="TTS Engine Server")
-    parser.add_argument("--config", default=None,
-                        help="Path to engine.yaml config file")
+    parser.add_argument("--config", default="engine.yaml",
+                        help="Path to engine.yaml config file (default: engine.yaml)")
     parser.add_argument("--tokenizer-dir", default="",
                         help="Path to tokenizer directory (tokenizer.json / vocab.json)")
     parser.add_argument("--weights-dir", default="",
@@ -275,9 +279,14 @@ def main():
 
     cfg = load_config(args.config, cli_overrides=cli_overrides)
 
+    engine_dir = args.engine_dir or cfg.paths.engine_dir
+    tokenizer_dir = args.tokenizer_dir or cfg.paths.tokenizer_dir
+    model_arch = load_model_manifest(engine_dir, cfg, tokenizer_dir=tokenizer_dir)
+
     async def run():
         engine = TTSEngine(
             config=cfg,
+            model_arch=model_arch,
             device_id=args.device,
         )
         await engine.start()
@@ -295,29 +304,41 @@ def main():
 
         try:
             from .gateway.grpc_server import serve as grpc_serve
-            grpc_task = asyncio.create_task(grpc_serve(engine, port))
+            grpc_task = asyncio.create_task(
+                grpc_serve(engine, port, stop_event=stop_event),
+            )
             logger.info("gRPC server launched on port %d", port)
         except Exception as e:
             logger.warning("gRPC server not started: %s", e)
 
         if health_port > 0:
             health_task = asyncio.create_task(
-                _run_health_server(engine, health_port),
+                _run_health_server(engine, health_port, stop_event),
             )
 
         logger.info("Engine ready, press Ctrl+C to stop")
         await stop_event.wait()
 
         if grpc_task:
-            grpc_task.cancel()
+            try:
+                await grpc_task
+            except Exception as e:
+                logger.warning("gRPC server shutdown: %s", e)
         if health_task:
-            health_task.cancel()
+            try:
+                await health_task
+            except Exception as e:
+                logger.warning("Health server shutdown: %s", e)
         await engine.stop()
 
     asyncio.run(run())
 
 
-async def _run_health_server(engine: TTSEngine, port: int) -> None:
+async def _run_health_server(
+    engine: TTSEngine,
+    port: int,
+    stop_event: asyncio.Event,
+) -> None:
     """Minimal HTTP health / metrics endpoint.
 
     Uses aiohttp if available; otherwise falls back to a simple
@@ -342,8 +363,8 @@ async def _run_health_server(engine: TTSEngine, port: int) -> None:
         try:
             await site.start()
             logger.info("Health/metrics HTTP server on port %d (aiohttp)", port)
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
+            await stop_event.wait()
+        finally:
             await runner.cleanup()
         return
     except ImportError:
@@ -362,11 +383,16 @@ async def _run_health_server(engine: TTSEngine, port: int) -> None:
 
     server = await asyncio.start_server(_handle_connection, "0.0.0.0", port)
     logger.info("Health/metrics HTTP server on port %d (asyncio)", port)
-    try:
-        async with server:
-            await server.serve_forever()
-    except asyncio.CancelledError:
-        server.close()
+    async with server:
+        serve_task = asyncio.create_task(server.serve_forever())
+        try:
+            await stop_event.wait()
+        finally:
+            serve_task.cancel()
+            try:
+                await serve_task
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == "__main__":

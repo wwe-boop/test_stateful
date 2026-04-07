@@ -201,6 +201,13 @@ class PrefillBuilder:
     def __init__(self, weights: EmbeddingWeights, tokenizer: Any):
         self.w = weights
         self.tokenizer = tokenizer
+        with torch.no_grad():
+            self._codec_bos_embed = weights.codec_embed(
+                torch.tensor(
+                    [[weights.codec_bos_id]],
+                    device=weights.device, dtype=torch.int64,
+                ),
+            )
 
     def build_plan(
         self,
@@ -459,6 +466,74 @@ class PrefillBuilder:
             else:
                 return []
         return [text_embed[:, i:i+1, :].clone() for i in range(text_embed.shape[1])]
+
+    def compute_cache_key(
+        self,
+        task_type: TaskType,
+        language: str = "auto",
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        spk_embedding: Optional[torch.Tensor] = None,
+    ) -> Optional[str]:
+        """Compute prefix cache key without building the full plan.
+
+        The key depends only on (variant, task_type, language, speaker),
+        NOT on the text content — so callers can check the cache before
+        any tokenization or embedding work.
+        """
+        return self._prefix_cache_key(
+            task_type, language, speaker, instruct, spk_embedding,
+        )
+
+    def build_suffix_from_ids(
+        self,
+        token_ids: list[int],
+        include_eos: bool = True,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Build request_prefill_embeds + trailing from raw token IDs.
+
+        Fast path for prefix cache hits: embeds text tokens directly,
+        skipping the text→template→retokenize round-trip that
+        ``build_plan()`` performs.
+
+        Args:
+            token_ids: raw text token IDs (from dispatcher / spliter).
+            include_eos: whether to append tts_eos_embed to trailing.
+
+        Returns:
+            (request_prefill_embeds [1,1,H], trailing list[[1,1,H]])
+        """
+        w = self.w
+        device = w.device
+        ids_tensor = torch.tensor(
+            [token_ids], device=device, dtype=torch.int64,
+        )
+        with torch.no_grad():
+            first_embed = w.text_embed(ids_tensor[:, :1])
+        request_prefill_embeds = first_embed + self._codec_bos_embed
+
+        with torch.no_grad():
+            if ids_tensor.shape[1] > 1:
+                mid_embed = w.text_embed(ids_tensor[:, 1:])
+                if include_eos:
+                    trailing_text = torch.cat(
+                        [mid_embed, w.tts_eos_embed], dim=1,
+                    )
+                else:
+                    trailing_text = mid_embed
+            else:
+                if include_eos:
+                    trailing_text = w.tts_eos_embed
+                else:
+                    trailing_text = torch.zeros(
+                        1, 0, w.hidden_size,
+                        device=device, dtype=torch.bfloat16,
+                    )
+        trailing = [
+            trailing_text[:, i : i + 1, :].clone()
+            for i in range(trailing_text.shape[1])
+        ]
+        return request_prefill_embeds, trailing
 
     def _prefix_cache_key(self, task_type, language, speaker, instruct, spk_embedding):
         key_parts = [self.w.variant, task_type.value, (language or "auto").strip().lower(),

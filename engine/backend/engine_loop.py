@@ -94,6 +94,8 @@ class EngineSegment:
         "text_complete", "prefill_plan",
         "trailing_idx", "text_tokens_consumed", "decode_start_frame",
         "mlfq_meta",
+        "pending_token_ids",
+        "eos_trailing_added",
     )
 
     def __init__(
@@ -111,6 +113,8 @@ class EngineSegment:
         self.text_tokens_consumed: int = 0
         self.decode_start_frame: int = 0
         self.mlfq_meta: MLFQMeta = MLFQMeta()
+        self.pending_token_ids: list[int] = []
+        self.eos_trailing_added: bool = False
 
 
 class EngineSessionGroup:
@@ -118,6 +122,7 @@ class EngineSessionGroup:
     __slots__ = (
         "session_id", "request", "result_queue",
         "segments", "text_complete_all", "created_at",
+        "overflow_token_ids",
     )
 
     def __init__(self, session_id: str, request: EngineRequest):
@@ -127,6 +132,7 @@ class EngineSessionGroup:
         self.segments: Dict[int, EngineSegment] = {}
         self.text_complete_all: bool = False
         self.created_at: float = time.monotonic()
+        self.overflow_token_ids: list[int] = []
 
     @property
     def active_slot_count(self) -> int:
@@ -197,6 +203,12 @@ class EngineLoop:
         self._total_timeouts: int = 0
         self._total_evictions: int = 0
 
+        self._tts_pad_embed = (
+            prefill_builder.w.tts_pad_embed.clone()
+            if prefill_builder is not None
+            else torch.zeros(1, 1, 1536)
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -229,16 +241,28 @@ class EngineLoop:
                 self._process_step_output(prev_output)
                 prev_output = None
 
-            # --- Phase 2: Prefill new sessions (synchronous GPU work,
-            # uses dedicated prefill stream so it does not conflict with
-            # the decode compute stream) ---
-            self._try_prefill_one()
+            # --- Phase 1.5: Drain inbox EARLY so newly arrived requests
+            # are immediately available for prefill/decode in this
+            # iteration, instead of waiting until the next one. ---
+            self._drain_inbox()
 
-            # --- Phase 3: Build & launch next decode step ---
+            # --- Phase 2: Launch decode for existing active slots FIRST.
+            # GPU starts computing on compute_stream while CPU proceeds
+            # to prefill on the separate prefill_stream. ---
             active_slots = self._get_active_slots_mlfq()
             gpu_future = None
             if active_slots:
                 gpu_future = self._executor.launch_decode_step(active_slots)
+
+            # --- Phase 3: Prefill ALL pending sessions (not just one).
+            # Uses the dedicated prefill_stream + separate TRT execution
+            # context, so prefill overlaps with the in-flight decode on
+            # compute_stream.  First audio chunk is produced during
+            # prefill, so first_chunk_latency = time-to-prefill. ---
+            try:
+                self._try_prefill_pending()
+            except Exception:
+                logger.exception("Prefill failed unexpectedly")
 
             # --- Phase 4: While GPU computes, do CPU housekeeping ---
             self._drain_inbox()
@@ -300,6 +324,18 @@ class EngineLoop:
             seg = EngineSegment(
                 req.session_id, req.segment_idx, req.priority,
             )
+            if group.overflow_token_ids:
+                seg.pending_token_ids.extend(group.overflow_token_ids)
+                seg.text_tokens_consumed += len(group.overflow_token_ids)
+                logger.info(
+                    "Prepended %d overflow tokens to %s seg=%d",
+                    len(group.overflow_token_ids),
+                    req.session_id, req.segment_idx,
+                )
+                group.overflow_token_ids.clear()
+            if req.token_ids:
+                seg.pending_token_ids.extend(req.token_ids)
+                seg.text_tokens_consumed += len(req.token_ids)
             group.segments[req.segment_idx] = seg
             if req.result_queue is not None:
                 group.result_queue = req.result_queue
@@ -310,10 +346,33 @@ class EngineLoop:
             group = self._groups.get(req.session_id)
             if group is None:
                 return
+            if not req.token_ids:
+                return
             seg = group.segments.get(req.segment_idx)
-            if seg and seg.slot and req.token_ids:
-                seg.slot.token_queue.extend(req.token_ids)
-                seg.text_tokens_consumed += len(req.token_ids)
+            if seg is None or seg.state == "done":
+                group.overflow_token_ids.extend(req.token_ids)
+                logger.debug(
+                    "Overflow %d tokens for %s seg=%d (seg_state=%s, overflow_total=%d)",
+                    len(req.token_ids), req.session_id,
+                    req.segment_idx,
+                    seg.state if seg else "MISSING",
+                    len(group.overflow_token_ids),
+                )
+                return
+            seg.pending_token_ids.extend(req.token_ids)
+            seg.text_tokens_consumed += len(req.token_ids)
+            if (
+                seg.state == "active"
+                and seg.slot is not None
+                and self._prefill_builder is not None
+            ):
+                self._append_trailing_tokens(seg.slot, req.token_ids)
+            else:
+                logger.debug(
+                    "APPEND_TEXT %d tokens for %s seg=%d state=%s (pre-prefill accumulate)",
+                    len(req.token_ids), req.session_id,
+                    req.segment_idx, seg.state,
+                )
 
         elif req.type == RequestType.TEXT_COMPLETE:
             group = self._groups.get(req.session_id)
@@ -322,6 +381,22 @@ class EngineLoop:
             seg = group.segments.get(req.segment_idx)
             if seg:
                 seg.text_complete = True
+                if (
+                    seg.state == "active"
+                    and seg.slot is not None
+                    and not seg.eos_trailing_added
+                    and self._prefill_builder is not None
+                ):
+                    self._append_eos_trailing(seg)
+                if seg.state == "done":
+                    self._check_session_done(group)
+
+        elif req.type == RequestType.SESSION_TEXT_DONE:
+            group = self._groups.get(req.session_id)
+            if group is None:
+                return
+            group.text_complete_all = True
+            self._check_session_done(group)
 
         elif req.type == RequestType.CANCEL_SESSION:
             self._remove_session(req.session_id)
@@ -330,14 +405,31 @@ class EngineLoop:
     # Priority-based prefill
     # ------------------------------------------------------------------
 
-    def _try_prefill_one(self) -> None:
+    def _try_prefill_pending(self) -> None:
+        """Prefill ALL pending segments, not just one.
+
+        Back-to-back prefills eliminate decode-step overhead between
+        consecutive new sessions, reducing first-chunk latency when
+        multiple requests arrive concurrently.  Capped at max_batch_size
+        to bound latency for existing decoding sessions.
+        """
+        count = 0
+        while count < self._max_batch:
+            if not self._try_prefill_one():
+                break
+            count += 1
+        if count > 1:
+            logger.info("Prefilled %d segments in one pass", count)
+
+    def _try_prefill_one(self) -> bool:
         """Run prefill for the highest-priority pending segment.
 
         Uses prefix KV cache when available to skip redundant GPU work.
+        Returns True if a segment was prefilled, False otherwise.
         """
         kv_pool = self._executor.kv_pool
         if kv_pool is None or kv_pool.free_count == 0:
-            return
+            return False
 
         best: Optional[EngineSegment] = None
         best_group: Optional[EngineSessionGroup] = None
@@ -348,58 +440,108 @@ class EngineLoop:
             for seg in group.segments.values():
                 if seg.state != "pending_prefill":
                     continue
+                if not seg.text_complete:
+                    continue
                 if best is None or seg.priority.value < best.priority.value:
                     best = seg
                     best_group = group
 
         if best is None or best_group is None:
-            return
+            return False
 
         slot = kv_pool.allocate(_seg_key(best.session_id, best.segment_idx))
         if slot is None:
-            return
+            return False
         best.slot = slot
         self._seg_by_slot[slot.slot_id] = best
         self._mlfq.on_segment_created(best.mlfq_meta)
 
+        segment_text = ""
         if self._prefill_builder is not None:
-            task_type = parse_task_type(
-                best_group.request.task_type or "custom_voice",
+            try:
+                task_type = parse_task_type(
+                    best_group.request.task_type or "custom_voice",
+                )
+            except ValueError as exc:
+                logger.error("Invalid task_type for %s: %s", best.session_id, exc)
+                best.state = "error"
+                self._seg_by_slot.pop(slot.slot_id, None)
+                kv_pool.release(slot.slot_id)
+                best.slot = None
+                self._send_result(best_group, EngineResult(
+                    type=ResultType.ERROR,
+                    session_id=best.session_id,
+                    segment_idx=best.segment_idx,
+                    error_msg=str(exc),
+                ))
+                return False
+            # Check prefix cache BEFORE build_plan to skip the
+            # token→text→retokenize round-trip on cache hits.
+            cache_key = self._prefill_builder.compute_cache_key(
+                task_type, "auto", best_group.request.speaker_key,
             )
-            plan = self._prefill_builder.build_plan(
-                task_type=task_type,
-                text="",
-                language="auto",
-                speaker=best_group.request.speaker_key,
-                include_eos=False,
-            )
-            best.prefill_plan = plan
+            cached = self._prefix_cache.get(cache_key)
 
-            cached = self._prefix_cache.get(plan.prefix_cache_key)
-            if cached is not None and plan.request_prefill_embeds is not None:
-                slot.talker_kv = cached.talker_kv.clone()
-                slot.past_len = cached.prefix_len
-                self._executor.prefill(slot, plan.request_prefill_embeds)
-                logger.debug(
-                    "Prefix cache hit: skipped %d prefix tokens for %s",
+            if cached is not None and best.pending_token_ids:
+                # ── Cache HIT: embed token IDs directly, skip TRT ──
+                req_embeds, trailing = (
+                    self._prefill_builder.build_suffix_from_ids(
+                        best.pending_token_ids,
+                        include_eos=best.text_complete,
+                    )
+                )
+                self._apply_prefix_cache_hit(
+                    slot, cached, req_embeds, trailing,
+                )
+                best.eos_trailing_added = best.text_complete
+                prefill_audio = None
+                prefill_eos = False
+                logger.info(
+                    "Prefix cache hit: copied %d KV tokens for %s "
+                    "(slot=%d, %d text tokens embedded directly)",
                     cached.prefix_len, best.session_id,
+                    slot.slot_id, len(best.pending_token_ids),
                 )
             else:
-                self._executor.prefill(slot, plan.prefill_embeds)
+                # ── Cache MISS: full build_plan + TRT prefill ──
+                segment_text = self._decode_token_ids(best.pending_token_ids)
+                plan = self._prefill_builder.build_plan(
+                    task_type=task_type,
+                    text=segment_text,
+                    language="auto",
+                    speaker=best_group.request.speaker_key,
+                    include_eos=best.text_complete,
+                )
+                best.prefill_plan = plan
+
+                prefill_audio, prefill_eos = self._executor.prefill(
+                    slot, plan.prefill_embeds,
+                )
+                # Populate cache — read from pool when preallocated
+                effective_key = plan.prefix_cache_key or cache_key
                 if (
-                    plan.prefix_cache_key is not None
+                    effective_key is not None
                     and plan.cacheable_prefix_embeds is not None
-                    and slot.talker_kv is not None
                 ):
                     prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
-                    prefix_kv = slot.talker_kv[:, :, :, :prefix_len, :].clone()
-                    self._prefix_cache.put(
-                        plan.prefix_cache_key, prefix_kv, prefix_len,
-                    )
+                    prefix_kv = self._read_prefix_kv(slot, prefix_len)
+                    if prefix_kv is not None:
+                        self._prefix_cache.put(
+                            effective_key, prefix_kv, prefix_len,
+                        )
 
-            slot.trailing = plan.trailing
+                slot.trailing = plan.trailing
+                best.eos_trailing_added = best.text_complete
+
+                # Combine codec_sum (TRT output) with first trailing text token
+                if slot.next_embed is not None and slot.trailing:
+                    first_trail = slot.trailing[0].to(slot.next_embed.dtype)
+                    slot.next_embed = (
+                        slot.next_embed + first_trail
+                    ).to(torch.float32)
+                    slot.text_idx = 1
         else:
-            self._executor.prefill(slot, torch.zeros(
+            prefill_audio, prefill_eos = self._executor.prefill(slot, torch.zeros(
                 1, 1, 1536, device=torch.device("cuda"), dtype=torch.bfloat16,
             ))
 
@@ -411,9 +553,79 @@ class EngineLoop:
             session_id=best.session_id,
             segment_idx=best.segment_idx,
         ))
-        logger.debug("Prefill done: %s seg=%d prio=%s (slot=%d, past_len=%d)",
-                     best.session_id, best.segment_idx, best.priority.name,
-                     slot.slot_id, slot.past_len)
+
+        if prefill_audio and len(prefill_audio) > 0:
+            self._send_result(best_group, EngineResult(
+                type=ResultType.AUDIO_CHUNK,
+                session_id=best.session_id,
+                segment_idx=best.segment_idx,
+                audio_bytes=prefill_audio,
+            ))
+        if prefill_eos:
+            self._handle_segment_eos(best_group, best)
+            return True
+        logger.debug(
+            "Prefill done: %s seg=%d prio=%s (slot=%d, past_len=%d, "
+            "trailing=%d, text_complete=%s, text='%.50s')",
+            best.session_id, best.segment_idx, best.priority.name,
+            slot.slot_id, slot.past_len,
+            len(slot.trailing), best.text_complete, segment_text,
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Prefix cache helpers
+    # ------------------------------------------------------------------
+
+    def _apply_prefix_cache_hit(
+        self,
+        slot: SlotKVState,
+        cached,
+        request_prefill_embeds: torch.Tensor,
+        trailing: list,
+    ) -> None:
+        """Set up slot from cached prefix KV without any TRT call.
+
+        Copies the cached talker KV into the KV pool (or slot) and
+        prepares the slot for decode.  The suffix token is stored as
+        next_embed so the first decode step processes it with full
+        attention to the cached KV.
+        """
+        kv_pool = self._executor.kv_pool
+        kv_pool.init_kv_tensors(slot)
+        prefix_len = cached.prefix_len
+
+        if kv_pool._preallocate and kv_pool._talker_kv_pool is not None:
+            kv_pool._talker_kv_pool[
+                slot.slot_id, :, :, :prefix_len, :
+            ] = cached.talker_kv[0, :, :, :prefix_len, :]
+        else:
+            slot.talker_kv = cached.talker_kv.clone()
+        slot.past_len = prefix_len
+        slot.frame_idx = 0
+
+        slot.c2w_kv = None
+        slot.c2w_conv_states = self._executor.make_zero_conv_states()
+        slot.c2w_transconv_states = self._executor.make_zero_transconv_states()
+        slot.init_pingpong_buffers()
+
+        slot.next_embed = request_prefill_embeds.to(torch.float32)
+        slot.trailing = trailing
+        slot.text_idx = 0
+
+    def _read_prefix_kv(
+        self, slot: SlotKVState, prefix_len: int,
+    ) -> Optional[torch.Tensor]:
+        """Read prefix KV from pool or slot for cache population."""
+        kv_pool = self._executor.kv_pool
+        if kv_pool._preallocate and kv_pool._talker_kv_pool is not None:
+            return kv_pool._talker_kv_pool[
+                slot.slot_id : slot.slot_id + 1,
+                :, :, :prefix_len, :,
+            ].clone()
+        if slot.talker_kv is not None:
+            return slot.talker_kv[:, :, :, :prefix_len, :].clone()
+        return None
 
     # ------------------------------------------------------------------
     # Decode batch (MLFQ-ordered)
@@ -421,12 +633,18 @@ class EngineLoop:
 
     def _get_active_slots_mlfq(self) -> list[SlotKVState]:
         """Build decode batch using MLFQ priority ordering."""
+        kv_pool = self._executor.kv_pool
+        max_seq = kv_pool.max_seq_len if kv_pool else float("inf")
+        evict_pairs: list[tuple[EngineSessionGroup, EngineSegment]] = []
         candidates: list[EngineSegment] = []
         for group in self._groups.values():
             for seg in group.segments.values():
                 if seg.state != "active" or seg.slot is None:
                     continue
                 slot = seg.slot
+                if slot.past_len >= max_seq:
+                    evict_pairs.append((group, seg))
+                    continue
                 if slot.next_embed is None:
                     if slot.trailing and slot.text_idx < len(slot.trailing):
                         slot.next_embed = slot.trailing[slot.text_idx]
@@ -434,6 +652,11 @@ class EngineLoop:
                     else:
                         continue
                 candidates.append(seg)
+
+        for group, seg in evict_pairs:
+            logger.warning("Segment hit max_seq_len (%d): %s seg=%d, forcing EOS",
+                           max_seq, seg.session_id, seg.segment_idx)
+            self._handle_segment_eos(group, seg)
 
         if not candidates:
             return []
@@ -517,6 +740,7 @@ class EngineLoop:
             slot_ids = [s.slot_id for s in output.slots]
             kv_pool.scatter_c2w_kv(slot_ids, output.batch_c2w_kv)
 
+        batch_size = len(output.slots)
         for i, slot in enumerate(output.slots):
             seg = self._seg_by_slot.get(slot.slot_id)
             if seg is None:
@@ -525,20 +749,37 @@ class EngineLoop:
             if group is None:
                 continue
 
+            if output.batch_c2w_kv is not None:
+                kv = output.batch_c2w_kv[i:i+1]
+                c2w_max_past = self._executor._config.c2w_sliding_window - 1
+                if kv.shape[3] > c2w_max_past:
+                    kv = kv[:, :, :, -c2w_max_past:, :]
+                slot.c2w_kv = kv.clone()
             if not use_pool:
                 if output.batch_talker_kv is not None:
                     slot.talker_kv = output.batch_talker_kv[i:i+1]
-                if output.batch_c2w_kv is not None:
-                    slot.c2w_kv = output.batch_c2w_kv[i:i+1]
 
-            if output.split_c2w_conv[i]:
-                slot.c2w_conv_states = [
-                    t for t in output.split_c2w_conv[i] if t is not None
-                ]
-            if output.split_c2w_transconv[i]:
-                slot.c2w_transconv_states = [
-                    t for t in output.split_c2w_transconv[i] if t is not None
-                ]
+            if output.used_pingpong and slot.pingpong_ready:
+                # batch=1 zero-copy: TRT wrote directly to write bufs
+                slot.flip_c2w_buffers()
+            elif slot.pingpong_ready:
+                # batch>1 pre-allocated copy: scatter into write bufs
+                slot.copy_c2w_and_flip(
+                    output.split_c2w_conv[i],
+                    output.split_c2w_transconv[i],
+                )
+            else:
+                # Fallback: clone (first step or non-pingpong slot)
+                if output.split_c2w_conv[i]:
+                    slot.c2w_conv_states = [
+                        t.clone() for t in output.split_c2w_conv[i]
+                        if t is not None
+                    ]
+                if output.split_c2w_transconv[i]:
+                    slot.c2w_transconv_states = [
+                        t.clone() for t in output.split_c2w_transconv[i]
+                        if t is not None
+                    ]
             if output.updated_tc is not None:
                 slot.token_counts = output.updated_tc[i:i+1].clone()
             slot.past_len += 1
@@ -547,25 +788,26 @@ class EngineLoop:
             self._mlfq.on_step_done(seg.mlfq_meta)
 
             if output.codec_sum is not None:
-                text_add = torch.zeros_like(output.codec_sum[i:i+1])
                 if slot.trailing and slot.text_idx < len(slot.trailing):
                     text_add = slot.trailing[slot.text_idx].to(output.codec_sum.dtype)
                     slot.text_idx += 1
+                else:
+                    text_add = self._tts_pad_embed.to(output.codec_sum.dtype)
                 slot.next_embed = (output.codec_sum[i:i+1] + text_add).to(torch.float32)
             else:
                 slot.next_embed = None
 
-            audio = output.audio_chunks[i]
-            if audio is not None and len(audio) > 0:
-                self._send_result(group, EngineResult(
-                    type=ResultType.AUDIO_CHUNK,
-                    session_id=seg.session_id,
-                    segment_idx=seg.segment_idx,
-                    audio_bytes=audio,
-                ))
-
             if output.eos_flags[i]:
                 self._handle_segment_eos(group, seg)
+            else:
+                audio = output.audio_chunks[i]
+                if audio is not None and len(audio) > 0:
+                    self._send_result(group, EngineResult(
+                        type=ResultType.AUDIO_CHUNK,
+                        session_id=seg.session_id,
+                        segment_idx=seg.segment_idx,
+                        audio_bytes=audio,
+                    ))
 
     def _handle_segment_eos(
         self, group: EngineSessionGroup, seg: EngineSegment,
@@ -595,22 +837,30 @@ class EngineLoop:
             metrics=metrics,
         ))
         logger.info("Segment EOS: %s seg=%d audio_steps=%d text_tokens=%d",
-                     seg.session_id, seg.segment_idx,
-                     audio_steps, seg.text_tokens_consumed)
+                    seg.session_id, seg.segment_idx,
+                    audio_steps, seg.text_tokens_consumed)
 
         self._check_session_done(group)
 
     def _check_session_done(self, group: EngineSessionGroup) -> None:
-        """Check if ALL segments are done and no more are expected."""
-        all_done = all(s.state == "done" for s in group.segments.values())
-        if not all_done:
+        """Check if ALL segments are done and no more are expected.
+
+        Requires text_complete_all (SESSION_TEXT_DONE received) so that
+        streaming sessions don't conclude before all text has arrived.
+        Also waits for overflow_token_ids to be drained into new segments.
+        """
+        if not group.text_complete_all:
             return
 
-        has_pending = any(
-            not s.text_complete for s in group.segments.values()
-            if s.state != "done"
-        )
-        if has_pending:
+        if group.overflow_token_ids:
+            logger.warning(
+                "Session %s has %d overflow tokens pending — waiting for new segment",
+                group.session_id, len(group.overflow_token_ids),
+            )
+            return
+
+        all_done = all(s.state == "done" for s in group.segments.values())
+        if not all_done:
             return
 
         self._send_result(group, EngineResult(
@@ -653,6 +903,49 @@ class EngineLoop:
             seg.state in ("pending_prefill", "active")
             for group in self._groups.values()
             for seg in group.segments.values()
+        )
+
+    # ------------------------------------------------------------------
+    # Text embedding helpers (for streaming APPEND_TEXT)
+    # ------------------------------------------------------------------
+
+    def _decode_token_ids(self, token_ids: list[int]) -> str:
+        """Decode raw token IDs back to text for build_plan."""
+        if not token_ids or self._prefill_builder is None:
+            return ""
+        return self._prefill_builder.tokenizer.decode(
+            token_ids, skip_special_tokens=False,
+        )
+
+    def _append_trailing_tokens(
+        self, slot: SlotKVState, token_ids: list[int],
+    ) -> None:
+        """Embed new token IDs and append to slot's trailing list.
+
+        Called when APPEND_TEXT arrives after a segment has already been
+        prefilled, so the model can see the new text during decode.
+        """
+        w = self._prefill_builder.w
+        ids_tensor = torch.tensor(
+            [token_ids], device=w.device, dtype=torch.int64,
+        )
+        with torch.no_grad():
+            embed = w.text_embed(ids_tensor)
+        for i in range(embed.shape[1]):
+            slot.trailing.append(embed[:, i : i + 1, :].clone())
+        logger.debug(
+            "Appended %d trailing tokens (total=%d, text_idx=%d)",
+            len(token_ids), len(slot.trailing), slot.text_idx,
+        )
+
+    def _append_eos_trailing(self, seg: EngineSegment) -> None:
+        """Append tts_eos_embed to trailing when TEXT_COMPLETE arrives post-prefill."""
+        w = self._prefill_builder.w
+        seg.slot.trailing.append(w.tts_eos_embed.clone())
+        seg.eos_trailing_added = True
+        logger.debug(
+            "Appended EOS trailing for seg=%d (total=%d)",
+            seg.segment_idx, len(seg.slot.trailing),
         )
 
     # ------------------------------------------------------------------

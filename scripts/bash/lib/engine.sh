@@ -18,6 +18,9 @@ source "${_LIB_DIR}/logging.sh"
 source "${_LIB_DIR}/utils.sh"
 
 ENGINE_GRPC_PORT="${ENGINE_GRPC_PORT:-50051}"
+ENGINE_HEALTH_PORT="${ENGINE_HEALTH_PORT:-8080}"
+ENGINE_IMAGE="${ENGINE_IMAGE:-qwen3-engine:26.02}"
+ENGINE_CONTAINER_NAME="${ENGINE_CONTAINER_NAME:-qwen3-engine}"
 
 # ---------------------------------------------------------------------------
 #  resolve_variant_model_dir <variant>
@@ -70,9 +73,16 @@ resolve_engine_paths() {
         return 1
     fi
 
-    # Engine dir (TRT plans): workspace/exported/<variant>/engines/talker_code2wav_fused
-    _ENGINE_DIR="$exported_dir/$variant/engines/talker_code2wav_fused"
-    if [ ! -d "$_ENGINE_DIR" ]; then
+    # TRT fused engine:
+    #   - Phase B (build_engines.sh): workspace/exported/<variant>/talker_code2wav_fused.engine
+    #   - Triton assemble copy:       .../engines/talker_code2wav_fused/model.plan
+    local fused_subdir="$exported_dir/$variant/engines/talker_code2wav_fused"
+    local fused_flat="$exported_dir/$variant/talker_code2wav_fused.engine"
+    if [ -d "$fused_subdir" ] && { [ -f "$fused_subdir/model.plan" ] || [ -f "$fused_subdir/talker_code2wav_fused.engine" ]; }; then
+        _ENGINE_DIR="$fused_subdir"
+    elif [ -f "$fused_flat" ]; then
+        _ENGINE_DIR="$exported_dir/$variant"
+    else
         _ENGINE_DIR=""
         log_warn "TRT engine directory not found, engine will run in stub/ONNX mode"
     fi
@@ -294,6 +304,125 @@ engine_health_check() {
 
     log_error "Engine health check timed out after ${timeout}s"
     return 1
+}
+
+# ---------------------------------------------------------------------------
+#  engine_build_image <repo_root> [image_tag]
+#  Builds the Docker image for the standalone engine.
+# ---------------------------------------------------------------------------
+engine_build_image() {
+    local repo_root="$1"
+    local image_tag="${2:-$ENGINE_IMAGE}"
+    local dockerfile="$repo_root/Dockerfile.engine"
+
+    if [ ! -f "$dockerfile" ]; then
+        log_error "Dockerfile not found: $dockerfile"
+        return 1
+    fi
+
+    log_step "Building engine Docker image: $image_tag"
+    docker build -t "$image_tag" -f "$dockerfile" "$repo_root" \
+        || { log_error "Docker build failed"; return 1; }
+    log_info "Image built: $image_tag"
+}
+
+# ---------------------------------------------------------------------------
+#  engine_start_docker <repo_root> <variant> [options...]
+#
+#  Starts the standalone TTS engine server inside a Docker container.
+#  Options: same as engine_start, plus --image <tag>
+# ---------------------------------------------------------------------------
+engine_start_docker() {
+    local repo_root="$1"
+    local variant="$2"
+    shift 2
+
+    local port="$ENGINE_GRPC_PORT"
+    local health_port="$ENGINE_HEALTH_PORT"
+    local device=0
+    local max_batch=48
+    local max_sessions=128
+    local max_seq_len=2048
+    local image="$ENGINE_IMAGE"
+    local container_name="$ENGINE_CONTAINER_NAME"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)          port="$2"; shift 2 ;;
+            --device)        device="$2"; shift 2 ;;
+            --max-batch)     max_batch="$2"; shift 2 ;;
+            --max-sessions)  max_sessions="$2"; shift 2 ;;
+            --max-seq-len)   max_seq_len="$2"; shift 2 ;;
+            --image)         image="$2"; shift 2 ;;
+            --name)          container_name="$2"; shift 2 ;;
+            *)               shift ;;
+        esac
+    done
+
+    if docker inspect "$container_name" &>/dev/null; then
+        log_warn "Container '$container_name' already exists"
+        if docker inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+            log_warn "Container is running. Stop first: deploy.sh stop"
+            return 1
+        fi
+        docker rm "$container_name" >/dev/null 2>&1
+    fi
+
+    resolve_engine_paths "$repo_root" "$variant" || return 1
+
+    log_step "Starting Engine (Docker: $image)"
+    log_info "  Container:    $container_name"
+    log_info "  Variant:      $variant"
+    log_info "  Tokenizer:    $_ENGINE_TOKENIZER_DIR"
+    log_info "  Weights:      $_ENGINE_WEIGHTS_DIR"
+    log_info "  TRT Engines:  ${_ENGINE_DIR:-stub mode}"
+    log_info "  GPU Device:   $device"
+    log_info "  Max Batch:    $max_batch"
+    log_info "  Max Sessions: $max_sessions"
+    log_info "  gRPC Port:    $port"
+
+    local ws="/workspace"
+    local tk_mount="$ws/workspace/models/$(resolve_variant_model_dir "$variant")"
+    local wt_mount="$ws/workspace/exported/$variant/weights"
+    local eng_mount="$ws/workspace/exported/$variant"
+
+    docker run --gpus all -d \
+        --name "$container_name" \
+        -v "$repo_root:$ws" \
+        -p "${port}:${port}" \
+        -p "${health_port}:${health_port}" \
+        --shm-size=4g \
+        -e "ENGINE_SCHEDULER_MAX_BATCH_SIZE=$max_batch" \
+        -e "ENGINE_SCHEDULER_MAX_SEQ_LEN=$max_seq_len" \
+        "$image" \
+        python3 -m engine.server \
+            --tokenizer-dir "$tk_mount" \
+            --weights-dir "$wt_mount" \
+            --engine-dir "$eng_mount" \
+            --device "$device" \
+            --max-batch "$max_batch" \
+            --max-sessions "$max_sessions" \
+            --port "$port" \
+        || { log_error "Docker run failed"; return 1; }
+
+    log_info "Container started: $container_name"
+    log_info "  Logs: docker logs -f $container_name"
+}
+
+# ---------------------------------------------------------------------------
+#  engine_stop_docker [container_name]
+#  Stops the engine Docker container.
+# ---------------------------------------------------------------------------
+engine_stop_docker() {
+    local container_name="${1:-$ENGINE_CONTAINER_NAME}"
+    if ! docker inspect "$container_name" &>/dev/null; then
+        log_info "No container '$container_name' found"
+        return 0
+    fi
+    log_info "Stopping container '$container_name'..."
+    docker stop "$container_name" >/dev/null 2>&1
+    docker rm "$container_name" >/dev/null 2>&1
+    log_info "Container stopped and removed"
 }
 
 # ---------------------------------------------------------------------------

@@ -10,10 +10,10 @@ Memory layout per slot (packed tensor format):
     c2w_conv:   17 tensors with heterogeneous shapes (static except batch)
     c2w_transconv: 4 tensors with heterogeneous shapes (static except batch)
 
-Total Talker KV per slot (example, 1.7B model):
-    28 layers × 2 × 8 heads × 64 dim × 2048 max_seq × 2 bytes (bf16)
-    = 28 × 2 × 8 × 64 × 2048 × 2 = ~115 MB/slot
-    64 slots = ~7.2 GB (fits on 24GB GPU with model weights)
+Total Talker KV per slot (example, 1.7B model, max_seq=512):
+    28 layers × 2 × 8 heads × 128 dim × 512 max_seq × 2 bytes (bf16)
+    = 28 × 2 × 8 × 128 × 512 × 2 = ~56 MB/slot
+    32 slots = ~1.8 GB (fits on 24GB GPU with model weights)
 
 Slot eviction:
     When the pool is full and a new session needs a slot, the pool can
@@ -36,14 +36,15 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     """Model architecture parameters for KV cache sizing."""
-    # Talker
+    # Talker (1.7b defaults; 0.6b: hidden=1536, head_dim=64, vocab=2176)
     num_layers: int = 28
     kv_heads: int = 8
-    head_dim: int = 64
-    max_seq_len: int = 2048
-    hidden_size: int = 1536
+    head_dim: int = 128
+    max_seq_len: int = 512
+    hidden_size: int = 2048
     dtype: torch.dtype = torch.bfloat16
-    codec_vocab_size: int = 2176
+    codec_vocab_size: int = 3072
+    logits_topk: int = 50
 
     # Code2Wav
     n_c2w_layers: int = 8
@@ -65,6 +66,11 @@ class SlotKVState:
     Uses packed KV tensors: single [1, L*2, H, S, D] per cache type
     instead of lists of per-layer tensors.  This reduces TRT I/O binding
     count from ~201 to ~61.
+
+    C2W conv/transconv states use **ping-pong double buffering** to avoid
+    per-step clone() overhead.  Two buffer sets are pre-allocated once at
+    prefill time.  After each decode step the read/write sets are swapped
+    via pointer swap (zero-copy for batch=1, copy_-only for batch>1).
     """
     slot_id: int
     session_id: Optional[str] = None
@@ -81,6 +87,10 @@ class SlotKVState:
     c2w_transconv_states: Optional[list[torch.Tensor]] = None
     frame_idx: int = 0
 
+    # Ping-pong write buffers (swapped with read buffers each step)
+    _c2w_conv_write: Optional[list[torch.Tensor]] = None
+    _c2w_transconv_write: Optional[list[torch.Tensor]] = None
+
     # Decode tracking
     next_embed: Optional[torch.Tensor] = None
     token_counts: Optional[torch.Tensor] = None
@@ -89,12 +99,58 @@ class SlotKVState:
     trailing: list = field(default_factory=list)
     text_idx: int = 0
 
+    # Appended text token IDs for streaming APPEND_TEXT
+    token_queue: list = field(default_factory=list)
+
     # Activity tracking for eviction
     last_active_time: float = field(default_factory=time.monotonic)
 
     @property
     def has_c2w_states(self) -> bool:
         return self.c2w_kv is not None
+
+    @property
+    def pingpong_ready(self) -> bool:
+        """True when double buffers are allocated and ping-pong is usable."""
+        return self._c2w_conv_write is not None
+
+    def init_pingpong_buffers(self) -> None:
+        """Allocate the write-side buffers matching current read-side shapes.
+
+        Called once after prefill populates the initial c2w states.
+        """
+        if self.c2w_conv_states:
+            self._c2w_conv_write = [t.clone() for t in self.c2w_conv_states]
+        if self.c2w_transconv_states:
+            self._c2w_transconv_write = [t.clone() for t in self.c2w_transconv_states]
+
+    def flip_c2w_buffers(self) -> None:
+        """Swap read/write buffer pointers (zero-copy pointer swap)."""
+        self.c2w_conv_states, self._c2w_conv_write = (
+            self._c2w_conv_write, self.c2w_conv_states
+        )
+        self.c2w_transconv_states, self._c2w_transconv_write = (
+            self._c2w_transconv_write, self.c2w_transconv_states
+        )
+
+    def copy_c2w_and_flip(
+        self,
+        conv_sources: list[Optional[torch.Tensor]],
+        transconv_sources: list[Optional[torch.Tensor]],
+    ) -> None:
+        """Copy batched output slices into write buffers, then flip.
+
+        Used for batch>1 where TRT wrote to its own output buffer.
+        """
+        if self._c2w_conv_write is not None:
+            for j, src in enumerate(conv_sources):
+                if src is not None:
+                    self._c2w_conv_write[j].copy_(src)
+        if self._c2w_transconv_write is not None:
+            for j, src in enumerate(transconv_sources):
+                if src is not None:
+                    self._c2w_transconv_write[j].copy_(src)
+        self.flip_c2w_buffers()
 
     def touch(self) -> None:
         """Update activity timestamp (call on each decode step)."""
@@ -171,6 +227,10 @@ class KVCachePool:
         return kv_bytes / (1024 * 1024)
 
     @property
+    def max_seq_len(self) -> int:
+        return self._config.max_seq_len
+
+    @property
     def free_count(self) -> int:
         return len(self._free_slots)
 
@@ -190,6 +250,7 @@ class KVCachePool:
         slot.frame_idx = 0
         slot.text_idx = 0
         slot.trailing = []
+        slot.token_queue = []
         slot.next_embed = None
         slot.last_active_time = time.monotonic()
         if self._preallocate and self._talker_kv_pool is not None:
@@ -213,6 +274,8 @@ class KVCachePool:
         slot.c2w_kv = None
         slot.c2w_conv_states = None
         slot.c2w_transconv_states = None
+        slot._c2w_conv_write = None
+        slot._c2w_transconv_write = None
         self._free_slots.append(slot_id)
         logger.debug("Released slot %d (free: %d)", slot_id, len(self._free_slots))
 
@@ -300,9 +363,12 @@ class KVCachePool:
         """
         if self._talker_kv_pool is None:
             raise RuntimeError("Pool not pre-allocated")
+        cap = self._config.max_seq_len
         uniform = len(set(original_past_lens)) <= 1
         for i, (slot_id, orig_pl) in enumerate(zip(slot_ids, original_past_lens)):
-            new_total = orig_pl + seq
+            new_total = min(orig_pl + seq, cap)
+            if new_total <= orig_pl:
+                continue
             if uniform or orig_pl >= padded_past_len:
                 self._talker_kv_pool[slot_id, :, :, :new_total, :] = \
                     present_kv[i, :, :, :new_total, :]

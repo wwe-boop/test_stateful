@@ -344,6 +344,8 @@ def _export_talker_code2wav_fused_onnx(
         c2w_out_names.append(f"c2w_new_conv_state_{i}")
     for i in range(NUM_TRANSCONV):
         c2w_out_names.append(f"c2w_new_transconv_overlap_{i}")
+    c2w_sliding_window = getattr(c2w_cfg, "sliding_window", None) or 72
+
     layout = {
         "num_code2wav_hidden_layers": n_c2w,
         "c2w_state_input_names": [f"c2w_{name}" for name in conv_transconv_names_cold],
@@ -355,6 +357,8 @@ def _export_talker_code2wav_fused_onnx(
         "packed_kv": True,
         "c2w_kv_heads": c2w_kv_heads,
         "c2w_head_dim": c2w_head_dim,
+        "c2w_sliding_window": c2w_sliding_window,
+        "logits_topk": LOGITS_TOPK,
     }
 
     weights_cfg_path = output_dir / "weights" / "config.json"

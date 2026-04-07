@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Generate engine audio for quality comparison with reference (PyTorch) output.
+
+Calls the running engine via gRPC for the same texts as gen_reference_audio.py,
+saves WAV files side by side for A/B listening.
+
+Usage:
+  python tests/e2e/gen_engine_audio.py
+"""
+
+import sys
+import time
+import uuid
+import wave
+from pathlib import Path
+
+import grpc
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from engine.gateway import tts_pb2, tts_pb2_grpc
+
+SAMPLE_RATE = 24000
+HOST = "localhost"
+PORT = 50051
+
+TEXTS = {
+    "test1": "你好，这是单路测试。",
+    "test2": "你好，这是流式文本输入测试。",
+    "test3": "你好，今天天气真好。",
+    "test4": "欢迎来到人工智能语音合成的世界。",
+}
+
+
+def save_wav(audio: np.ndarray, path: str):
+    audio = np.clip(audio, -1.0, 1.0)
+    audio_int16 = (audio * 32767).astype(np.int16)
+    with wave.open(path, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(audio_int16.tobytes())
+
+
+def synthesize(text: str, speaker: str = "Serena") -> tuple[np.ndarray | None, float, int]:
+    sid = uuid.uuid4().hex[:12]
+    channel = grpc.insecure_channel(f"{HOST}:{PORT}")
+    stub = tts_pb2_grpc.TTSServiceStub(channel)
+
+    def request_gen():
+        yield tts_pb2.SynthesizeRequest(
+            init=tts_pb2.InitRequest(
+                session_id=sid, speaker=speaker, task_type="custom_voice",
+            )
+        )
+        yield tts_pb2.SynthesizeRequest(text=tts_pb2.TextChunk(text=text))
+        yield tts_pb2.SynthesizeRequest(done=tts_pb2.TextComplete())
+
+    chunks = []
+    first_ts = None
+    t0 = time.perf_counter()
+    try:
+        for resp in stub.SynthesizeStream(request_gen(), timeout=60):
+            which = resp.WhichOneof("response")
+            if which == "audio":
+                if first_ts is None:
+                    first_ts = time.perf_counter()
+                chunks.append(np.frombuffer(resp.audio.pcm_data, dtype=np.float32))
+            elif which == "status":
+                if resp.status.event == "error":
+                    print(f"  ERROR: {resp.status.message}")
+                    break
+                if resp.status.event == "done":
+                    break
+    except grpc.RpcError as e:
+        print(f"  gRPC error: {e.code().name}: {e.details()}")
+    finally:
+        channel.close()
+
+    elapsed = time.perf_counter() - t0
+    if chunks:
+        audio = np.concatenate(chunks)
+        return audio, elapsed, len(chunks)
+    return None, elapsed, 0
+
+
+def main():
+    out_dir = REPO_ROOT / "workspace" / "audio_samples" / "reference"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    channel = grpc.insecure_channel(f"{HOST}:{PORT}")
+    try:
+        grpc.channel_ready_future(channel).result(timeout=5)
+    except grpc.FutureTimeoutError:
+        print(f"Engine not reachable at {HOST}:{PORT}")
+        sys.exit(1)
+    finally:
+        channel.close()
+
+    print("Engine connected. Generating audio...")
+
+    for name, text in TEXTS.items():
+        print(f"\nGenerating [{name}]: {text}")
+        audio, elapsed, n_chunks = synthesize(text)
+        if audio is not None:
+            duration = len(audio) / SAMPLE_RATE
+            out_path = out_dir / f"engine_{name}.wav"
+            save_wav(audio, str(out_path))
+            print(f"  -> {out_path.name}: {len(audio)} samples, {duration:.2f}s, "
+                  f"{n_chunks} chunks, took {elapsed:.1f}s")
+        else:
+            print(f"  -> FAILED: no audio returned")
+
+    print(f"\nAll engine audio saved to: {out_dir}")
+    print("Compare proto_*.wav (PyTorch) vs engine_*.wav (TRT engine):")
+    for name in TEXTS:
+        proto = out_dir / f"proto_{name}.wav"
+        engine = out_dir / f"engine_{name}.wav"
+        p_size = proto.stat().st_size if proto.exists() else 0
+        e_size = engine.stat().st_size if engine.exists() else 0
+        print(f"  {name}: proto={p_size:,}B  engine={e_size:,}B")
+
+
+if __name__ == "__main__":
+    main()

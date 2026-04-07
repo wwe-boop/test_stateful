@@ -100,15 +100,42 @@ def build_manifest_for_export(
     engine_dtype: TensorRT builder precision (e.g. trtexec --bf16); Phase B reads this for prec flags.
     triton_io_float_dtype: Float tensor I/O for trtexec --inputIOFormats/--outputIOFormats and Triton config.pbtxt.
         ONNX graph remains FP32 (ONNX_EXPORT_DTYPE); TRT may insert reformats at boundaries.
+
+    The ``architecture`` section provides a complete, self-contained model
+    description for the standalone engine.  Priority: manifest > engine.yaml > defaults.
     """
     talker = weights_to_talker_section(weights_config)
     orch = variant_orchestrator_defaults(variant)
+
+    architecture: Dict[str, Any] = {
+        "num_layers": talker["num_layers"],
+        "hidden_size": talker["hidden_size"],
+        "kv_heads": talker["num_kv_heads"],
+        "head_dim": talker["head_dim"],
+        "codec_vocab_size": talker["vocab_size"],
+        "logits_topk": code2wav_layout.get("logits_topk", 50),
+        "n_c2w_layers": code2wav_layout["num_code2wav_hidden_layers"],
+        "c2w_kv_heads": code2wav_layout.get("c2w_kv_heads", 16),
+        "c2w_head_dim": code2wav_layout.get("c2w_head_dim", 64),
+        "c2w_sliding_window": code2wav_layout.get("c2w_sliding_window", 72),
+        "n_c2w_conv_states": len([
+            n for n in code2wav_layout.get("c2w_state_input_names", [])
+            if "conv_state" in n
+        ]),
+        "n_c2w_transconv_states": len([
+            n for n in code2wav_layout.get("c2w_state_input_names", [])
+            if "transconv" in n
+        ]),
+        "dtype": engine_dtype,
+    }
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "variant": variant,
         "engine_mode": engine_mode,
         "engine_dtype": engine_dtype,
         "triton_io_float_dtype": triton_io_float_dtype,
+        "architecture": architecture,
         "talker": talker,
         "code2wav_fused": {
             "num_code2wav_hidden_layers": code2wav_layout["num_code2wav_hidden_layers"],

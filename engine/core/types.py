@@ -36,7 +36,8 @@ class RequestType(Enum):
     NEW_SESSION      = auto()
     START_SEGMENT    = auto()  # begin a new segment within an existing session
     APPEND_TEXT      = auto()
-    TEXT_COMPLETE    = auto()
+    TEXT_COMPLETE    = auto()  # per-segment: no more text for this segment
+    SESSION_TEXT_DONE = auto() # session-level: upstream has finished all text
     CANCEL_SESSION   = auto()
 
 

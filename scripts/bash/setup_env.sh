@@ -184,6 +184,10 @@ install_dependencies() {
     # (Talker, Code Predictor, etc.) and convert them to ONNX / TRT.
     # NOT needed in the final Triton image.
     install_qwen3_tts "${REPO_ROOT}/${SUBMODULE_PATH}"
+
+    # Standalone TTS engine (python -m engine.server) loads .engine from Phase B;
+    # TensorRT plan format is tied to the trtexec version in the NGC build image.
+    install_tensorrt_for_standalone_engine
 }
 
 # ---- Step 4: Model download ----------------------------------------------

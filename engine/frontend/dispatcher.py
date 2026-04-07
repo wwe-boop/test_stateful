@@ -83,6 +83,12 @@ class Dispatcher:
         on_audio: Optional[Callable] = None,
         on_done: Optional[Callable] = None,
     ) -> Session:
+        if session_id in self._sessions:
+            old_task = self._consumer_tasks.pop(session_id, None)
+            if old_task and not old_task.done():
+                old_task.cancel()
+            self._cleanup_session(session_id)
+
         if len(self._sessions) >= self._max_sessions:
             raise RuntimeError(f"Max sessions ({self._max_sessions}) reached")
 
@@ -159,6 +165,11 @@ class Dispatcher:
         seg_actions = spliter.set_full_text(tokens)
         await self._dispatch_segment_actions(session, seg_actions)
 
+        await self._engine_inbox.put(EngineRequest(
+            type=RequestType.SESSION_TEXT_DONE,
+            session_id=session_id,
+        ))
+
     async def text_complete(self, session_id: str) -> None:
         """Upstream signals no more text will arrive."""
         session = self._sessions.get(session_id)
@@ -169,6 +180,11 @@ class Dispatcher:
         spliter: Spliter = session.spliter
         seg_actions = spliter.text_done()
         await self._dispatch_segment_actions(session, seg_actions)
+
+        await self._engine_inbox.put(EngineRequest(
+            type=RequestType.SESSION_TEXT_DONE,
+            session_id=session_id,
+        ))
 
     # ------------------------------------------------------------------
     # Translate SegmentActions → EngineRequests

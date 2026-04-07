@@ -36,6 +36,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts" / "python"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(REPO_ROOT / "scripts" / "export"))
 sys.path.insert(0, str(REPO_ROOT / "third_party" / "Qwen3-TTS"))
+sys.path.insert(0, str(REPO_ROOT / "tests" / "integration"))
 
 from utils import (
     setup_logging,
@@ -87,6 +88,8 @@ def run_ort_decode_loop(
     head_dim,
     max_steps,
     codec_eos_id,
+    codec_vocab_size=3072,
+    logits_topk=50,
 ):
     """Run ORT talker_unified prefill + decode, return (codes [T, 16], eos_step)."""
     B, S = 1, seq_len
@@ -94,9 +97,19 @@ def run_ort_decode_loop(
     position_ids_prefill = np.broadcast_to(
         position_ids_prefill.reshape(1, 1, -1, 1), (B, 3, S, 1)
     )
+
+    token_counts = np.zeros((B, codec_vocab_size), dtype=np.float32)
+    gumbel_noise = np.zeros((B, logits_topk), dtype=np.float32)
+    temperature = np.zeros((B, 1), dtype=np.float32)
+    penalty = np.ones((B, 1), dtype=np.float32)
+
     feed = {
         "input_embeds": inputs_embeds,
         "position_ids": position_ids_prefill,
+        "token_counts": token_counts,
+        "gumbel_noise": gumbel_noise,
+        "temperature": temperature,
+        "penalty": penalty,
     }
     for i in range(num_layers):
         feed[f"past_kv_{i}_k"] = np.zeros(
@@ -109,6 +122,7 @@ def run_ort_decode_loop(
     out_map = dict(zip(output_names, outs))
     codec_sum = out_map["codec_sum"]
     full_codec = out_map["full_codec"]
+    token_counts = out_map.get("updated_token_counts", token_counts).copy()
     past_kv = []
     for i in range(num_layers):
         past_kv.append(out_map[f"present_kv_{i}_k"].copy())
@@ -139,6 +153,10 @@ def run_ort_decode_loop(
         dec_feed = {
             "input_embeds": current_codec_sum,
             "position_ids": pos_step,
+            "token_counts": token_counts,
+            "gumbel_noise": gumbel_noise,
+            "temperature": temperature,
+            "penalty": penalty,
         }
         for i in range(num_layers):
             dec_feed[f"past_kv_{i}_k"] = past_kv[2 * i]
@@ -146,6 +164,7 @@ def run_ort_decode_loop(
         dec_outs = session.run(output_names, dec_feed)
         dec_map = dict(zip(output_names, dec_outs))
         codec_sum_step = dec_map["codec_sum"]
+        token_counts = dec_map.get("updated_token_counts", token_counts).copy()
         next_text = (
             trailing_text_hidden[step + 1]
             if (
@@ -172,6 +191,8 @@ def run_ort_decode_loop(
         all_codes.append(row)
         if eos_step < 0 and row[0] == codec_eos_id:
             eos_step = step + 1
+        if (step + 1) % 20 == 0:
+            logger.info("  ORT step %d: codec_0=%d", step + 1, row[0])
     codes = np.stack(all_codes, axis=0)
     return codes, eos_step
 
@@ -205,11 +226,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Three-way audio compare: prototype vs manual PyTorch vs ORT"
     )
-    parser.add_argument("--variant", default="design-1.7b", help="Model variant")
+    parser.add_argument("--variant", default="custom-1.7b", help="Model variant")
     parser.add_argument("--text", default=DEFAULT_TEXT, help="Input text")
     parser.add_argument("--instruct", default="", help="VoiceDesign instruction text")
     parser.add_argument("--language", default="auto")
-    parser.add_argument("--speaker", default="")
+    parser.add_argument("--speaker", default="vivian")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--device", default=None)
@@ -223,8 +244,8 @@ def main():
         help="Force greedy (do_sample=False) for all paths",
     )
     parser.add_argument(
-        "--triton-url", default="localhost:8001",
-        help="Triton gRPC URL for TRT path (default localhost:8001). Set to empty to skip TRT.",
+        "--triton-url", default="",
+        help="Triton gRPC URL for TRT path (empty=skip). Set to localhost:8001 to test Triton.",
     )
     args = parser.parse_args()
 

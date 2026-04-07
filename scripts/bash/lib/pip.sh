@@ -270,6 +270,30 @@ install_onnx_export_deps() {
 }
 
 # ---------------------------------------------------------------------------
+#  install_tensorrt_for_standalone_engine
+#  Pins the TensorRT Python wheel to match Phase B trtexec inside the default
+#  NGC image (build_engines.sh / resolve_ngc_image).  Engine plans are not
+#  portable across TRT minor versions; e.g. tritonserver:26.02 ships libnvinfer
+#  10.15.1 while pip's latest tensorrt may be 10.16.x, which cannot load those
+#  engines.  Override pin with STANDALONE_ENGINE_TENSORRT_PIP_VERSION.
+# ---------------------------------------------------------------------------
+install_tensorrt_for_standalone_engine() {
+    local want="${STANDALONE_ENGINE_TENSORRT_PIP_VERSION:-10.15.1.29}"
+    local have=""
+    have=$(python3 -c "import tensorrt as trt; print(trt.__version__)" 2>/dev/null || echo "")
+
+    if [ -n "$have" ] && [ "$have" = "$want" ]; then
+        log_info "TensorRT $want (standalone engine) already installed, skipping"
+        return 0
+    fi
+
+    log_step "Installing TensorRT $want for standalone engine (match Phase B NGC trtexec)..."
+    python3 -m pip install --upgrade "tensorrt==${want}" \
+        || { log_error "TensorRT install failed"; return 1; }
+    log_info "TensorRT $want installed"
+}
+
+# ---------------------------------------------------------------------------
 #  validate_python_env
 #  Quick smoke-test: imports the core packages and reports versions.
 # ---------------------------------------------------------------------------

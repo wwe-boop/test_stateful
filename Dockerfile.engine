@@ -1,0 +1,19 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt:26.02-py3
+FROM ${BASE_IMAGE}
+
+RUN pip install --no-cache-dir \
+    -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
+    --trusted-host mirrors.bfsu.edu.cn \
+    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    torch \
+    tokenizers \
+    pyyaml \
+    grpcio \
+    grpcio-tools \
+    && python3 -c "\
+import tensorrt as trt; \
+import torch, tokenizers, yaml, grpc; \
+print(f'TRT {trt.__version__}'); \
+print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
+print(f'tokenizers {tokenizers.__version__}'); \
+print(f'grpcio {grpc.__version__}')"

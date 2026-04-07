@@ -128,6 +128,18 @@ class LightQwen3TTSTokenizer:
         spans = [text[s:e] for s, e in enc.offsets]
         return enc.ids, spans
     
+    def __call__(self, text: str, return_tensors: str | None = None, **kwargs: Any) -> Dict[str, Any]:
+        """HuggingFace-compatible __call__ for drop-in use in PrefillBuilder."""
+        ids = self.encode_ids(text, add_special_tokens=kwargs.get("add_special_tokens", True))
+        if return_tensors == "np":
+            import numpy as np
+            arr = np.array(ids, dtype=np.int64).reshape(1, -1)
+            return {"input_ids": arr}
+        elif return_tensors == "pt":
+            import torch
+            return {"input_ids": torch.tensor([ids], dtype=torch.int64)}
+        return {"input_ids": ids}
+
     def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
 

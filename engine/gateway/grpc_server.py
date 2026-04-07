@@ -8,7 +8,7 @@ Protocol:
 
 Uses grpcio.aio for async compatibility with the engine's asyncio event loop.
 
-To generate proto stubs:
+To regenerate proto stubs:
     python -m grpc_tools.protoc -I engine/gateway \
         --python_out=engine/gateway \
         --grpc_python_out=engine/gateway \
@@ -22,6 +22,8 @@ import logging
 import uuid
 from typing import TYPE_CHECKING
 
+from . import tts_pb2, tts_pb2_grpc
+
 if TYPE_CHECKING:
     from ..server import TTSEngine
 
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 24000
 
 
-class TTSServicer:
+class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
     """gRPC servicer that bridges streaming requests to TTSEngine."""
 
     def __init__(self, engine: TTSEngine):
@@ -39,12 +41,14 @@ class TTSServicer:
     async def SynthesizeStream(self, request_iterator, context):
         """Handle one bidirectional stream.
 
-        Spawns two concurrent tasks:
-          1. Reader:  consumes client messages (init → text → done)
-          2. Writer:  yields audio chunks from engine to client
+        Phase 1: consume client messages, draining available audio between each.
+        Phase 2: after client stream ends (or "done" received), wait for the
+                 engine to finish producing audio before returning.
         """
         session_id = None
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        got_done = False
+        got_cancel = False
 
         try:
             async for request in request_iterator:
@@ -77,60 +81,82 @@ class TTSServicer:
                 elif msg_type == "done":
                     if session_id:
                         await self._engine.text_complete(session_id)
+                    got_done = True
 
                 elif msg_type == "cancel":
                     if session_id:
                         await self._engine.cancel(session_id)
-                        break
+                    got_cancel = True
+                    break
 
                 while not audio_queue.empty():
                     msg_type_q, payload = audio_queue.get_nowait()
                     if msg_type_q == "audio":
-                        yield self._make_audio_response(payload)
+                        yield _make_audio_response(payload)
                     elif msg_type_q == "done":
-                        yield self._make_status_response("done", "Synthesis complete")
+                        err = payload.get("error") if isinstance(payload, dict) else None
+                        if err:
+                            yield _make_status_response("error", str(err))
+                        else:
+                            yield _make_status_response("done", "Synthesis complete")
+                        return
+
+            if got_done and not got_cancel and session_id:
+                while True:
+                    try:
+                        msg_type_q, payload = await asyncio.wait_for(
+                            audio_queue.get(), timeout=300.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("gRPC session %s: audio wait timeout", session_id)
+                        break
+                    if msg_type_q == "audio":
+                        yield _make_audio_response(payload)
+                    elif msg_type_q == "done":
+                        err = payload.get("error") if isinstance(payload, dict) else None
+                        if err:
+                            yield _make_status_response("error", str(err))
+                        else:
+                            yield _make_status_response("done", "Synthesis complete")
                         return
 
         except asyncio.CancelledError:
             logger.info("gRPC stream cancelled: %s", session_id)
         except Exception as e:
             logger.error("gRPC stream error: %s: %s", session_id, e)
-            yield self._make_status_response("error", str(e))
+            yield _make_status_response("error", str(e))
         finally:
             if session_id:
                 await self._engine.cancel(session_id)
 
-        while not audio_queue.empty():
-            msg_type_q, payload = audio_queue.get_nowait()
-            if msg_type_q == "audio":
-                yield self._make_audio_response(payload)
-
-        yield self._make_status_response("done", "Stream ended")
-
-    def _make_audio_response(self, pcm_bytes: bytes):
-        """Build a SynthesizeResponse with audio data.
-
-        Returns a dict-like object; actual proto construction depends on
-        generated stubs.
-        """
-        return {
-            "audio": {
-                "pcm_data": pcm_bytes,
-                "sample_rate": SAMPLE_RATE,
-            }
-        }
-
-    def _make_status_response(self, event: str, message: str = ""):
-        return {
-            "status": {
-                "event": event,
-                "message": message,
-            }
-        }
+        yield _make_status_response("done", "Stream ended")
 
 
-async def serve(engine: TTSEngine, port: int = 50051) -> None:
-    """Start gRPC aio server. Call from within an asyncio event loop."""
+def _make_audio_response(pcm_bytes: bytes) -> tts_pb2.SynthesizeResponse:
+    return tts_pb2.SynthesizeResponse(
+        audio=tts_pb2.AudioChunk(
+            pcm_data=pcm_bytes,
+            sample_rate=SAMPLE_RATE,
+        )
+    )
+
+
+def _make_status_response(event: str, message: str = "") -> tts_pb2.SynthesizeResponse:
+    return tts_pb2.SynthesizeResponse(
+        status=tts_pb2.StatusUpdate(
+            event=event,
+            message=message,
+        )
+    )
+
+
+async def serve(engine: TTSEngine, port: int = 50051, *, stop_event: asyncio.Event) -> None:
+    """Start gRPC aio server. Call from within an asyncio event loop.
+
+    Waits on ``stop_event`` then calls ``server.stop()`` so SIGINT/SIGTERM can shut
+    down cleanly. ``wait_for_termination()`` alone does not reliably react to
+    asyncio task cancellation.
+    """
     try:
         import grpc
         from grpc import aio as grpc_aio
@@ -141,12 +167,10 @@ async def serve(engine: TTSEngine, port: int = 50051) -> None:
     server = grpc_aio.server()
 
     servicer = TTSServicer(engine)
-
-    # When proto stubs are generated, register like this:
-    # from . import tts_pb2_grpc
-    # tts_pb2_grpc.add_TTSServiceServicer_to_server(servicer, server)
+    tts_pb2_grpc.add_TTSServiceServicer_to_server(servicer, server)
 
     server.add_insecure_port(f"[::]:{port}")
     await server.start()
     logger.info("gRPC server listening on port %d", port)
-    await server.wait_for_termination()
+    await stop_event.wait()
+    await server.stop(5.0)

@@ -1,5 +1,6 @@
-"""Tests for engine.config — YAML config loading."""
+"""Tests for engine.config — YAML config loading + model manifest."""
 
+import json
 import os
 import tempfile
 
@@ -7,7 +8,9 @@ import pytest
 
 from engine.config import (
     EngineConfig,
+    ModelArchConfig,
     load_config,
+    load_model_manifest,
     _coerce_value,
     _apply_env_overrides,
     _dict_to_config,
@@ -54,7 +57,6 @@ class TestLoadConfig:
     def test_defaults(self):
         cfg = load_config()
         assert cfg.scheduler.max_batch_size == 48
-        assert cfg.model.num_layers == 28
         assert cfg.prefix_cache.enabled is True
 
     def test_yaml_file(self):
@@ -63,14 +65,18 @@ class TestLoadConfig:
         except ImportError:
             pytest.skip("PyYAML not installed")
 
-        content = "scheduler:\n  max_batch_size: 16\nmodel:\n  variant: base-0.6b\n"
+        content = "scheduler:\n  max_batch_size: 16\n"
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(content)
             f.flush()
             cfg = load_config(f.name)
         os.unlink(f.name)
         assert cfg.scheduler.max_batch_size == 16
-        assert cfg.model.variant == "base-0.6b"
+
+    def test_no_model_section(self):
+        """EngineConfig no longer has a model section."""
+        cfg = load_config()
+        assert not hasattr(cfg, "model")
 
     def test_cli_overrides(self):
         cfg = load_config(cli_overrides={"scheduler": {"max_batch_size": 8}})
@@ -81,13 +87,77 @@ class TestLoadConfig:
         assert cfg.scheduler.max_batch_size == 48
 
 
+class TestModelManifest:
+    def test_defaults(self):
+        arch = load_model_manifest("", None)
+        assert arch.num_layers == 28
+        assert arch.hidden_size == 2048
+
+    def test_from_manifest_file(self, tmp_path):
+        manifest = {
+            "schema_version": 2,
+            "variant": "custom-1.7b",
+            "architecture": {
+                "num_layers": 28,
+                "hidden_size": 2048,
+                "kv_heads": 8,
+                "head_dim": 128,
+                "codec_vocab_size": 3072,
+                "logits_topk": 50,
+            },
+        }
+        manifest_file = tmp_path / "triton_manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        arch = load_model_manifest(str(tmp_path), None)
+        assert arch.variant == "custom-1.7b"
+        assert arch.hidden_size == 2048
+        assert arch.head_dim == 128
+        assert arch.codec_vocab_size == 3072
+
+    def test_legacy_manifest_compat(self, tmp_path):
+        """v1 manifest without architecture section still works."""
+        manifest = {
+            "schema_version": 1,
+            "variant": "base-0.6b",
+            "talker": {
+                "num_layers": 28,
+                "hidden_size": 1536,
+                "num_kv_heads": 4,
+                "head_dim": 64,
+                "vocab_size": 2176,
+            },
+        }
+        manifest_file = tmp_path / "triton_manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        arch = load_model_manifest(str(tmp_path), None)
+        assert arch.variant == "base-0.6b"
+        assert arch.hidden_size == 1536
+        assert arch.head_dim == 64
+
+    def test_manifest_priority_over_defaults(self, tmp_path):
+        manifest = {
+            "variant": "test",
+            "architecture": {"hidden_size": 4096, "head_dim": 256},
+        }
+        (tmp_path / "triton_manifest.json").write_text(json.dumps(manifest))
+
+        arch = load_model_manifest(str(tmp_path), None)
+        assert arch.hidden_size == 4096
+        assert arch.head_dim == 256
+        assert arch.num_layers == 28  # still default
+
+
 class TestToModelConfig:
     def test_conversion(self):
+        arch = ModelArchConfig()
         cfg = EngineConfig()
-        mc = to_model_config(cfg)
-        assert mc.num_layers == cfg.model.num_layers
-        assert mc.kv_heads == cfg.model.kv_heads
-        assert mc.c2w_sliding_window == cfg.model.c2w_sliding_window
+        mc = to_model_config(arch, cfg)
+        assert mc.num_layers == arch.num_layers
+        assert mc.kv_heads == arch.kv_heads
+        assert mc.c2w_sliding_window == arch.c2w_sliding_window
+        assert mc.max_seq_len == cfg.scheduler.max_seq_len
 
 
 # ---------------------------------------------------------------------------
