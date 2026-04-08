@@ -20,9 +20,10 @@ In streaming mode, segments are driven as tokens arrive.
 
 from __future__ import annotations
 
+from collections import deque
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 from .driver import (
     StreamingDriver,
@@ -46,13 +47,18 @@ class SegmentAction:
     """One Driver action tagged with the segment it belongs to."""
     segment_idx: int
     action: ActionResult
+    group_idx: int = -1
+    local_idx: int = 0
+    group_final: bool = True
 
 
 @dataclass
 class PendingGroup:
     """One offline pre-split group with a resumable read cursor."""
+    group_idx: int
     tokens: List[Tuple[int, str, int]]
     cursor: int = 0
+    next_local_idx: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +106,7 @@ class Spliter:
 
         # Offline pre-split groups. Each group may still yield multiple
         # backend segments because the Driver remains the final decider.
-        self._presplit_groups: List[PendingGroup] = []
+        self._presplit_groups: Deque[PendingGroup] = deque()
         self._presplit_thresholds: Optional[SplitThresholds] = None
 
         # Streaming token buffer (streaming mode)
@@ -281,9 +287,9 @@ class Spliter:
         Remaining work is queued by group and driven as previous segments flush.
         """
         self._presplit_thresholds = self._make_thresholds()
-        self._presplit_groups = [
-            PendingGroup(seg_tokens) for seg_tokens in self.pre_split(tokens)
-        ]
+        self._presplit_groups = deque([
+            PendingGroup(i, seg_tokens) for i, seg_tokens in enumerate(self.pre_split(tokens))
+        ])
         self._text_complete = True
 
         return self._drive_presplit_batch()
@@ -292,7 +298,7 @@ class Spliter:
         """Drive as many queued offline groups as concurrency allows."""
         actions: List[SegmentAction] = []
         while self._presplit_groups and self.active_segment_count < self._max_concurrent:
-            group = self._presplit_groups.pop(0)
+            group = self._presplit_groups.popleft()
             group_actions, has_remaining = self._drive_group(group)
             actions.extend(group_actions)
             if has_remaining:
@@ -309,20 +315,27 @@ class Spliter:
         still yield multiple backend segments because the Driver keeps the
         final authority to flush inside the group.
         """
-        idx, driver = self._create_driver(self._presplit_thresholds)
+        # Recompute thresholds with the latest EMA before starting each new
+        # offline segment so long pre-split queues can benefit from ratio
+        # learning accumulated by earlier groups.
+        thresholds = self._make_thresholds()
+        self._presplit_thresholds = thresholds
+        idx, driver = self._create_driver(thresholds)
         actions: List[SegmentAction] = []
         flushed = False
+        local_idx = group.next_local_idx
+        group.next_local_idx += 1
 
         start_evt = SpliterEvent(type=ET.START)
         for r in driver.feed(start_evt):
-            actions.append(SegmentAction(idx, r))
+            actions.append(SegmentAction(idx, r, group.group_idx, local_idx, False))
 
         while group.cursor < len(group.tokens):
             token_id, text, pl = group.tokens[group.cursor]
             group.cursor += 1
             evt = self._make_event(token_id, text, pl)
             for r in driver.feed(evt):
-                actions.append(SegmentAction(idx, r))
+                actions.append(SegmentAction(idx, r, group.group_idx, local_idx, False))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(idx)
                     flushed = True
@@ -333,9 +346,13 @@ class Spliter:
         if not flushed:
             end_evt = SpliterEvent(type=ET.END)
             for r in driver.feed(end_evt):
-                actions.append(SegmentAction(idx, r))
+                actions.append(SegmentAction(idx, r, group.group_idx, local_idx, False))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(idx)
+
+        group_final = group.cursor >= len(group.tokens)
+        for sa in actions:
+            sa.group_final = group_final
 
         return actions, group.cursor < len(group.tokens)
 

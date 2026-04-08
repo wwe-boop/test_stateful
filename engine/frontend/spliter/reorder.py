@@ -1,10 +1,9 @@
 """Per-session audio chunk reorder buffer for Level 2 segment pipelining.
 
 When multiple segments of the same session decode in parallel, audio chunks
-may arrive out of segment order.  This buffer ensures chunks are emitted
-to the gRPC stream in strict segment order.
-
-Memory overhead: at most one segment's audio buffered (~600 KB typical).
+may arrive out of order. For offline pre-split mode, ordering is hierarchical:
+``group_idx`` preserves top-level text order while ``local_idx`` preserves the
+Driver-created sub-segment order inside each group.
 """
 
 from __future__ import annotations
@@ -14,60 +13,76 @@ from typing import List
 
 
 class AudioReorder:
-    """Reorder buffer that emits audio in segment order.
+    """Reorder buffer that emits audio in text order.
 
     Usage::
 
         reorder = AudioReorder()
-        out = reorder.push(1, b"seg1_chunk0")  # buffered (seg 0 not done)
-        out = reorder.push(0, b"seg0_chunk0")  # emitted (seg 0 is current)
-        out = reorder.mark_done(0)              # drains buffered seg 1
+        out = reorder.push(0, 1, b"g0s1")      # buffered
+        out = reorder.push(0, 0, b"g0s0")      # emitted
+        out = reorder.mark_done(0, 0)           # drains g0s1 if ready
     """
 
-    __slots__ = ("_next_emit", "_buffers", "_done")
+    __slots__ = ("_next_group", "_next_local", "_buffers", "_done", "_final_locals")
 
     def __init__(self) -> None:
-        self._next_emit: int = 0
-        self._buffers: dict[int, list[bytes]] = defaultdict(list)
-        self._done: set[int] = set()
+        self._next_group: int = 0
+        self._next_local: int = 0
+        self._buffers: dict[tuple[int, int], list[bytes]] = defaultdict(list)
+        self._done: set[tuple[int, int]] = set()
+        self._final_locals: dict[int, int] = {}
 
     @property
-    def next_emit_segment(self) -> int:
-        return self._next_emit
+    def next_emit_segment(self) -> tuple[int, int]:
+        return (self._next_group, self._next_local)
 
-    def push(self, segment_idx: int, audio: bytes) -> List[bytes]:
+    def push(self, group_idx: int, local_idx: int, audio: bytes) -> List[bytes]:
         """Push an audio chunk; return chunks ready for emission (in order)."""
-        self._buffers[segment_idx].append(audio)
-        if segment_idx == self._next_emit:
+        key = (group_idx, local_idx)
+        self._buffers[key].append(audio)
+        if key == (self._next_group, self._next_local):
             return self._try_drain()
         return []
 
-    def mark_done(self, segment_idx: int) -> List[bytes]:
+    def mark_done(self, group_idx: int, local_idx: int, *, group_final: bool = False) -> List[bytes]:
         """Mark a segment as fully complete; drain any contiguous completions."""
-        self._done.add(segment_idx)
+        key = (group_idx, local_idx)
+        self._done.add(key)
+        if group_final:
+            self._final_locals[group_idx] = local_idx
         return self._try_drain()
 
     def _try_drain(self) -> List[bytes]:
         out: List[bytes] = []
         while True:
-            seg = self._next_emit
-            buf = self._buffers.get(seg)
-            if buf is None:
+            key = (self._next_group, self._next_local)
+            buf = self._buffers.get(key)
+            if buf is None and key not in self._done:
                 break
-            out.extend(buf)
-            buf.clear()
-            if seg in self._done:
-                del self._buffers[seg]
-                self._done.discard(seg)
-                self._next_emit += 1
+            if buf:
+                out.extend(buf)
+                buf.clear()
+            if key in self._done:
+                if key in self._buffers:
+                    del self._buffers[key]
+                self._done.discard(key)
+                final_local = self._final_locals.get(self._next_group)
+                if final_local is not None and self._next_local >= final_local:
+                    self._final_locals.pop(self._next_group, None)
+                    self._next_group += 1
+                    self._next_local = 0
+                else:
+                    self._next_local += 1
             else:
                 break
         return out
 
     def reset(self) -> None:
-        self._next_emit = 0
+        self._next_group = 0
+        self._next_local = 0
         self._buffers.clear()
         self._done.clear()
+        self._final_locals.clear()
 
 
 __all__ = ("AudioReorder",)

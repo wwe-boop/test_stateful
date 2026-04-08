@@ -23,7 +23,7 @@ import asyncio
 import logging
 from typing import Callable, Dict, List, Optional
 
-from ..core.session import Session
+from ..core.session import Session, SegmentOrderMeta
 from ..core.types import (
     EngineRequest,
     EngineResult,
@@ -179,11 +179,7 @@ class Dispatcher:
         spliter: Spliter = session.spliter
         seg_actions = spliter.set_full_text(tokens)
         await self._dispatch_segment_actions(session, seg_actions)
-
-        await self._engine_inbox.put(EngineRequest(
-            type=RequestType.SESSION_TEXT_DONE,
-            session_id=session_id,
-        ))
+        await self._maybe_send_session_text_done(session)
 
     async def text_complete(self, session_id: str) -> None:
         """Upstream signals no more text will arrive."""
@@ -200,17 +196,42 @@ class Dispatcher:
             type=RequestType.SESSION_TEXT_DONE,
             session_id=session_id,
         ))
+        session.engine_text_done_sent = True
+
+    async def _maybe_send_session_text_done(self, session: Session) -> None:
+        """Signal session-level text completion when no more offline groups remain.
+
+        Offline ``feed_full_text()`` knows the complete text up front, but the
+        Spliter may still have future groups that have not been submitted to the
+        engine yet. Sending SESSION_TEXT_DONE too early lets the backend close
+        the session before those queued groups are started.
+        """
+        if session.engine_text_done_sent or session.spliter is None:
+            return
+        spliter: Spliter = session.spliter
+        if getattr(spliter, "_presplit_thresholds", None) is None:
+            return
+        if getattr(spliter, "_presplit_groups", None):
+            return
+        await self._engine_inbox.put(EngineRequest(
+            type=RequestType.SESSION_TEXT_DONE,
+            session_id=session.session_id,
+        ))
+        session.engine_text_done_sent = True
 
     # ------------------------------------------------------------------
     # Translate SegmentActions → EngineRequests
     # ------------------------------------------------------------------
 
     def _segment_priority(
-        self, session: Session, segment_idx: int,
+        self, session: Session, sa: SegmentAction,
     ) -> RequestPriority:
         """Determine priority for a segment's requests."""
+        segment_idx = sa.segment_idx
         if segment_idx == 0 and session.segments_submitted == 0:
             return RequestPriority.FIRST_SEGMENT
+        if sa.local_idx > 0:
+            return RequestPriority.CONTINUATION
         if segment_idx > 0 and (segment_idx - 1) in (
                 session.spliter._flushing if session.spliter else set()):
             return RequestPriority.CONTINUATION
@@ -223,10 +244,16 @@ class Dispatcher:
         for sa in actions:
             seg_idx = sa.segment_idx
             action = sa.action
-            priority = self._segment_priority(session, seg_idx)
+            priority = self._segment_priority(session, sa)
+            order_meta = SegmentOrderMeta(
+                group_idx=sa.group_idx if sa.group_idx >= 0 else seg_idx,
+                local_idx=sa.local_idx if sa.group_idx >= 0 else 0,
+                group_final=sa.group_final if sa.group_idx >= 0 else True,
+            )
 
             if action.type == ActionType.PREFILL:
                 session.segments_submitted += 1
+                session.segment_order[seg_idx] = order_meta
                 await self._engine_inbox.put(EngineRequest(
                     type=RequestType.START_SEGMENT,
                     session_id=session.session_id,
@@ -274,7 +301,11 @@ class Dispatcher:
                     session.total_audio_bytes += len(audio)
 
                     reorder: AudioReorder = session.reorder
-                    ready = reorder.push(result.segment_idx, audio)
+                    meta = session.segment_order.get(
+                        result.segment_idx,
+                        SegmentOrderMeta(result.segment_idx, 0, True),
+                    )
+                    ready = reorder.push(meta.group_idx, meta.local_idx, audio)
                     if ready and on_audio:
                         for chunk in ready:
                             await on_audio(session.session_id, chunk)
@@ -284,7 +315,13 @@ class Dispatcher:
                     session.segments_done += 1
 
                     reorder: AudioReorder = session.reorder
-                    ready = reorder.mark_done(seg_idx)
+                    meta = session.segment_order.pop(
+                        seg_idx,
+                        SegmentOrderMeta(seg_idx, 0, True),
+                    )
+                    ready = reorder.mark_done(
+                        meta.group_idx, meta.local_idx, group_final=meta.group_final,
+                    )
                     if ready and on_audio:
                         for chunk in ready:
                             await on_audio(session.session_id, chunk)
@@ -302,6 +339,7 @@ class Dispatcher:
                     new_actions = spliter.on_segment_done(seg_idx)
                     if new_actions:
                         await self._dispatch_segment_actions(session, new_actions)
+                    await self._maybe_send_session_text_done(session)
 
                 elif result.type == ResultType.RATIO_UPDATE:
                     if session.spliter and result.ema_ratio > 0:

@@ -208,6 +208,48 @@ talker ~1.7B 模型，单 GPU（24GB+）开 2-4 实例可行，是性价比最�
 4. **优先级调度** — prefill 优先级 `FIRST_SEGMENT > CONTINUATION
    > PREFETCHED`；decode batch 可按首包紧迫性排序
 
+### 长文本 Offline 预切分语义
+
+离线场景下，`Spliter` 中的 `presplit` 与 `driver` 不是同一层概念：
+
+- **presplit = 分组（group）**：利用全文视野把长文本切成多个较自然、长度接近的组，
+  目标是提高离线合成时的并行度，并尽量降低单组触碰 `max_seq_len` 的风险
+- **driver = 组内分句（segment）**：每个 group 内仍由 driver 按 L1/L2/L3/d
+  阈值和后端状态协同决定真正的 flush 时机，driver 是最终裁决者
+- **backend segment**：真正提交到 engine 的执行单元；一个 group 可以产出多个
+  backend segment
+
+因此，offline 路径的真实层次是：
+
+`全文 -> presplit groups -> driver flush -> backend segments`
+
+而不是“presplit 直接决定最终 segment 边界”。
+
+### 超长 presplit 队列的执行模型
+
+当长文本被 `presplit` 切成远多于 `max_batch_size` 的 group 时，系统仍可正常执行，
+因为 frontend 与 backend 都做了分层限流：
+
+- **frontend 限流**：offline group 不会一次性全部提交，只会启动到
+  `max_concurrent_segments` 为止；其余 group 留在队列中等待前面的 segment 完成
+- **backend 限流**：每个 decode iteration 只会从活跃 segment 中选择最多
+  `max_batch_size` 个进入本轮 batch
+- **顺序保证**：音频下发顺序按 `group_idx + local_idx` 进行层级重排，避免
+  “前面 group 的后续句子被后面 group 抢先播放”
+
+这意味着“presplit 很长”带来的主要问题是**排队和尾延迟**，而不是 correctness
+失效或 engine 被一次性灌爆。
+
+### EMA 与 Offline 长文本
+
+对于超长 offline 请求，未来 group 不能一直复用最初的切分阈值。随着前面 segment
+完成，audio/text ratio 的 EMA 会持续更新，因此：
+
+- active driver 的阈值会随 EMA 刷新
+- 新启动的 offline group 也必须基于**最新 EMA**重新计算阈值
+
+否则，后半段文本会长期使用过时阈值，导致分组/分句策略逐渐偏离真实 decode 行为。
+
 ### 何时引入 Triton 壳
 
 当遇到以下场景时考虑：

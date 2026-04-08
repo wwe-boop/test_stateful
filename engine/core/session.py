@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class SegmentOrderMeta:
+    group_idx: int
+    local_idx: int
+    group_final: bool = True
+
+
+@dataclass
 class Session:
     session_id: str
     speaker_key: Optional[str] = None
@@ -48,6 +55,8 @@ class Session:
     # Segment tracking
     segments_submitted: int = 0
     segments_done: int = 0
+    segment_order: dict[int, SegmentOrderMeta] = field(default_factory=dict)
+    engine_text_done_sent: bool = False
 
     # Metrics
     total_steps: int = 0
