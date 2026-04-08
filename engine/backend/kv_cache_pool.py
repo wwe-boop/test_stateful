@@ -102,6 +102,10 @@ class SlotKVState:
     # Appended text token IDs for streaming APPEND_TEXT
     token_queue: list = field(default_factory=list)
 
+    # Pad phase tracking (aligned with old engine's Phase B controls)
+    pad_start_frame: int = -1
+    pad_consecutive_silence: int = 0
+
     # Activity tracking for eviction
     last_active_time: float = field(default_factory=time.monotonic)
 

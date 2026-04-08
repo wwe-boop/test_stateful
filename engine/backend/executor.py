@@ -328,6 +328,8 @@ class Executor:
         max_batch_size: int = 48,
         max_seq_len: int = 512,
         model_config: Optional[ModelConfig] = None,
+        temperature: float = 0.9,
+        repetition_penalty: float = 1.05,
     ):
         self._engine_dir = Path(engine_dir) if engine_dir else None
         self._weights_dir = Path(weights_dir) if weights_dir else None
@@ -335,6 +337,8 @@ class Executor:
         self._max_batch = max_batch_size
         self._max_seq_len = max_seq_len
         self._config = model_config or ModelConfig()
+        self._temperature = temperature
+        self._repetition_penalty = repetition_penalty
 
         self._compute_stream = torch.cuda.Stream(device=self._device)
         self._prefill_stream = torch.cuda.Stream(device=self._device)
@@ -721,8 +725,14 @@ class Executor:
         gumbel = torch.rand(batch, cfg.logits_topk,
                             device=self._device, dtype=torch.float32)
         gumbel = -(-gumbel.clamp(min=1e-8).log()).clamp(min=1e-8).log()
-        temperature = torch.ones(batch, 1, device=self._device, dtype=torch.float32)
-        penalty = torch.ones(batch, 1, device=self._device, dtype=torch.float32)
+        temperature = torch.full(
+            (batch, 1), self._temperature,
+            device=self._device, dtype=torch.float32,
+        )
+        penalty = torch.full(
+            (batch, 1), self._repetition_penalty,
+            device=self._device, dtype=torch.float32,
+        )
 
         d: Dict[str, torch.Tensor] = {
             "input_embeds": input_embeds.contiguous(),

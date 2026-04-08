@@ -108,9 +108,15 @@ class TTSEngine:
             prefill_len=sc.prefill_len,
             ema_ratio=sc.ema_ratio_initial,
             max_concurrent_segments=sc.max_concurrent_segments,
+            ema_alpha=sc.ema_alpha,
+            ema_overflow_alpha=sc.ema_overflow_alpha,
+            ema_min_ratio=sc.ema_min_ratio,
+            ema_max_ratio=sc.ema_max_ratio,
+            safety_margin=sc.safety_margin,
         )
 
         model_config = to_model_config(self._model_arch, self._cfg)
+        sampling = self._cfg.sampling
         self._executor = Executor(
             engine_dir=self._engine_dir,
             weights_dir=self._weights_dir,
@@ -118,6 +124,8 @@ class TTSEngine:
             max_batch_size=self._max_batch,
             max_seq_len=self._max_seq_len,
             model_config=model_config,
+            temperature=sampling.temperature,
+            repetition_penalty=sampling.repetition_penalty,
         )
         self._executor.load()
 
@@ -154,6 +162,7 @@ class TTSEngine:
             max_idle_sec=sched.max_idle_sec,
             max_queue_size=sched.max_queue_size,
             session_timeout_sec=sched.session_timeout_sec,
+            min_pad_steps=sched.min_pad_steps,
         )
         self._engine_loop.start()
 
@@ -209,6 +218,10 @@ class TTSEngine:
 
     async def feed_text(self, session_id: str, text: str) -> None:
         await self._dispatcher.feed_text(session_id, text)
+
+    async def feed_full_text(self, session_id: str, text: str) -> None:
+        """Offline mode: set complete text, pre-split, drive all segments."""
+        await self._dispatcher.feed_full_text(session_id, text)
 
     async def text_complete(self, session_id: str) -> None:
         await self._dispatcher.text_complete(session_id)

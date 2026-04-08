@@ -96,6 +96,8 @@ class SchedulerConfig:
     max_queue_size: int = 256
     # Session timeout
     session_timeout_sec: float = 300.0
+    # Pad phase: minimum pad steps before silence detection activates
+    min_pad_steps: int = 4
 
 
 @dataclass
@@ -112,14 +114,17 @@ class SpliterConfig:
     ema_ratio_initial: float = 5.5
     ema_alpha: float = 0.1
     ema_overflow_alpha: float = 0.5
+    ema_min_ratio: float = 2.0
+    ema_max_ratio: float = 10.0
     max_concurrent_segments: int = 2
     prefill_len: int = 12
+    safety_margin: int = 8
 
 
 @dataclass
 class SamplingConfig:
     """Decode sampling parameters (defaults, overridable per-request)."""
-    temperature: float = 1.0
+    temperature: float = 0.9
     repetition_penalty: float = 1.05
     top_k: int = 50
 

@@ -37,7 +37,7 @@ class ActionResult:
 @dataclass
 class SplitThresholds:
     """Three-tier punctuation thresholds + forced cut."""
-    a: int   # L1 only  (。！？) — currently unused, L1 always splits
+    a: int   # L1 only  (。！？)
     b: int   # L1 + L2  (，；：)
     c: int   # L1+L2+L3 (\n——)
     d: int   # forced cut (= max_tokens)
@@ -87,7 +87,7 @@ The Driver uses 4 thresholds (a < b < c < d) computed from remaining
 KV budget and the EMA audio:text ratio.
 
 TEXT_INPUTING transitions on punctuation:
-  - punct_level == 1 (L1: 。！？)                   → always split
+  - token_count >= a  AND  punct_level == 1 (L1)  → split
   - token_count >= b  AND  punct_level <= 2 (L2)  → split
   - token_count >= c  AND  punct_level <= 3 (L3)  → split
   - token_count >= d  (any token)                  → forced split
@@ -152,7 +152,7 @@ class StreamingDriver:
     def _meets_split_threshold(self, e: SpliterEvent) -> bool:
         tc = self._token_count
         pl = e.punct_level
-        if pl == 1:
+        if pl == 1 and tc >= self.thresholds.a:
             return True
         if pl == 2 and tc >= self.thresholds.b:
             return True

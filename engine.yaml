@@ -51,6 +51,6 @@ spliter:
   prefill_len: 12
 
 sampling:
-  temperature: 1.0
+  temperature: 0.9
   repetition_penalty: 1.05
   top_k: 50

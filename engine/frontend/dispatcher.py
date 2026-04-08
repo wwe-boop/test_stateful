@@ -53,6 +53,11 @@ class Dispatcher:
         prefill_len: int = 12,
         ema_ratio: float = 5.0,
         max_concurrent_segments: int = 2,
+        ema_alpha: float = 0.1,
+        ema_overflow_alpha: float = 0.5,
+        ema_min_ratio: float = 2.0,
+        ema_max_ratio: float = 10.0,
+        safety_margin: int = 8,
     ):
         self._engine_inbox = engine_inbox
         self._tokenizer = tokenizer
@@ -61,6 +66,11 @@ class Dispatcher:
         self._prefill_len = prefill_len
         self._ema_ratio = ema_ratio
         self._max_concurrent = max_concurrent_segments
+        self._ema_alpha = ema_alpha
+        self._ema_overflow_alpha = ema_overflow_alpha
+        self._ema_min_ratio = ema_min_ratio
+        self._ema_max_ratio = ema_max_ratio
+        self._safety_margin = safety_margin
 
         self._sessions: Dict[str, Session] = {}
         self._consumer_tasks: Dict[str, asyncio.Task] = {}
@@ -102,6 +112,11 @@ class Dispatcher:
             prefill_len=self._prefill_len,
             ema_ratio=self._ema_ratio,
             max_concurrent=self._max_concurrent,
+            ema_alpha=self._ema_alpha,
+            ema_overflow_alpha=self._ema_overflow_alpha,
+            ema_min_ratio=self._ema_min_ratio,
+            ema_max_ratio=self._ema_max_ratio,
+            safety_margin=self._safety_margin,
         )
         session.reorder = AudioReorder()
         self._sessions[session_id] = session

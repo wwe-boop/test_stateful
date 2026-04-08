@@ -41,14 +41,21 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
     async def SynthesizeStream(self, request_iterator, context):
         """Handle one bidirectional stream.
 
-        Phase 1: consume client messages, draining available audio between each.
-        Phase 2: after client stream ends (or "done" received), wait for the
-                 engine to finish producing audio before returning.
+        Text buffering strategy:
+        - Text chunks are accumulated in a buffer
+        - When ``done`` arrives, if no text has been streamed yet (all text
+          arrived before ``done``), we use ``feed_full_text`` for optimal
+          offline pre-splitting.  Otherwise we finalize streaming with
+          ``text_complete``.
+        - When audio is produced before ``done``, we flush buffered text
+          via ``feed_text`` and switch to streaming mode.
         """
         session_id = None
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
         got_done = False
         got_cancel = False
+        text_buffer: list[str] = []
+        text_flushed = False
 
         try:
             async for request in request_iterator:
@@ -76,11 +83,22 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
 
                 elif msg_type == "text":
                     if session_id:
-                        await self._engine.feed_text(session_id, request.text.text)
+                        if text_flushed:
+                            await self._engine.feed_text(session_id, request.text.text)
+                        else:
+                            text_buffer.append(request.text.text)
 
                 elif msg_type == "done":
                     if session_id:
-                        await self._engine.text_complete(session_id)
+                        if not text_flushed and text_buffer:
+                            full_text = "".join(text_buffer)
+                            text_buffer.clear()
+                            text_flushed = True
+                            await self._engine.feed_full_text(session_id, full_text)
+                            logger.info("gRPC oneshot: %s (%d chars via feed_full_text)",
+                                        session_id, len(full_text))
+                        else:
+                            await self._engine.text_complete(session_id)
                     got_done = True
 
                 elif msg_type == "cancel":
@@ -89,9 +107,16 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
                     got_cancel = True
                     break
 
+                # Drain available audio; if audio arrives while text is
+                # still buffered, flush the buffer into streaming mode.
                 while not audio_queue.empty():
                     msg_type_q, payload = audio_queue.get_nowait()
                     if msg_type_q == "audio":
+                        if not text_flushed and text_buffer and session_id:
+                            for chunk in text_buffer:
+                                await self._engine.feed_text(session_id, chunk)
+                            text_buffer.clear()
+                            text_flushed = True
                         yield _make_audio_response(payload)
                     elif msg_type_q == "done":
                         err = payload.get("error") if isinstance(payload, dict) else None

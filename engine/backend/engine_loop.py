@@ -65,6 +65,7 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from ..core.mlfq import MLFQConfig, MLFQMeta, MLFQScheduler
@@ -173,6 +174,7 @@ class EngineLoop:
         max_idle_sec: float = 10.0,
         max_queue_size: int = 256,
         session_timeout_sec: float = 300.0,
+        min_pad_steps: int = 4,
     ):
         self._inbox = engine_inbox
         self._async_loop = async_loop
@@ -182,6 +184,7 @@ class EngineLoop:
         self._max_idle_sec = max_idle_sec
         self._max_queue_size = max_queue_size
         self._session_timeout_sec = session_timeout_sec
+        self._min_pad_steps = min_pad_steps
 
         self._groups: Dict[str, EngineSessionGroup] = {}
         self._seg_by_slot: Dict[int, EngineSegment] = {}
@@ -654,9 +657,9 @@ class EngineLoop:
                 candidates.append(seg)
 
         for group, seg in evict_pairs:
-            logger.warning("Segment hit max_seq_len (%d): %s seg=%d, forcing EOS",
+            logger.warning("Segment hit max_seq_len (%d): %s seg=%d, forcing EOS (overflow)",
                            max_seq, seg.session_id, seg.segment_idx)
-            self._handle_segment_eos(group, seg)
+            self._handle_segment_eos(group, seg, overflow=True)
 
         if not candidates:
             return []
@@ -787,20 +790,59 @@ class EngineLoop:
             slot.touch()
             self._mlfq.on_step_done(seg.mlfq_meta)
 
+            # --- Determine text_add and track pad phase ---
+            in_pad = False
             if output.codec_sum is not None:
                 if slot.trailing and slot.text_idx < len(slot.trailing):
                     text_add = slot.trailing[slot.text_idx].to(output.codec_sum.dtype)
                     slot.text_idx += 1
+                    slot.pad_start_frame = -1
+                    slot.pad_consecutive_silence = 0
                 else:
                     text_add = self._tts_pad_embed.to(output.codec_sum.dtype)
+                    in_pad = True
+                    if slot.pad_start_frame < 0:
+                        slot.pad_start_frame = slot.frame_idx
                 slot.next_embed = (output.codec_sum[i:i+1] + text_add).to(torch.float32)
             else:
                 slot.next_embed = None
+
+            # --- Pad phase controls ---
+            # Only two safeguards:
+            #   1) Dynamic silence abort — stricter as KV budget shrinks
+            #   2) KV overflow (past_len >= max_seq_len) — handled by
+            #      _get_active_slots_mlfq before the next decode step
+            pad_steps = (slot.frame_idx - slot.pad_start_frame) if in_pad and slot.pad_start_frame >= 0 else 0
 
             if output.eos_flags[i]:
                 self._handle_segment_eos(group, seg)
             else:
                 audio = output.audio_chunks[i]
+
+                if in_pad:
+                    if audio is not None and len(audio) > 0:
+                        audio_np = np.frombuffer(audio, dtype=np.float32)
+                        if audio_np.size > 0 and np.max(np.abs(audio_np)) < 1e-4:
+                            slot.pad_consecutive_silence += 1
+                        else:
+                            slot.pad_consecutive_silence = 0
+
+                    if pad_steps >= self._min_pad_steps:
+                        kv_pool = self._executor.kv_pool
+                        max_seq = kv_pool.max_seq_len if kv_pool else 512
+                        remaining_kv = max(0, max_seq - slot.past_len)
+                        silence_limit = self._dynamic_silence_limit(remaining_kv)
+                        if slot.pad_consecutive_silence > silence_limit:
+                            logger.info(
+                                "Silence abort: %s seg=%d silence=%d limit=%d "
+                                "pad=%d remaining_kv=%d",
+                                seg.session_id, seg.segment_idx,
+                                slot.pad_consecutive_silence,
+                                silence_limit, pad_steps, remaining_kv,
+                            )
+                            self._handle_segment_eos(group, seg)
+                            continue
+
                 if audio is not None and len(audio) > 0:
                     self._send_result(group, EngineResult(
                         type=ResultType.AUDIO_CHUNK,
@@ -809,8 +851,25 @@ class EngineLoop:
                         audio_bytes=audio,
                     ))
 
+    @staticmethod
+    def _dynamic_silence_limit(remaining_kv: int) -> int:
+        """Silence frame threshold — stricter as KV budget shrinks.
+
+        Mirrors old engine DecodeSessionFSM.dynamic_silence_limit:
+        more patience early (remaining > 100 → 12 frames), increasingly
+        aggressive as the slot approaches max_seq_len (≤ 20 → 1 frame).
+        """
+        if remaining_kv > 100:
+            return 12
+        if remaining_kv > 50:
+            return 6
+        if remaining_kv > 20:
+            return 3
+        return 1
+
     def _handle_segment_eos(
         self, group: EngineSessionGroup, seg: EngineSegment,
+        *, overflow: bool = False,
     ) -> None:
         """Handle EOS for one segment."""
         self._total_eos += 1
@@ -821,6 +880,7 @@ class EngineLoop:
             "audio_steps": audio_steps,
             "text_tokens": seg.text_tokens_consumed,
             "segment_idx": seg.segment_idx,
+            "overflow": overflow,
         }
 
         seg.state = "done"
@@ -836,9 +896,9 @@ class EngineLoop:
             segment_idx=seg.segment_idx,
             metrics=metrics,
         ))
-        logger.info("Segment EOS: %s seg=%d audio_steps=%d text_tokens=%d",
+        logger.info("Segment EOS: %s seg=%d audio_steps=%d text_tokens=%d overflow=%s",
                     seg.session_id, seg.segment_idx,
-                    audio_steps, seg.text_tokens_consumed)
+                    audio_steps, seg.text_tokens_consumed, overflow)
 
         self._check_session_done(group)
 

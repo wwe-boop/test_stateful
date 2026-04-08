@@ -1,8 +1,8 @@
 """Text segmentation orchestrator for Qwen3-TTS streaming/offline synthesis.
 
 Responsibilities:
-  1. Offline pre-split: find globally optimal L1 punctuation boundaries
-     within KV budget so each segment exactly triggers one Driver split.
+  1. Offline pre-split: split at L1 punctuation (。！？) for optimal
+     prosody; forced-cut fallback uses L1 > L2 > L3 priority.
   2. Text buffering: accumulate upstream text chunks, smooth input rate.
   3. Drive Driver: tokenize buffered text, classify punct level, feed
      events to per-segment StreamingDrivers, collect actions.
@@ -48,6 +48,13 @@ class SegmentAction:
     action: ActionResult
 
 
+@dataclass
+class PendingGroup:
+    """One offline pre-split group with a resumable read cursor."""
+    tokens: List[Tuple[int, str, int]]
+    cursor: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Spliter
 # ---------------------------------------------------------------------------
@@ -76,16 +83,25 @@ class Spliter:
         ema_ratio: float = 5.0,
         safety_margin: int = 8,
         max_concurrent: int = 2,
+        ema_alpha: float = 0.1,
+        ema_overflow_alpha: float = 0.5,
+        ema_min_ratio: float = 2.0,
+        ema_max_ratio: float = 10.0,
     ) -> None:
         self._engine_max = engine_max_decode_len
         self._prefill_len = prefill_len
         self._ema_ratio = ema_ratio
         self._safety_margin = safety_margin
         self._max_concurrent = max_concurrent
+        self._ema_alpha = ema_alpha
+        self._ema_overflow_alpha = ema_overflow_alpha
+        self._ema_min_ratio = ema_min_ratio
+        self._ema_max_ratio = ema_max_ratio
 
-        # Pre-split token sequences (offline mode)
-        self._presplit_segments: List[List[Tuple[int, str, int]]] = []
-        self._presplit_cursor: int = 0
+        # Offline pre-split groups. Each group may still yield multiple
+        # backend segments because the Driver remains the final decider.
+        self._presplit_groups: List[PendingGroup] = []
+        self._presplit_thresholds: Optional[SplitThresholds] = None
 
         # Streaming token buffer (streaming mode)
         self._token_buffer: List[Tuple[int, str, int]] = []
@@ -115,7 +131,7 @@ class Spliter:
 
     @property
     def active_segment_count(self) -> int:
-        return len(self._drivers) - len(self._done)
+        return len(self._drivers)
 
     # ------------------------------------------------------------------
     # Threshold helpers
@@ -127,10 +143,12 @@ class Spliter:
             remaining_kv, self._ema_ratio, self._safety_margin,
         )
 
-    def _create_driver(self) -> Tuple[int, StreamingDriver]:
+    def _create_driver(
+        self, thresholds: Optional[SplitThresholds] = None,
+    ) -> Tuple[int, StreamingDriver]:
         idx = self._next_segment_idx
         self._next_segment_idx += 1
-        driver = StreamingDriver(self._make_thresholds())
+        driver = StreamingDriver(thresholds or self._make_thresholds())
         self._drivers[idx] = driver
         return idx, driver
 
@@ -181,20 +199,18 @@ class Spliter:
     def pre_split(
         self, tokens: List[Tuple[int, str]],
     ) -> List[List[Tuple[int, str, int]]]:
-        """Split a fully-known token sequence at globally optimal L1 boundaries.
+        """Split a fully-known token sequence at L1 punctuation boundaries.
 
         Returns list of segments, each segment is [(token_id, text, punct_level), ...].
 
-        Algorithm:
-          1. Greedy scan; L1 punct (。！？) always triggers a split.
-          2. If threshold_d is reached without a qualifying L1 split, look back
-             for the LAST L1 punct in the current segment and split there.
-             This maximises natural sentence boundaries.
-          3. If no L1 punct at all, force-cut at threshold_d.
+        Unlike the streaming Driver (which uses L1/L2/L3 thresholds because it
+        lacks global visibility), offline pre-split only cuts at L1 (。！？)
+        for optimal prosody and fewer segments.
 
-        L1 always splits to ensure each sub-sentence is fully available
-        before prefill, avoiding pad_embed interruptions that degrade
-        audio quality.
+        Algorithm:
+          1. Greedy scan; split at L1 punctuation when token_count >= a.
+          2. If threshold_d is reached without an L1 split, look back for
+             the best boundary: L1 > L2 > L3 > forced cut.
         """
         if not tokens:
             return []
@@ -202,7 +218,24 @@ class Spliter:
         th = self._make_thresholds()
         segments: List[List[Tuple[int, str, int]]] = []
         current: List[Tuple[int, str, int]] = []
-        last_l1_in_current: int = -1  # 0-indexed position of last L1
+        last_l1: int = -1
+        last_l2: int = -1
+        last_l3: int = -1
+
+        def _flush_at(pos: int) -> None:
+            nonlocal current, last_l1, last_l2, last_l3
+            split_at = pos + 1
+            segments.append(current[:split_at])
+            remaining = current[split_at:]
+            current = remaining
+            last_l1 = last_l2 = last_l3 = -1
+            for j, (_, _, p) in enumerate(current):
+                if p == 1:
+                    last_l1 = j
+                elif p == 2:
+                    last_l2 = j
+                elif p == 3:
+                    last_l3 = j
 
         for token_id, text in tokens:
             pl = self.classify_punct_level(text)
@@ -210,26 +243,25 @@ class Spliter:
             n = len(current)
 
             if pl == 1:
-                last_l1_in_current = n - 1
+                last_l1 = n - 1
+            elif pl == 2:
+                last_l2 = n - 1
+            elif pl == 3:
+                last_l3 = n - 1
 
-            if pl == 1:
-                segments.append(current)
-                current = []
-                last_l1_in_current = -1
+            if pl == 1 and n >= th.a:
+                _flush_at(n - 1)
             elif n >= th.d:
-                if last_l1_in_current >= 0:
-                    split_at = last_l1_in_current + 1
-                    segments.append(current[:split_at])
-                    remaining = current[split_at:]
-                    current = remaining
-                    last_l1_in_current = -1
-                    for j, (_, _, p) in enumerate(current):
-                        if p == 1:
-                            last_l1_in_current = j
+                if last_l1 >= 0:
+                    _flush_at(last_l1)
+                elif last_l2 >= 0:
+                    _flush_at(last_l2)
+                elif last_l3 >= 0:
+                    _flush_at(last_l3)
                 else:
                     segments.append(current)
                     current = []
-                    last_l1_in_current = -1
+                    last_l1 = last_l2 = last_l3 = -1
 
         if current:
             segments.append(current)
@@ -246,62 +278,66 @@ class Spliter:
         """Offline mode: set complete token sequence, pre-split, drive all.
 
         Returns SegmentActions for up to max_concurrent segments.
-        Remaining segments are queued and driven as previous ones flush.
+        Remaining work is queued by group and driven as previous segments flush.
         """
-        self._presplit_segments = self.pre_split(tokens)
-        self._presplit_cursor = 0
+        self._presplit_thresholds = self._make_thresholds()
+        self._presplit_groups = [
+            PendingGroup(seg_tokens) for seg_tokens in self.pre_split(tokens)
+        ]
         self._text_complete = True
 
         return self._drive_presplit_batch()
 
     def _drive_presplit_batch(self) -> List[SegmentAction]:
-        """Drive as many queued pre-split segments as concurrency allows."""
+        """Drive as many queued offline groups as concurrency allows."""
         actions: List[SegmentAction] = []
-        while (self._presplit_cursor < len(self._presplit_segments)
-               and self.active_segment_count < self._max_concurrent):
-            seg_tokens = self._presplit_segments[self._presplit_cursor]
-            self._presplit_cursor += 1
-            actions.extend(self._drive_segment(seg_tokens, is_final=False))
-        # Mark the last driven segment as final if all segments are consumed
-        if (self._presplit_cursor >= len(self._presplit_segments)
-                and self._text_complete and actions):
-            last_idx = actions[-1].segment_idx
-            driver = self._drivers.get(last_idx)
-            # The Driver's is_final is set via END event in _drive_segment
+        while self._presplit_groups and self.active_segment_count < self._max_concurrent:
+            group = self._presplit_groups.pop(0)
+            group_actions, has_remaining = self._drive_group(group)
+            actions.extend(group_actions)
+            if has_remaining:
+                self._presplit_groups.append(group)
         return actions
 
-    def _drive_segment(
+    def _drive_group(
         self,
-        tokens: List[Tuple[int, str, int]],
-        *,
-        is_final: bool = False,
-    ) -> List[SegmentAction]:
-        """Create a Driver for one segment and feed all its tokens."""
-        idx, driver = self._create_driver()
+        group: PendingGroup,
+    ) -> tuple[List[SegmentAction], bool]:
+        """Drive one offline group until it flushes or runs out of tokens.
+
+        Returns ``(actions, has_remaining_tokens)``. A pre-split group may
+        still yield multiple backend segments because the Driver keeps the
+        final authority to flush inside the group.
+        """
+        idx, driver = self._create_driver(self._presplit_thresholds)
         actions: List[SegmentAction] = []
+        flushed = False
 
         start_evt = SpliterEvent(type=ET.START)
         for r in driver.feed(start_evt):
             actions.append(SegmentAction(idx, r))
 
-        for token_id, text, pl in tokens:
+        while group.cursor < len(group.tokens):
+            token_id, text, pl = group.tokens[group.cursor]
+            group.cursor += 1
             evt = self._make_event(token_id, text, pl)
             for r in driver.feed(evt):
                 actions.append(SegmentAction(idx, r))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(idx)
+                    flushed = True
+                    break
+            if flushed:
+                break
 
-        # Determine if this is the final segment
-        is_last = is_final or (
-            self._text_complete
-            and self._presplit_cursor >= len(self._presplit_segments)
-        )
+        if not flushed:
+            end_evt = SpliterEvent(type=ET.END)
+            for r in driver.feed(end_evt):
+                actions.append(SegmentAction(idx, r))
+                if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
+                    self._flushing.add(idx)
 
-        end_evt = SpliterEvent(type=ET.END)
-        for r in driver.feed(end_evt):
-            actions.append(SegmentAction(idx, r))
-
-        return actions
+        return actions, group.cursor < len(group.tokens)
 
     # ------------------------------------------------------------------
     # Public API: streaming
@@ -379,15 +415,14 @@ class Spliter:
 
         # Drain any buffered tokens into the new driver
         remaining: List[Tuple[int, str, int]] = []
-        for token_id, text, pl in self._token_buffer:
+        for i, (token_id, text, pl) in enumerate(self._token_buffer):
             evt = self._make_event(token_id, text, pl)
             results = driver.feed(evt)
             for r in results:
                 actions.append(SegmentAction(idx, r))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(idx)
-                    remaining = self._token_buffer[
-                        self._token_buffer.index((token_id, text, pl)) + 1:]
+                    remaining = self._token_buffer[i + 1:]
                     break
             else:
                 continue
@@ -415,7 +450,7 @@ class Spliter:
         self._flushing.discard(segment_idx)
         self._drivers.pop(segment_idx, None)
 
-        if self._presplit_segments:
+        if self._presplit_thresholds is not None:
             return self._drive_presplit_batch()
 
         if self._token_buffer or self._text_complete:
@@ -426,25 +461,67 @@ class Spliter:
         self, actual_audio_steps: int, actual_text_tokens: int,
         *, overflow: bool = False,
     ) -> None:
-        """Update EMA audio:text ratio from engine feedback."""
+        """Update EMA audio:text ratio from engine feedback.
+
+        After EMA update, refreshes thresholds for all active (non-flushing)
+        drivers so subsequent token classification uses the latest ratio.
+
+        Parameters
+        ----------
+        overflow : bool
+            When True, uses ``ema_overflow_alpha`` (default 0.5) for faster
+            convergence after a KV cache overflow event.
+        """
         if actual_text_tokens <= 0:
             return
-        actual = actual_audio_steps / actual_text_tokens
+        observed = actual_audio_steps / actual_text_tokens
+        old_ratio = self._ema_ratio
         if overflow:
-            self._ema_ratio = actual
-            logger.warning("EMA ratio overflow reset: %.2f", self._ema_ratio)
+            alpha = self._ema_overflow_alpha
+            self._ema_ratio = (1.0 - alpha) * self._ema_ratio + alpha * observed
+            self._ema_ratio = max(self._ema_min_ratio, min(self._ema_max_ratio, self._ema_ratio))
+            logger.warning(
+                "EMA overflow update: observed=%.3f ema=%.3f→%.3f (steps=%d tokens=%d)",
+                observed, old_ratio, self._ema_ratio, actual_audio_steps, actual_text_tokens,
+            )
         else:
-            alpha = 0.3
-            self._ema_ratio = alpha * actual + (1 - alpha) * self._ema_ratio
-            logger.debug("EMA ratio updated: %.2f", self._ema_ratio)
+            alpha = self._ema_alpha
+            self._ema_ratio = (1.0 - alpha) * self._ema_ratio + alpha * observed
+            self._ema_ratio = max(self._ema_min_ratio, min(self._ema_max_ratio, self._ema_ratio))
+            logger.debug(
+                "EMA update: observed=%.3f ema=%.3f→%.3f (steps=%d tokens=%d)",
+                observed, old_ratio, self._ema_ratio, actual_audio_steps, actual_text_tokens,
+            )
+
+        if abs(self._ema_ratio - old_ratio) > 0.01:
+            self._refresh_active_thresholds()
+
+    def _refresh_active_thresholds(self) -> None:
+        """Recompute thresholds for all non-flushing active drivers.
+
+        Called after EMA ratio changes so that drivers currently
+        accumulating tokens use up-to-date split thresholds.
+        """
+        new_th = self._make_thresholds()
+        refreshed = 0
+        for idx, driver in self._drivers.items():
+            if idx in self._flushing:
+                continue
+            driver.thresholds = new_th
+            refreshed += 1
+        if refreshed:
+            logger.debug(
+                "Refreshed thresholds for %d active driver(s): a=%d b=%d c=%d d=%d",
+                refreshed, new_th.a, new_th.b, new_th.c, new_th.d,
+            )
 
     # ------------------------------------------------------------------
     # Full reset
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        self._presplit_segments.clear()
-        self._presplit_cursor = 0
+        self._presplit_groups.clear()
+        self._presplit_thresholds = None
         self._token_buffer.clear()
         self._text_complete = False
         self._drivers.clear()
