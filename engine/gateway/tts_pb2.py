@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\ttts.proto\x12\x03tts\"\xa9\x01\n\x11SynthesizeRequest\x12 \n\x04init\x18\x01 \x01(\x0b\x32\x10.tts.InitRequestH\x00\x12\x1e\n\x04text\x18\x02 \x01(\x0b\x32\x0e.tts.TextChunkH\x00\x12!\n\x04\x64one\x18\x03 \x01(\x0b\x32\x11.tts.TextCompleteH\x00\x12$\n\x06\x63\x61ncel\x18\x04 \x01(\x0b\x32\x12.tts.CancelRequestH\x00\x42\t\n\x07request\"|\n\x0bInitRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07speaker\x18\x02 \x01(\t\x12\x11\n\ttask_type\x18\x03 \x01(\t\x12\x10\n\x08language\x18\x04 \x01(\t\x12\x11\n\tref_audio\x18\x05 \x01(\x0c\x12\x10\n\x08ref_text\x18\x06 \x01(\t\"\x19\n\tTextChunk\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x0e\n\x0cTextComplete\"\x0f\n\rCancelRequest\"g\n\x12SynthesizeResponse\x12 \n\x05\x61udio\x18\x01 \x01(\x0b\x32\x0f.tts.AudioChunkH\x00\x12#\n\x06status\x18\x02 \x01(\x0b\x32\x11.tts.StatusUpdateH\x00\x42\n\n\x08response\"3\n\nAudioChunk\x12\x10\n\x08pcm_data\x18\x01 \x01(\x0c\x12\x13\n\x0bsample_rate\x18\x02 \x01(\x05\"\x8f\x01\n\x0cStatusUpdate\x12\r\n\x05\x65vent\x18\x01 \x01(\t\x12\x0f\n\x07message\x18\x02 \x01(\t\x12/\n\x07metrics\x18\x03 \x03(\x0b\x32\x1e.tts.StatusUpdate.MetricsEntry\x1a.\n\x0cMetricsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x32U\n\nTTSService\x12G\n\x10SynthesizeStream\x12\x16.tts.SynthesizeRequest\x1a\x17.tts.SynthesizeResponse(\x01\x30\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\ttts.proto\x12\x03tts\"\x94\x01\n\x15SynthesizeOnceRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07speaker\x18\x02 \x01(\t\x12\x11\n\ttask_type\x18\x03 \x01(\t\x12\x10\n\x08language\x18\x04 \x01(\t\x12\x11\n\tref_audio\x18\x05 \x01(\x0c\x12\x10\n\x08ref_text\x18\x06 \x01(\t\x12\x0c\n\x04text\x18\x07 \x01(\t\"\xa9\x01\n\x11SynthesizeRequest\x12 \n\x04init\x18\x01 \x01(\x0b\x32\x10.tts.InitRequestH\x00\x12\x1e\n\x04text\x18\x02 \x01(\x0b\x32\x0e.tts.TextChunkH\x00\x12!\n\x04\x64one\x18\x03 \x01(\x0b\x32\x11.tts.TextCompleteH\x00\x12$\n\x06\x63\x61ncel\x18\x04 \x01(\x0b\x32\x12.tts.CancelRequestH\x00\x42\t\n\x07request\"|\n\x0bInitRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0f\n\x07speaker\x18\x02 \x01(\t\x12\x11\n\ttask_type\x18\x03 \x01(\t\x12\x10\n\x08language\x18\x04 \x01(\t\x12\x11\n\tref_audio\x18\x05 \x01(\x0c\x12\x10\n\x08ref_text\x18\x06 \x01(\t\"\x19\n\tTextChunk\x12\x0c\n\x04text\x18\x01 \x01(\t\"\x0e\n\x0cTextComplete\"\x0f\n\rCancelRequest\"g\n\x12SynthesizeResponse\x12 \n\x05\x61udio\x18\x01 \x01(\x0b\x32\x0f.tts.AudioChunkH\x00\x12#\n\x06status\x18\x02 \x01(\x0b\x32\x11.tts.StatusUpdateH\x00\x42\n\n\x08response\"3\n\nAudioChunk\x12\x10\n\x08pcm_data\x18\x01 \x01(\x0c\x12\x13\n\x0bsample_rate\x18\x02 \x01(\x05\"\x8f\x01\n\x0cStatusUpdate\x12\r\n\x05\x65vent\x18\x01 \x01(\t\x12\x0f\n\x07message\x18\x02 \x01(\t\x12/\n\x07metrics\x18\x03 \x03(\x0b\x32\x1e.tts.StatusUpdate.MetricsEntry\x1a.\n\x0cMetricsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x32\x9e\x01\n\nTTSService\x12G\n\x0eSynthesizeOnce\x12\x1a.tts.SynthesizeOnceRequest\x1a\x17.tts.SynthesizeResponse0\x01\x12G\n\x10SynthesizeStream\x12\x16.tts.SynthesizeRequest\x1a\x17.tts.SynthesizeResponse(\x01\x30\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,24 +33,26 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_STATUSUPDATE_METRICSENTRY']._loaded_options = None
   _globals['_STATUSUPDATE_METRICSENTRY']._serialized_options = b'8\001'
-  _globals['_SYNTHESIZEREQUEST']._serialized_start=19
-  _globals['_SYNTHESIZEREQUEST']._serialized_end=188
-  _globals['_INITREQUEST']._serialized_start=190
-  _globals['_INITREQUEST']._serialized_end=314
-  _globals['_TEXTCHUNK']._serialized_start=316
-  _globals['_TEXTCHUNK']._serialized_end=341
-  _globals['_TEXTCOMPLETE']._serialized_start=343
-  _globals['_TEXTCOMPLETE']._serialized_end=357
-  _globals['_CANCELREQUEST']._serialized_start=359
-  _globals['_CANCELREQUEST']._serialized_end=374
-  _globals['_SYNTHESIZERESPONSE']._serialized_start=376
-  _globals['_SYNTHESIZERESPONSE']._serialized_end=479
-  _globals['_AUDIOCHUNK']._serialized_start=481
-  _globals['_AUDIOCHUNK']._serialized_end=532
-  _globals['_STATUSUPDATE']._serialized_start=535
-  _globals['_STATUSUPDATE']._serialized_end=678
-  _globals['_STATUSUPDATE_METRICSENTRY']._serialized_start=632
-  _globals['_STATUSUPDATE_METRICSENTRY']._serialized_end=678
-  _globals['_TTSSERVICE']._serialized_start=680
-  _globals['_TTSSERVICE']._serialized_end=765
+  _globals['_SYNTHESIZEONCEREQUEST']._serialized_start=19
+  _globals['_SYNTHESIZEONCEREQUEST']._serialized_end=167
+  _globals['_SYNTHESIZEREQUEST']._serialized_start=170
+  _globals['_SYNTHESIZEREQUEST']._serialized_end=339
+  _globals['_INITREQUEST']._serialized_start=341
+  _globals['_INITREQUEST']._serialized_end=465
+  _globals['_TEXTCHUNK']._serialized_start=467
+  _globals['_TEXTCHUNK']._serialized_end=492
+  _globals['_TEXTCOMPLETE']._serialized_start=494
+  _globals['_TEXTCOMPLETE']._serialized_end=508
+  _globals['_CANCELREQUEST']._serialized_start=510
+  _globals['_CANCELREQUEST']._serialized_end=525
+  _globals['_SYNTHESIZERESPONSE']._serialized_start=527
+  _globals['_SYNTHESIZERESPONSE']._serialized_end=630
+  _globals['_AUDIOCHUNK']._serialized_start=632
+  _globals['_AUDIOCHUNK']._serialized_end=683
+  _globals['_STATUSUPDATE']._serialized_start=686
+  _globals['_STATUSUPDATE']._serialized_end=829
+  _globals['_STATUSUPDATE_METRICSENTRY']._serialized_start=783
+  _globals['_STATUSUPDATE_METRICSENTRY']._serialized_end=829
+  _globals['_TTSSERVICE']._serialized_start=832
+  _globals['_TTSSERVICE']._serialized_end=990
 # @@protoc_insertion_point(module_scope)

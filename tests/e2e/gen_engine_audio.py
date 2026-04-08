@@ -49,20 +49,17 @@ def synthesize(text: str, speaker: str = "Serena") -> tuple[np.ndarray | None, f
     channel = grpc.insecure_channel(f"{HOST}:{PORT}")
     stub = tts_pb2_grpc.TTSServiceStub(channel)
 
-    def request_gen():
-        yield tts_pb2.SynthesizeRequest(
-            init=tts_pb2.InitRequest(
-                session_id=sid, speaker=speaker, task_type="custom_voice",
-            )
-        )
-        yield tts_pb2.SynthesizeRequest(text=tts_pb2.TextChunk(text=text))
-        yield tts_pb2.SynthesizeRequest(done=tts_pb2.TextComplete())
-
     chunks = []
     first_ts = None
     t0 = time.perf_counter()
     try:
-        for resp in stub.SynthesizeStream(request_gen(), timeout=60):
+        request = tts_pb2.SynthesizeOnceRequest(
+            session_id=sid,
+            speaker=speaker,
+            task_type="custom_voice",
+            text=text,
+        )
+        for resp in stub.SynthesizeOnce(request, timeout=60):
             which = resp.WhichOneof("response")
             if which == "audio":
                 if first_ts is None:

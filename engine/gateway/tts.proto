@@ -3,8 +3,20 @@ syntax = "proto3";
 package tts;
 
 service TTSService {
+  // Unary request with the full text, server streams audio chunks back
+  rpc SynthesizeOnce (SynthesizeOnceRequest) returns (stream SynthesizeResponse);
   // Bidirectional streaming: client sends text chunks, server sends audio chunks
   rpc SynthesizeStream (stream SynthesizeRequest) returns (stream SynthesizeResponse);
+}
+
+message SynthesizeOnceRequest {
+  string session_id = 1;
+  string speaker = 2;        // speaker name (for custom_voice)
+  string task_type = 3;      // "custom_voice" | "voice_clone" | "voice_design"
+  string language = 4;       // "auto" | "zh" | "en" | ...
+  bytes ref_audio = 5;       // reference audio for voice clone
+  string ref_text = 6;       // reference text for voice clone
+  string text = 7;
 }
 
 message SynthesizeRequest {

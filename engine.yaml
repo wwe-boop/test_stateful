@@ -55,3 +55,9 @@ sampling:
   temperature: 0.9
   repetition_penalty: 1.05
   top_k: 50
+  random_seed: 0
+
+# Prefill: CustomVoice client speaker missing / invalid (must exist in weights spk_id)
+prefill:
+  default_speaker: vivian
+  fallback_speaker: vivian

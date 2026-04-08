@@ -166,7 +166,7 @@ def _synthesize_oneshot(
     session_id: str = "",
     timeout: float = 120.0,
 ) -> TTSResult:
-    """Send init → text → done in one shot, collect audio. Runs sync (for ThreadPool)."""
+    """Send a unary full-text request and collect streamed audio."""
     sid = session_id or uuid.uuid4().hex[:12]
     result = TTSResult(session_id=sid, text=text)
 
@@ -174,27 +174,18 @@ def _synthesize_oneshot(
     channel = grpc.insecure_channel(f"{host}:{port}")
     stub = tts_pb2_grpc.TTSServiceStub(channel)
 
-    def request_gen():
-        yield tts_pb2.SynthesizeRequest(
-            init=tts_pb2.InitRequest(
-                session_id=sid,
-                speaker=speaker,
-                task_type=task_type,
-            )
-        )
-        yield tts_pb2.SynthesizeRequest(
-            text=tts_pb2.TextChunk(text=text)
-        )
-        yield tts_pb2.SynthesizeRequest(
-            done=tts_pb2.TextComplete()
-        )
-
     chunks = []
     first_ts = None
 
     t0 = time.perf_counter()
     try:
-        for resp in stub.SynthesizeStream(request_gen(), timeout=timeout):
+        request = tts_pb2.SynthesizeOnceRequest(
+            session_id=sid,
+            speaker=speaker,
+            task_type=task_type,
+            text=text,
+        )
+        for resp in stub.SynthesizeOnce(request, timeout=timeout):
             which = resp.WhichOneof("response")
             if which == "audio":
                 if first_ts is None:

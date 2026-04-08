@@ -128,6 +128,14 @@ class SamplingConfig:
     temperature: float = 0.9
     repetition_penalty: float = 1.05
     top_k: int = 50
+    random_seed: int = 0
+
+
+@dataclass
+class PrefillConfig:
+    """Prefill / CustomVoice speaker defaults (see engine.yaml)."""
+    default_speaker: str = "vivian"
+    fallback_speaker: str = "vivian"
 
 
 @dataclass
@@ -139,6 +147,7 @@ class EngineConfig:
     prefix_cache: PrefixCacheConfig = field(default_factory=PrefixCacheConfig)
     spliter: SpliterConfig = field(default_factory=SpliterConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    prefill: PrefillConfig = field(default_factory=PrefillConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +210,7 @@ def _dict_to_config(raw: dict) -> EngineConfig:
         ("prefix_cache", PrefixCacheConfig),
         ("spliter", SpliterConfig),
         ("sampling", SamplingConfig),
+        ("prefill", PrefillConfig),
     ]:
         section_data = raw.get(section_name, {})
         if not isinstance(section_data, dict):

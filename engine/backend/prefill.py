@@ -48,10 +48,6 @@ class TaskType(Enum):
     VOICE_DESIGN = "voice_design"
 
 
-FALLBACK_SPEAKER = "vivian"
-DEFAULT_SPEAKER = "vivian"
-
-
 @dataclass
 class PrefillPlan:
     prefill_embeds: torch.Tensor           # [1, S, H] bf16
@@ -81,7 +77,14 @@ def parse_task_type(task_type_str: str, x_vector_only: bool = False) -> TaskType
 class EmbeddingWeights:
     """Holds text/codec/special embeddings on GPU (BF16)."""
 
-    def __init__(self, weights_dir: str, device_id: int = 0):
+    def __init__(
+        self,
+        weights_dir: str,
+        device_id: int = 0,
+        *,
+        default_speaker: Optional[str] = None,
+        fallback_speaker: Optional[str] = None,
+    ):
         weights_dir = Path(weights_dir)
         with open(weights_dir / "config.json") as f:
             self.config = json.load(f)
@@ -99,6 +102,19 @@ class EmbeddingWeights:
         self.codec_think_id = self.config.get("codec_think_id", 2154)
         self.codec_language_id = self.config.get("codec_language_id", {})
         self.spk_id_map = self.config.get("spk_id", {})
+        self.spk_is_dialect = self.config.get("spk_is_dialect") or {}
+        # CustomVoice: empty → default_speaker; unknown name → fallback_speaker.
+        # Prefer engine.yaml (passed in); else weights config.json; else vivian.
+        self.default_speaker = str(
+            default_speaker
+            if default_speaker is not None
+            else self.config.get("default_speaker", "vivian"),
+        ).strip()
+        self.fallback_speaker = str(
+            fallback_speaker
+            if fallback_speaker is not None
+            else self.config.get("fallback_speaker", "vivian"),
+        ).strip()
 
         self.device = torch.device("cuda", device_id)
         dtype = torch.bfloat16
@@ -186,7 +202,9 @@ def normalize_tts_text(text: str) -> str:
 # PrefillBuilder
 # ---------------------------------------------------------------------------
 
-OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|redacted_im_end|>\n<|im_start|>assistant\n"
+OFFICIAL_REF_TEXT_FMT = "<|im_start|>assistant\n{text}<|redacted_im_end|>\n"
+OFFICIAL_INSTRUCT_FMT = "<|im_start|>user\n{instruct}<|im_end|>\n"
 
 
 class PrefillBuilder:
@@ -237,15 +255,29 @@ class PrefillBuilder:
 
         role_embed = w.text_embed(input_ids[:, :3])
 
-        if language == "auto" or language is None:
+        lang_lower = (language or "auto").strip().lower()
+        language_id: Optional[int] = None
+        if lang_lower != "auto":
+            if lang_lower not in w.codec_language_id:
+                raise NotImplementedError(f"Language {language} not implemented")
+            language_id = w.codec_language_id[lang_lower]
+
+        if lang_lower in ("chinese", "auto") and speaker:
+            dialect_key = w.spk_is_dialect.get(speaker.lower()) if w.spk_is_dialect else None
+            if dialect_key is not None and dialect_key is not False:
+                dkey = str(dialect_key).lower()
+                if dkey not in w.codec_language_id:
+                    raise NotImplementedError(f"Dialect language {dialect_key!r} not implemented")
+                language_id = w.codec_language_id[dkey]
+
+        if language_id is None:
             tag_ids = torch.tensor(
                 [[w.codec_nothink_id, w.codec_think_bos_id, w.codec_think_eos_id]],
                 device=device, dtype=torch.int64,
             )
         else:
-            lang_id = w.codec_language_id.get(language.lower(), w.codec_pad_id)
             tag_ids = torch.tensor(
-                [[w.codec_think_id, w.codec_think_bos_id, lang_id, w.codec_think_eos_id]],
+                [[w.codec_think_id, w.codec_think_bos_id, language_id, w.codec_think_eos_id]],
                 device=device, dtype=torch.int64,
             )
         codec_input_embedding_0 = w.codec_embed(tag_ids)
@@ -257,29 +289,46 @@ class PrefillBuilder:
         speaker_embed = None
         plan_warnings: list[str] = []
 
-        if task_type == TaskType.CUSTOM_VOICE and speaker:
-            spk_id_val = w.spk_id_map.get(speaker.lower())
-            if spk_id_val is not None:
-                speaker_embed = w.codec_embed(
-                    torch.tensor([[spk_id_val]], device=device, dtype=torch.int64)
-                )
-            else:
-                fb_id = w.spk_id_map.get(FALLBACK_SPEAKER)
-                warn_msg = f"Speaker '{speaker}' not found, using '{FALLBACK_SPEAKER}'"
-                logger.warning(warn_msg)
-                plan_warnings.append(warn_msg)
-                if fb_id is not None:
+        if task_type == TaskType.CUSTOM_VOICE:
+            raw_spk = (speaker or "").strip()
+            if not raw_spk:
+                ds_name = w.default_speaker
+                ds_id = w.spk_id_map.get(ds_name.lower())
+                if ds_id is not None:
                     speaker_embed = w.codec_embed(
-                        torch.tensor([[fb_id]], device=device, dtype=torch.int64)
+                        torch.tensor([[ds_id]], device=device, dtype=torch.int64),
                     )
-                    speaker = FALLBACK_SPEAKER
-        elif task_type == TaskType.CUSTOM_VOICE and not speaker:
-            default_id = w.spk_id_map.get(DEFAULT_SPEAKER)
-            if default_id is not None:
+                    speaker = ds_name
+                else:
+                    logger.warning(
+                        "default_speaker %r not in spk_id map; continuing without speaker codec",
+                        ds_name,
+                    )
+            elif raw_spk.lower() in w.spk_id_map:
+                spk_id_val = w.spk_id_map[raw_spk.lower()]
                 speaker_embed = w.codec_embed(
-                    torch.tensor([[default_id]], device=device, dtype=torch.int64)
+                    torch.tensor([[spk_id_val]], device=device, dtype=torch.int64),
                 )
-                speaker = DEFAULT_SPEAKER
+                speaker = raw_spk
+            else:
+                fb_name = w.fallback_speaker
+                fb_id = w.spk_id_map.get(fb_name.lower())
+                if fb_id is not None:
+                    warn_msg = (
+                        f"Speaker {raw_spk!r} not found, using fallback_speaker {fb_name!r}"
+                    )
+                    logger.warning(warn_msg)
+                    plan_warnings.append(warn_msg)
+                    speaker_embed = w.codec_embed(
+                        torch.tensor([[fb_id]], device=device, dtype=torch.int64),
+                    )
+                    speaker = fb_name
+                else:
+                    logger.warning(
+                        "fallback_speaker %r not in spk_id map; continuing without speaker codec",
+                        fb_name,
+                    )
+                    speaker = None
         elif task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
             if spk_embedding is not None:
                 speaker_embed = spk_embedding.reshape(1, 1, -1)
@@ -302,7 +351,8 @@ class PrefillBuilder:
 
         instruct_embed = None
         if instruct and task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN):
-            instruct_ids_np = self.tokenizer(instruct, return_tensors="pt")["input_ids"]
+            instruct_wrapped = OFFICIAL_INSTRUCT_FMT.format(instruct=instruct)
+            instruct_ids_np = self.tokenizer(instruct_wrapped, return_tensors="pt")["input_ids"]
             if not isinstance(instruct_ids_np, np.ndarray):
                 instruct_ids_np = np.asarray(instruct_ids_np, dtype=np.int64)
             if instruct_ids_np.ndim == 1:
@@ -311,7 +361,7 @@ class PrefillBuilder:
             instruct_embed = w.text_embed(instruct_ids)
 
         if instruct_embed is not None:
-            talker_input_embed = torch.cat([role_embed, instruct_embed, dual_track], dim=1)
+            talker_input_embed = torch.cat([instruct_embed, role_embed, dual_track], dim=1)
         else:
             talker_input_embed = torch.cat([role_embed, dual_track], dim=1)
 
@@ -411,14 +461,14 @@ class PrefillBuilder:
         ], dim=1)
 
         if ref_text and ref_text.strip():
-            ref_assistant = OFFICIAL_ASSISTANT_FMT.format(text=ref_text.strip())
-            ref_ids_np = self.tokenizer(ref_assistant, return_tensors="pt")["input_ids"]
+            ref_wrapped = OFFICIAL_REF_TEXT_FMT.format(text=ref_text.strip())
+            ref_ids_np = self.tokenizer(ref_wrapped, return_tensors="pt")["input_ids"]
             if not isinstance(ref_ids_np, np.ndarray):
                 ref_ids_np = np.asarray(ref_ids_np, dtype=np.int64)
             if ref_ids_np.ndim == 1:
                 ref_ids_np = ref_ids_np.reshape(1, -1)
             ref_ids = torch.as_tensor(ref_ids_np, device=device, dtype=torch.int64)
-            ref_id = ref_ids[:, 3:-5] if ref_ids.shape[1] > 8 else ref_ids[:, :0]
+            ref_id = ref_ids[:, 3:-2]
         else:
             ref_id = input_ids[:, :0]
 

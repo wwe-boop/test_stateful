@@ -605,7 +605,9 @@ class EngineLoop:
         else:
             slot.talker_kv = cached.talker_kv.clone()
         slot.past_len = prefix_len
-        slot.frame_idx = 0
+        # Match Executor.prefill(): one fused forward has consumed the prefill
+        # chunk; frame_idx feeds cache_position for the vocoder on decode steps.
+        slot.frame_idx = 1
 
         slot.c2w_kv = None
         slot.c2w_conv_states = self._executor.make_zero_conv_states()
@@ -739,18 +741,9 @@ class EngineLoop:
                 slot_ids, output.batch_talker_kv,
                 output.original_past_lens, output.padded_past_len, 1,
             )
-        batch_c2w_kv = output.batch_c2w_kv
-        if batch_c2w_kv is not None:
-            c2w_max_past = self._executor._config.c2w_sliding_window - 1
-            if batch_c2w_kv.shape[3] > c2w_max_past:
-                # Keep the newest sliding-window states in both the slot-local
-                # tensor and the preallocated pool. Otherwise the pool would
-                # retain an older prefix window while the slot keeps the newer
-                # cropped window, causing the next gather() to feed stale C2W KV.
-                batch_c2w_kv = batch_c2w_kv[:, :, :, -c2w_max_past:, :].contiguous()
-        if use_pool and batch_c2w_kv is not None:
+        if use_pool and output.batch_c2w_kv is not None:
             slot_ids = [s.slot_id for s in output.slots]
-            kv_pool.scatter_c2w_kv(slot_ids, batch_c2w_kv)
+            kv_pool.scatter_c2w_kv(slot_ids, output.batch_c2w_kv)
 
         batch_size = len(output.slots)
         for i, slot in enumerate(output.slots):
@@ -761,8 +754,11 @@ class EngineLoop:
             if group is None:
                 continue
 
-            if batch_c2w_kv is not None:
-                kv = batch_c2w_kv[i:i+1]
+            if output.batch_c2w_kv is not None:
+                kv = output.batch_c2w_kv[i:i+1]
+                c2w_max_past = self._executor._config.c2w_sliding_window - 1
+                if kv.shape[3] > c2w_max_past:
+                    kv = kv[:, :, :, -c2w_max_past:, :]
                 slot.c2w_kv = kv.clone()
             if not use_pool:
                 if output.batch_talker_kv is not None:

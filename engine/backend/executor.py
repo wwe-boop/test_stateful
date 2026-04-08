@@ -332,6 +332,7 @@ class Executor:
         do_sample: bool = True,
         temperature: float = 0.9,
         repetition_penalty: float = 1.05,
+        random_seed: int = 0,
     ):
         self._engine_dir = Path(engine_dir) if engine_dir else None
         self._weights_dir = Path(weights_dir) if weights_dir else None
@@ -345,6 +346,9 @@ class Executor:
 
         self._compute_stream = torch.cuda.Stream(device=self._device)
         self._prefill_stream = torch.cuda.Stream(device=self._device)
+
+        self._sampling_gen = torch.Generator(device=self._device)
+        self._sampling_gen.manual_seed(random_seed)
 
         self._fused_engine: Optional[TRTEngine] = None
         self._prefill_context = None
@@ -670,9 +674,6 @@ class Executor:
             and flip — avoids per-step allocation while supporting
             heterogeneous slot ordering.
         """
-        if len(slots) != 1:
-            return None
-
         slot = slots[0]
         if not slot.pingpong_ready:
             return None
@@ -741,6 +742,7 @@ class Executor:
             gumbel = torch.rand(
                 batch, cfg.logits_topk,
                 device=self._device, dtype=torch.float32,
+                generator=self._sampling_gen,
             ).clamp(1e-8, 1.0)
             gumbel = -torch.log(-torch.log(gumbel))
             temperature = torch.full(

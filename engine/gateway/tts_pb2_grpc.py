@@ -34,6 +34,11 @@ class TTSServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.SynthesizeOnce = channel.unary_stream(
+                '/tts.TTSService/SynthesizeOnce',
+                request_serializer=tts__pb2.SynthesizeOnceRequest.SerializeToString,
+                response_deserializer=tts__pb2.SynthesizeResponse.FromString,
+                _registered_method=True)
         self.SynthesizeStream = channel.stream_stream(
                 '/tts.TTSService/SynthesizeStream',
                 request_serializer=tts__pb2.SynthesizeRequest.SerializeToString,
@@ -43,6 +48,13 @@ class TTSServiceStub(object):
 
 class TTSServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
+
+    def SynthesizeOnce(self, request, context):
+        """Unary request with the full text, server streams audio chunks back
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
     def SynthesizeStream(self, request_iterator, context):
         """Bidirectional streaming: client sends text chunks, server sends audio chunks
@@ -54,6 +66,11 @@ class TTSServiceServicer(object):
 
 def add_TTSServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'SynthesizeOnce': grpc.unary_stream_rpc_method_handler(
+                    servicer.SynthesizeOnce,
+                    request_deserializer=tts__pb2.SynthesizeOnceRequest.FromString,
+                    response_serializer=tts__pb2.SynthesizeResponse.SerializeToString,
+            ),
             'SynthesizeStream': grpc.stream_stream_rpc_method_handler(
                     servicer.SynthesizeStream,
                     request_deserializer=tts__pb2.SynthesizeRequest.FromString,
@@ -69,6 +86,33 @@ def add_TTSServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class TTSService(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def SynthesizeOnce(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/tts.TTSService/SynthesizeOnce',
+            tts__pb2.SynthesizeOnceRequest.SerializeToString,
+            tts__pb2.SynthesizeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def SynthesizeStream(request_iterator,

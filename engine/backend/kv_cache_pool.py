@@ -394,12 +394,22 @@ class KVCachePool:
     def scatter_c2w_kv(
         self, slot_ids: list[int], present_kv: torch.Tensor,
     ) -> None:
-        """Write C2W KV back to the pool (sliding window, uniform length)."""
+        """Write C2W KV back to the pool (sliding window, per-slot cropping).
+
+        Each slot may have different past_len, so we must crop per-slot
+        to the sliding window size before writing to the pool.
+        """
         if self._c2w_kv_pool is None:
             raise RuntimeError("Pool not pre-allocated")
-        s_len = present_kv.shape[3]
+        c2w_max_past = self._config.c2w_sliding_window - 1
         for i, slot_id in enumerate(slot_ids):
-            self._c2w_kv_pool[slot_id, :, :, :s_len, :] = present_kv[i]
+            kv = present_kv[i:i+1]
+            s_len = kv.shape[3]
+            if s_len > c2w_max_past:
+                # Crop to sliding window for this slot
+                kv = kv[:, :, :, -c2w_max_past:, :]
+                s_len = c2w_max_past
+            self._c2w_kv_pool[slot_id, :, :, :s_len, :] = kv[0, :, :, :s_len, :]
 
     # ------------------------------------------------------------------
     # Slot eviction

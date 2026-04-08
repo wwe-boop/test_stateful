@@ -127,6 +127,7 @@ class TTSEngine:
             do_sample=sampling.do_sample,
             temperature=sampling.temperature,
             repetition_penalty=sampling.repetition_penalty,
+            random_seed=sampling.random_seed,
         )
         self._executor.load()
 
@@ -135,7 +136,13 @@ class TTSEngine:
         prefill_builder = None
         if self._weights_dir:
             try:
-                emb_weights = EmbeddingWeights(self._weights_dir, self._device_id)
+                pf = self._cfg.prefill
+                emb_weights = EmbeddingWeights(
+                    self._weights_dir,
+                    self._device_id,
+                    default_speaker=pf.default_speaker,
+                    fallback_speaker=pf.fallback_speaker,
+                )
                 self._executor.set_embedding_weights(emb_weights)
                 prefill_builder = PrefillBuilder(emb_weights, self._tokenizer)
                 logger.info("PrefillBuilder loaded from %s", self._weights_dir)

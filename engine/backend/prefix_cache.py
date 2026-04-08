@@ -109,6 +109,10 @@ class PrefixKVCache:
         """
         if key is None:
             return
+        # Server passes max_entries=0 when prefix_cache.enabled is false — never
+        # store; avoid LRU loop on an empty OrderedDict (popitem → KeyError).
+        if self._max_entries <= 0:
+            return
         if prefix_len > self._max_prefix_len:
             logger.debug(
                 "Prefix too long (%d > %d), skipping cache", prefix_len, self._max_prefix_len,

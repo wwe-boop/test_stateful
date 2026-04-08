@@ -18,6 +18,13 @@ class TestPrefixKVCache:
         assert cache.get("nonexistent") is None
         assert cache.get(None) is None
 
+    def test_disabled_put_is_noop(self):
+        """max_entries=0 (prefix_cache.enabled=false) must not raise on put."""
+        cache = PrefixKVCache(max_entries=0)
+        cache.put("k", _make_kv(5), 5)
+        assert cache.size == 0
+        assert cache.get("k") is None
+
     def test_put_and_hit(self):
         cache = PrefixKVCache(max_entries=4)
         kv = _make_kv(20)
