@@ -124,6 +124,7 @@ class TTSEngine:
             max_batch_size=self._max_batch,
             max_seq_len=self._max_seq_len,
             model_config=model_config,
+            do_sample=sampling.do_sample,
             temperature=sampling.temperature,
             repetition_penalty=sampling.repetition_penalty,
         )

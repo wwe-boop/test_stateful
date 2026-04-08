@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -328,6 +329,7 @@ class Executor:
         max_batch_size: int = 48,
         max_seq_len: int = 512,
         model_config: Optional[ModelConfig] = None,
+        do_sample: bool = True,
         temperature: float = 0.9,
         repetition_penalty: float = 1.05,
     ):
@@ -337,6 +339,7 @@ class Executor:
         self._max_batch = max_batch_size
         self._max_seq_len = max_seq_len
         self._config = model_config or ModelConfig()
+        self._do_sample = do_sample
         self._temperature = temperature
         self._repetition_penalty = repetition_penalty
 
@@ -374,6 +377,10 @@ class Executor:
                 fused_plan = mp
             elif te.exists():
                 fused_plan = te
+            manifest_path = self._engine_dir / "triton_manifest.json"
+            if manifest_path.exists():
+                with open(manifest_path) as f:
+                    self._manifest = json.load(f)
         if self._engine_dir and fused_plan is not None:
             self._fused_engine = TRTEngine(
                 str(fused_plan), self._device,
@@ -389,10 +396,6 @@ class Executor:
                 logger.info("Prefill shares execution context with decode")
         else:
             logger.warning("No TRT plan found, running in stub mode")
-
-        if self._engine_dir and (self._engine_dir / "triton_manifest.json").exists():
-            with open(self._engine_dir / "triton_manifest.json") as f:
-                self._manifest = json.load(f)
 
         self._kv_pool = KVCachePool(
             max_slots=self._max_batch,
@@ -416,21 +419,33 @@ class Executor:
         if self._fused_engine is None:
             return
         input_names, output_names = self._fused_engine.get_io_names()
-        self._c2w_conv_input_names = sorted(
-            n for n in input_names
-            if n.startswith("c2w_conv_state_")
+        layout = self._manifest.get("code2wav_fused", {}) if self._manifest else {}
+        layout_inputs = layout.get("c2w_state_input_names") or []
+        layout_outputs = layout.get("c2w_state_output_names") or []
+
+        def _natural_key(name: str) -> tuple[str, int]:
+            m = re.search(r"^(.*?)(\d+)$", name)
+            if m:
+                return (m.group(1), int(m.group(2)))
+            return (name, -1)
+
+        def _ordered(names: list[str], prefix: str, layout_names: list[str]) -> list[str]:
+            from_layout = [n for n in layout_names if n.startswith(prefix) and n in names]
+            if from_layout:
+                return from_layout
+            return sorted((n for n in names if n.startswith(prefix)), key=_natural_key)
+
+        self._c2w_conv_input_names = _ordered(
+            input_names, "c2w_conv_state_", layout_inputs,
         )
-        self._c2w_transconv_input_names = sorted(
-            n for n in input_names
-            if n.startswith("c2w_transconv_overlap_")
+        self._c2w_transconv_input_names = _ordered(
+            input_names, "c2w_transconv_overlap_", layout_inputs,
         )
-        self._c2w_conv_output_names = sorted(
-            n for n in output_names
-            if n.startswith("c2w_new_conv_state_")
+        self._c2w_conv_output_names = _ordered(
+            output_names, "c2w_new_conv_state_", layout_outputs,
         )
-        self._c2w_transconv_output_names = sorted(
-            n for n in output_names
-            if n.startswith("c2w_new_transconv_overlap_")
+        self._c2w_transconv_output_names = _ordered(
+            output_names, "c2w_new_transconv_overlap_", layout_outputs,
         )
 
         eng = self._fused_engine._engine
@@ -722,13 +737,24 @@ class Executor:
             for s in slots
         ], dim=0)
 
-        gumbel = torch.rand(batch, cfg.logits_topk,
-                            device=self._device, dtype=torch.float32)
-        gumbel = -(-gumbel.clamp(min=1e-8).log()).clamp(min=1e-8).log()
-        temperature = torch.full(
-            (batch, 1), self._temperature,
-            device=self._device, dtype=torch.float32,
-        )
+        if self._do_sample:
+            gumbel = torch.rand(
+                batch, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+            ).clamp(1e-8, 1.0)
+            gumbel = -torch.log(-torch.log(gumbel))
+            temperature = torch.full(
+                (batch, 1), self._temperature,
+                device=self._device, dtype=torch.float32,
+            )
+        else:
+            gumbel = torch.zeros(
+                batch, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+            )
+            temperature = torch.ones(
+                batch, 1, device=self._device, dtype=torch.float32,
+            )
         penalty = torch.full(
             (batch, 1), self._repetition_penalty,
             device=self._device, dtype=torch.float32,
