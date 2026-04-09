@@ -21,8 +21,10 @@ from ..core.types import (
     GroupPolicy,
     InputMode,
     ResultType,
+    SegmentToken,
     SessionConfig,
     SessionState,
+    TokenizedText,
 )
 from .dispatcher import Dispatcher
 from .spliter import Spliter
@@ -30,6 +32,21 @@ from .spliter.reorder import AudioReorder
 from .spliter.tokenizer import LightQwen3TTSTokenizer
 
 logger = logging.getLogger(__name__)
+
+_WHITESPACE_TO_STRIP = str.maketrans({
+    "\n": "",
+    "\r": "",
+    "\t": " ",
+    "\u3000": "",
+})
+
+
+def _normalize_tts_text(text: str) -> str:
+    """Remove formatting whitespace that harms tokenization/prosody."""
+    text = (text or "").translate(_WHITESPACE_TO_STRIP)
+    while "  " in text:
+        text = text.replace("  ", " ")
+    return text
 
 
 class FrontendInterface:
@@ -97,6 +114,7 @@ class FrontendInterface:
                 speaker=speaker_key,
                 ref_audio=ref_audio,
             )
+        self._prepare_session_config(config)
 
         session = Session(session_id=session_id, config=config)
         session.spliter = Spliter(
@@ -129,10 +147,13 @@ class FrontendInterface:
         session.state = SessionState.DONE
         await self._dispatcher.submit_cancel(session_id)
 
-    async def feed_text(self, session_id: str, text: str) -> None:
-        """Feed text according to the session's declared input mode."""
+    async def push_text_input(self, session_id: str, text: str) -> None:
+        """Feed transport text according to the session's declared input mode."""
         session = self._sessions.get(session_id)
         if session is None or session.state == SessionState.DONE:
+            return
+        text = _normalize_tts_text(text)
+        if not text.strip():
             return
 
         mode = session.config.input_mode
@@ -140,12 +161,11 @@ class FrontendInterface:
             session.append_text(text)
             return
 
-        ids, texts = self._tokenizer.encode_with_text(text, add_special_tokens=False)
-        tokens = list(zip(ids, texts))
+        tokens = self._tokenize_segment_text(text)
         if not tokens:
             return
 
-        spliter = session.spliter
+        spliter: Spliter = session.spliter
         if mode == InputMode.LONG_SEGMENT and session.config.group_policy != GroupPolicy.NONE:
             seg_actions = spliter.push_group_tokens(tokens)
         else:
@@ -157,22 +177,24 @@ class FrontendInterface:
         session = self._sessions.get(session_id)
         if session is None or session.state == SessionState.DONE:
             return
+        text = _normalize_tts_text(text).strip()
+        if not text:
+            return
 
-        ids, texts = self._tokenizer.encode_with_text(text, add_special_tokens=False)
-        tokens = list(zip(ids, texts))
+        tokens = self._tokenize_segment_text(text)
         if not tokens:
             return
 
         seg_actions = session.spliter.set_full_text(tokens)
         await self._dispatcher.dispatch_segment_actions(session, seg_actions)
-        await self._dispatcher.maybe_send_session_text_done(session)
+        await self._dispatcher.maybe_send_session_tokens_done(session)
 
-    async def text_complete(self, session_id: str) -> None:
-        """Upstream signals no more text will arrive."""
+    async def mark_input_complete(self, session_id: str) -> None:
+        """Upstream signals no more transport input will arrive."""
         session = self._sessions.get(session_id)
         if session is None:
             return
-        session.mark_text_complete()
+        session.mark_input_complete()
 
         mode = session.config.input_mode
         if mode == InputMode.FULL_TEXT:
@@ -180,18 +202,18 @@ class FrontendInterface:
             if full_text.strip():
                 await self.feed_full_text(session_id, full_text)
             else:
-                await self._dispatcher.submit_session_text_done(session_id)
-                session.engine_text_done_sent = True
+                await self._dispatcher.submit_session_tokens_done(session_id)
+                session.engine_tokens_done_sent = True
             return
 
         if mode == InputMode.LONG_SEGMENT and session.config.group_policy != GroupPolicy.NONE:
-            await self._dispatcher.maybe_send_session_text_done(session)
+            await self._dispatcher.maybe_send_session_tokens_done(session)
             return
 
-        seg_actions = session.spliter.text_done()
+        seg_actions = session.spliter.input_done()
         await self._dispatcher.dispatch_segment_actions(session, seg_actions)
-        await self._dispatcher.submit_session_text_done(session_id)
-        session.engine_text_done_sent = True
+        await self._dispatcher.submit_session_tokens_done(session_id)
+        session.engine_tokens_done_sent = True
 
     async def _consume_results(
         self,
@@ -247,7 +269,7 @@ class FrontendInterface:
                     new_actions = session.spliter.on_segment_done(seg_idx)
                     if new_actions:
                         await self._dispatcher.dispatch_segment_actions(session, new_actions)
-                    await self._dispatcher.maybe_send_session_text_done(session)
+                    await self._dispatcher.maybe_send_session_tokens_done(session)
 
                 elif result.type == ResultType.RATIO_UPDATE:
                     if session.spliter and result.ema_ratio > 0:
@@ -284,3 +306,36 @@ class FrontendInterface:
                 session.segments_done,
                 session.segments_submitted,
             )
+
+    def _prepare_session_config(self, config: SessionConfig) -> None:
+        """Canonicalize session-level prompt text once at session creation."""
+        config.instruct_spec = self._tokenize_prompt_text(config.instruct)
+        config.instruct = config.instruct_spec.text if config.instruct_spec else None
+        config.ref_text_spec = self._tokenize_prompt_text(config.ref_text)
+        config.ref_text = config.ref_text_spec.text if config.ref_text_spec else None
+
+    def _tokenize_prompt_text(self, text: Optional[str]) -> Optional[TokenizedText]:
+        normalized = _normalize_tts_text(text or "").strip()
+        if not normalized:
+            return None
+        return TokenizedText(
+            text=normalized,
+            token_ids=self._encode_ids(normalized),
+        )
+
+    def _tokenize_segment_text(self, text: str) -> list[SegmentToken]:
+        ids, texts = self._tokenizer.encode_with_text(text, add_special_tokens=False)
+        return [
+            SegmentToken(
+                token_id=token_id,
+                text=token_text,
+                punct_level=Spliter.classify_punct_level(token_text),
+            )
+            for token_id, token_text in zip(ids, texts)
+        ]
+
+    def _encode_ids(self, text: str) -> list[int]:
+        if hasattr(self._tokenizer, "encode_ids"):
+            return list(self._tokenizer.encode_ids(text, add_special_tokens=False))
+        ids, _ = self._tokenizer.encode_with_text(text, add_special_tokens=False)
+        return list(ids)

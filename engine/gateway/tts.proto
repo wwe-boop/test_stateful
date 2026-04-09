@@ -5,9 +5,11 @@ package tts;
 service TTSService {
   // Query the currently loaded standalone engine capabilities.
   rpc GetCapabilities (GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
-  // Convenience unary wrapper for FULL_TEXT mode.
+  // Convenience unary wrapper for FULL_TEXT mode. The server still
+  // normalizes/tokenizes internally before backend execution.
   rpc SynthesizeOnce (SynthesizeOnceRequest) returns (stream SynthesizeResponse);
-  // Primary session protocol: start -> text* -> end/cancel.
+  // Primary transport protocol: start -> text* -> end/cancel.
+  // TextChunk carries raw transport text; backend inference remains token-native.
   rpc SynthesizeStream (stream SynthesizeRequest) returns (stream SynthesizeResponse);
 }
 
@@ -117,13 +119,13 @@ message InitRequest {
 }
 
 message TextChunk {
-  string text = 1;
+  string text = 1;  // transport text chunk; canonical tokenization happens server-side
   int64 seq_no = 2;
 }
 
 message EndRequest {}
 
-message TextComplete {}
+message TextComplete {}  // legacy alias for end-of-input
 
 message CancelRequest {}
 

@@ -84,6 +84,23 @@ class TestSpliter:
         segments = spliter.pre_split(tokens)
         assert len(segments) >= 2, f"Expected >=2 segments, got {len(segments)}"
 
+    def test_pre_split_does_not_snap_to_l2_in_offline_mode(self):
+        """Offline pre-split should avoid comma-level snap cuts."""
+        from engine.frontend.spliter.spliter import Spliter
+
+        spliter = Spliter(engine_max_decode_len=100, ema_ratio=2.0)
+        th = spliter._make_thresholds()
+
+        tokens = [(i, f"tok{i}") for i in range(th.d - 2)]
+        tokens.append((900, "逗号，"))
+        tokens.append((901, "后续甲"))
+        tokens.append((902, "后续乙"))
+        tokens.append((903, "后续丙"))
+
+        segments = spliter.pre_split(tokens)
+        assert len(segments) >= 2
+        assert segments[0][-1].punct_level != 2, "offline pre-split should not end on L2 punctuation"
+
     def test_streaming_feed_tokens(self):
         """Streaming mode: feed tokens one by one, expect segment actions."""
         from engine.frontend.spliter.spliter import Spliter
@@ -208,7 +225,105 @@ class TestTokenizer:
 
 
 # ---------------------------------------------------------------------------
-# 4. Full pipeline integration test (asyncio + engine thread, stub mode)
+# 4. Prefill boundary tests
+# ---------------------------------------------------------------------------
+
+class TestPrefillBuilderBoundary:
+    @SKIP_NO_TOKENIZER
+    @pytest.mark.parametrize(
+        ("task_type_name", "kwargs"),
+        [
+            ("custom_voice", {"speaker": "vivian", "instruct": "用温柔的语气说"}),
+            ("voice_design", {"instruct": "请保持平静、克制的旁白语气"}),
+        ],
+    )
+    def test_build_plan_from_ids_matches_text_path(self, task_type_name, kwargs):
+        torch = pytest.importorskip("torch")
+        from engine.backend.prefill import PrefillBuilder, TaskType
+        from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
+
+        class _FakeWeights:
+            def __init__(self):
+                self.device = torch.device("cpu")
+                self.hidden_size = 4
+                self.variant = "fake"
+                self.codec_bos_id = 10
+                self.codec_pad_id = 11
+                self.codec_nothink_id = 12
+                self.codec_think_bos_id = 13
+                self.codec_think_eos_id = 14
+                self.codec_think_id = 15
+                self.codec_language_id = {}
+                self.spk_id_map = {"vivian": 16}
+                self.spk_is_dialect = {}
+                self.default_speaker = "vivian"
+                self.fallback_speaker = "vivian"
+                self.codec_embeddings_3d = None
+                self.tts_pad_embed = torch.full((1, 1, self.hidden_size), 1, dtype=torch.bfloat16)
+                self.tts_bos_embed = torch.full((1, 1, self.hidden_size), 2, dtype=torch.bfloat16)
+                self.tts_eos_embed = torch.full((1, 1, self.hidden_size), 3, dtype=torch.bfloat16)
+
+            def _embed(self, token_ids: torch.Tensor, scale: float) -> torch.Tensor:
+                base = token_ids.to(dtype=torch.float32).unsqueeze(-1)
+                cols = [base * scale + float(i) for i in range(self.hidden_size)]
+                return torch.cat(cols, dim=-1).to(dtype=torch.bfloat16)
+
+            def text_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+                return self._embed(token_ids, 0.01)
+
+            def codec_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+                return self._embed(token_ids, 0.02)
+
+        tokenizer = LightQwen3TTSTokenizer(str(TOKENIZER_DIR))
+        builder = PrefillBuilder(_FakeWeights(), tokenizer)
+        task_type = getattr(TaskType, task_type_name.upper())
+        text = "一个月后，国王的城堡里挤满了来自世界各地的王子，"
+        token_ids = tokenizer.encode_ids(text, add_special_tokens=False)
+
+        plan_from_text = builder.build_plan(
+            task_type=task_type,
+            text=text,
+            include_eos=True,
+            **kwargs,
+        )
+        prompt_kwargs = {}
+        if kwargs.get("instruct"):
+            prompt_kwargs["instruct"] = None
+            prompt_kwargs["instruct_token_ids"] = tokenizer.encode_ids(
+                kwargs["instruct"], add_special_tokens=False,
+            )
+        kwargs_from_ids = dict(kwargs)
+        kwargs_from_ids.update(prompt_kwargs)
+
+        plan_from_ids = builder.build_plan_from_ids(
+            task_type=task_type,
+            token_ids=token_ids,
+            include_eos=True,
+            **kwargs_from_ids,
+        )
+
+        assert plan_from_text.prefix_cache_key == plan_from_ids.prefix_cache_key
+        assert torch.equal(plan_from_text.prefill_embeds, plan_from_ids.prefill_embeds)
+        assert len(plan_from_text.trailing) == len(plan_from_ids.trailing)
+        assert plan_from_text.warnings == plan_from_ids.warnings
+
+        for lhs, rhs in zip(plan_from_text.trailing, plan_from_ids.trailing):
+            assert torch.equal(lhs, rhs)
+
+        if plan_from_text.cacheable_prefix_embeds is not None:
+            assert torch.equal(
+                plan_from_text.cacheable_prefix_embeds,
+                plan_from_ids.cacheable_prefix_embeds,
+            )
+        if plan_from_text.request_prefill_embeds is not None:
+            assert torch.equal(
+                plan_from_text.request_prefill_embeds,
+                plan_from_ids.request_prefill_embeds,
+            )
+
+
+# ---------------------------------------------------------------------------
+# 5. Full pipeline integration test (asyncio + engine thread, stub mode)
 # ---------------------------------------------------------------------------
 
 class TestEngineIntegration:
@@ -252,8 +367,8 @@ class TestEngineIntegration:
         )
         assert interface.active_count == 1
 
-        await interface.feed_text("test-001", "你好世界。")
-        await interface.text_complete("test-001")
+        await interface.push_text_input("test-001", "你好世界。")
+        await interface.mark_input_complete("test-001")
 
         requests_sent = []
         while not async_inbox.empty():
@@ -262,8 +377,8 @@ class TestEngineIntegration:
 
         req_types = [r.type for r in requests_sent]
         assert RequestType.NEW_SESSION in req_types
-        has_segment = (RequestType.START_SEGMENT in req_types
-                       or RequestType.APPEND_TEXT in req_types)
+        has_segment = (RequestType.START_TOKENS in req_types
+                       or RequestType.APPEND_TOKENS in req_types)
         assert has_segment, f"Expected segment requests, got: {req_types}"
 
         print(f"\nRequests sent to engine: {len(requests_sent)}")
@@ -278,6 +393,88 @@ class TestEngineIntegration:
         await asyncio.wait_for(done_event.wait(), timeout=2.0)
         assert interface.active_count == 0
         print("Session completed successfully")
+
+    @pytest.mark.asyncio
+    async def test_full_text_normalizes_newlines_before_tokenization(self):
+        from engine.frontend.interface import FrontendInterface
+        from engine.core.types import EngineResult, InputMode, ResultType, SessionConfig
+
+        class _FakeTokenizer:
+            def __init__(self):
+                self.last_text = None
+
+            def encode_with_text(self, text, add_special_tokens=False):
+                self.last_text = text
+                return [1], [text]
+
+        tokenizer = _FakeTokenizer()
+        async_inbox = asyncio.Queue(maxsize=16)
+        interface = FrontendInterface(
+            engine_inbox=async_inbox,
+            tokenizer=tokenizer,
+            max_sessions=4,
+            engine_max_decode_len=200,
+        )
+
+        session = await interface.create_session(
+            "norm-001",
+            config=SessionConfig(
+                task_type="custom_voice",
+                speaker="Serena",
+                input_mode=InputMode.FULL_TEXT,
+            ),
+        )
+
+        await interface.push_text_input("norm-001", "第一行，\n第二行。\t第三行。")
+        await interface.mark_input_complete("norm-001")
+
+        assert tokenizer.last_text == "第一行，第二行。 第三行。"
+        assert session.engine_tokens_done_sent is True
+        await session.result_queue.put(EngineResult(
+            type=ResultType.SESSION_DONE,
+            session_id="norm-001",
+        ))
+        await asyncio.sleep(0)
+
+    @pytest.mark.asyncio
+    async def test_create_session_prepares_prompt_token_specs(self):
+        from engine.core.types import EngineResult, ResultType, SessionConfig
+        from engine.frontend.interface import FrontendInterface
+
+        class _FakeTokenizer:
+            def encode_ids(self, text, add_special_tokens=False):
+                return [len(text), len(text) + 1]
+
+            def encode_with_text(self, text, add_special_tokens=False):
+                return [1], [text]
+
+        config = SessionConfig(
+            task_type="voice_clone",
+            ref_text="参考文段，\n第二行。",
+            instruct="请温柔地说。\t",
+        )
+        interface = FrontendInterface(
+            engine_inbox=asyncio.Queue(maxsize=16),
+            tokenizer=_FakeTokenizer(),
+            max_sessions=4,
+            engine_max_decode_len=200,
+        )
+
+        session = await interface.create_session("prompt-001", config=config)
+
+        assert session.config.instruct == "请温柔地说。"
+        assert session.config.ref_text == "参考文段，第二行。"
+        assert session.config.instruct_spec is not None
+        assert session.config.ref_text_spec is not None
+        assert session.config.instruct_spec.text == "请温柔地说。"
+        assert session.config.ref_text_spec.text == "参考文段，第二行。"
+        assert session.config.instruct_spec.token_ids == [6, 7]
+        assert session.config.ref_text_spec.token_ids == [9, 10]
+        await session.result_queue.put(EngineResult(
+            type=ResultType.SESSION_DONE,
+            session_id="prompt-001",
+        ))
+        await asyncio.sleep(0)
 
     @SKIP_NO_TOKENIZER
     @pytest.mark.asyncio
@@ -322,8 +519,8 @@ class TestEngineIntegration:
             "测试。", "一二三四五。", "很高兴见到你！", "再见！",
         ]
         for i, sid in enumerate(sessions):
-            await interface.feed_text(sid, texts[i])
-            await interface.text_complete(sid)
+            await interface.push_text_input(sid, texts[i])
+            await interface.mark_input_complete(sid)
 
         req_count = 0
         while not async_inbox.empty():
@@ -379,18 +576,18 @@ class TestEngineIntegration:
             "文本追加功能",
             "是否工作正常。",
         ]:
-            await interface.feed_text("long-seg-001", chunk)
-        await interface.text_complete("long-seg-001")
+            await interface.push_text_input("long-seg-001", chunk)
+        await interface.mark_input_complete("long-seg-001")
 
         initial_types = []
         while not async_inbox.empty():
             req = await async_inbox.get()
             initial_types.append((req.type.name, req.segment_idx))
 
-        assert ("START_SEGMENT", 0) in initial_types
-        assert ("START_SEGMENT", 1) in initial_types
-        assert ("START_SEGMENT", 2) not in initial_types
-        assert ("START_SEGMENT", 3) not in initial_types
+        assert ("START_TOKENS", 0) in initial_types
+        assert ("START_TOKENS", 1) in initial_types
+        assert ("START_TOKENS", 2) not in initial_types
+        assert ("START_TOKENS", 3) not in initial_types
 
         await session.result_queue.put(EngineResult(
             type=ResultType.SEGMENT_END,
@@ -404,7 +601,7 @@ class TestEngineIntegration:
         while not async_inbox.empty():
             req = await async_inbox.get()
             after_seg0.append((req.type.name, req.segment_idx))
-        assert ("START_SEGMENT", 2) in after_seg0
+        assert ("START_TOKENS", 2) in after_seg0
 
         await session.result_queue.put(EngineResult(
             type=ResultType.SEGMENT_END,
@@ -418,7 +615,7 @@ class TestEngineIntegration:
         while not async_inbox.empty():
             req = await async_inbox.get()
             after_seg1.append((req.type.name, req.segment_idx))
-        assert ("START_SEGMENT", 3) in after_seg1
+        assert ("START_TOKENS", 3) in after_seg1
 
         await session.result_queue.put(EngineResult(
             type=ResultType.SESSION_DONE,
@@ -428,7 +625,7 @@ class TestEngineIntegration:
 
 
 # ---------------------------------------------------------------------------
-# 5. Performance benchmark (optional, needs real tokenizer)
+# 6. Performance benchmark (optional, needs real tokenizer)
 # ---------------------------------------------------------------------------
 
 class TestPerformance:

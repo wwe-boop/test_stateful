@@ -1,6 +1,7 @@
 """gRPC streaming gateway for the TTS engine.
 
-Handles bidirectional streaming: client sends text chunks, server sends audio.
+Handles bidirectional streaming: clients send text chunks, while the gateway
+normalizes that transport protocol into the engine's internal token contract.
 
 Protocol:
   Client sends:  StartRequest → TextChunk* → EndRequest
@@ -130,8 +131,8 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
                 config=config,
                 audio_queue=audio_queue,
             )
-            await self._engine.feed_text(session_id, request.text)
-            await self._engine.text_complete(session_id)
+            await self._engine.push_text_input(session_id, request.text)
+            await self._engine.mark_input_complete(session_id)
             async for response in self._drain_until_done(session_id, audio_queue):
                 yield response
             return
@@ -151,9 +152,9 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
 
         Protocol semantics:
         - ``StartRequest`` declares task config, input mode, and audio format.
-        - ``TextChunk`` carries payload only; routing behavior is determined by
-          the session config, not inferred from timing.
-        - ``EndRequest`` / legacy ``TextComplete`` signals no more text.
+        - ``TextChunk`` carries transport text only; the frontend owns
+          normalization/tokenization before the backend sees it.
+        - ``EndRequest`` / legacy ``TextComplete`` signals no more transport input.
         """
         session_id = None
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -188,7 +189,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
                     if kind == "eof":
                         input_eof = True
                         if session_id and not got_done and not got_cancel:
-                            await self._engine.text_complete(session_id)
+                            await self._engine.mark_input_complete(session_id)
                             got_done = True
                     else:
                         request = payload
@@ -205,11 +206,11 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
 
                         elif msg_type == "text":
                             if session_id:
-                                await self._engine.feed_text(session_id, request.text.text)
+                                await self._engine.push_text_input(session_id, request.text.text)
 
                         elif msg_type in {"end", "done"}:
                             if session_id:
-                                await self._engine.text_complete(session_id)
+                                await self._engine.mark_input_complete(session_id)
                             got_done = True
 
                         elif msg_type == "cancel":

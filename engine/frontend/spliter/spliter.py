@@ -25,6 +25,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
 
+from ...core.types import SegmentToken
 from .driver import (
     StreamingDriver,
     ActionType,
@@ -56,7 +57,7 @@ class SegmentAction:
 class PendingGroup:
     """One offline pre-split group with a resumable read cursor."""
     group_idx: int
-    tokens: List[Tuple[int, str, int]]
+    tokens: List[SegmentToken]
     cursor: int = 0
     next_local_idx: int = 0
 
@@ -111,8 +112,8 @@ class Spliter:
         self._next_group_idx: int = 0
 
         # Streaming token buffer (streaming mode)
-        self._token_buffer: List[Tuple[int, str, int]] = []
-        self._text_complete: bool = False
+        self._token_buffer: List[SegmentToken] = []
+        self._input_complete: bool = False
 
         # Per-segment drivers; key = segment_idx
         self._drivers: dict[int, StreamingDriver] = {}
@@ -204,11 +205,11 @@ class Spliter:
     # ------------------------------------------------------------------
 
     def pre_split(
-        self, tokens: List[Tuple[int, str]],
-    ) -> List[List[Tuple[int, str, int]]]:
+        self, tokens: List[SegmentToken],
+    ) -> List[List[SegmentToken]]:
         """Split a fully-known token sequence at L1 punctuation boundaries.
 
-        Returns list of segments, each segment is [(token_id, text, punct_level), ...].
+        Returns list of segments, each segment is ``SegmentToken`` sequence.
 
         Unlike the streaming Driver (which uses L1/L2/L3 thresholds because it
         lacks global visibility), offline pre-split only cuts at L1 (。！？)
@@ -216,59 +217,46 @@ class Spliter:
 
         Algorithm:
           1. Greedy scan; split at L1 punctuation when token_count >= a.
-          2. If threshold_d is reached without an L1 split, look back for
-             the best boundary: L1 > L2 > L3 > forced cut.
+          2. If threshold_d is reached without an L1 split, prefer L1 only;
+             otherwise hard-cut at the current position instead of snapping
+             to L2/L3 punctuation. This avoids exaggerated prosodic breaks
+             on commas / formatting newlines in fully-known long sentences.
         """
         if not tokens:
             return []
 
         th = self._make_thresholds()
-        segments: List[List[Tuple[int, str, int]]] = []
-        current: List[Tuple[int, str, int]] = []
+        source_tokens = self._coerce_tokens(tokens)
+        segments: List[List[SegmentToken]] = []
+        current: List[SegmentToken] = []
         last_l1: int = -1
-        last_l2: int = -1
-        last_l3: int = -1
-
         def _flush_at(pos: int) -> None:
-            nonlocal current, last_l1, last_l2, last_l3
+            nonlocal current, last_l1
             split_at = pos + 1
             segments.append(current[:split_at])
             remaining = current[split_at:]
             current = remaining
-            last_l1 = last_l2 = last_l3 = -1
-            for j, (_, _, p) in enumerate(current):
-                if p == 1:
+            last_l1 = -1
+            for j, token in enumerate(current):
+                if token.punct_level == 1:
                     last_l1 = j
-                elif p == 2:
-                    last_l2 = j
-                elif p == 3:
-                    last_l3 = j
 
-        for token_id, text in tokens:
-            pl = self.classify_punct_level(text)
-            current.append((token_id, text, pl))
+        for token in source_tokens:
+            current.append(token)
             n = len(current)
 
-            if pl == 1:
+            if token.punct_level == 1:
                 last_l1 = n - 1
-            elif pl == 2:
-                last_l2 = n - 1
-            elif pl == 3:
-                last_l3 = n - 1
 
-            if pl == 1 and n >= th.a:
+            if token.punct_level == 1 and n >= th.a:
                 _flush_at(n - 1)
             elif n >= th.d:
                 if last_l1 >= 0:
                     _flush_at(last_l1)
-                elif last_l2 >= 0:
-                    _flush_at(last_l2)
-                elif last_l3 >= 0:
-                    _flush_at(last_l3)
                 else:
                     segments.append(current)
                     current = []
-                    last_l1 = last_l2 = last_l3 = -1
+                    last_l1 = -1
 
         if current:
             segments.append(current)
@@ -280,7 +268,7 @@ class Spliter:
     # ------------------------------------------------------------------
 
     def set_full_text(
-        self, tokens: List[Tuple[int, str]],
+        self, tokens: List[SegmentToken],
     ) -> List[SegmentAction]:
         """Offline mode: set complete token sequence, pre-split, drive all.
 
@@ -290,12 +278,12 @@ class Spliter:
         self._presplit_groups.clear()
         self._next_group_idx = 0
         self._enqueue_presplit_groups(tokens)
-        self._text_complete = True
+        self._input_complete = True
 
         return self._drive_presplit_batch()
 
     def _enqueue_presplit_groups(
-        self, tokens: List[Tuple[int, str]],
+        self, tokens: List[SegmentToken],
     ) -> None:
         """Pre-split a complete long segment and append its groups."""
         self._presplit_thresholds = self._make_thresholds()
@@ -306,7 +294,7 @@ class Spliter:
             self._next_group_idx += 1
 
     def push_group_tokens(
-        self, tokens: List[Tuple[int, str]],
+        self, tokens: List[SegmentToken],
     ) -> List[SegmentAction]:
         """Queue one complete long-segment unit for group-level pre-splitting.
 
@@ -357,9 +345,9 @@ class Spliter:
             actions.append(SegmentAction(idx, r, group.group_idx, local_idx, False))
 
         while group.cursor < len(group.tokens):
-            token_id, text, pl = group.tokens[group.cursor]
+            token = group.tokens[group.cursor]
             group.cursor += 1
-            evt = self._make_event(token_id, text, pl)
+            evt = self._make_event(token.token_id, token.text, token.punct_level)
             for r in driver.feed(evt):
                 actions.append(SegmentAction(idx, r, group.group_idx, local_idx, False))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
@@ -387,7 +375,7 @@ class Spliter:
     # ------------------------------------------------------------------
 
     def feed_tokens(
-        self, tokens: List[Tuple[int, str]],
+        self, tokens: List[SegmentToken],
     ) -> List[SegmentAction]:
         """Streaming mode: feed tokenized text, return actions.
 
@@ -395,12 +383,11 @@ class Spliter:
         If the Driver produces a FLUSH, a new Driver is created for the
         next segment (if concurrency allows).
         """
-        classified = [(tid, txt, self.classify_punct_level(txt))
-                      for tid, txt in tokens]
+        classified = self._coerce_tokens(tokens)
 
         actions: List[SegmentAction] = []
 
-        for token_id, text, pl in classified:
+        for token in classified:
             active_idx = self._get_active_driver_idx()
             if active_idx is None:
                 if self.active_segment_count < self._max_concurrent:
@@ -408,11 +395,11 @@ class Spliter:
                     actions.extend(boot)
                     active_idx = self._get_active_driver_idx()
                 if active_idx is None:
-                    self._token_buffer.append((token_id, text, pl))
+                    self._token_buffer.append(token)
                     continue
 
             driver = self._drivers[active_idx]
-            evt = self._make_event(token_id, text, pl)
+            evt = self._make_event(token.token_id, token.text, token.punct_level)
             results = driver.feed(evt)
 
             for r in results:
@@ -423,9 +410,9 @@ class Spliter:
 
         return actions
 
-    def text_done(self) -> List[SegmentAction]:
-        """Signal that no more text will arrive (streaming mode)."""
-        self._text_complete = True
+    def input_done(self) -> List[SegmentAction]:
+        """Signal that no more tokens will arrive (streaming mode)."""
+        self._input_complete = True
         actions: List[SegmentAction] = []
 
         active_idx = self._get_active_driver_idx()
@@ -457,9 +444,9 @@ class Spliter:
             actions.append(SegmentAction(idx, r))
 
         # Drain any buffered tokens into the new driver
-        remaining: List[Tuple[int, str, int]] = []
-        for i, (token_id, text, pl) in enumerate(self._token_buffer):
-            evt = self._make_event(token_id, text, pl)
+        remaining: List[SegmentToken] = []
+        for i, token in enumerate(self._token_buffer):
+            evt = self._make_event(token.token_id, token.text, token.punct_level)
             results = driver.feed(evt)
             for r in results:
                 actions.append(SegmentAction(idx, r))
@@ -472,7 +459,7 @@ class Spliter:
             break
         self._token_buffer = remaining
 
-        if self._text_complete and not self._token_buffer:
+        if self._input_complete and not self._token_buffer:
             end_evt = SpliterEvent(type=ET.END)
             for r in driver.feed(end_evt):
                 actions.append(SegmentAction(idx, r))
@@ -496,7 +483,7 @@ class Spliter:
         if self._presplit_thresholds is not None:
             return self._drive_presplit_batch()
 
-        if self._token_buffer or self._text_complete:
+        if self._token_buffer or self._input_complete:
             return self._try_start_next()
         return []
 
@@ -567,11 +554,29 @@ class Spliter:
         self._presplit_thresholds = None
         self._next_group_idx = 0
         self._token_buffer.clear()
-        self._text_complete = False
+        self._input_complete = False
         self._drivers.clear()
         self._next_segment_idx = 0
         self._flushing.clear()
         self._done.clear()
+
+    def _coerce_tokens(self, tokens) -> List[SegmentToken]:
+        """Accept legacy tuple tokens at the API edge, normalize internally."""
+        normalized: List[SegmentToken] = []
+        for token in tokens:
+            if isinstance(token, SegmentToken):
+                normalized.append(token)
+                continue
+            token_id, text = token[:2]
+            punct_level = token[2] if len(token) > 2 else self.classify_punct_level(text)
+            normalized.append(
+                SegmentToken(
+                    token_id=token_id,
+                    text=text,
+                    punct_level=punct_level,
+                )
+            )
+        return normalized
 
 
 __all__ = ("Spliter", "SegmentAction")

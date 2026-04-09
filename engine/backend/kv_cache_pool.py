@@ -100,7 +100,7 @@ class SlotKVState:
     trailing: list = field(default_factory=list)
     text_idx: int = 0
 
-    # Appended text token IDs for streaming APPEND_TEXT
+    # Appended text token IDs for streaming APPEND_TOKENS
     token_queue: list = field(default_factory=list)
 
     # Pad phase tracking (aligned with old engine's Phase B controls)

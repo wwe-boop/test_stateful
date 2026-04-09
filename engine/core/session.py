@@ -49,13 +49,13 @@ class Session:
 
     # Accumulated text that hasn't been tokenized yet (streaming buffer)
     _text_buffer: str = ""
-    _text_complete: bool = False
+    _input_complete: bool = False
 
     # Segment tracking
     segments_submitted: int = 0
     segments_done: int = 0
     segment_order: dict[int, SegmentOrderMeta] = field(default_factory=dict)
-    engine_text_done_sent: bool = False
+    engine_tokens_done_sent: bool = False
 
     # Metrics
     total_steps: int = 0
@@ -73,12 +73,12 @@ class Session:
     def has_pending_text(self) -> bool:
         return len(self._text_buffer) > 0
 
-    def mark_text_complete(self) -> None:
-        self._text_complete = True
+    def mark_input_complete(self) -> None:
+        self._input_complete = True
 
     @property
-    def text_complete(self) -> bool:
-        return self._text_complete
+    def input_complete(self) -> bool:
+        return self._input_complete
 
     def record_first_audio(self) -> None:
         if self.first_audio_at is None:

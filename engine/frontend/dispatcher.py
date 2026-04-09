@@ -42,9 +42,9 @@ class Dispatcher:
             session_id=session_id,
         ))
 
-    async def submit_session_text_done(self, session_id: str) -> None:
+    async def submit_session_tokens_done(self, session_id: str) -> None:
         await self._engine_inbox.put(EngineRequest(
-            type=RequestType.SESSION_TEXT_DONE,
+            type=RequestType.SESSION_TOKENS_DONE,
             session_id=session_id,
         ))
 
@@ -68,7 +68,7 @@ class Dispatcher:
                 session.segments_submitted += 1
                 session.segment_order[seg_idx] = order_meta
                 await self._engine_inbox.put(EngineRequest(
-                    type=RequestType.START_SEGMENT,
+                    type=RequestType.START_TOKENS,
                     session_id=session.session_id,
                     segment_idx=seg_idx,
                     priority=priority,
@@ -78,7 +78,7 @@ class Dispatcher:
 
             elif action.type == ActionType.DECODE:
                 await self._engine_inbox.put(EngineRequest(
-                    type=RequestType.APPEND_TEXT,
+                    type=RequestType.APPEND_TOKENS,
                     session_id=session.session_id,
                     segment_idx=seg_idx,
                     priority=priority,
@@ -87,15 +87,15 @@ class Dispatcher:
 
             elif action.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                 await self._engine_inbox.put(EngineRequest(
-                    type=RequestType.TEXT_COMPLETE,
+                    type=RequestType.SEGMENT_TOKENS_DONE,
                     session_id=session.session_id,
                     segment_idx=seg_idx,
                     append_eos=(action.type == ActionType.FLUSH_EOS),
                 ))
 
-    async def maybe_send_session_text_done(self, session: Session) -> None:
-        """Signal session-level text completion when no more groups remain."""
-        if session.engine_text_done_sent or session.spliter is None:
+    async def maybe_send_session_tokens_done(self, session: Session) -> None:
+        """Signal session-level token completion when no more groups remain."""
+        if session.engine_tokens_done_sent or session.spliter is None:
             return
         spliter = session.spliter
         pending_groups = getattr(spliter, "_presplit_groups", None)
@@ -104,8 +104,8 @@ class Dispatcher:
             return
         if pending_groups:
             return
-        await self.submit_session_text_done(session.session_id)
-        session.engine_text_done_sent = True
+        await self.submit_session_tokens_done(session.session_id)
+        session.engine_tokens_done_sent = True
 
     def _segment_priority(
         self,

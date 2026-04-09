@@ -2243,13 +2243,11 @@ class TritonPythonModel:
             raise
 
         c2w_past_len = int(c2w_states[0].shape[2]) if c2w_states else 0
-        c2w_key_total = min(c2w_past_len + chunk_t, self.code2wav_sliding_window)
-        if c2w_key_total <= 0:
-            c2w_key_total = 1
-        c2w_attention_bias = torch.zeros(
-            (batch, 1, chunk_t, c2w_key_total),
-            device=self.device,
-            dtype=self._code2wav_dtype,
+        c2w_attention_bias = self._build_c2w_attention_bias(
+            batch=batch,
+            chunk_t=chunk_t,
+            c2w_past_len=c2w_past_len,
+            use_dummy_past_kv=use_dummy_past_kv,
         )
         try:
             inputs.append(pb_utils.Tensor.from_dlpack("c2w_attention_bias", c2w_attention_bias.contiguous()))
@@ -2345,7 +2343,11 @@ class TritonPythonModel:
         for out_name in self._c2w_state_output_names:
             t = self._tensor_from_response_torch(response, out_name)
             t = self._maybe_fix_trt_batch_axis(t, batch)
-            t = self._clip_code2wav_state_window(out_name, t)
+            t = self._postprocess_c2w_state_output(
+                out_name,
+                t,
+                use_dummy_past_kv=use_dummy_past_kv,
+            )
             new_c2w.append(t)
 
         return wav, codec_sum, full_codec, logits, updated_tc, kv_tensors, new_c2w
@@ -2407,6 +2409,45 @@ class TritonPythonModel:
         if tensor.shape[2] <= max_kv_t:
             return tensor
         return tensor[:, :, -max_kv_t:, :].contiguous()
+
+    def _build_c2w_attention_bias(
+        self,
+        batch: int,
+        chunk_t: int,
+        c2w_past_len: int,
+        *,
+        use_dummy_past_kv: bool,
+    ) -> torch.Tensor:
+        c2w_key_total = min(c2w_past_len + chunk_t, self.code2wav_sliding_window)
+        if c2w_key_total <= 0:
+            c2w_key_total = 1
+        bias = torch.zeros(
+            (batch, 1, chunk_t, c2w_key_total),
+            device=self.device,
+            dtype=self._code2wav_dtype,
+        )
+        # Cold-start code2wav uses a physical past_len=1 dummy slot.
+        # Mask it exactly like the direct TRT path so the fake history never
+        # participates in attention, then drop it from the returned KV below.
+        if use_dummy_past_kv and c2w_past_len == _FUSED_DUMMY_PAST_LEN:
+            bias[:, :, :, 0] = float("-inf")
+        return bias
+
+    def _postprocess_c2w_state_output(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        *,
+        use_dummy_past_kv: bool,
+    ) -> torch.Tensor:
+        if (
+            use_dummy_past_kv
+            and name.startswith("c2w_present_kv_")
+            and tensor.dim() >= 4
+            and tensor.shape[2] > 0
+        ):
+            tensor = tensor[:, :, 1:, :].contiguous()
+        return self._clip_code2wav_state_window(name, tensor)
 
     def _tensor_from_response_torch(self, response, name: str) -> torch.Tensor:
         t = pb_utils.get_output_tensor_by_name(response, name)

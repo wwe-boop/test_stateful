@@ -264,15 +264,17 @@ class TTSEngine:
             on_done=on_done,
         )
 
-    async def feed_text(self, session_id: str, text: str) -> None:
-        await self._frontend.feed_text(session_id, text)
+    async def push_text_input(self, session_id: str, text: str) -> None:
+        """Transport-facing text ingress; frontend converts it to tokens."""
+        await self._frontend.push_text_input(session_id, text)
 
     async def feed_full_text(self, session_id: str, text: str) -> None:
         """Offline mode: set complete text, pre-split, drive all segments."""
         await self._frontend.feed_full_text(session_id, text)
 
-    async def text_complete(self, session_id: str) -> None:
-        await self._frontend.text_complete(session_id)
+    async def mark_input_complete(self, session_id: str) -> None:
+        """Signal that the transport has finished sending text input."""
+        await self._frontend.mark_input_complete(session_id)
 
     async def cancel(self, session_id: str) -> None:
         await self._frontend.cancel_session(session_id)

@@ -132,13 +132,13 @@ async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
             self._on_done = on_done
             return session_id
 
-        async def feed_text(self, session_id, text):
+        async def push_text_input(self, session_id, text):
             async def _emit():
                 await asyncio.sleep(0.01)
                 await self._on_audio(session_id, b"\x00\x00\x00\x00")
             asyncio.create_task(_emit())
 
-        async def text_complete(self, session_id):
+        async def mark_input_complete(self, session_id):
             async def _finish():
                 await asyncio.sleep(0.01)
                 await self._on_done(session_id, {})

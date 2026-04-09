@@ -53,13 +53,30 @@ class AudioConfig:
 
 
 @dataclass
+class TokenizedText:
+    """Canonical text payload: normalized text plus its token IDs."""
+    text: str = ""
+    token_ids: list[int] = field(default_factory=list)
+
+
+@dataclass
+class SegmentToken:
+    """One canonical text token used by the frontend spliter."""
+    token_id: int
+    text: str
+    punct_level: int = 0
+
+
+@dataclass
 class SessionConfig:
     task_type: str = ""
     language: str = "auto"
     speaker: Optional[str] = None
     instruct: Optional[str] = None
+    instruct_spec: Optional[TokenizedText] = None
     ref_audio: Optional[bytes] = None
     ref_text: Optional[str] = None
+    ref_text_spec: Optional[TokenizedText] = None
     x_vector_only: bool = False
     input_mode: InputMode = InputMode.LONG_SEGMENT
     group_policy: GroupPolicy = GroupPolicy.AUTO
@@ -72,10 +89,10 @@ class SessionConfig:
 
 class RequestType(Enum):
     NEW_SESSION      = auto()
-    START_SEGMENT    = auto()  # begin a new segment within an existing session
-    APPEND_TEXT      = auto()
-    TEXT_COMPLETE    = auto()  # per-segment: no more text for this segment
-    SESSION_TEXT_DONE = auto() # session-level: upstream has finished all text
+    START_TOKENS     = auto()  # begin a new token segment within an existing session
+    APPEND_TOKENS    = auto()
+    SEGMENT_TOKENS_DONE = auto()  # per-segment: no more tokens for this segment
+    SESSION_TOKENS_DONE = auto()  # session-level: upstream has finished all tokens
     CANCEL_SESSION   = auto()
 
 
@@ -98,9 +115,8 @@ class EngineRequest:
     speaker_key: Optional[str] = None
     task_type: Optional[str] = None       # "custom_voice" | "voice_design" | "voice_clone"
     ref_audio: Optional[bytes] = None
-    # APPEND_TEXT / START_SEGMENT payload
+    # APPEND_TOKENS / START_TOKENS payload
     token_ids: Optional[list[int]] = None
-    text: Optional[str] = None
     append_eos: bool = True
     # back-reference so engine thread can push results to the right queue
     result_queue: Optional[asyncio.Queue] = None

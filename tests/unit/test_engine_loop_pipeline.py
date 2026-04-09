@@ -190,7 +190,8 @@ class TestProcessStepOutput:
         engine_loop._process_step_output(output)
         assert slot.past_len == 6
         assert slot.frame_idx == 4
-        assert slot.next_embed is not None
+        assert slot.next_embed is None
+        assert slot.last_codec_sum is not None
         loop.close()
 
 
