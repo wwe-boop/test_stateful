@@ -93,6 +93,7 @@ class SlotKVState:
 
     # Decode tracking
     next_embed: Optional[torch.Tensor] = None
+    last_codec_sum: Optional[torch.Tensor] = None
     token_counts: Optional[torch.Tensor] = None
 
     # Trailing text embeddings for streaming decode
@@ -256,6 +257,7 @@ class KVCachePool:
         slot.trailing = []
         slot.token_queue = []
         slot.next_embed = None
+        slot.last_codec_sum = None
         slot.last_active_time = time.monotonic()
         if self._preallocate and self._talker_kv_pool is not None:
             self._talker_kv_pool[slot_id].zero_()
@@ -273,6 +275,7 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.next_embed = None
+        slot.last_codec_sum = None
         slot.token_counts = None
         slot.talker_kv = None
         slot.c2w_kv = None
@@ -313,6 +316,7 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.next_embed = None
+        slot.last_codec_sum = None
 
     def scatter_prefill_kv(
         self, slot_id: int, kv: torch.Tensor, seq_len: int,

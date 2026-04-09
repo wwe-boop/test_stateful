@@ -57,6 +57,8 @@ class ModelArchConfig:
     n_c2w_conv_states: int = 17
     n_c2w_transconv_states: int = 4
     dtype: str = "bf16"
+    tts_model_type: str = "unknown"
+    supported_task_types: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +343,20 @@ def load_model_manifest(
     # --- Apply architecture to ModelArchConfig ---
     if manifest_data.get("variant"):
         arch.variant = manifest_data["variant"]
+    orchestrator = manifest_data.get("orchestrator", {})
+    if isinstance(orchestrator, dict):
+        tts_model_type = orchestrator.get("tts_model_type")
+        if tts_model_type:
+            arch.tts_model_type = str(tts_model_type)
+        supported = orchestrator.get("supported_task_types")
+        if isinstance(supported, str) and supported.strip():
+            arch.supported_task_types = tuple(
+                s.strip() for s in supported.split(",") if s.strip()
+            )
+        elif isinstance(supported, list):
+            arch.supported_task_types = tuple(
+                str(s).strip() for s in supported if str(s).strip()
+            )
 
     applied = []
     for k, v in arch_section.items():

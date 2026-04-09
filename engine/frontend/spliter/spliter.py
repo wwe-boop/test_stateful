@@ -108,6 +108,7 @@ class Spliter:
         # backend segments because the Driver remains the final decider.
         self._presplit_groups: Deque[PendingGroup] = deque()
         self._presplit_thresholds: Optional[SplitThresholds] = None
+        self._next_group_idx: int = 0
 
         # Streaming token buffer (streaming mode)
         self._token_buffer: List[Tuple[int, str, int]] = []
@@ -286,12 +287,37 @@ class Spliter:
         Returns SegmentActions for up to max_concurrent segments.
         Remaining work is queued by group and driven as previous segments flush.
         """
-        self._presplit_thresholds = self._make_thresholds()
-        self._presplit_groups = deque([
-            PendingGroup(i, seg_tokens) for i, seg_tokens in enumerate(self.pre_split(tokens))
-        ])
+        self._presplit_groups.clear()
+        self._next_group_idx = 0
+        self._enqueue_presplit_groups(tokens)
         self._text_complete = True
 
+        return self._drive_presplit_batch()
+
+    def _enqueue_presplit_groups(
+        self, tokens: List[Tuple[int, str]],
+    ) -> None:
+        """Pre-split a complete long segment and append its groups."""
+        self._presplit_thresholds = self._make_thresholds()
+        for seg_tokens in self.pre_split(tokens):
+            self._presplit_groups.append(
+                PendingGroup(self._next_group_idx, seg_tokens),
+            )
+            self._next_group_idx += 1
+
+    def push_group_tokens(
+        self, tokens: List[Tuple[int, str]],
+    ) -> List[SegmentAction]:
+        """Queue one complete long-segment unit for group-level pre-splitting.
+
+        Unlike ``set_full_text()``, this does not mark the session text-complete.
+        Each incoming long segment is treated as a self-contained unit that may
+        be further pre-split into one or more groups before the second-layer
+        driver takes over.
+        """
+        if not tokens:
+            return []
+        self._enqueue_presplit_groups(tokens)
         return self._drive_presplit_batch()
 
     def _drive_presplit_batch(self) -> List[SegmentAction]:
@@ -539,6 +565,7 @@ class Spliter:
     def reset(self) -> None:
         self._presplit_groups.clear()
         self._presplit_thresholds = None
+        self._next_group_idx = 0
         self._token_buffer.clear()
         self._text_complete = False
         self._drivers.clear()

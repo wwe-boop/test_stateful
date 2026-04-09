@@ -148,6 +148,20 @@ class TestModelManifest:
         assert arch.head_dim == 256
         assert arch.num_layers == 28  # still default
 
+    def test_manifest_reads_orchestrator_task_capabilities(self, tmp_path):
+        manifest = {
+            "variant": "base-1.7b",
+            "orchestrator": {
+                "tts_model_type": "base",
+                "supported_task_types": ["base", "instruct", "voice_clone"],
+            },
+        }
+        (tmp_path / "triton_manifest.json").write_text(json.dumps(manifest))
+
+        arch = load_model_manifest(str(tmp_path), None)
+        assert arch.tts_model_type == "base"
+        assert arch.supported_task_types == ("base", "instruct", "voice_clone")
+
 
 class TestToModelConfig:
     def test_conversion(self):

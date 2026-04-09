@@ -572,6 +572,7 @@ class Executor:
         codec_sum = raw.get("codec_sum")
         if codec_sum is not None:
             slot.next_embed = codec_sum
+            slot.last_codec_sum = None
 
         wav = raw.get("wav")
         full_codec = raw.get("full_codec")
@@ -674,6 +675,9 @@ class Executor:
             and flip — avoids per-step allocation while supporting
             heterogeneous slot ordering.
         """
+        if len(slots) != 1:
+            return None
+
         slot = slots[0]
         if not slot.pingpong_ready:
             return None

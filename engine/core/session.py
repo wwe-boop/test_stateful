@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .types import SessionState, EngineResult
+from .types import EngineResult, SessionConfig, SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +30,7 @@ class SegmentOrderMeta:
 @dataclass
 class Session:
     session_id: str
-    speaker_key: Optional[str] = None
-    task_type: str = "custom"
+    config: SessionConfig = field(default_factory=SessionConfig)
 
     state: SessionState = SessionState.PENDING
     created_at: float = field(default_factory=time.monotonic)
@@ -84,6 +83,14 @@ class Session:
     def record_first_audio(self) -> None:
         if self.first_audio_at is None:
             self.first_audio_at = time.monotonic()
+
+    @property
+    def speaker_key(self) -> Optional[str]:
+        return self.config.speaker
+
+    @property
+    def task_type(self) -> str:
+        return self.config.task_type
 
     @property
     def first_audio_latency_ms(self) -> Optional[float]:

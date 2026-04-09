@@ -4,7 +4,8 @@ Architecture:
 
     ┌────────── asyncio event loop (main thread) ──────────┐
     │                                                       │
-    │  gRPC aio server  ──►  Dispatcher  ──►  engine_inbox  │
+    │  gRPC aio server  ──►  FrontendInterface ─► Dispatcher │
+    │                                       │         │      │
     │       ▲                                    │          │
     │       │ audio chunks                       │          │
     │       │ (call_soon_threadsafe)              │          │
@@ -40,14 +41,25 @@ from .config import (
     EngineConfig, ModelArchConfig, load_config, load_model_manifest, to_model_config,
 )
 from .core.mlfq import MLFQConfig
-from .core.types import EngineResult, ResultType
-from .frontend.dispatcher import Dispatcher
+from .core.types import SessionConfig
+from .frontend.interface import FrontendInterface
 from .frontend.spliter.tokenizer import LightQwen3TTSTokenizer
 from .backend.engine_loop import EngineLoop
 from .backend.executor import Executor
 from .backend.prefill import EmbeddingWeights, PrefillBuilder
+from .backend.ref_audio_processor import ReferenceAudioProcessor
 
 logger = logging.getLogger(__name__)
+
+
+_EXTERNAL_TO_INTERNAL_TASK_TYPE = {
+    "base": "voice_clone",
+    "icl": "voice_clone",
+    "voice_clone": "voice_clone",
+    "custom_voice": "custom_voice",
+    "voice_design": "voice_design",
+    "instruct": "voice_design",
+}
 
 
 class TTSEngine:
@@ -83,10 +95,11 @@ class TTSEngine:
         self._max_seq_len = max_seq_len if max_seq_len != 512 else self._cfg.scheduler.max_seq_len
 
         self._tokenizer: Optional[LightQwen3TTSTokenizer] = None
-        self._dispatcher: Optional[Dispatcher] = None
+        self._frontend: Optional[FrontendInterface] = None
         self._executor: Optional[Executor] = None
         self._engine_loop: Optional[EngineLoop] = None
         self._relay_task: Optional[asyncio.Task] = None
+        self._ref_audio_processor: Optional[ReferenceAudioProcessor] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -100,7 +113,7 @@ class TTSEngine:
         self._tokenizer = LightQwen3TTSTokenizer(self._tokenizer_dir)
 
         sc = self._cfg.spliter
-        self._dispatcher = Dispatcher(
+        self._frontend = FrontendInterface(
             engine_inbox=self._async_inbox,
             tokenizer=self._tokenizer,
             max_sessions=self._max_sessions,
@@ -130,6 +143,10 @@ class TTSEngine:
             random_seed=sampling.random_seed,
         )
         self._executor.load()
+        self._ref_audio_processor = ReferenceAudioProcessor(
+            self._engine_dir,
+            self._model_arch.variant,
+        )
 
         self._executor.warmup(n_rounds=self._cfg.server.warmup_rounds)
 
@@ -197,7 +214,7 @@ class TTSEngine:
         session_id: str,
         *,
         speaker_key: Optional[str] = None,
-        task_type: str = "custom",
+        task_type: Optional[str] = None,
         ref_audio: Optional[bytes] = None,
     ) -> AsyncIterator[bytes]:
         """Create a session and yield audio chunks as they are produced."""
@@ -209,11 +226,13 @@ class TTSEngine:
         async def on_done(sid: str, metrics: dict) -> None:
             await audio_queue.put(None)
 
-        await self._dispatcher.create_session(
+        await self.start_session(
             session_id,
-            speaker_key=speaker_key,
-            task_type=task_type,
-            ref_audio=ref_audio,
+            config=SessionConfig(
+                task_type=task_type or "",
+                speaker=speaker_key,
+                ref_audio=ref_audio,
+            ),
             on_audio=on_audio,
             on_done=on_done,
         )
@@ -224,24 +243,183 @@ class TTSEngine:
                 break
             yield chunk
 
+    async def start_session(
+        self,
+        session_id: str,
+        *,
+        config: SessionConfig,
+        on_audio=None,
+        on_done=None,
+    ):
+        """Create a configured session through the frontend interface.
+
+        This is the public session-entry API for gateways/adapters. It keeps the
+        transport layer from reaching into frontend internals directly.
+        """
+        self._validate_session_config(config)
+        return await self._frontend.create_session(
+            session_id,
+            config=config,
+            on_audio=on_audio,
+            on_done=on_done,
+        )
+
     async def feed_text(self, session_id: str, text: str) -> None:
-        await self._dispatcher.feed_text(session_id, text)
+        await self._frontend.feed_text(session_id, text)
 
     async def feed_full_text(self, session_id: str, text: str) -> None:
         """Offline mode: set complete text, pre-split, drive all segments."""
-        await self._dispatcher.feed_full_text(session_id, text)
+        await self._frontend.feed_full_text(session_id, text)
 
     async def text_complete(self, session_id: str) -> None:
-        await self._dispatcher.text_complete(session_id)
+        await self._frontend.text_complete(session_id)
 
     async def cancel(self, session_id: str) -> None:
-        await self._dispatcher.cancel_session(session_id)
+        await self._frontend.cancel_session(session_id)
 
     def health_stats(self) -> dict:
         """Return engine health metrics (safe to call from asyncio thread)."""
         if self._engine_loop is None:
             return {"running": False}
-        return self._engine_loop.health_stats()
+        stats = self._engine_loop.health_stats()
+        stats["variant"] = self._model_arch.variant
+        stats["loaded_model_type"] = self._loaded_model_type()
+        if self._model_arch.supported_task_types:
+            stats["declared_supported_task_types"] = list(self._model_arch.supported_task_types)
+        if self._ref_audio_processor is not None:
+            support = self._ref_audio_processor.support
+            stats["ref_audio_available"] = support.available
+            if support.reason:
+                stats["ref_audio_reason"] = support.reason
+        return stats
+
+    def describe_capabilities(self) -> dict:
+        """Return static standalone capability metadata for clients."""
+        ref_audio_available = False
+        ref_audio_reason = ""
+        if self._ref_audio_processor is not None:
+            support = self._ref_audio_processor.support
+            ref_audio_available = support.available
+            ref_audio_reason = support.reason or ""
+
+        return {
+            "variant": self._model_arch.variant,
+            "loaded_model_type": self._loaded_model_type(),
+            "declared_supported_task_types": list(self._model_arch.supported_task_types or ()),
+            "supported_input_modes": ["token", "clause", "long_segment", "full_text"],
+            "supported_group_policies": ["none", "auto"],
+            "supported_audio_formats": [
+                {"encoding": "pcm_f32", "sample_rate": 24000, "channels": 1},
+                {"encoding": "pcm_f32", "sample_rate": 16000, "channels": 1},
+                {"encoding": "pcm_s16le", "sample_rate": 24000, "channels": 1},
+                {"encoding": "pcm_s16le", "sample_rate": 16000, "channels": 1},
+            ],
+            "ref_audio_available": ref_audio_available,
+            "ref_audio_reason": ref_audio_reason,
+        }
+
+    def _validate_session_config(self, config: SessionConfig) -> None:
+        loaded_model_type = self._loaded_model_type()
+        requested = (config.task_type or "").strip()
+
+        if loaded_model_type != "unknown":
+            if requested and requested != loaded_model_type:
+                raise ValueError(
+                    f"standalone engine has loaded model_type '{loaded_model_type}', "
+                    f"but client requested task_type '{requested}'. "
+                    "Omit task_type or send the same loaded model type."
+                )
+            model_type = loaded_model_type
+        elif not requested:
+            raise ValueError(
+                "task_type is required because the loaded engine manifest does not declare tts_model_type"
+            )
+        else:
+            model_type = requested
+
+        self._validate_model_specific_fields(model_type, config)
+        config.task_type = self._internal_task_type_for_model(model_type)
+
+        task_type = (config.task_type or "").strip()
+        if task_type == "voice_clone":
+            if not config.ref_audio:
+                raise ValueError("ref_audio is required for task_type 'voice_clone'")
+            if self._ref_audio_processor is None or not self._ref_audio_processor.support.available:
+                reason = (
+                    self._ref_audio_processor.support.reason
+                    if self._ref_audio_processor is not None
+                    else "reference-audio processor unavailable"
+                )
+                raise ValueError(f"voice_clone is not available in standalone mode: {reason}")
+
+    def _loaded_model_type(self) -> str:
+        model_type = (self._model_arch.tts_model_type or "").strip()
+        if model_type and model_type != "unknown":
+            return model_type
+        supported = tuple(t.strip() for t in self._model_arch.supported_task_types or () if t and t.strip())
+        if len(supported) == 1:
+            return supported[0]
+        return "unknown"
+
+    def _internal_task_type_for_model(self, model_type: str) -> str:
+        normalized = (model_type or "").strip()
+        internal = _EXTERNAL_TO_INTERNAL_TASK_TYPE.get(normalized)
+        if internal:
+            return internal
+        raise ValueError(f"Unknown loaded model type: '{normalized}'")
+
+    def _validate_model_specific_fields(self, model_type: str, config: SessionConfig) -> None:
+        normalized = (model_type or "").strip()
+        if normalized == "base":
+            if not config.ref_audio:
+                raise ValueError("ref_audio is required for loaded model_type 'base'")
+            if config.ref_text:
+                raise ValueError("ref_text is not used for loaded model_type 'base'")
+            if config.instruct:
+                raise ValueError("instruct is not supported for loaded model_type 'base'")
+            if config.speaker:
+                raise ValueError("speaker is not supported for loaded model_type 'base'")
+            config.x_vector_only = True
+            return
+
+        if normalized in ("icl",):
+            if not config.ref_audio:
+                raise ValueError("ref_audio is required for loaded model_type 'icl'")
+            if not (config.ref_text or "").strip():
+                raise ValueError("ref_text is required for loaded model_type 'icl'")
+            if config.instruct:
+                raise ValueError("instruct is not supported for loaded model_type 'icl'")
+            if config.speaker:
+                raise ValueError("speaker is not supported for loaded model_type 'icl'")
+            config.x_vector_only = False
+            return
+
+        if normalized in ("voice_design", "instruct"):
+            if not (config.instruct or "").strip():
+                raise ValueError("instruct is required for loaded model_type 'voice_design'")
+            if config.speaker:
+                raise ValueError("speaker is not supported for loaded model_type 'voice_design'")
+            if config.ref_audio:
+                raise ValueError("ref_audio is not supported for loaded model_type 'voice_design'")
+            if config.ref_text:
+                raise ValueError("ref_text is not supported for loaded model_type 'voice_design'")
+            if config.x_vector_only:
+                raise ValueError("x_vector_only is not supported for loaded model_type 'voice_design'")
+            return
+
+        if normalized == "custom_voice":
+            if config.ref_audio:
+                raise ValueError("ref_audio is not supported for loaded model_type 'custom_voice'")
+            if config.ref_text:
+                raise ValueError("ref_text is not supported for loaded model_type 'custom_voice'")
+            if config.x_vector_only:
+                raise ValueError("x_vector_only is not supported for loaded model_type 'custom_voice'")
+            return
+
+        if normalized == "voice_clone":
+            return
+
+        raise ValueError(f"Unknown loaded model type: '{normalized}'")
 
     # ------------------------------------------------------------------
     # Internal: relay asyncio.Queue → stdlib queue.Queue

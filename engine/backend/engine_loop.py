@@ -370,6 +370,7 @@ class EngineLoop:
                 and self._prefill_builder is not None
             ):
                 self._append_trailing_tokens(seg.slot, req.token_ids)
+                self._resume_streaming_segment_if_ready(seg)
             else:
                 logger.debug(
                     "APPEND_TEXT %d tokens for %s seg=%d state=%s (pre-prefill accumulate)",
@@ -385,12 +386,17 @@ class EngineLoop:
             if seg:
                 seg.text_complete = True
                 if (
+                    req.append_eos
+                    and
                     seg.state == "active"
                     and seg.slot is not None
                     and not seg.eos_trailing_added
                     and self._prefill_builder is not None
                 ):
                     self._append_eos_trailing(seg)
+                    self._resume_streaming_segment_if_ready(seg)
+                elif req.append_eos:
+                    seg.eos_trailing_added = False
                 if seg.state == "done":
                     self._check_session_done(group)
 
@@ -443,7 +449,7 @@ class EngineLoop:
             for seg in group.segments.values():
                 if seg.state != "pending_prefill":
                     continue
-                if not seg.text_complete:
+                if not seg.pending_token_ids:
                     continue
                 if best is None or seg.priority.value < best.priority.value:
                     best = seg
@@ -461,9 +467,16 @@ class EngineLoop:
 
         segment_text = ""
         if self._prefill_builder is not None:
+            req_cfg = best_group.request.session_config
+            task_type_str = (
+                req_cfg.task_type
+                if req_cfg is not None
+                else (best_group.request.task_type or "custom_voice")
+            )
             try:
                 task_type = parse_task_type(
-                    best_group.request.task_type or "custom_voice",
+                    task_type_str,
+                    x_vector_only=(req_cfg.x_vector_only if req_cfg is not None else False),
                 )
             except ValueError as exc:
                 logger.error("Invalid task_type for %s: %s", best.session_id, exc)
@@ -481,7 +494,10 @@ class EngineLoop:
             # Check prefix cache BEFORE build_plan to skip the
             # token→text→retokenize round-trip on cache hits.
             cache_key = self._prefill_builder.compute_cache_key(
-                task_type, "auto", best_group.request.speaker_key,
+                task_type,
+                req_cfg.language if req_cfg is not None else "auto",
+                req_cfg.speaker if req_cfg is not None else best_group.request.speaker_key,
+                req_cfg.instruct if req_cfg is not None else None,
             )
             cached = self._prefix_cache.get(cache_key)
 
@@ -511,8 +527,10 @@ class EngineLoop:
                 plan = self._prefill_builder.build_plan(
                     task_type=task_type,
                     text=segment_text,
-                    language="auto",
-                    speaker=best_group.request.speaker_key,
+                    language=req_cfg.language if req_cfg is not None else "auto",
+                    speaker=req_cfg.speaker if req_cfg is not None else best_group.request.speaker_key,
+                    instruct=req_cfg.instruct if req_cfg is not None else None,
+                    ref_text=req_cfg.ref_text if req_cfg is not None else None,
                     include_eos=best.text_complete,
                 )
                 best.prefill_plan = plan
@@ -615,8 +633,30 @@ class EngineLoop:
         slot.init_pingpong_buffers()
 
         slot.next_embed = request_prefill_embeds.to(torch.float32)
+        slot.last_codec_sum = None
         slot.trailing = trailing
         slot.text_idx = 0
+
+    def _resume_streaming_segment_if_ready(self, seg: EngineSegment) -> None:
+        """Resume a paused streaming segment when new trailing text/EOS arrives."""
+        slot = seg.slot
+        if slot is None or slot.last_codec_sum is None or slot.next_embed is not None:
+            return
+        if not slot.trailing or slot.text_idx >= len(slot.trailing):
+            return
+        text_add = slot.trailing[slot.text_idx].to(slot.last_codec_sum.dtype)
+        slot.text_idx += 1
+        slot.next_embed = (slot.last_codec_sum + text_add).to(torch.float32)
+        slot.last_codec_sum = None
+        slot.pad_start_frame = -1
+        slot.pad_consecutive_silence = 0
+        logger.debug(
+            "Resumed paused streaming segment %s:%d (trailing=%d, text_idx=%d)",
+            seg.session_id,
+            seg.segment_idx,
+            len(slot.trailing),
+            slot.text_idx,
+        )
 
     def _read_prefix_kv(
         self, slot: SlotKVState, prefix_len: int,
@@ -800,12 +840,30 @@ class EngineLoop:
                     slot.text_idx += 1
                     slot.pad_start_frame = -1
                     slot.pad_consecutive_silence = 0
+                    slot.last_codec_sum = None
+                    slot.next_embed = (output.codec_sum[i:i+1] + text_add).to(torch.float32)
+                elif not seg.text_complete:
+                    # True streaming pause: preserve the latest codec_sum and
+                    # wait for more text instead of injecting pad tokens, which
+                    # creates artificial silences and prosody discontinuities.
+                    slot.last_codec_sum = output.codec_sum[i:i+1].clone()
+                    slot.next_embed = None
+                    slot.pad_start_frame = -1
+                    slot.pad_consecutive_silence = 0
+                    logger.debug(
+                        "Paused streaming segment %s:%d awaiting text (frame=%d, past=%d)",
+                        seg.session_id,
+                        seg.segment_idx,
+                        slot.frame_idx,
+                        slot.past_len,
+                    )
                 else:
                     text_add = self._tts_pad_embed.to(output.codec_sum.dtype)
                     in_pad = True
+                    slot.last_codec_sum = None
                     if slot.pad_start_frame < 0:
                         slot.pad_start_frame = slot.frame_idx
-                slot.next_embed = (output.codec_sum[i:i+1] + text_add).to(torch.float32)
+                    slot.next_embed = (output.codec_sum[i:i+1] + text_add).to(torch.float32)
             else:
                 slot.next_embed = None
 

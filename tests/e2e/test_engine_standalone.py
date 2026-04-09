@@ -58,12 +58,15 @@ class TTSResult:
     session_id: str
     text: str
     first_chunk_ms: Optional[float] = None
+    ttft_ms: Optional[float] = None
+    start_to_first_audio_ms: Optional[float] = None
     total_ms: float = 0.0
     num_chunks: int = 0
     total_samples: int = 0
     error: Optional[str] = None
     audio: Optional[np.ndarray] = None
     warnings: list = field(default_factory=list)
+    audio_chunk_intervals_ms: list[float] = field(default_factory=list)
 
     @property
     def duration_sec(self) -> float:
@@ -74,6 +77,35 @@ class TTSResult:
         if self.duration_sec <= 0 or self.total_ms <= 0:
             return 0.0
         return (self.total_ms / 1000) / self.duration_sec
+
+    @property
+    def decode_step_mean_ms(self) -> Optional[float]:
+        if not self.audio_chunk_intervals_ms:
+            return None
+        return statistics.mean(self.audio_chunk_intervals_ms)
+
+    @property
+    def decode_step_p50_ms(self) -> Optional[float]:
+        if not self.audio_chunk_intervals_ms:
+            return None
+        return statistics.median(self.audio_chunk_intervals_ms)
+
+    @property
+    def decode_step_p95_ms(self) -> Optional[float]:
+        if not self.audio_chunk_intervals_ms:
+            return None
+        vals = sorted(self.audio_chunk_intervals_ms)
+        idx = min(len(vals) - 1, max(0, int(round(0.95 * (len(vals) - 1)))))
+        return vals[idx]
+
+
+def _compute_intervals_ms(timestamps: list[float]) -> list[float]:
+    if len(timestamps) < 2:
+        return []
+    return [
+        (timestamps[i] - timestamps[i - 1]) * 1000.0
+        for i in range(1, len(timestamps))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +164,41 @@ def _pcm_bytes_to_f32(pcm_data: bytes) -> np.ndarray:
     return np.frombuffer(pcm_data, dtype=np.float32)
 
 
+def _audio_chunk_to_f32(audio_chunk) -> np.ndarray:
+    encoding = getattr(audio_chunk, "encoding", tts_pb2.AUDIO_ENCODING_PCM_F32)
+    if encoding == tts_pb2.AUDIO_ENCODING_PCM_S16LE:
+        return np.frombuffer(audio_chunk.pcm_data, dtype=np.int16).astype(np.float32) / 32767.0
+    return np.frombuffer(audio_chunk.pcm_data, dtype=np.float32)
+
+
+def _make_session_config(
+    *,
+    task_type: str,
+    speaker: str = "",
+    input_mode=None,
+    group_policy=None,
+    sample_rate: int = SAMPLE_RATE,
+    encoding=None,
+):
+    if input_mode is None:
+        input_mode = tts_pb2.INPUT_MODE_LONG_SEGMENT
+    if group_policy is None:
+        group_policy = tts_pb2.GROUP_POLICY_AUTO
+    if encoding is None:
+        encoding = tts_pb2.AUDIO_ENCODING_PCM_F32
+    return tts_pb2.SessionConfig(
+        task_type=task_type,
+        speaker=speaker,
+        input_mode=input_mode,
+        group_policy=group_policy,
+        audio=tts_pb2.AudioFormat(
+            encoding=encoding,
+            sample_rate=sample_rate,
+            channels=1,
+        ),
+    )
+
+
 def _save_wav(audio: np.ndarray, path: str):
     audio = np.clip(audio, -1.0, 1.0)
     audio_int16 = (audio * 32767).astype(np.int16)
@@ -158,6 +225,29 @@ def _check_server(host: str, port: int) -> bool:
         channel.close()
 
 
+def _get_capabilities(host: str, port: int) -> dict:
+    import grpc
+    channel = grpc.insecure_channel(f"{host}:{port}")
+    stub = tts_pb2_grpc.TTSServiceStub(channel)
+    try:
+        resp = stub.GetCapabilities(tts_pb2.GetCapabilitiesRequest(), timeout=10)
+        return {
+            "variant": resp.variant,
+            "loaded_model_type": resp.loaded_model_type,
+            "declared_supported_task_types": list(resp.declared_supported_task_types),
+            "supported_input_modes": list(resp.supported_input_modes),
+            "supported_group_policies": list(resp.supported_group_policies),
+            "supported_audio_formats": [
+                (fmt.encoding, fmt.sample_rate, fmt.channels)
+                for fmt in resp.supported_audio_formats
+            ],
+            "ref_audio_available": resp.ref_audio_available,
+            "ref_audio_reason": resp.ref_audio_reason,
+        }
+    finally:
+        channel.close()
+
+
 def _synthesize_oneshot(
     host: str, port: int,
     text: str,
@@ -176,21 +266,29 @@ def _synthesize_oneshot(
 
     chunks = []
     first_ts = None
+    chunk_timestamps: list[float] = []
 
     t0 = time.perf_counter()
+    request_sent_ts = t0
     try:
         request = tts_pb2.SynthesizeOnceRequest(
             session_id=sid,
-            speaker=speaker,
-            task_type=task_type,
             text=text,
+            config=_make_session_config(
+                task_type=task_type,
+                speaker=speaker,
+                input_mode=tts_pb2.INPUT_MODE_FULL_TEXT,
+            ),
         )
         for resp in stub.SynthesizeOnce(request, timeout=timeout):
             which = resp.WhichOneof("response")
             if which == "audio":
                 if first_ts is None:
                     first_ts = time.perf_counter()
-                chunks.append(_pcm_bytes_to_f32(resp.audio.pcm_data))
+                    chunk_timestamps.append(first_ts)
+                else:
+                    chunk_timestamps.append(time.perf_counter())
+                chunks.append(_audio_chunk_to_f32(resp.audio))
             elif which == "status":
                 if resp.status.event == "error":
                     result.error = resp.status.message
@@ -207,6 +305,9 @@ def _synthesize_oneshot(
     elapsed = time.perf_counter() - t0
     result.total_ms = elapsed * 1000
     result.first_chunk_ms = (first_ts - t0) * 1000 if first_ts else None
+    result.start_to_first_audio_ms = result.first_chunk_ms
+    result.ttft_ms = (first_ts - request_sent_ts) * 1000 if first_ts else None
+    result.audio_chunk_intervals_ms = _compute_intervals_ms(chunk_timestamps)
     result.num_chunks = len(chunks)
     if chunks:
         result.audio = np.concatenate(chunks)
@@ -220,6 +321,7 @@ async def _synthesize_streaming(
     init_speaker: str,
     init_task_type: str,
     text_chunks: list[str],
+    input_mode=tts_pb2.INPUT_MODE_LONG_SEGMENT,
     chunk_delay_ms: float = 50.0,
     session_id: str = "",
     timeout: float = 120.0,
@@ -234,25 +336,37 @@ async def _synthesize_streaming(
 
     chunks: List[np.ndarray] = []
     first_ts = None
+    chunk_timestamps: list[float] = []
+    send_marks: dict[str, Optional[float]] = {
+        "start_sent_ts": None,
+        "first_text_sent_ts": None,
+    }
 
     async def request_gen():
+        send_marks["start_sent_ts"] = time.perf_counter()
         yield tts_pb2.SynthesizeRequest(
-            init=tts_pb2.InitRequest(
+            start=tts_pb2.StartRequest(
                 session_id=sid,
-                speaker=init_speaker,
-                task_type=init_task_type,
+                config=_make_session_config(
+                    task_type=init_task_type,
+                    speaker=init_speaker,
+                    input_mode=input_mode,
+                ),
             )
         )
         for chunk_text in text_chunks:
             if chunk_delay_ms > 0:
                 await asyncio.sleep(chunk_delay_ms / 1000)
+            now = time.perf_counter()
+            if send_marks["first_text_sent_ts"] is None:
+                send_marks["first_text_sent_ts"] = now
             yield tts_pb2.SynthesizeRequest(
                 text=tts_pb2.TextChunk(text=chunk_text)
             )
         if chunk_delay_ms > 0:
             await asyncio.sleep(chunk_delay_ms / 1000)
         yield tts_pb2.SynthesizeRequest(
-            done=tts_pb2.TextComplete()
+            end=tts_pb2.EndRequest()
         )
 
     t0 = time.perf_counter()
@@ -263,7 +377,10 @@ async def _synthesize_streaming(
             if which == "audio":
                 if first_ts is None:
                     first_ts = time.perf_counter()
-                chunks.append(_pcm_bytes_to_f32(resp.audio.pcm_data))
+                    chunk_timestamps.append(first_ts)
+                else:
+                    chunk_timestamps.append(time.perf_counter())
+                chunks.append(_audio_chunk_to_f32(resp.audio))
             elif which == "status":
                 if resp.status.event == "error":
                     result.error = resp.status.message
@@ -278,6 +395,15 @@ async def _synthesize_streaming(
     elapsed = time.perf_counter() - t0
     result.total_ms = elapsed * 1000
     result.first_chunk_ms = (first_ts - t0) * 1000 if first_ts else None
+    result.start_to_first_audio_ms = (
+        (first_ts - send_marks["start_sent_ts"]) * 1000
+        if first_ts and send_marks["start_sent_ts"] is not None else None
+    )
+    result.ttft_ms = (
+        (first_ts - send_marks["first_text_sent_ts"]) * 1000
+        if first_ts and send_marks["first_text_sent_ts"] is not None else None
+    )
+    result.audio_chunk_intervals_ms = _compute_intervals_ms(chunk_timestamps)
     result.num_chunks = len(chunks)
     if chunks:
         result.audio = np.concatenate(chunks)
@@ -299,9 +425,31 @@ def _print_result(result: TTSResult, label: str = ""):
         for w in result.warnings:
             print(f"{prefix} WARNING: {w}")
     fc = f"{result.first_chunk_ms:.0f}ms" if result.first_chunk_ms is not None else "N/A"
+    ttft = f"{result.ttft_ms:.0f}ms" if result.ttft_ms is not None else "N/A"
+    start_to_first = (
+        f"{result.start_to_first_audio_ms:.0f}ms"
+        if result.start_to_first_audio_ms is not None else "N/A"
+    )
+    step_mean = (
+        f"{result.decode_step_mean_ms:.1f}ms"
+        if result.decode_step_mean_ms is not None else "N/A"
+    )
+    step_p50 = (
+        f"{result.decode_step_p50_ms:.1f}ms"
+        if result.decode_step_p50_ms is not None else "N/A"
+    )
+    step_p95 = (
+        f"{result.decode_step_p95_ms:.1f}ms"
+        if result.decode_step_p95_ms is not None else "N/A"
+    )
     print(
         f"{prefix} session={result.session_id}"
         f"  first_chunk={fc}"
+        f"  ttft={ttft}"
+        f"  start_to_first_audio={start_to_first}"
+        f"  decode_step_mean={step_mean}"
+        f"  p50={step_p50}"
+        f"  p95={step_p95}"
         f"  total={result.total_ms:.0f}ms"
         f"  chunks={result.num_chunks}"
         f"  audio={result.duration_sec:.2f}s"
@@ -317,17 +465,33 @@ def _print_summary(results: list[TTSResult], label: str):
     if not ok:
         return
     first_chunks = [r.first_chunk_ms for r in ok]
+    ttfts = [r.ttft_ms for r in ok if r.ttft_ms is not None]
     totals = [r.total_ms for r in ok]
     rtfs = [r.rtf for r in ok if r.rtf > 0]
     durations = [r.duration_sec for r in ok]
+    decode_steps = [
+        step
+        for r in ok
+        for step in r.audio_chunk_intervals_ms
+    ]
     print(f"  First-chunk latency:  min={min(first_chunks):.0f}ms  "
           f"median={statistics.median(first_chunks):.0f}ms  "
           f"max={max(first_chunks):.0f}ms  "
           f"mean={statistics.mean(first_chunks):.0f}ms")
+    if ttfts:
+        print(f"  TTFT:                 min={min(ttfts):.0f}ms  "
+              f"median={statistics.median(ttfts):.0f}ms  "
+              f"max={max(ttfts):.0f}ms  "
+              f"mean={statistics.mean(ttfts):.0f}ms")
     print(f"  Total latency:        min={min(totals):.0f}ms  "
           f"median={statistics.median(totals):.0f}ms  "
           f"max={max(totals):.0f}ms  "
           f"mean={statistics.mean(totals):.0f}ms")
+    if decode_steps:
+        print(f"  Decode-step interval: min={min(decode_steps):.1f}ms  "
+              f"p50={statistics.median(decode_steps):.1f}ms  "
+              f"p95={sorted(decode_steps)[min(len(decode_steps) - 1, max(0, int(round(0.95 * (len(decode_steps) - 1)))) )]:.1f}ms  "
+              f"mean={statistics.mean(decode_steps):.1f}ms")
     if rtfs:
         print(f"  RTF (wall/audio):     min={min(rtfs):.2f}  "
               f"median={statistics.median(rtfs):.2f}  "
@@ -375,6 +539,7 @@ def test_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
         host, port,
         init_speaker="Serena",
         init_task_type="custom_voice",
+        input_mode=tts_pb2.INPUT_MODE_CLAUSE,
         text_chunks=[
             "你好，这是流式文本输入测试。",
             "我们正在验证",
@@ -488,6 +653,7 @@ def test_long_text(host: str, port: int, output_dir: Path) -> list[TTSResult]:
         host, port,
         init_speaker="Serena",
         init_task_type="custom_voice",
+        input_mode=tts_pb2.INPUT_MODE_LONG_SEGMENT,
         text_chunks=sentences,
         chunk_delay_ms=300,
         session_id="stream-long",
@@ -568,6 +734,7 @@ def test_badcases(host: str, port: int, output_dir: Path) -> list:
     r = asyncio.run(_synthesize_streaming(
         host, port,
         init_speaker="Serena", init_task_type="custom_voice",
+        input_mode=tts_pb2.INPUT_MODE_CLAUSE,
         text_chunks=[],
         chunk_delay_ms=100, session_id="badcase-stream-notext", timeout=15,
     ))
@@ -609,6 +776,7 @@ def test_badcases(host: str, port: int, output_dir: Path) -> list:
     r = asyncio.run(_synthesize_streaming(
         host, port,
         init_speaker="Serena", init_task_type="custom_voice",
+        input_mode=tts_pb2.INPUT_MODE_CLAUSE,
         text_chunks=["你好，", "这是一个", "慢速输入的测试。"],
         chunk_delay_ms=1000, session_id="badcase-slow-stream", timeout=60,
     ))
@@ -644,8 +812,13 @@ def _test_cancel(host: str, port: int) -> TTSResult:
 
     def request_gen():
         yield tts_pb2.SynthesizeRequest(
-            init=tts_pb2.InitRequest(
-                session_id=sid, speaker="Serena", task_type="custom_voice",
+            start=tts_pb2.StartRequest(
+                session_id=sid,
+                config=_make_session_config(
+                    task_type="custom_voice",
+                    speaker="Serena",
+                    input_mode=tts_pb2.INPUT_MODE_LONG_SEGMENT,
+                ),
             )
         )
         yield tts_pb2.SynthesizeRequest(
@@ -662,7 +835,7 @@ def _test_cancel(host: str, port: int) -> TTSResult:
         for resp in stub.SynthesizeStream(request_gen(), timeout=15):
             which = resp.WhichOneof("response")
             if which == "audio":
-                chunks.append(_pcm_bytes_to_f32(resp.audio.pcm_data))
+                chunks.append(_audio_chunk_to_f32(resp.audio))
             elif which == "status":
                 break
     except grpc.RpcError:
@@ -701,6 +874,12 @@ def engine_addr():
 class TestEngineSmokeAndStreaming:
     """Smoke + streaming tests against the standalone engine."""
 
+    def test_get_capabilities(self, engine_addr):
+        host, port = engine_addr
+        cap = _get_capabilities(host, port)
+        assert cap["loaded_model_type"]
+        assert cap["supported_audio_formats"]
+
     def test_single_smoke(self, engine_addr):
         host, port = engine_addr
         r = _synthesize_oneshot(host, port, text="你好，这是一个测试。", speaker="Serena")
@@ -719,6 +898,7 @@ class TestEngineSmokeAndStreaming:
         r = asyncio.run(_synthesize_streaming(
             host, port,
             init_speaker="Serena", init_task_type="custom_voice",
+            input_mode=tts_pb2.INPUT_MODE_CLAUSE,
             text_chunks=["你好，", "这是流式测试。"],
             chunk_delay_ms=100,
         ))
@@ -816,6 +996,12 @@ def main():
         print("  python -m engine.server --config engine.yaml")
         sys.exit(1)
     print("  Server:      READY")
+    cap = _get_capabilities(args.host, args.port)
+    print(f"  Variant:     {cap['variant'] or 'unknown'}")
+    print(f"  Model Type:  {cap['loaded_model_type'] or 'unknown'}")
+    print(f"  Ref Audio:   {cap['ref_audio_available']}")
+    if cap["ref_audio_reason"]:
+        print(f"  Ref Reason:  {cap['ref_audio_reason']}")
 
     all_results: dict[str, list[TTSResult]] = {}
 

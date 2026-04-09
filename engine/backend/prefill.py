@@ -202,8 +202,8 @@ def normalize_tts_text(text: str) -> str:
 # PrefillBuilder
 # ---------------------------------------------------------------------------
 
-OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|redacted_im_end|>\n<|im_start|>assistant\n"
-OFFICIAL_REF_TEXT_FMT = "<|im_start|>assistant\n{text}<|redacted_im_end|>\n"
+OFFICIAL_ASSISTANT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+OFFICIAL_REF_TEXT_FMT = "<|im_start|>assistant\n{text}<|im_end|>\n"
 OFFICIAL_INSTRUCT_FMT = "<|im_start|>user\n{instruct}<|im_end|>\n"
 
 

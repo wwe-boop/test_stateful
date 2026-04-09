@@ -28,6 +28,44 @@ class SessionState(Enum):
     DONE      = auto()
 
 
+class InputMode(Enum):
+    TOKEN = "token"
+    CLAUSE = "clause"
+    LONG_SEGMENT = "long_segment"
+    FULL_TEXT = "full_text"
+
+
+class GroupPolicy(Enum):
+    NONE = "none"
+    AUTO = "auto"
+
+
+class AudioEncoding(Enum):
+    PCM_F32 = "pcm_f32"
+    PCM_S16LE = "pcm_s16le"
+
+
+@dataclass
+class AudioConfig:
+    sample_rate: int = 24000
+    encoding: AudioEncoding = AudioEncoding.PCM_F32
+    channels: int = 1
+
+
+@dataclass
+class SessionConfig:
+    task_type: str = ""
+    language: str = "auto"
+    speaker: Optional[str] = None
+    instruct: Optional[str] = None
+    ref_audio: Optional[bytes] = None
+    ref_text: Optional[str] = None
+    x_vector_only: bool = False
+    input_mode: InputMode = InputMode.LONG_SEGMENT
+    group_policy: GroupPolicy = GroupPolicy.AUTO
+    audio: AudioConfig = field(default_factory=AudioConfig)
+
+
 # ---------------------------------------------------------------------------
 # Frontend → Engine thread  (via engine_inbox)
 # ---------------------------------------------------------------------------
@@ -55,13 +93,15 @@ class EngineRequest:
     session_id: str
     segment_idx: int = 0
     priority: RequestPriority = RequestPriority.FIRST_SEGMENT
+    session_config: Optional[SessionConfig] = None
     # NEW_SESSION payload
     speaker_key: Optional[str] = None
-    task_type: Optional[str] = None       # "icl" | "custom" | "design"
+    task_type: Optional[str] = None       # "custom_voice" | "voice_design" | "voice_clone"
     ref_audio: Optional[bytes] = None
     # APPEND_TEXT / START_SEGMENT payload
     token_ids: Optional[list[int]] = None
     text: Optional[str] = None
+    append_eos: bool = True
     # back-reference so engine thread can push results to the right queue
     result_queue: Optional[asyncio.Queue] = None
 

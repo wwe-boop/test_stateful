@@ -44,6 +44,13 @@ def save_wav(audio: np.ndarray, path: str):
         wf.writeframes(audio_int16.tobytes())
 
 
+def _audio_chunk_to_f32(audio_chunk) -> np.ndarray:
+    encoding = getattr(audio_chunk, "encoding", tts_pb2.AUDIO_ENCODING_PCM_F32)
+    if encoding == tts_pb2.AUDIO_ENCODING_PCM_S16LE:
+        return np.frombuffer(audio_chunk.pcm_data, dtype=np.int16).astype(np.float32) / 32767.0
+    return np.frombuffer(audio_chunk.pcm_data, dtype=np.float32)
+
+
 def synthesize(text: str, speaker: str = "Serena") -> tuple[np.ndarray | None, float, int]:
     sid = uuid.uuid4().hex[:12]
     channel = grpc.insecure_channel(f"{HOST}:{PORT}")
@@ -55,16 +62,25 @@ def synthesize(text: str, speaker: str = "Serena") -> tuple[np.ndarray | None, f
     try:
         request = tts_pb2.SynthesizeOnceRequest(
             session_id=sid,
-            speaker=speaker,
-            task_type="custom_voice",
             text=text,
+            config=tts_pb2.SessionConfig(
+                task_type="custom_voice",
+                speaker=speaker,
+                input_mode=tts_pb2.INPUT_MODE_FULL_TEXT,
+                group_policy=tts_pb2.GROUP_POLICY_AUTO,
+                audio=tts_pb2.AudioFormat(
+                    encoding=tts_pb2.AUDIO_ENCODING_PCM_F32,
+                    sample_rate=SAMPLE_RATE,
+                    channels=1,
+                ),
+            ),
         )
         for resp in stub.SynthesizeOnce(request, timeout=60):
             which = resp.WhichOneof("response")
             if which == "audio":
                 if first_ts is None:
                     first_ts = time.perf_counter()
-                chunks.append(np.frombuffer(resp.audio.pcm_data, dtype=np.float32))
+                chunks.append(_audio_chunk_to_f32(resp.audio))
             elif which == "status":
                 if resp.status.event == "error":
                     print(f"  ERROR: {resp.status.message}")

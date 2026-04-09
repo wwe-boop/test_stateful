@@ -3,7 +3,10 @@
 import grpc
 import warnings
 
-from . import tts_pb2 as tts__pb2
+try:
+    from . import tts_pb2 as tts__pb2
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    import tts_pb2 as tts__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -34,6 +37,11 @@ class TTSServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
+        self.GetCapabilities = channel.unary_unary(
+                '/tts.TTSService/GetCapabilities',
+                request_serializer=tts__pb2.GetCapabilitiesRequest.SerializeToString,
+                response_deserializer=tts__pb2.GetCapabilitiesResponse.FromString,
+                _registered_method=True)
         self.SynthesizeOnce = channel.unary_stream(
                 '/tts.TTSService/SynthesizeOnce',
                 request_serializer=tts__pb2.SynthesizeOnceRequest.SerializeToString,
@@ -49,15 +57,22 @@ class TTSServiceStub(object):
 class TTSServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
+    def GetCapabilities(self, request, context):
+        """Query the currently loaded standalone engine capabilities.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def SynthesizeOnce(self, request, context):
-        """Unary request with the full text, server streams audio chunks back
+        """Convenience unary wrapper for FULL_TEXT mode.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def SynthesizeStream(self, request_iterator, context):
-        """Bidirectional streaming: client sends text chunks, server sends audio chunks
+        """Primary session protocol: start -> text* -> end/cancel.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -66,6 +81,11 @@ class TTSServiceServicer(object):
 
 def add_TTSServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
+            'GetCapabilities': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetCapabilities,
+                    request_deserializer=tts__pb2.GetCapabilitiesRequest.FromString,
+                    response_serializer=tts__pb2.GetCapabilitiesResponse.SerializeToString,
+            ),
             'SynthesizeOnce': grpc.unary_stream_rpc_method_handler(
                     servicer.SynthesizeOnce,
                     request_deserializer=tts__pb2.SynthesizeOnceRequest.FromString,
@@ -86,6 +106,33 @@ def add_TTSServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class TTSService(object):
     """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def GetCapabilities(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/tts.TTSService/GetCapabilities',
+            tts__pb2.GetCapabilitiesRequest.SerializeToString,
+            tts__pb2.GetCapabilitiesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
     @staticmethod
     def SynthesizeOnce(request,

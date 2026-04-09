@@ -3,7 +3,7 @@
 Handles bidirectional streaming: client sends text chunks, server sends audio.
 
 Protocol:
-  Client sends:  InitRequest → TextChunk* → TextComplete
+  Client sends:  StartRequest → TextChunk* → EndRequest
   Server sends:  AudioChunk* → StatusUpdate(done)
 
 Uses grpcio.aio for async compatibility with the engine's asyncio event loop.
@@ -22,6 +22,15 @@ import logging
 import uuid
 from typing import TYPE_CHECKING
 
+import numpy as np
+
+from ..core.types import (
+    AudioConfig,
+    AudioEncoding,
+    GroupPolicy,
+    InputMode,
+    SessionConfig,
+)
 from . import tts_pb2, tts_pb2_grpc
 
 if TYPE_CHECKING:
@@ -29,7 +38,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_RATE = 24000
+ENGINE_SAMPLE_RATE = 24000
 
 
 class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
@@ -38,28 +47,28 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
     def __init__(self, engine: TTSEngine):
         self._engine = engine
 
+    async def GetCapabilities(self, request, context):
+        return _make_capabilities_response(self._engine.describe_capabilities())
+
     async def _create_session(
         self,
         session_id: str | None,
         *,
-        speaker: str,
-        task_type: str,
-        ref_audio: bytes,
+        config: SessionConfig,
         audio_queue: asyncio.Queue,
     ) -> str:
         session_id = session_id or str(uuid.uuid4())
 
         async def on_audio(sid, data):
-            await audio_queue.put(("audio", data))
+            converted = _convert_audio_chunk(data, config.audio)
+            await audio_queue.put(("audio", _make_audio_response(converted, config.audio)))
 
         async def on_done(sid, metrics):
             await audio_queue.put(("done", metrics))
 
-        await self._engine._dispatcher.create_session(
+        await self._engine.start_session(
             session_id,
-            speaker_key=speaker or None,
-            task_type=task_type or "custom_voice",
-            ref_audio=ref_audio or None,
+            config=config,
             on_audio=on_audio,
             on_done=on_done,
         )
@@ -96,20 +105,33 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             if msg_type_q == "done":
                 return
 
+    async def _pump_requests(
+        self,
+        request_iterator,
+        request_queue: asyncio.Queue,
+    ) -> None:
+        try:
+            async for request in request_iterator:
+                await request_queue.put(("request", request))
+        except Exception as exc:
+            await request_queue.put(("error", exc))
+        finally:
+            await request_queue.put(("eof", None))
+
     async def SynthesizeOnce(self, request, context):
         """Handle unary full-text requests with streamed audio output."""
         session_id = None
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
 
         try:
+            config = _session_config_from_oneshot_request(request)
             session_id = await self._create_session(
                 request.session_id,
-                speaker=request.speaker,
-                task_type=request.task_type,
-                ref_audio=request.ref_audio,
+                config=config,
                 audio_queue=audio_queue,
             )
-            await self._engine.feed_full_text(session_id, request.text)
+            await self._engine.feed_text(session_id, request.text)
+            await self._engine.text_complete(session_id)
             async for response in self._drain_until_done(session_id, audio_queue):
                 yield response
             return
@@ -127,59 +149,90 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
     async def SynthesizeStream(self, request_iterator, context):
         """Handle one bidirectional stream.
 
-        Stream semantics:
-        - Each ``TextChunk`` is forwarded to the engine immediately.
-        - ``TextComplete`` only signals that no more text will arrive.
-
-        This keeps bidirectional streaming truly incremental. Offline
-        pre-splitting should use a dedicated oneshot path instead of being
-        inferred from delayed chunks in this RPC.
+        Protocol semantics:
+        - ``StartRequest`` declares task config, input mode, and audio format.
+        - ``TextChunk`` carries payload only; routing behavior is determined by
+          the session config, not inferred from timing.
+        - ``EndRequest`` / legacy ``TextComplete`` signals no more text.
         """
         session_id = None
         audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        request_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         got_done = False
         got_cancel = False
+        input_eof = False
+        request_task: asyncio.Task | None = None
+        audio_task: asyncio.Task | None = None
+        pump_task = asyncio.create_task(self._pump_requests(request_iterator, request_queue))
 
         try:
-            async for request in request_iterator:
-                msg_type = request.WhichOneof("request")
+            while True:
+                if request_task is None and not input_eof:
+                    request_task = asyncio.create_task(request_queue.get())
+                if audio_task is None and session_id and not got_cancel:
+                    audio_task = asyncio.create_task(audio_queue.get())
 
-                if msg_type == "init":
-                    init = request.init
-                    session_id = await self._create_session(
-                        init.session_id,
-                        speaker=init.speaker,
-                        task_type=init.task_type,
-                        ref_audio=init.ref_audio,
-                        audio_queue=audio_queue,
-                    )
-
-                elif msg_type == "text":
-                    if session_id:
-                        await self._engine.feed_text(session_id, request.text.text)
-
-                elif msg_type == "done":
-                    if session_id:
-                        await self._engine.text_complete(session_id)
-                    got_done = True
-
-                elif msg_type == "cancel":
-                    if session_id:
-                        await self._engine.cancel(session_id)
-                    got_cancel = True
+                wait_set = {t for t in (request_task, audio_task) if t is not None}
+                if not wait_set:
                     break
 
-                # Drain available audio promptly to reduce streaming latency.
-                async for response in self._drain_available_audio(audio_queue):
-                    yield response
-                    if _is_done_response(response):
-                        return
+                done, _ = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
 
-            if got_done and not got_cancel and session_id:
-                async for response in self._drain_until_done(session_id, audio_queue):
-                    yield response
-                    if _is_done_response(response):
-                        return
+                if request_task in done:
+                    kind, payload = request_task.result()
+                    request_task = None
+
+                    if kind == "error":
+                        raise payload
+
+                    if kind == "eof":
+                        input_eof = True
+                        if session_id and not got_done and not got_cancel:
+                            await self._engine.text_complete(session_id)
+                            got_done = True
+                    else:
+                        request = payload
+                        msg_type = request.WhichOneof("request")
+
+                        if msg_type in {"start", "init"}:
+                            config = _session_config_from_stream_request(request)
+                            start_req = request.start if msg_type == "start" else request.init
+                            session_id = await self._create_session(
+                                start_req.session_id,
+                                config=config,
+                                audio_queue=audio_queue,
+                            )
+
+                        elif msg_type == "text":
+                            if session_id:
+                                await self._engine.feed_text(session_id, request.text.text)
+
+                        elif msg_type in {"end", "done"}:
+                            if session_id:
+                                await self._engine.text_complete(session_id)
+                            got_done = True
+
+                        elif msg_type == "cancel":
+                            if session_id:
+                                await self._engine.cancel(session_id)
+                            got_cancel = True
+
+                        async for response in self._drain_available_audio(audio_queue):
+                            yield response
+                            if _is_done_response(response):
+                                return
+
+                if audio_task in done:
+                    msg_type_q, payload = audio_task.result()
+                    audio_task = None
+                    response = _queue_message_to_response(msg_type_q, payload)
+                    if response is not None:
+                        yield response
+                        if _is_done_response(response):
+                            return
+
+                if input_eof and got_cancel:
+                    break
 
         except asyncio.CancelledError:
             logger.info("gRPC stream cancelled: %s", session_id)
@@ -187,17 +240,31 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             logger.error("gRPC stream error: %s: %s", session_id, e)
             yield _make_status_response("error", str(e))
         finally:
+            for task in (request_task, audio_task, pump_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (request_task, audio_task, pump_task):
+                if task is not None:
+                    try:
+                        await task
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
             if session_id:
                 await self._engine.cancel(session_id)
 
         yield _make_status_response("done", "Stream ended")
 
 
-def _make_audio_response(pcm_bytes: bytes) -> tts_pb2.SynthesizeResponse:
+def _make_audio_response(
+    pcm_bytes: bytes,
+    audio_config: AudioConfig,
+) -> tts_pb2.SynthesizeResponse:
     return tts_pb2.SynthesizeResponse(
         audio=tts_pb2.AudioChunk(
             pcm_data=pcm_bytes,
-            sample_rate=SAMPLE_RATE,
+            sample_rate=audio_config.sample_rate,
+            encoding=_audio_encoding_to_proto(audio_config.encoding),
+            channels=audio_config.channels,
         )
     )
 
@@ -211,11 +278,35 @@ def _make_status_response(event: str, message: str = "") -> tts_pb2.SynthesizeRe
     )
 
 
+def _make_capabilities_response(cap: dict) -> tts_pb2.GetCapabilitiesResponse:
+    return tts_pb2.GetCapabilitiesResponse(
+        variant=str(cap.get("variant", "") or ""),
+        loaded_model_type=str(cap.get("loaded_model_type", "") or ""),
+        declared_supported_task_types=list(cap.get("declared_supported_task_types", ()) or ()),
+        supported_input_modes=[
+            _input_mode_to_proto(value) for value in cap.get("supported_input_modes", ()) or ()
+        ],
+        supported_group_policies=[
+            _group_policy_to_proto(value) for value in cap.get("supported_group_policies", ()) or ()
+        ],
+        supported_audio_formats=[
+            tts_pb2.AudioFormat(
+                encoding=_audio_encoding_to_proto(_audio_encoding_from_name(fmt.get("encoding", ""))),
+                sample_rate=int(fmt.get("sample_rate", ENGINE_SAMPLE_RATE)),
+                channels=int(fmt.get("channels", 1)),
+            )
+            for fmt in (cap.get("supported_audio_formats", ()) or ())
+        ],
+        ref_audio_available=bool(cap.get("ref_audio_available", False)),
+        ref_audio_reason=str(cap.get("ref_audio_reason", "") or ""),
+    )
+
+
 def _queue_message_to_response(
     msg_type_q: str, payload,
 ) -> tts_pb2.SynthesizeResponse | None:
     if msg_type_q == "audio":
-        return _make_audio_response(payload)
+        return payload
     if msg_type_q == "done":
         err = payload.get("error") if isinstance(payload, dict) else None
         if err:
@@ -255,3 +346,184 @@ async def serve(engine: TTSEngine, port: int = 50051, *, stop_event: asyncio.Eve
     logger.info("gRPC server listening on port %d", port)
     await stop_event.wait()
     await server.stop(5.0)
+
+
+def _session_config_from_stream_request(request) -> SessionConfig:
+    if request.WhichOneof("request") == "start":
+        return _session_config_from_proto(request.start.config, default_mode=InputMode.LONG_SEGMENT)
+    init = request.init
+    return _session_config_from_legacy_fields(
+        task_type=init.task_type,
+        language=init.language,
+        speaker=init.speaker,
+        instruct=getattr(init, "instruct", ""),
+        ref_audio=init.ref_audio,
+        ref_text=init.ref_text,
+        x_vector_only=getattr(init, "x_vector_only", False),
+        input_mode=getattr(init, "input_mode", tts_pb2.INPUT_MODE_LONG_SEGMENT),
+        group_policy=getattr(init, "group_policy", tts_pb2.GROUP_POLICY_AUTO),
+        audio=getattr(init, "audio", None),
+        default_mode=InputMode.LONG_SEGMENT,
+    )
+
+
+def _session_config_from_oneshot_request(request) -> SessionConfig:
+    if request.HasField("config"):
+        cfg = _session_config_from_proto(request.config, default_mode=InputMode.FULL_TEXT)
+        cfg.input_mode = InputMode.FULL_TEXT
+        if cfg.group_policy == GroupPolicy.NONE:
+            cfg.group_policy = GroupPolicy.AUTO
+        return cfg
+    return _session_config_from_legacy_fields(
+        task_type=request.task_type,
+        language=request.language,
+        speaker=request.speaker,
+        instruct="",
+        ref_audio=request.ref_audio,
+        ref_text=request.ref_text,
+        x_vector_only=False,
+        input_mode=tts_pb2.INPUT_MODE_FULL_TEXT,
+        group_policy=tts_pb2.GROUP_POLICY_AUTO,
+        audio=None,
+        default_mode=InputMode.FULL_TEXT,
+    )
+
+
+def _session_config_from_legacy_fields(
+    *,
+    task_type: str,
+    language: str,
+    speaker: str,
+    instruct: str,
+    ref_audio: bytes,
+    ref_text: str,
+    x_vector_only: bool,
+    input_mode,
+    group_policy,
+    audio,
+    default_mode: InputMode,
+) -> SessionConfig:
+    cfg = SessionConfig(
+        task_type=task_type or "",
+        language=language or "auto",
+        speaker=speaker or None,
+        instruct=instruct or None,
+        ref_audio=ref_audio or None,
+        ref_text=ref_text or None,
+        x_vector_only=bool(x_vector_only),
+        input_mode=_input_mode_from_proto(input_mode, default_mode=default_mode),
+        group_policy=_group_policy_from_proto(group_policy),
+        audio=_audio_config_from_proto(audio),
+    )
+    _validate_audio_config(cfg.audio)
+    return cfg
+
+
+def _session_config_from_proto(proto_cfg, *, default_mode: InputMode) -> SessionConfig:
+    cfg = SessionConfig(
+        task_type=proto_cfg.task_type or "",
+        language=proto_cfg.language or "auto",
+        speaker=proto_cfg.speaker or None,
+        instruct=proto_cfg.instruct or None,
+        ref_audio=proto_cfg.ref_audio or None,
+        ref_text=proto_cfg.ref_text or None,
+        x_vector_only=bool(proto_cfg.x_vector_only),
+        input_mode=_input_mode_from_proto(proto_cfg.input_mode, default_mode=default_mode),
+        group_policy=_group_policy_from_proto(proto_cfg.group_policy),
+        audio=_audio_config_from_proto(proto_cfg.audio if proto_cfg.HasField("audio") else None),
+    )
+    _validate_audio_config(cfg.audio)
+    return cfg
+
+
+def _input_mode_from_proto(value, *, default_mode: InputMode) -> InputMode:
+    mapping = {
+        tts_pb2.INPUT_MODE_TOKEN: InputMode.TOKEN,
+        tts_pb2.INPUT_MODE_CLAUSE: InputMode.CLAUSE,
+        tts_pb2.INPUT_MODE_LONG_SEGMENT: InputMode.LONG_SEGMENT,
+        tts_pb2.INPUT_MODE_FULL_TEXT: InputMode.FULL_TEXT,
+    }
+    return mapping.get(value, default_mode)
+
+
+def _input_mode_to_proto(value) -> int:
+    if isinstance(value, InputMode):
+        value = value.value
+    mapping = {
+        "token": tts_pb2.INPUT_MODE_TOKEN,
+        "clause": tts_pb2.INPUT_MODE_CLAUSE,
+        "long_segment": tts_pb2.INPUT_MODE_LONG_SEGMENT,
+        "full_text": tts_pb2.INPUT_MODE_FULL_TEXT,
+    }
+    return mapping.get(value, tts_pb2.INPUT_MODE_UNSPECIFIED)
+
+
+def _group_policy_from_proto(value) -> GroupPolicy:
+    mapping = {
+        tts_pb2.GROUP_POLICY_NONE: GroupPolicy.NONE,
+        tts_pb2.GROUP_POLICY_AUTO: GroupPolicy.AUTO,
+    }
+    return mapping.get(value, GroupPolicy.AUTO)
+
+
+def _group_policy_to_proto(value) -> int:
+    if isinstance(value, GroupPolicy):
+        value = value.value
+    mapping = {
+        "none": tts_pb2.GROUP_POLICY_NONE,
+        "auto": tts_pb2.GROUP_POLICY_AUTO,
+    }
+    return mapping.get(value, tts_pb2.GROUP_POLICY_UNSPECIFIED)
+
+
+def _audio_config_from_proto(audio_msg) -> AudioConfig:
+    if audio_msg is None:
+        return AudioConfig()
+    sample_rate = audio_msg.sample_rate or ENGINE_SAMPLE_RATE
+    channels = audio_msg.channels or 1
+    encoding = {
+        tts_pb2.AUDIO_ENCODING_PCM_S16LE: AudioEncoding.PCM_S16LE,
+        tts_pb2.AUDIO_ENCODING_PCM_F32: AudioEncoding.PCM_F32,
+    }.get(audio_msg.encoding, AudioEncoding.PCM_F32)
+    return AudioConfig(sample_rate=sample_rate, encoding=encoding, channels=channels)
+
+
+def _audio_encoding_to_proto(value: AudioEncoding) -> int:
+    if value == AudioEncoding.PCM_S16LE:
+        return tts_pb2.AUDIO_ENCODING_PCM_S16LE
+    return tts_pb2.AUDIO_ENCODING_PCM_F32
+
+
+def _audio_encoding_from_name(value: str) -> AudioEncoding:
+    if value == "pcm_s16le":
+        return AudioEncoding.PCM_S16LE
+    return AudioEncoding.PCM_F32
+
+
+def _validate_audio_config(audio: AudioConfig) -> None:
+    if audio.channels != 1:
+        raise ValueError(f"Unsupported channel count: {audio.channels} (mono only)")
+    if audio.sample_rate not in (16000, 24000):
+        raise ValueError(f"Unsupported sample_rate: {audio.sample_rate} (expected 16000 or 24000)")
+    if audio.encoding not in (AudioEncoding.PCM_F32, AudioEncoding.PCM_S16LE):
+        raise ValueError(f"Unsupported audio encoding: {audio.encoding}")
+
+
+def _convert_audio_chunk(pcm_bytes: bytes, audio_config: AudioConfig) -> bytes:
+    audio = np.frombuffer(pcm_bytes, dtype=np.float32)
+    if audio_config.sample_rate != ENGINE_SAMPLE_RATE:
+        audio = _resample_linear(audio, ENGINE_SAMPLE_RATE, audio_config.sample_rate)
+    if audio_config.encoding == AudioEncoding.PCM_S16LE:
+        audio = np.clip(audio, -1.0, 1.0)
+        return (audio * 32767.0).astype(np.int16).tobytes()
+    return audio.astype(np.float32, copy=False).tobytes()
+
+
+def _resample_linear(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    if audio.size == 0 or src_sr == dst_sr:
+        return audio
+    duration = audio.shape[0] / float(src_sr)
+    dst_len = max(1, int(round(duration * dst_sr)))
+    src_x = np.linspace(0.0, duration, num=audio.shape[0], endpoint=False)
+    dst_x = np.linspace(0.0, duration, num=dst_len, endpoint=False)
+    return np.interp(dst_x, src_x, audio).astype(np.float32)

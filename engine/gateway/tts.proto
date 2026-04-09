@@ -3,43 +3,125 @@ syntax = "proto3";
 package tts;
 
 service TTSService {
-  // Unary request with the full text, server streams audio chunks back
+  // Query the currently loaded standalone engine capabilities.
+  rpc GetCapabilities (GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
+  // Convenience unary wrapper for FULL_TEXT mode.
   rpc SynthesizeOnce (SynthesizeOnceRequest) returns (stream SynthesizeResponse);
-  // Bidirectional streaming: client sends text chunks, server sends audio chunks
+  // Primary session protocol: start -> text* -> end/cancel.
   rpc SynthesizeStream (stream SynthesizeRequest) returns (stream SynthesizeResponse);
+}
+
+enum InputMode {
+  INPUT_MODE_UNSPECIFIED = 0;
+  INPUT_MODE_TOKEN = 1;
+  INPUT_MODE_CLAUSE = 2;
+  INPUT_MODE_LONG_SEGMENT = 3;
+  INPUT_MODE_FULL_TEXT = 4;
+}
+
+enum GroupPolicy {
+  GROUP_POLICY_UNSPECIFIED = 0;
+  GROUP_POLICY_NONE = 1;
+  GROUP_POLICY_AUTO = 2;
+}
+
+enum AudioEncoding {
+  AUDIO_ENCODING_UNSPECIFIED = 0;
+  AUDIO_ENCODING_PCM_F32 = 1;
+  AUDIO_ENCODING_PCM_S16LE = 2;
+}
+
+message AudioFormat {
+  AudioEncoding encoding = 1;
+  int32 sample_rate = 2;
+  int32 channels = 3;
+}
+
+message SamplingParams {
+  float temperature = 1;
+  int32 top_k = 2;
+  float top_p = 3;
+  float repetition_penalty = 4;
+  int32 max_new_tokens = 5;
+  bool do_sample = 6;
+}
+
+message GetCapabilitiesRequest {}
+
+message GetCapabilitiesResponse {
+  string variant = 1;
+  string loaded_model_type = 2;
+  repeated string declared_supported_task_types = 3;
+  repeated InputMode supported_input_modes = 4;
+  repeated GroupPolicy supported_group_policies = 5;
+  repeated AudioFormat supported_audio_formats = 6;
+  bool ref_audio_available = 7;
+  string ref_audio_reason = 8;
+}
+
+message SessionConfig {
+  string task_type = 1;
+  string language = 2;
+  string speaker = 3;
+  string instruct = 4;
+  bytes ref_audio = 5;
+  string ref_text = 6;
+  bool x_vector_only = 7;
+  InputMode input_mode = 8;
+  GroupPolicy group_policy = 9;
+  AudioFormat audio = 10;
+  SamplingParams sampling = 11;
 }
 
 message SynthesizeOnceRequest {
   string session_id = 1;
-  string speaker = 2;        // speaker name (for custom_voice)
-  string task_type = 3;      // "custom_voice" | "voice_clone" | "voice_design"
-  string language = 4;       // "auto" | "zh" | "en" | ...
-  bytes ref_audio = 5;       // reference audio for voice clone
-  string ref_text = 6;       // reference text for voice clone
+  string speaker = 2;        // legacy compatibility
+  string task_type = 3;      // legacy compatibility
+  string language = 4;       // legacy compatibility
+  bytes ref_audio = 5;       // legacy compatibility
+  string ref_text = 6;       // legacy compatibility
   string text = 7;
+  SessionConfig config = 8;  // preferred
 }
 
 message SynthesizeRequest {
   oneof request {
-    InitRequest init = 1;
+    StartRequest start = 1;
     TextChunk text = 2;
-    TextComplete done = 3;
+    EndRequest end = 3;
     CancelRequest cancel = 4;
+
+    // Legacy compatibility path.
+    InitRequest init = 10;
+    TextComplete done = 11;
   }
+}
+
+message StartRequest {
+  string session_id = 1;
+  SessionConfig config = 2;
 }
 
 message InitRequest {
   string session_id = 1;
-  string speaker = 2;        // speaker name (for custom_voice)
-  string task_type = 3;      // "custom_voice" | "voice_clone" | "voice_design"
-  string language = 4;       // "auto" | "zh" | "en" | ...
-  bytes ref_audio = 5;       // reference audio for voice clone
-  string ref_text = 6;       // reference text for voice clone
+  string speaker = 2;
+  string task_type = 3;
+  string language = 4;
+  bytes ref_audio = 5;
+  string ref_text = 6;
+  string instruct = 7;
+  bool x_vector_only = 8;
+  InputMode input_mode = 9;
+  GroupPolicy group_policy = 10;
+  AudioFormat audio = 11;
 }
 
 message TextChunk {
   string text = 1;
+  int64 seq_no = 2;
 }
+
+message EndRequest {}
 
 message TextComplete {}
 
@@ -53,12 +135,14 @@ message SynthesizeResponse {
 }
 
 message AudioChunk {
-  bytes pcm_data = 1;        // float32 PCM samples
-  int32 sample_rate = 2;     // 24000
+  bytes pcm_data = 1;
+  int32 sample_rate = 2;
+  AudioEncoding encoding = 3;
+  int32 channels = 4;
 }
 
 message StatusUpdate {
-  string event = 1;           // "session_started" | "segment_end" | "done" | "error"
+  string event = 1;
   string message = 2;
   map<string, string> metrics = 3;
 }

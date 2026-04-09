@@ -120,6 +120,22 @@ class TestSpliter:
         action_types = [a.action.type for a in actions]
         assert ActionType.PREFILL in action_types
 
+    def test_push_group_tokens_assigns_monotonic_group_ids(self):
+        """Long-segment mode should preserve a stable outer group order."""
+        from engine.frontend.spliter.spliter import Spliter
+        from engine.frontend.spliter.driver import ActionType
+
+        spliter = Spliter(engine_max_decode_len=100, ema_ratio=2.0)
+
+        a1 = spliter.push_group_tokens([(1, "你好"), (2, "。")])
+        a2 = spliter.push_group_tokens([(3, "世界"), (4, "。")])
+
+        groups1 = {a.group_idx for a in a1 if a.action.type in (ActionType.PREFILL, ActionType.DECODE)}
+        groups2 = {a.group_idx for a in a2 if a.action.type in (ActionType.PREFILL, ActionType.DECODE)}
+
+        assert groups1 == {0}
+        assert groups2 == {1}
+
 
 # ---------------------------------------------------------------------------
 # 2. AudioReorder tests
@@ -130,25 +146,25 @@ class TestAudioReorder:
         from engine.frontend.spliter.reorder import AudioReorder
 
         r = AudioReorder()
-        out = r.push(0, b"a0")
+        out = r.push(0, 0, b"a0")
         assert out == [b"a0"]
-        out = r.push(0, b"a1")
+        out = r.push(0, 0, b"a1")
         assert out == [b"a1"]
-        out = r.mark_done(0)
+        out = r.mark_done(0, 0, group_final=True)
         assert out == []
-        assert r.next_emit_segment == 1
+        assert r.next_emit_segment == (1, 0)
 
     def test_out_of_order(self):
         from engine.frontend.spliter.reorder import AudioReorder
 
         r = AudioReorder()
-        out = r.push(1, b"b0")
+        out = r.push(1, 0, b"b0")
         assert out == []
-        out = r.push(0, b"a0")
+        out = r.push(0, 0, b"a0")
         assert out == [b"a0"]
-        out = r.mark_done(0)
+        out = r.mark_done(0, 0, group_final=True)
         assert b"b0" in out
-        assert r.next_emit_segment == 1
+        assert r.next_emit_segment == (1, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -205,13 +221,13 @@ class TestEngineIntegration:
         from engine.core.types import (
             EngineRequest, EngineResult, RequestType, ResultType,
         )
-        from engine.frontend.dispatcher import Dispatcher
+        from engine.frontend.interface import FrontendInterface
         from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
 
         tokenizer = LightQwen3TTSTokenizer(str(TOKENIZER_DIR))
         async_inbox = asyncio.Queue(maxsize=256)
 
-        dispatcher = Dispatcher(
+        interface = FrontendInterface(
             engine_inbox=async_inbox,
             tokenizer=tokenizer,
             max_sessions=8,
@@ -227,17 +243,17 @@ class TestEngineIntegration:
         async def on_done(sid: str, metrics: dict):
             done_event.set()
 
-        session = await dispatcher.create_session(
+        session = await interface.create_session(
             "test-001",
             speaker_key="vivian",
             task_type="custom_voice",
             on_audio=on_audio,
             on_done=on_done,
         )
-        assert dispatcher.active_count == 1
+        assert interface.active_count == 1
 
-        await dispatcher.feed_text("test-001", "你好世界。")
-        await dispatcher.text_complete("test-001")
+        await interface.feed_text("test-001", "你好世界。")
+        await interface.text_complete("test-001")
 
         requests_sent = []
         while not async_inbox.empty():
@@ -260,7 +276,7 @@ class TestEngineIntegration:
         ))
 
         await asyncio.wait_for(done_event.wait(), timeout=2.0)
-        assert dispatcher.active_count == 0
+        assert interface.active_count == 0
         print("Session completed successfully")
 
     @SKIP_NO_TOKENIZER
@@ -270,13 +286,13 @@ class TestEngineIntegration:
         from engine.core.types import (
             EngineResult, RequestType, ResultType,
         )
-        from engine.frontend.dispatcher import Dispatcher
+        from engine.frontend.interface import FrontendInterface
         from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
 
         tokenizer = LightQwen3TTSTokenizer(str(TOKENIZER_DIR))
         async_inbox = asyncio.Queue(maxsize=1024)
 
-        dispatcher = Dispatcher(
+        interface = FrontendInterface(
             engine_inbox=async_inbox,
             tokenizer=tokenizer,
             max_sessions=64,
@@ -294,20 +310,20 @@ class TestEngineIntegration:
             async def on_done(sid_inner: str, metrics: dict, _e=done_events[sid]):
                 _e.set()
 
-            s = await dispatcher.create_session(
+            s = await interface.create_session(
                 sid, task_type="custom_voice", on_done=on_done,
             )
             sessions[sid] = s
 
-        assert dispatcher.active_count == n_sessions
+        assert interface.active_count == n_sessions
 
         texts = [
             "你好。", "世界！", "今天天气好。", "明天见。",
             "测试。", "一二三四五。", "很高兴见到你！", "再见！",
         ]
         for i, sid in enumerate(sessions):
-            await dispatcher.feed_text(sid, texts[i])
-            await dispatcher.text_complete(sid)
+            await interface.feed_text(sid, texts[i])
+            await interface.text_complete(sid)
 
         req_count = 0
         while not async_inbox.empty():
@@ -326,8 +342,89 @@ class TestEngineIntegration:
         for sid, evt in done_events.items():
             await asyncio.wait_for(evt.wait(), timeout=2.0)
 
-        assert dispatcher.active_count == 0
+        assert interface.active_count == 0
         print(f"All {n_sessions} sessions completed")
+
+    @SKIP_NO_TOKENIZER
+    @pytest.mark.asyncio
+    async def test_long_segment_streaming_queues_followup_groups_until_segment_done(self):
+        from engine.core.types import (
+            EngineResult, GroupPolicy, InputMode, ResultType, SessionConfig,
+        )
+        from engine.frontend.interface import FrontendInterface
+        from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
+
+        tokenizer = LightQwen3TTSTokenizer(str(TOKENIZER_DIR))
+        async_inbox = asyncio.Queue(maxsize=256)
+        interface = FrontendInterface(
+            engine_inbox=async_inbox,
+            tokenizer=tokenizer,
+            max_sessions=8,
+            engine_max_decode_len=200,
+        )
+
+        session = await interface.create_session(
+            "long-seg-001",
+            config=SessionConfig(
+                task_type="custom_voice",
+                speaker="Serena",
+                input_mode=InputMode.LONG_SEGMENT,
+                group_policy=GroupPolicy.AUTO,
+            ),
+        )
+
+        for chunk in [
+            "你好，这是流式文本输入测试。",
+            "我们正在验证",
+            "文本追加功能",
+            "是否工作正常。",
+        ]:
+            await interface.feed_text("long-seg-001", chunk)
+        await interface.text_complete("long-seg-001")
+
+        initial_types = []
+        while not async_inbox.empty():
+            req = await async_inbox.get()
+            initial_types.append((req.type.name, req.segment_idx))
+
+        assert ("START_SEGMENT", 0) in initial_types
+        assert ("START_SEGMENT", 1) in initial_types
+        assert ("START_SEGMENT", 2) not in initial_types
+        assert ("START_SEGMENT", 3) not in initial_types
+
+        await session.result_queue.put(EngineResult(
+            type=ResultType.SEGMENT_END,
+            session_id="long-seg-001",
+            segment_idx=0,
+            metrics={"audio_steps": 10, "text_tokens": 9},
+        ))
+        await asyncio.sleep(0)
+
+        after_seg0 = []
+        while not async_inbox.empty():
+            req = await async_inbox.get()
+            after_seg0.append((req.type.name, req.segment_idx))
+        assert ("START_SEGMENT", 2) in after_seg0
+
+        await session.result_queue.put(EngineResult(
+            type=ResultType.SEGMENT_END,
+            session_id="long-seg-001",
+            segment_idx=1,
+            metrics={"audio_steps": 10, "text_tokens": 3},
+        ))
+        await asyncio.sleep(0)
+
+        after_seg1 = []
+        while not async_inbox.empty():
+            req = await async_inbox.get()
+            after_seg1.append((req.type.name, req.segment_idx))
+        assert ("START_SEGMENT", 3) in after_seg1
+
+        await session.result_queue.put(EngineResult(
+            type=ResultType.SESSION_DONE,
+            session_id="long-seg-001",
+        ))
+        await asyncio.sleep(0)
 
 
 # ---------------------------------------------------------------------------
