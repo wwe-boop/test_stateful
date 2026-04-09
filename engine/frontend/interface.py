@@ -28,6 +28,7 @@ from ..core.types import (
 )
 from .dispatcher import Dispatcher
 from .spliter import Spliter
+from .spliter.driver import ActionType
 from .spliter.reorder import AudioReorder
 from .spliter.tokenizer import LightQwen3TTSTokenizer
 
@@ -98,6 +99,7 @@ class FrontendInterface:
         ref_audio: Optional[bytes] = None,
         on_audio: Optional[Callable] = None,
         on_done: Optional[Callable] = None,
+        on_event: Optional[Callable] = None,
     ) -> Session:
         if session_id in self._sessions:
             old_task = self._consumer_tasks.pop(session_id, None)
@@ -129,10 +131,11 @@ class FrontendInterface:
             safety_margin=self._safety_margin,
         )
         session.reorder = AudioReorder()
+        session.event_callback = on_event
         self._sessions[session_id] = session
 
         task = asyncio.create_task(
-            self._consume_results(session, on_audio=on_audio, on_done=on_done)
+            self._consume_results(session, on_audio=on_audio, on_done=on_done, on_event=on_event)
         )
         self._consumer_tasks[session_id] = task
 
@@ -170,7 +173,7 @@ class FrontendInterface:
             seg_actions = spliter.push_group_tokens(tokens)
         else:
             seg_actions = spliter.feed_tokens(tokens)
-        await self._dispatcher.dispatch_segment_actions(session, seg_actions)
+        await self._dispatch_segment_actions(session, seg_actions)
 
     async def feed_full_text(self, session_id: str, text: str) -> None:
         """Explicit offline mode: set complete text, pre-split, drive all segments."""
@@ -186,7 +189,7 @@ class FrontendInterface:
             return
 
         seg_actions = session.spliter.set_full_text(tokens)
-        await self._dispatcher.dispatch_segment_actions(session, seg_actions)
+        await self._dispatch_segment_actions(session, seg_actions)
         await self._dispatcher.maybe_send_session_tokens_done(session)
 
     async def mark_input_complete(self, session_id: str) -> None:
@@ -211,7 +214,7 @@ class FrontendInterface:
             return
 
         seg_actions = session.spliter.input_done()
-        await self._dispatcher.dispatch_segment_actions(session, seg_actions)
+        await self._dispatch_segment_actions(session, seg_actions)
         await self._dispatcher.submit_session_tokens_done(session_id)
         session.engine_tokens_done_sent = True
 
@@ -221,6 +224,7 @@ class FrontendInterface:
         *,
         on_audio: Optional[Callable] = None,
         on_done: Optional[Callable] = None,
+        on_event: Optional[Callable] = None,
     ) -> None:
         try:
             while True:
@@ -266,14 +270,40 @@ class FrontendInterface:
                                 audio_steps, text_tokens, overflow=overflow,
                             )
 
+                    if on_event:
+                        metrics = {
+                            str(k): str(v) for k, v in (result.metrics or {}).items()
+                        }
+                        await on_event(
+                            session.session_id,
+                            {
+                                "type": "segment_end",
+                                "segment_idx": seg_idx,
+                                "text": session.segment_texts.pop(seg_idx, ""),
+                                "meta": metrics,
+                            },
+                        )
+
                     new_actions = session.spliter.on_segment_done(seg_idx)
                     if new_actions:
-                        await self._dispatcher.dispatch_segment_actions(session, new_actions)
+                        await self._dispatch_segment_actions(session, new_actions)
                     await self._dispatcher.maybe_send_session_tokens_done(session)
 
                 elif result.type == ResultType.RATIO_UPDATE:
                     if session.spliter and result.ema_ratio > 0:
                         session.spliter._ema_ratio = result.ema_ratio
+
+                elif result.type == ResultType.WARNING:
+                    if on_event:
+                        await on_event(
+                            session.session_id,
+                            {
+                                "type": "warning",
+                                "segment_idx": result.segment_idx,
+                                "message": result.warning_msg or "",
+                                "text": session.segment_texts.get(result.segment_idx, ""),
+                            },
+                        )
 
                 elif result.type == ResultType.SESSION_DONE:
                     session.state = SessionState.DONE
@@ -305,6 +335,49 @@ class FrontendInterface:
                 latency or -1,
                 session.segments_done,
                 session.segments_submitted,
+            )
+
+    async def _dispatch_segment_actions(
+        self,
+        session: Session,
+        actions: list,
+    ) -> None:
+        if not actions:
+            return
+        self._record_segment_text(actions, session)
+        await self._dispatcher.dispatch_segment_actions(session, actions)
+        await self._emit_segment_start_events(session, actions)
+
+    def _record_segment_text(self, actions: list, session: Session) -> None:
+        for sa in actions:
+            if sa.token_text and sa.action.type in (ActionType.PREFILL, ActionType.DECODE):
+                session.segment_texts[sa.segment_idx] = (
+                    session.segment_texts.get(sa.segment_idx, "") + sa.token_text
+                )
+
+    async def _emit_segment_start_events(self, session: Session, actions: list) -> None:
+        on_event = session.event_callback
+        if on_event is None:
+            return
+        for sa in actions:
+            if sa.action.type != ActionType.PREFILL:
+                continue
+            if sa.segment_idx in session.segment_start_emitted:
+                continue
+            session.segment_start_emitted.add(sa.segment_idx)
+            await on_event(
+                session.session_id,
+                {
+                    "type": "segment_start",
+                    "segment_idx": sa.segment_idx,
+                    "text": session.segment_texts.get(sa.segment_idx, ""),
+                    "meta": {
+                        "group_idx": str(sa.group_idx),
+                        "local_idx": str(sa.local_idx),
+                        "group_final": "true" if sa.group_final else "false",
+                        "text_complete": "false",
+                    },
+                },
             )
 
     def _prepare_session_config(self, config: SessionConfig) -> None:

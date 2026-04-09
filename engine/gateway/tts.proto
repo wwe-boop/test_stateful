@@ -132,7 +132,8 @@ message CancelRequest {}
 message SynthesizeResponse {
   oneof response {
     AudioChunk audio = 1;
-    StatusUpdate status = 2;
+    StreamEvent event = 2;
+    StatusUpdate status = 3;  // deprecated compatibility path
   }
 }
 
@@ -141,6 +142,16 @@ message AudioChunk {
   int32 sample_rate = 2;
   AudioEncoding encoding = 3;
   int32 channels = 4;
+}
+
+message StreamEvent {
+  string type = 1;          // start | segment_start | segment_end | warning | done | error
+  string session_id = 2;
+  int32 segment_id = 3;     // -1 when not segment-scoped
+  string text = 4;
+  string message = 5;
+  AudioFormat audio = 6;    // populated on start
+  map<string, string> meta = 7;
 }
 
 message StatusUpdate {

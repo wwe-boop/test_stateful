@@ -3,10 +3,7 @@
 import grpc
 import warnings
 
-try:
-    from . import tts_pb2 as tts__pb2
-except ImportError:  # pragma: no cover - fallback for direct script execution
-    import tts_pb2 as tts__pb2
+import tts_pb2 as tts__pb2
 
 GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
@@ -65,14 +62,16 @@ class TTSServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def SynthesizeOnce(self, request, context):
-        """Convenience unary wrapper for FULL_TEXT mode.
+        """Convenience unary wrapper for FULL_TEXT mode. The server still
+        normalizes/tokenizes internally before backend execution.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def SynthesizeStream(self, request_iterator, context):
-        """Primary session protocol: start -> text* -> end/cancel.
+        """Primary transport protocol: start -> text* -> end/cancel.
+        TextChunk carries raw transport text; backend inference remains token-native.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

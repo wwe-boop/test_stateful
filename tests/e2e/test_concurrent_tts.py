@@ -64,6 +64,18 @@ def _get_client(triton_url: str):
     return grpcclient, grpcclient.InferenceServerClient(url=triton_url)
 
 
+def _decode_obj(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def _decode_audio_bytes(raw: bytes, audio_format: dict) -> np.ndarray:
+    if (audio_format.get("encoding") or "pcm_f32") == "pcm_s16le":
+        return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
+    return np.frombuffer(raw, dtype=np.float32)
+
+
 def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) -> TTSResult:
     """Send a single TTS request and collect streaming audio."""
     session_id = req_dict.get("session_id", "unknown")
@@ -73,6 +85,8 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
     req_input = grpcclient.InferInput("request", [1], "BYTES")
     req_input.set_data_from_numpy(np.array([req_json], dtype=object))
     audio_out = grpcclient.InferRequestedOutput("audio_chunk")
+    event_type_out = grpcclient.InferRequestedOutput("event_type")
+    event_json_out = grpcclient.InferRequestedOutput("event_json")
     final_out = grpcclient.InferRequestedOutput("is_final")
 
     chunks = []
@@ -80,6 +94,7 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
     warnings = []
     done = threading.Event()
     first_ts = [None]
+    audio_format = {"encoding": "pcm_f32", "sample_rate": SAMPLE_RATE}
 
     def callback(result=None, error=None):
         if error:
@@ -90,18 +105,29 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
             return
         if result is None:
             return
-        warn = result.as_numpy("warning")
-        if warn is not None and warn.size > 0:
-            w_str = warn.flatten()[0]
-            if isinstance(w_str, bytes):
-                w_str = w_str.decode("utf-8")
-            warnings.append(w_str)
-        if first_ts[0] is None:
-            first_ts[0] = time.perf_counter()
+        event_type = result.as_numpy("event_type")
+        event_json = result.as_numpy("event_json")
         audio = result.as_numpy("audio_chunk")
         is_final = result.as_numpy("is_final")
+        et = _decode_obj(event_type.flatten()[0]) if event_type is not None and event_type.size else ""
+        payload = {}
+        if event_json is not None and event_json.size:
+            raw_json = _decode_obj(event_json.flatten()[0])
+            if raw_json:
+                payload = json.loads(raw_json)
+        if et == "start":
+            audio_format.update(payload.get("audio_format", {}) or {})
+        elif et == "warning":
+            warnings.append(payload.get("message", ""))
+        elif et == "audio" and audio is not None and audio.size:
+            if first_ts[0] is None:
+                first_ts[0] = time.perf_counter()
+            chunks.append(_decode_audio_bytes(audio.flatten()[0], audio_format))
+        elif et == "error":
+            errors.append(payload.get("message", "unknown error"))
+            done.set()
+            return
         final = bool(is_final.flatten()[0]) if is_final is not None and is_final.size else False
-        chunks.append(audio.flatten())
         if final:
             done.set()
 
@@ -110,7 +136,7 @@ def _send_request(client, grpcclient, req_dict: dict, timeout: float = 120.0) ->
     client.async_stream_infer(
         model_name="tts_orchestrator",
         inputs=[req_input],
-        outputs=[audio_out, final_out],
+        outputs=[audio_out, event_type_out, event_json_out, final_out],
     )
     done.wait(timeout=timeout)
     client.stop_stream()
@@ -147,6 +173,7 @@ def _send_streaming_request(
     warnings = []
     done = threading.Event()
     first_ts = [None]
+    audio_format = {"encoding": "pcm_f32", "sample_rate": SAMPLE_RATE}
 
     def callback(result=None, error=None):
         if error:
@@ -156,18 +183,29 @@ def _send_streaming_request(
             return
         if result is None:
             return
-        warn = result.as_numpy("warning")
-        if warn is not None and warn.size > 0:
-            w_str = warn.flatten()[0]
-            if isinstance(w_str, bytes):
-                w_str = w_str.decode("utf-8")
-            warnings.append(w_str)
-        if first_ts[0] is None:
-            first_ts[0] = time.perf_counter()
+        event_type = result.as_numpy("event_type")
+        event_json = result.as_numpy("event_json")
         audio = result.as_numpy("audio_chunk")
         is_final = result.as_numpy("is_final")
+        et = _decode_obj(event_type.flatten()[0]) if event_type is not None and event_type.size else ""
+        payload = {}
+        if event_json is not None and event_json.size:
+            raw_json = _decode_obj(event_json.flatten()[0])
+            if raw_json:
+                payload = json.loads(raw_json)
+        if et == "start":
+            audio_format.update(payload.get("audio_format", {}) or {})
+        elif et == "warning":
+            warnings.append(payload.get("message", ""))
+        elif et == "audio" and audio is not None and audio.size:
+            if first_ts[0] is None:
+                first_ts[0] = time.perf_counter()
+            audio_chunks.append(_decode_audio_bytes(audio.flatten()[0], audio_format))
+        elif et == "error":
+            errors.append(payload.get("message", "unknown error"))
+            done.set()
+            return
         final = bool(is_final.flatten()[0]) if is_final is not None and is_final.size else False
-        audio_chunks.append(audio.flatten())
         if final:
             done.set()
 
@@ -176,11 +214,13 @@ def _send_streaming_request(
         req_input = grpcclient_mod.InferInput("request", [1], "BYTES")
         req_input.set_data_from_numpy(np.array([req_json], dtype=object))
         audio_out = grpcclient_mod.InferRequestedOutput("audio_chunk")
+        event_type_out = grpcclient_mod.InferRequestedOutput("event_type")
+        event_json_out = grpcclient_mod.InferRequestedOutput("event_json")
         final_out = grpcclient_mod.InferRequestedOutput("is_final")
         client.async_stream_infer(
             model_name="tts_orchestrator",
             inputs=[req_input],
-            outputs=[audio_out, final_out],
+            outputs=[audio_out, event_type_out, event_json_out, final_out],
         )
 
     t0 = time.perf_counter()

@@ -548,6 +548,15 @@ class EngineLoop:
                 )
                 best.prefill_plan = plan
 
+                if plan.warnings:
+                    for warning_msg in plan.warnings:
+                        self._send_result(best_group, EngineResult(
+                            type=ResultType.WARNING,
+                            session_id=best.session_id,
+                            segment_idx=best.segment_idx,
+                            warning_msg=str(warning_msg),
+                        ))
+
                 prefill_audio, prefill_eos = self._executor.prefill(
                     slot, plan.prefill_embeds,
                 )

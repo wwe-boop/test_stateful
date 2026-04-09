@@ -1,5 +1,7 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.01-py3
+ARG TENSORRT_PYTHON_VERSION=10.15.1.29
 FROM ${BASE_IMAGE}
+ARG TENSORRT_PYTHON_VERSION
 
 RUN pip install --no-cache-dir \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
@@ -9,7 +11,9 @@ RUN pip install --no-cache-dir \
     tokenizers \
     scipy \
     soundfile \
+    "tensorrt==${TENSORRT_PYTHON_VERSION}" \
     && python3 -c "\
-import torch, tokenizers; \
+import torch, tokenizers, tensorrt; \
 print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
-print(f'tokenizers {tokenizers.__version__}')"
+print(f'tokenizers {tokenizers.__version__}'); \
+print(f'tensorrt {tensorrt.__version__}')"

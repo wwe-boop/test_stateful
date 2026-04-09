@@ -115,11 +115,19 @@ def _stream_orchestrator(client, req_dict: dict, timeout: float = 180.0):
     req_input = grpcclient.InferInput("request", [1], "BYTES")
     req_input.set_data_from_numpy(np.array([req_json], dtype=object))
     audio_out = grpcclient.InferRequestedOutput("audio_chunk")
+    event_type_out = grpcclient.InferRequestedOutput("event_type")
+    event_json_out = grpcclient.InferRequestedOutput("event_json")
     final_out = grpcclient.InferRequestedOutput("is_final")
 
     chunks: list[np.ndarray] = []
     errors: list[str] = []
     done = False
+    audio_format = {"encoding": "pcm_f32", "sample_rate": 24000}
+
+    def _decode_obj(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
 
     def callback(result, error):
         nonlocal done
@@ -127,9 +135,27 @@ def _stream_orchestrator(client, req_dict: dict, timeout: float = 180.0):
             errors.append(str(error))
             done = True
             return
+        event_type = result.as_numpy("event_type")
+        event_json = result.as_numpy("event_json")
         audio = result.as_numpy("audio_chunk")
-        if audio is not None and audio.size:
-            chunks.append(audio.flatten().copy())
+        et = _decode_obj(event_type.flatten()[0]) if event_type is not None and event_type.size else ""
+        payload = {}
+        if event_json is not None and event_json.size:
+            raw_json = _decode_obj(event_json.flatten()[0])
+            if raw_json:
+                payload = json.loads(raw_json)
+        if et == "start":
+            audio_format.update(payload.get("audio_format", {}) or {})
+        elif et == "audio" and audio is not None and audio.size:
+            raw = audio.flatten()[0]
+            if audio_format.get("encoding") == "pcm_s16le":
+                chunks.append(np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0)
+            else:
+                chunks.append(np.frombuffer(raw, dtype=np.float32))
+        elif et == "error":
+            errors.append(payload.get("message", "unknown error"))
+            done = True
+            return
         fin = result.as_numpy("is_final")
         if fin is not None and fin.size and bool(fin.flatten()[0]):
             done = True
@@ -139,7 +165,7 @@ def _stream_orchestrator(client, req_dict: dict, timeout: float = 180.0):
     client.async_stream_infer(
         model_name="tts_orchestrator",
         inputs=[req_input],
-        outputs=[audio_out, final_out],
+        outputs=[audio_out, event_type_out, event_json_out, final_out],
     )
     while not done and (time.perf_counter() - t0) < timeout:
         time.sleep(0.05)

@@ -19,8 +19,8 @@ class _StubFrontend:
     def __init__(self):
         self.calls = []
 
-    async def create_session(self, session_id: str, *, config, on_audio=None, on_done=None):
-        self.calls.append((session_id, config, on_audio, on_done))
+    async def create_session(self, session_id: str, *, config, on_audio=None, on_done=None, on_event=None):
+        self.calls.append((session_id, config, on_audio, on_done, on_event))
         return {"session_id": session_id, "config": config}
 
 

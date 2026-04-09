@@ -123,13 +123,15 @@ async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
         def __init__(self):
             self._on_audio = None
             self._on_done = None
+            self._on_event = None
 
         def describe_capabilities(self):
             return {}
 
-        async def start_session(self, session_id, *, config, on_audio=None, on_done=None):
+        async def start_session(self, session_id, *, config, on_audio=None, on_done=None, on_event=None):
             self._on_audio = on_audio
             self._on_done = on_done
+            self._on_event = on_event
             return session_id
 
         async def push_text_input(self, session_id, text):
@@ -165,8 +167,12 @@ async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
 
     stream = servicer.SynthesizeStream(request_gen(), context=None)
     first_response = await asyncio.wait_for(anext(stream), timeout=0.1)
+    second_response = await asyncio.wait_for(anext(stream), timeout=0.1)
 
-    assert first_response.WhichOneof("response") == "audio"
+    assert first_response.WhichOneof("response") == "event"
+    assert first_response.event.type == "start"
+    assert first_response.event.audio.sample_rate == 24000
+    assert second_response.WhichOneof("response") == "audio"
 
 
 def test_oneshot_request_forces_full_text_semantics():

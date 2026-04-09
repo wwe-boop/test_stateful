@@ -171,6 +171,27 @@ def _audio_chunk_to_f32(audio_chunk) -> np.ndarray:
     return np.frombuffer(audio_chunk.pcm_data, dtype=np.float32)
 
 
+def _handle_stream_control(resp, result: TTSResult) -> bool:
+    which = resp.WhichOneof("response")
+    if which == "event":
+        et = resp.event.type
+        if et == "warning" and resp.event.message:
+            result.warnings.append(resp.event.message)
+        if et == "error":
+            result.error = resp.event.message
+            return True
+        if et in ("done", "end"):
+            return True
+        return False
+    if which == "status":
+        if resp.status.event == "error":
+            result.error = resp.status.message
+            return True
+        if resp.status.event == "done":
+            return True
+    return False
+
+
 def _make_session_config(
     *,
     task_type: str,
@@ -289,12 +310,8 @@ def _synthesize_oneshot(
                 else:
                     chunk_timestamps.append(time.perf_counter())
                 chunks.append(_audio_chunk_to_f32(resp.audio))
-            elif which == "status":
-                if resp.status.event == "error":
-                    result.error = resp.status.message
-                    break
-                if resp.status.event == "done":
-                    break
+            elif _handle_stream_control(resp, result):
+                break
     except grpc.RpcError as e:
         result.error = f"gRPC {e.code().name}: {e.details()}"
     except Exception as e:
@@ -381,12 +398,8 @@ async def _synthesize_streaming(
                 else:
                     chunk_timestamps.append(time.perf_counter())
                 chunks.append(_audio_chunk_to_f32(resp.audio))
-            elif which == "status":
-                if resp.status.event == "error":
-                    result.error = resp.status.message
-                    break
-                if resp.status.event == "done":
-                    break
+            elif _handle_stream_control(resp, result):
+                break
     except Exception as e:
         result.error = str(e)
     finally:
@@ -836,7 +849,7 @@ def _test_cancel(host: str, port: int) -> TTSResult:
             which = resp.WhichOneof("response")
             if which == "audio":
                 chunks.append(_audio_chunk_to_f32(resp.audio))
-            elif which == "status":
+            elif _handle_stream_control(resp, result):
                 break
     except grpc.RpcError:
         pass

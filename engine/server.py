@@ -250,6 +250,7 @@ class TTSEngine:
         config: SessionConfig,
         on_audio=None,
         on_done=None,
+        on_event=None,
     ):
         """Create a configured session through the frontend interface.
 
@@ -262,6 +263,7 @@ class TTSEngine:
             config=config,
             on_audio=on_audio,
             on_done=on_done,
+            on_event=on_event,
         )
 
     async def push_text_input(self, session_id: str, text: str) -> None:

@@ -375,6 +375,7 @@ resolve_ngc_python_version() {
 # ---------------------------------------------------------------------------
 build_triton_deploy_image() {
     local ngc_tag="${1:-}"
+    local trt_python_version="${TRITON_TENSORRT_PIP_VERSION:-10.15.1.29}"
 
     if [ -z "$ngc_tag" ]; then
         ngc_tag=$(resolve_ngc_tag) \
@@ -410,6 +411,7 @@ build_triton_deploy_image() {
 
     if ! docker build \
         --build-arg "BASE_IMAGE=$base_image" \
+        --build-arg "TENSORRT_PYTHON_VERSION=$trt_python_version" \
         -t "$deploy_tag" \
         -f "$dockerfile" \
         "$build_ctx"; then

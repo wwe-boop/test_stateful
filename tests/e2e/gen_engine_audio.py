@@ -51,6 +51,21 @@ def _audio_chunk_to_f32(audio_chunk) -> np.ndarray:
     return np.frombuffer(audio_chunk.pcm_data, dtype=np.float32)
 
 
+def _is_terminal_event(resp) -> tuple[bool, str]:
+    which = resp.WhichOneof("response")
+    if which == "event":
+        if resp.event.type == "error":
+            return True, resp.event.message
+        if resp.event.type in ("done", "end"):
+            return True, ""
+    elif which == "status":
+        if resp.status.event == "error":
+            return True, resp.status.message
+        if resp.status.event == "done":
+            return True, ""
+    return False, ""
+
+
 def synthesize(text: str, speaker: str = "Serena") -> tuple[np.ndarray | None, float, int]:
     sid = uuid.uuid4().hex[:12]
     channel = grpc.insecure_channel(f"{HOST}:{PORT}")
@@ -81,11 +96,11 @@ def synthesize(text: str, speaker: str = "Serena") -> tuple[np.ndarray | None, f
                 if first_ts is None:
                     first_ts = time.perf_counter()
                 chunks.append(_audio_chunk_to_f32(resp.audio))
-            elif which == "status":
-                if resp.status.event == "error":
-                    print(f"  ERROR: {resp.status.message}")
-                    break
-                if resp.status.event == "done":
+            else:
+                done, message = _is_terminal_event(resp)
+                if message:
+                    print(f"  ERROR: {message}")
+                if done:
                     break
     except grpc.RpcError as e:
         print(f"  gRPC error: {e.code().name}: {e.details()}")

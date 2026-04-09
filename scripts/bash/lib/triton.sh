@@ -111,6 +111,15 @@ assemble_model_repo() {
     fi
 
     mkdir -p "$repo_dir"
+    rm -rf \
+        "$repo_dir/speaker_encoder" \
+        "$repo_dir/speech_tokenizer_codec_fused" \
+        "$repo_dir/talker_code2wav_fused" \
+        "$repo_dir/speech_tokenizer_encoder" \
+        "$repo_dir/talker_unified" \
+        "$repo_dir/code2wav" \
+        "$repo_dir/tts_orchestrator" \
+        "$repo_dir/triton_manifest.json"
 
     # Helper: copy engine/onnx only; config.pbtxt comes from generate_triton_configs.py
     _place_model() {
@@ -202,22 +211,17 @@ assemble_model_repo() {
         log_warn "  tts_orchestrator/weights: MISSING (no embedding weights found)"
     fi
 
-    # Copy orchestrator Python source files (paths relative to repo root)
+    # Copy orchestrator adapter + new engine package (paths relative to repo root)
     local repo_root
     repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
     local orch_py_dir="$repo_root/model_repository/tts_orchestrator/1"
     if [ -d "$orch_py_dir" ]; then
-        for pyf in model.py batch_decode_scheduler.py text_segmenter.py prefill_builder.py audio_utils.py \
-            lightweight_tokenizer.py session_manager.py decode_fsm.py ratio_tracker.py mlfq_scheduler.py; do
-            if [ -f "$orch_py_dir/$pyf" ]; then
-                cp "$orch_py_dir/$pyf" "$repo_dir/tts_orchestrator/1/$pyf"
-            fi
-        done
-        local ces="$repo_root/scripts/python/codec_embedding_sum.py"
-        if [ -f "$ces" ]; then
-            cp "$ces" "$repo_dir/tts_orchestrator/1/codec_embedding_sum.py"
-        fi
-        log_info "  tts_orchestrator/python: OK (copied model.py + helpers)"
+        cp "$orch_py_dir/model.py" "$repo_dir/tts_orchestrator/1/model.py"
+
+        rm -rf "$repo_dir/tts_orchestrator/1/engine"
+        cp -R "$repo_root/engine" "$repo_dir/tts_orchestrator/1/engine"
+
+        log_info "  tts_orchestrator/python: OK (copied model.py + engine/ package)"
     else
         log_warn "  tts_orchestrator/python: source dir not found, using stub"
     fi
@@ -252,6 +256,19 @@ assemble_model_repo() {
     _link_or_copy "$variant_dir/triton_manifest.json" \
         "$repo_dir/tts_orchestrator/1/triton_manifest.json"
     log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/1)"
+
+    # Keep the Triton Python backend payload minimal.  Only the new adapter,
+    # engine package, tokenizer / weights, and manifest should enter the container.
+    find "$repo_dir/tts_orchestrator/1" -mindepth 1 -maxdepth 1 \
+        ! -name "model.py" \
+        ! -name "engine" \
+        ! -name "tokenizer" \
+        ! -name "weights" \
+        ! -name "triton_manifest.json" \
+        -exec rm -rf {} +
+    find "$repo_dir/tts_orchestrator/1" -type d -name "__pycache__" -prune -exec rm -rf {} +
+    log_info "  tts_orchestrator/python: pruned legacy payload"
+
     if ! python3 "$repo_root/scripts/python/generate_triton_configs.py" \
         --manifest "$repo_dir/triton_manifest.json" \
         --output-repo "$repo_dir" \
@@ -367,29 +384,75 @@ build_triton_image() {
     local repo_root="$1"
     local image_tag="$2"
     local base_image="${3:-}"
+    local trt_python_version="${TRITON_TENSORRT_PIP_VERSION:-10.15.1.29}"
 
     if [ -z "$base_image" ]; then
         base_image=$(resolve_triton_deploy_image) \
             || { log_error "Cannot determine base image"; return 1; }
     fi
 
-    local dockerfile="$repo_root/Dockerfile.triton"
-    if [ ! -f "$dockerfile" ]; then
-        log_error "Dockerfile not found: $dockerfile"
-        log_error "Generate it first with: bash scripts/bash/build_triton.sh --generate-dockerfile"
+    local model_repo="$repo_root/workspace/model_repository"
+    local fused_artifact=""
+    if [ -f "$model_repo/talker_code2wav_fused/1/model.plan" ]; then
+        fused_artifact="$model_repo/talker_code2wav_fused/1/model.plan"
+    elif [ -f "$model_repo/talker_code2wav_fused/1/model.onnx" ]; then
+        fused_artifact="$model_repo/talker_code2wav_fused/1/model.onnx"
+    fi
+
+    if [ ! -f "$model_repo/tts_orchestrator/1/model.py" ] \
+        || [ ! -d "$model_repo/tts_orchestrator/1/engine" ] \
+        || [ -z "$fused_artifact" ]; then
+        log_error "Assembled model repository is incomplete for image build"
+        log_error "Expected:"
+        log_error "  $model_repo/tts_orchestrator/1/model.py"
+        log_error "  $model_repo/tts_orchestrator/1/engine/"
+        log_error "  $model_repo/talker_code2wav_fused/1/model.plan or model.onnx"
         return 1
     fi
 
+    local build_dir
+    build_dir=$(mktemp -d)
+    local dockerfile="$build_dir/Dockerfile"
+    cat > "$dockerfile" <<DOCKERFILE
+ARG BASE_IMAGE=${base_image}
+ARG TENSORRT_PYTHON_VERSION=${trt_python_version}
+FROM \${BASE_IMAGE}
+ARG TENSORRT_PYTHON_VERSION
+
+RUN python3 -m pip install --no-cache-dir \
+    -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
+    --trusted-host mirrors.bfsu.edu.cn \
+    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    torch \
+    tokenizers \
+    scipy \
+    soundfile \
+    "tensorrt==\${TENSORRT_PYTHON_VERSION}"
+
+COPY workspace/model_repository /models
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=6 \
+    CMD curl -f http://localhost:8000/v2/health/ready || exit 1
+
+EXPOSE 8000 8001 8002
+
+ENTRYPOINT ["tritonserver"]
+CMD ["--model-repository=/models", "--strict-model-config=false", "--disable-auto-complete-config", "--log-verbose=1"]
+DOCKERFILE
+
     log_step "Building Triton deployment image: $image_tag"
     log_info "  Base image:  $base_image"
-    log_info "  Dockerfile:  $dockerfile"
+    log_info "  Runtime:     /models/tts_orchestrator/1/model.py + engine/ + $(basename "$fused_artifact")"
 
     docker build \
         --build-arg "BASE_IMAGE=$base_image" \
+        --build-arg "TENSORRT_PYTHON_VERSION=$trt_python_version" \
         -t "$image_tag" \
         -f "$dockerfile" \
         "$repo_root" \
-        || { log_error "Docker build failed"; return 1; }
+        || { rm -rf "$build_dir"; log_error "Docker build failed"; return 1; }
+
+    rm -rf "$build_dir"
 
     log_info "Image built: $image_tag"
 }
@@ -569,10 +632,12 @@ class TritonPythonModel:
     def execute(self, requests):
         responses = []
         for request in requests:
-            audio = np.zeros(1, dtype=np.float32)
+            audio = np.array([b""], dtype=object)
             is_final = np.array([True], dtype=bool)
             response = pb_utils.InferenceResponse(
                 output_tensors=[pb_utils.Tensor("audio_chunk", audio),
+                                pb_utils.Tensor("event_type", np.array(["error"], dtype=object)),
+                                pb_utils.Tensor("event_json", np.array([json.dumps({"type":"error","message":"stub"})], dtype=object)),
                                 pb_utils.Tensor("is_final", is_final)])
             responses.append(response)
         return responses

@@ -64,15 +64,47 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             converted = _convert_audio_chunk(data, config.audio)
             await audio_queue.put(("audio", _make_audio_response(converted, config.audio)))
 
+        async def on_event(sid, event: dict):
+            await audio_queue.put(("event", _make_event_response(
+                event_type=str(event.get("type", "") or ""),
+                session_id=sid,
+                segment_id=int(event.get("segment_idx", -1)),
+                text=str(event.get("text", "") or ""),
+                message=str(event.get("message", "") or ""),
+                audio_format=config.audio if event.get("type") == "start" else None,
+                meta={str(k): str(v) for k, v in (event.get("meta", {}) or {}).items()},
+            )))
+
         async def on_done(sid, metrics):
-            await audio_queue.put(("done", metrics))
+            event_type = "error" if isinstance(metrics, dict) and metrics.get("error") else "done"
+            await audio_queue.put(("event", _make_event_response(
+                event_type=event_type,
+                session_id=sid,
+                message=str(metrics.get("error", "") if isinstance(metrics, dict) else ""),
+                meta={
+                    str(k): str(v)
+                    for k, v in (metrics or {}).items()
+                    if k != "error"
+                } if isinstance(metrics, dict) else {},
+            )))
 
         await self._engine.start_session(
             session_id,
             config=config,
             on_audio=on_audio,
             on_done=on_done,
+            on_event=on_event,
         )
+        await audio_queue.put(("event", _make_event_response(
+            event_type="start",
+            session_id=session_id,
+            audio_format=config.audio,
+            meta={
+                "input_mode": config.input_mode.value,
+                "group_policy": config.group_policy.value,
+                "task_type": config.task_type or "",
+            },
+        )))
         logger.info("gRPC session started: %s", session_id)
         return session_id
 
@@ -82,7 +114,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             response = _queue_message_to_response(msg_type_q, payload)
             if response is not None:
                 yield response
-            if msg_type_q == "done":
+            if msg_type_q == "event" and _is_done_response(response):
                 return
 
     async def _drain_until_done(
@@ -103,7 +135,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             response = _queue_message_to_response(msg_type_q, payload)
             if response is not None:
                 yield response
-            if msg_type_q == "done":
+            if msg_type_q == "event" and _is_done_response(response):
                 return
 
     async def _pump_requests(
@@ -140,12 +172,12 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             logger.info("gRPC oneshot cancelled: %s", session_id)
         except Exception as e:
             logger.error("gRPC oneshot error: %s: %s", session_id, e)
-            yield _make_status_response("error", str(e))
+            yield _make_event_response(event_type="error", session_id=session_id or "", message=str(e))
         finally:
             if session_id:
                 await self._engine.cancel(session_id)
 
-        yield _make_status_response("done", "Stream ended")
+        yield _make_event_response(event_type="done", session_id=session_id or "", message="Stream ended")
 
     async def SynthesizeStream(self, request_iterator, context):
         """Handle one bidirectional stream.
@@ -239,7 +271,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             logger.info("gRPC stream cancelled: %s", session_id)
         except Exception as e:
             logger.error("gRPC stream error: %s: %s", session_id, e)
-            yield _make_status_response("error", str(e))
+            yield _make_event_response(event_type="error", session_id=session_id or "", message=str(e))
         finally:
             for task in (request_task, audio_task, pump_task):
                 if task is not None and not task.done():
@@ -253,7 +285,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
             if session_id:
                 await self._engine.cancel(session_id)
 
-        yield _make_status_response("done", "Stream ended")
+        yield _make_event_response(event_type="done", session_id=session_id or "", message="Stream ended")
 
 
 def _make_audio_response(
@@ -267,6 +299,35 @@ def _make_audio_response(
             encoding=_audio_encoding_to_proto(audio_config.encoding),
             channels=audio_config.channels,
         )
+    )
+
+
+def _make_event_response(
+    *,
+    event_type: str,
+    session_id: str = "",
+    segment_id: int = -1,
+    text: str = "",
+    message: str = "",
+    audio_format: AudioConfig | None = None,
+    meta: dict[str, str] | None = None,
+) -> tts_pb2.SynthesizeResponse:
+    kwargs = {
+        "type": event_type,
+        "session_id": session_id,
+        "segment_id": segment_id,
+        "text": text,
+        "message": message,
+        "meta": meta or {},
+    }
+    if audio_format is not None:
+        kwargs["audio"] = tts_pb2.AudioFormat(
+            encoding=_audio_encoding_to_proto(audio_format.encoding),
+            sample_rate=audio_format.sample_rate,
+            channels=audio_format.channels,
+        )
+    return tts_pb2.SynthesizeResponse(
+        event=tts_pb2.StreamEvent(**kwargs)
     )
 
 
@@ -308,19 +369,18 @@ def _queue_message_to_response(
 ) -> tts_pb2.SynthesizeResponse | None:
     if msg_type_q == "audio":
         return payload
-    if msg_type_q == "done":
-        err = payload.get("error") if isinstance(payload, dict) else None
-        if err:
-            return _make_status_response("error", str(err))
-        return _make_status_response("done", "Synthesis complete")
+    if msg_type_q == "event":
+        return payload
     return None
 
 
 def _is_done_response(response: tts_pb2.SynthesizeResponse) -> bool:
-    return (
-        response.WhichOneof("response") == "status"
-        and response.status.event in {"done", "error"}
-    )
+    if response is None:
+        return False
+    which = response.WhichOneof("response")
+    if which == "event":
+        return response.event.type in {"done", "error"}
+    return which == "status" and response.status.event in {"done", "error"}
 
 
 async def serve(engine: TTSEngine, port: int = 50051, *, stop_event: asyncio.Event) -> None:

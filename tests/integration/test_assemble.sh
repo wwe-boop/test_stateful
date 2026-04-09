@@ -3,9 +3,9 @@
 #  L2 test T2.4: assemble_model_repo ONNX/TRT dual mode and validate.
 #
 #  Verifies:
-#    - ONNX mode: .onnx + .onnx.data copy, tokenizer.json, batch_decode_scheduler.py,
-#                 text_segmenter.py, audio_utils.py, lightweight_tokenizer.py in tts_orchestrator/1
-#    - TRT mode:  talker_code2wav_fused config has TYPE_BF16, same Python files
+#    - ONNX mode: .onnx + .onnx.data copy, tokenizer assets, TTSEngine payload in
+#                 tts_orchestrator/1/engine, and the thin model.py adapter
+#    - TRT mode:  talker_code2wav_fused config has TYPE_BF16, same adapter payload
 #    - Both: first_chunk_frames in tts_orchestrator config, weights/ .pt files
 #
 #  Run from repo root:
@@ -46,12 +46,15 @@ validate_model_repo "${TEST_REPO_ONNX}" || { log_error "validate (onnx) failed";
 # Assert ONNX-specific
 ORCH_1="${TEST_REPO_ONNX}/tts_orchestrator/1"
 [ -f "${ORCH_1}/model.py" ] || { log_error "Missing ${ORCH_1}/model.py"; exit 1; }
-[ -f "${ORCH_1}/batch_decode_scheduler.py" ] || { log_error "Missing batch_decode_scheduler.py"; exit 1; }
-[ -f "${ORCH_1}/text_segmenter.py" ] || { log_error "Missing text_segmenter.py"; exit 1; }
-[ -f "${ORCH_1}/prefill_builder.py" ] || { log_error "Missing prefill_builder.py"; exit 1; }
-[ -f "${ORCH_1}/audio_utils.py" ] || { log_error "Missing audio_utils.py"; exit 1; }
-[ -f "${ORCH_1}/lightweight_tokenizer.py" ] || { log_error "Missing lightweight_tokenizer.py"; exit 1; }
+[ -f "${ORCH_1}/engine/server.py" ] || { log_error "Missing TTSEngine payload: engine/server.py"; exit 1; }
+[ -f "${ORCH_1}/engine/frontend/interface.py" ] || { log_error "Missing TTSEngine payload: engine/frontend/interface.py"; exit 1; }
+[ -f "${ORCH_1}/engine/backend/engine_loop.py" ] || { log_error "Missing TTSEngine payload: engine/backend/engine_loop.py"; exit 1; }
 [ -f "${ORCH_1}/weights/config.json" ] || { log_error "Missing orchestrator weights/config.json"; exit 1; }
+for legacy in __pycache__ greedy_tokenizer.py batch_decode_scheduler.py text_segmenter.py \
+              prefill_builder.py audio_utils.py lightweight_tokenizer.py \
+              session_manager.py decode_fsm.py ratio_tracker.py mlfq_scheduler.py; do
+  [ ! -e "${ORCH_1}/${legacy}" ] || { log_error "Unexpected legacy BLS payload remained: ${ORCH_1}/${legacy}"; exit 1; }
+done
 grep -q "first_chunk_frames" "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config missing first_chunk_frames"; exit 1; }
 if [ -d "${ORCH_1}/tokenizer" ]; then
   if [ -f "${ORCH_1}/tokenizer/tokenizer.json" ]; then
@@ -70,6 +73,10 @@ if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${E
   grep -q 'name: "input_embeds"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
     && grep -qE "TYPE_BF16|TYPE_FP16|TYPE_FP32" "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
     || { log_error "talker_code2wav_fused TRT config missing float input_embeds type"; exit 1; }
+  grep -q 'name: "talker_past_kv"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
+    || { log_error "talker_code2wav_fused TRT config missing packed talker_past_kv"; exit 1; }
+  grep -q 'name: "c2w_past_kv"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
+    || { log_error "talker_code2wav_fused TRT config missing packed c2w_past_kv"; exit 1; }
   log_info "TRT assemble checks passed"
 else
   log_warn "No talker_code2wav_fused.engine/.plan found; skipping TRT assemble test"

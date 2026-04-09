@@ -39,6 +39,8 @@ def test_http_non_streaming(url: str, text: str, output_path: str):
         ],
         "outputs": [
             {"name": "audio_chunk"},
+            {"name": "event_type"},
+            {"name": "event_json"},
             {"name": "is_final"},
         ],
     }
@@ -101,11 +103,24 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
     req_input.set_data_from_numpy(np.array([req_json], dtype=object))
 
     audio_output = grpcclient.InferRequestedOutput("audio_chunk")
+    event_type_output = grpcclient.InferRequestedOutput("event_type")
+    event_json_output = grpcclient.InferRequestedOutput("event_json")
     final_output = grpcclient.InferRequestedOutput("is_final")
 
     audio_chunks = []
     errors = []
     done = False
+    audio_format = {"encoding": "pcm_f32", "sample_rate": 24000}
+
+    def _decode_obj(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
+
+    def _chunk_to_f32(raw: bytes) -> np.ndarray:
+        if audio_format.get("encoding") == "pcm_s16le":
+            return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
+        return np.frombuffer(raw, dtype=np.float32)
 
     def callback(result, error):
         nonlocal done
@@ -114,11 +129,30 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
             done = True
             return
 
+        event_type = result.as_numpy("event_type")
+        event_json = result.as_numpy("event_json")
         audio = result.as_numpy("audio_chunk")
         is_final = result.as_numpy("is_final")
-        audio_chunks.append(audio.flatten())
-        print(f"  Chunk {len(audio_chunks)}: {audio.shape} samples, "
-              f"final={is_final.flatten()[0]}")
+        et = _decode_obj(event_type.flatten()[0]) if event_type is not None and event_type.size else ""
+        payload = {}
+        if event_json is not None and event_json.size:
+            raw_json = _decode_obj(event_json.flatten()[0])
+            if raw_json:
+                payload = json.loads(raw_json)
+        if et == "start":
+            audio_format.update(payload.get("audio_format", {}) or {})
+            print(f"  Start: format={audio_format}")
+        elif et == "audio" and audio is not None and audio.size:
+            chunk = _chunk_to_f32(audio.flatten()[0])
+            audio_chunks.append(chunk)
+            print(f"  Chunk {len(audio_chunks)}: {chunk.shape} samples, "
+                  f"final={is_final.flatten()[0]}")
+        elif et == "segment_end":
+            print(f"  Segment end: {payload.get('text', '')}")
+        elif et == "error":
+            errors.append(payload.get("message", "unknown error"))
+            done = True
+            return
         if is_final.flatten()[0]:
             done = True
 
@@ -127,7 +161,7 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
     client.async_stream_infer(
         model_name="tts_orchestrator",
         inputs=[req_input],
-        outputs=[audio_output, final_output],
+        outputs=[audio_output, event_type_output, event_json_output, final_output],
     )
 
     timeout = 120

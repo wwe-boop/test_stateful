@@ -129,6 +129,7 @@ class EngineRequest:
 class ResultType(Enum):
     PREFILL_DONE   = auto()
     AUDIO_CHUNK    = auto()
+    WARNING        = auto()
     SEGMENT_END    = auto()
     SESSION_DONE   = auto()
     RATIO_UPDATE   = auto()  # EMA audio:text ratio feedback
@@ -141,6 +142,7 @@ class EngineResult:
     session_id: str
     segment_idx: int = 0
     audio_bytes: Optional[bytes] = None   # for AUDIO_CHUNK
+    warning_msg: Optional[str] = None     # for WARNING
     error_msg: Optional[str] = None       # for ERROR
     metrics: dict = field(default_factory=dict)  # step_count, rtf, etc.
     ema_ratio: float = 0.0                # for RATIO_UPDATE

@@ -300,6 +300,10 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
     in_names: List[str] = list(c2w.get("c2w_state_input_names") or [])
     init_shapes_raw = c2w.get("initial_state_shapes") or []
     out_names_c2w: List[str] = list(c2w.get("c2w_state_output_names") or [])
+    packed_kv = bool(c2w.get("packed_kv"))
+    n_c2w_layers = int(c2w.get("num_code2wav_hidden_layers", 8))
+    c2w_kv_heads = int(c2w.get("c2w_kv_heads", kv))
+    c2w_head_dim = int(c2w.get("c2w_head_dim", hd))
 
     init_shapes: List[List[int]] = []
     for row in init_shapes_raw:
@@ -350,17 +354,29 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         f"  {{ name: \"c2w_attention_bias\"  data_type: {io_ft}  dims: [ -1, 1, -1, -1 ] }}",
         "]",
     ]
-    for i in range(nl):
+    if packed_kv:
         parts.append("input [")
         parts.append(
-            f'  {{ name: "past_kv_{i}_k"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            f'  {{ name: "talker_past_kv"  data_type: {io_ft}  dims: [ -1, {nl * 2}, {kv}, -1, {hd} ] }}'
         )
         parts.append("]")
         parts.append("input [")
         parts.append(
-            f'  {{ name: "past_kv_{i}_v"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            f'  {{ name: "c2w_past_kv"  data_type: {io_ft}  dims: [ -1, {n_c2w_layers * 2}, {c2w_kv_heads}, -1, {c2w_head_dim} ] }}'
         )
         parts.append("]")
+    else:
+        for i in range(nl):
+            parts.append("input [")
+            parts.append(
+                f'  {{ name: "past_kv_{i}_k"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            )
+            parts.append("]")
+            parts.append("input [")
+            parts.append(
+                f'  {{ name: "past_kv_{i}_v"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            )
+            parts.append("]")
     for name, shp in zip(in_names, init_shapes):
         dims = _c2w_state_shape_to_triton_dims(name, shp)
         parts.append("input [")
@@ -388,17 +404,29 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
             "]",
         ]
     )
-    for i in range(nl):
+    if packed_kv:
         parts.append("output [")
         parts.append(
-            f'  {{ name: "present_kv_{i}_k"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            f'  {{ name: "talker_present_kv"  data_type: {io_ft}  dims: [ -1, {nl * 2}, {kv}, -1, {hd} ] }}'
         )
         parts.append("]")
         parts.append("output [")
         parts.append(
-            f'  {{ name: "present_kv_{i}_v"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            f'  {{ name: "c2w_present_kv"  data_type: {io_ft}  dims: [ -1, {n_c2w_layers * 2}, {c2w_kv_heads}, -1, {c2w_head_dim} ] }}'
         )
         parts.append("]")
+    else:
+        for i in range(nl):
+            parts.append("output [")
+            parts.append(
+                f'  {{ name: "present_kv_{i}_k"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            )
+            parts.append("]")
+            parts.append("output [")
+            parts.append(
+                f'  {{ name: "present_kv_{i}_v"  data_type: {io_ft}  dims: [ -1, {kv}, -1, {hd} ] }}'
+            )
+            parts.append("]")
     for out_name, shp in zip(out_names_c2w, init_shapes):
         dims = _c2w_state_shape_to_triton_dims(out_name, shp)
         parts.append("output [")
@@ -532,17 +560,22 @@ input [
 output [
   {{
     name: "audio_chunk"
-    data_type: TYPE_FP32
-    dims: [ -1 ]
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }},
+  {{
+    name: "event_type"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }},
+  {{
+    name: "event_json"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
   }},
   {{
     name: "is_final"
     data_type: TYPE_BOOL
-    dims: [ 1 ]
-  }},
-  {{
-    name: "warning"
-    data_type: TYPE_STRING
     dims: [ 1 ]
   }}
 ]

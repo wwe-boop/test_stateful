@@ -221,12 +221,20 @@ def run_triton_greedy(triton_url: str, output_dir: Path):
         req_input = grpcclient.InferInput("request", [1], "BYTES")
         req_input.set_data_from_numpy(np.array([req_json], dtype=object))
         audio_out = grpcclient.InferRequestedOutput("audio_chunk")
+        event_type_out = grpcclient.InferRequestedOutput("event_type")
+        event_json_out = grpcclient.InferRequestedOutput("event_json")
         final_out = grpcclient.InferRequestedOutput("is_final")
 
         chunks = []
         errors = []
         warnings = []
         done = threading.Event()
+        audio_format = {"encoding": "pcm_f32", "sample_rate": SAMPLE_RATE}
+
+        def _decode_obj(value):
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            return str(value)
 
         def callback(result=None, error=None):
             if error:
@@ -236,16 +244,31 @@ def run_triton_greedy(triton_url: str, output_dir: Path):
                 return
             if result is None:
                 return
-            warn = result.as_numpy("warning")
-            if warn is not None and warn.size > 0:
-                w_str = warn.flatten()[0]
-                if isinstance(w_str, bytes):
-                    w_str = w_str.decode("utf-8")
-                warnings.append(w_str)
+            event_type = result.as_numpy("event_type")
+            event_json = result.as_numpy("event_json")
             audio = result.as_numpy("audio_chunk")
             is_final = result.as_numpy("is_final")
+            et = _decode_obj(event_type.flatten()[0]) if event_type is not None and event_type.size else ""
+            payload = {}
+            if event_json is not None and event_json.size:
+                raw_json = _decode_obj(event_json.flatten()[0])
+                if raw_json:
+                    payload = json.loads(raw_json)
+            if et == "start":
+                audio_format.update(payload.get("audio_format", {}) or {})
+            elif et == "warning":
+                warnings.append(payload.get("message", ""))
+            elif et == "audio" and audio is not None and audio.size:
+                raw = audio.flatten()[0]
+                if audio_format.get("encoding") == "pcm_s16le":
+                    chunks.append(np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0)
+                else:
+                    chunks.append(np.frombuffer(raw, dtype=np.float32))
+            elif et == "error":
+                errors.append(payload.get("message", "unknown error"))
+                done.set()
+                return
             final = bool(is_final.flatten()[0]) if is_final is not None and is_final.size else False
-            chunks.append(audio.flatten())
             if final:
                 done.set()
 
@@ -254,7 +277,7 @@ def run_triton_greedy(triton_url: str, output_dir: Path):
         client.async_stream_infer(
             model_name="tts_orchestrator",
             inputs=[req_input],
-            outputs=[audio_out, final_out],
+            outputs=[audio_out, event_type_out, event_json_out, final_out],
         )
         done.wait(timeout=300)
         client.stop_stream()

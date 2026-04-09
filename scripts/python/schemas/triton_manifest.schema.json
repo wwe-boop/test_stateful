@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1,
+      "enum": [1, 2],
       "description": "Manifest format version"
     },
     "variant": {
@@ -64,7 +64,12 @@
             "type": "array",
             "items": { "type": "integer" }
           }
-        }
+        },
+        "packed_kv": { "type": "boolean" },
+        "c2w_kv_heads": { "type": "integer" },
+        "c2w_head_dim": { "type": "integer" },
+        "c2w_sliding_window": { "type": "integer" },
+        "logits_topk": { "type": "integer" }
       }
     },
     "orchestrator": {

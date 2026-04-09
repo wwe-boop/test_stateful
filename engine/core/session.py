@@ -55,7 +55,12 @@ class Session:
     segments_submitted: int = 0
     segments_done: int = 0
     segment_order: dict[int, SegmentOrderMeta] = field(default_factory=dict)
+    segment_texts: dict[int, str] = field(default_factory=dict)
+    segment_start_emitted: set[int] = field(default_factory=set)
     engine_tokens_done_sent: bool = False
+
+    # Optional transport-layer callback hook (e.g. gRPC / Triton adapters)
+    event_callback: Any = None
 
     # Metrics
     total_steps: int = 0

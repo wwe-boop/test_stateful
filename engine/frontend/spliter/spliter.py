@@ -51,6 +51,7 @@ class SegmentAction:
     group_idx: int = -1
     local_idx: int = 0
     group_final: bool = True
+    token_text: str = ""
 
 
 @dataclass
@@ -349,7 +350,14 @@ class Spliter:
             group.cursor += 1
             evt = self._make_event(token.token_id, token.text, token.punct_level)
             for r in driver.feed(evt):
-                actions.append(SegmentAction(idx, r, group.group_idx, local_idx, False))
+                actions.append(SegmentAction(
+                    idx,
+                    r,
+                    group.group_idx,
+                    local_idx,
+                    False,
+                    token_text=token.text if r.type in (ActionType.PREFILL, ActionType.DECODE) else "",
+                ))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(idx)
                     flushed = True
@@ -403,7 +411,11 @@ class Spliter:
             results = driver.feed(evt)
 
             for r in results:
-                actions.append(SegmentAction(active_idx, r))
+                actions.append(SegmentAction(
+                    active_idx,
+                    r,
+                    token_text=token.text if r.type in (ActionType.PREFILL, ActionType.DECODE) else "",
+                ))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(active_idx)
                     actions.extend(self._try_start_next())
@@ -449,7 +461,11 @@ class Spliter:
             evt = self._make_event(token.token_id, token.text, token.punct_level)
             results = driver.feed(evt)
             for r in results:
-                actions.append(SegmentAction(idx, r))
+                actions.append(SegmentAction(
+                    idx,
+                    r,
+                    token_text=token.text if r.type in (ActionType.PREFILL, ActionType.DECODE) else "",
+                ))
                 if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
                     self._flushing.add(idx)
                     remaining = self._token_buffer[i + 1:]

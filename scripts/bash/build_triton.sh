@@ -277,12 +277,27 @@ cmd_run() {
             stale=true
             log_warn "Orchestrator Python source (model.py) is newer than assembled copy"
         fi
-        # Re-assemble if orchestrator helpers were added after an older assemble (see triton.sh copy list)
-        local orch_h
-        for orch_h in batch_decode_scheduler.py text_segmenter.py; do
-            if [ ! -f "$MODEL_REPO_DIR/tts_orchestrator/1/$orch_h" ]; then
+        # Re-assemble if the new TTSEngine payload is missing from an older assemble.
+        if [ ! -f "$MODEL_REPO_DIR/tts_orchestrator/1/engine/server.py" ]; then
+            stale=true
+            log_warn "TTSEngine package missing in model repo: tts_orchestrator/1/engine/server.py"
+        fi
+        local legacy_payload
+        for legacy_payload in \
+            "__pycache__" \
+            "greedy_tokenizer.py" \
+            "batch_decode_scheduler.py" \
+            "text_segmenter.py" \
+            "prefill_builder.py" \
+            "audio_utils.py" \
+            "lightweight_tokenizer.py" \
+            "session_manager.py" \
+            "decode_fsm.py" \
+            "ratio_tracker.py" \
+            "mlfq_scheduler.py"; do
+            if [ -e "$MODEL_REPO_DIR/tts_orchestrator/1/$legacy_payload" ]; then
                 stale=true
-                log_warn "Orchestrator helper missing in model repo: $orch_h (re-assemble required)"
+                log_warn "Legacy BLS payload still present in model repo: tts_orchestrator/1/$legacy_payload"
                 break
             fi
         done

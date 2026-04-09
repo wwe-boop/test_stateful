@@ -105,9 +105,12 @@ def test_build_manifest_for_export_roundtrip():
         "talker_num_heads": 16,
     }
     m = build_manifest_for_export("custom-1.7b", wc, lay)
-    assert m["schema_version"] == 1
+    assert m["schema_version"] == 2
     assert m.get("triton_io_float_dtype") == "bf16"
-    assert m["code2wav_fused"]["c2w_state_input_names"][0] == "c2w_past_kv_0_k"
+    assert m["code2wav_fused"]["packed_kv"] is True
+    assert m["code2wav_fused"]["c2w_kv_heads"] == 16
+    assert m["code2wav_fused"]["c2w_head_dim"] == 64
+    assert m["code2wav_fused"]["c2w_state_input_names"][0] == "c2w_conv_state_0"
 
 
 def test_triton_io_float_dtype_from_manifest_defaults_fp32():
@@ -130,10 +133,11 @@ def test_generate_configs_minimal_repo(tmp_path):
     assert 'name: "input_embeds"' in fused_cfg
     assert 'name: "cache_position"' in fused_cfg
     assert 'name: "wav"' in fused_cfg
-    assert "c2w_past_kv_0_k" in fused_cfg
-    assert 'name: "past_kv_0_k"' in fused_cfg
+    assert 'name: "talker_past_kv"' in fused_cfg
+    assert 'name: "c2w_past_kv"' in fused_cfg
+    assert 'name: "talker_present_kv"' in fused_cfg
+    assert 'name: "c2w_present_kv"' in fused_cfg
     assert "TYPE_BF16" in fused_cfg
     orch_cfg = (tmp_path / "tts_orchestrator" / "config.pbtxt").read_text()
     assert "tts_orchestrator" in orch_cfg
     assert "custom-1.7b" in orch_cfg
-

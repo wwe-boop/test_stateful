@@ -142,6 +142,11 @@ def build_manifest_for_export(
             "c2w_state_input_names": code2wav_layout["c2w_state_input_names"],
             "c2w_state_output_names": code2wav_layout["c2w_state_output_names"],
             "initial_state_shapes": code2wav_layout["initial_state_shapes"],
+            "packed_kv": bool(code2wav_layout.get("packed_kv", False)),
+            "c2w_kv_heads": int(code2wav_layout.get("c2w_kv_heads", 16)),
+            "c2w_head_dim": int(code2wav_layout.get("c2w_head_dim", 64)),
+            "c2w_sliding_window": int(code2wav_layout.get("c2w_sliding_window", 72)),
+            "logits_topk": int(code2wav_layout.get("logits_topk", 50)),
         },
         "orchestrator": orch,
     }

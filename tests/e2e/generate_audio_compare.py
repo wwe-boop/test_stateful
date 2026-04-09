@@ -413,18 +413,43 @@ def main():
             req_input = grpcclient.InferInput("request", [1], "BYTES")
             req_input.set_data_from_numpy(np.array([json.dumps(req_dict)], dtype=object))
             audio_out = grpcclient.InferRequestedOutput("audio_chunk")
+            event_type_out = grpcclient.InferRequestedOutput("event_type")
+            event_json_out = grpcclient.InferRequestedOutput("event_json")
             final_out = grpcclient.InferRequestedOutput("is_final")
             chunks = []
             errors = []
             done = [False]
+            audio_format = {"encoding": "pcm_f32", "sample_rate": 24000}
+            def _decode_obj(value):
+                if isinstance(value, bytes):
+                    return value.decode("utf-8")
+                return str(value)
             def _stream_cb(result, error):
                 if error:
                     errors.append(str(error))
                     done[0] = True
                     return
+                event_type = result.as_numpy("event_type")
+                event_json = result.as_numpy("event_json")
                 chunk = result.as_numpy("audio_chunk")
-                if chunk is not None and chunk.size > 0:
-                    chunks.append(chunk.flatten().copy())
+                et = _decode_obj(event_type.flatten()[0]) if event_type is not None and event_type.size else ""
+                payload = {}
+                if event_json is not None and event_json.size:
+                    raw_json = _decode_obj(event_json.flatten()[0])
+                    if raw_json:
+                        payload = json.loads(raw_json)
+                if et == "start":
+                    audio_format.update(payload.get("audio_format", {}) or {})
+                elif et == "audio" and chunk is not None and chunk.size > 0:
+                    raw = chunk.flatten()[0]
+                    if audio_format.get("encoding") == "pcm_s16le":
+                        chunks.append(np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0)
+                    else:
+                        chunks.append(np.frombuffer(raw, dtype=np.float32))
+                elif et == "error":
+                    errors.append(payload.get("message", "unknown error"))
+                    done[0] = True
+                    return
                 fin = result.as_numpy("is_final")
                 if fin is not None and fin.size and fin.flatten()[0]:
                     done[0] = True
@@ -433,7 +458,7 @@ def main():
             triton_client.async_stream_infer(
                 model_name="tts_orchestrator",
                 inputs=[req_input],
-                outputs=[audio_out, final_out],
+                outputs=[audio_out, event_type_out, event_json_out, final_out],
             )
             while not done[0] and (time.perf_counter() - t0) < 120:
                 time.sleep(0.05)

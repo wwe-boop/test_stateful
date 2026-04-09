@@ -37,11 +37,10 @@ def test_fused_io_format_counts_and_int_positions():
     inp, out = fused_input_output_io_format_strings(m)
     in_parts = inp.split(",")
     out_parts = out.split(",")
-    nl = int(m["talker"]["num_layers"])
     n_c2w_in = len(m["code2wav_fused"]["c2w_state_input_names"])
     n_c2w_out = len(m["code2wav_fused"]["c2w_state_output_names"])
-    assert len(in_parts) == 9 + 2 * nl + n_c2w_in
-    assert len(out_parts) == 6 + 2 * nl + n_c2w_out
+    assert len(in_parts) == 11 + n_c2w_in
+    assert len(out_parts) == 8 + n_c2w_out
     # input_embeds, position_ids, attention_bias,
     # token_counts(i64), gumbel_noise(fp32), temperature(fp32), penalty(fp32),
     # cache_position(fp32), c2w_attention_bias
@@ -67,7 +66,7 @@ def test_fused_io_fp32_float_tokens():
     m = _load_fixture()
     m["triton_io_float_dtype"] = "fp32"
     inp, out = fused_input_output_io_format_strings(m)
-    assert inp.startswith("fp32:chw,int64:chw,fp32:chw,int64:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,")
+    assert inp.startswith("fp32:chw,int64:chw,fp32:chw,int64:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,")
     assert "fp32:chw" in out.split(",")[0]
 
 
