@@ -604,6 +604,32 @@ class TestEngineIntegration:
 
     @SKIP_NO_TOKENIZER
     @pytest.mark.asyncio
+    async def test_cancel_session_releases_frontend_slot_immediately(self):
+        from engine.frontend.interface import FrontendInterface
+        from engine.frontend.spliter.tokenizer import LightQwen3TTSTokenizer
+
+        tokenizer = LightQwen3TTSTokenizer(str(TOKENIZER_DIR))
+        async_inbox = asyncio.Queue(maxsize=64)
+        interface = FrontendInterface(
+            engine_inbox=async_inbox,
+            tokenizer=tokenizer,
+            max_sessions=2,
+            engine_max_decode_len=200,
+        )
+
+        await interface.create_session(
+            "cancel-me",
+            task_type="custom_voice",
+        )
+        assert interface.active_count == 1
+
+        await interface.cancel_session("cancel-me")
+        await asyncio.sleep(0)
+
+        assert interface.active_count == 0
+
+    @SKIP_NO_TOKENIZER
+    @pytest.mark.asyncio
     async def test_long_segment_streaming_queues_followup_groups_until_segment_done(self):
         from engine.core.types import (
             EngineResult, GroupPolicy, InputMode, ResultType, SessionConfig,

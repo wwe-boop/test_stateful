@@ -158,6 +158,10 @@ class FrontendInterface:
             return
         session.state = SessionState.DONE
         await self._dispatcher.submit_cancel(session_id)
+        task = self._consumer_tasks.get(session_id)
+        if task and not task.done():
+            task.cancel()
+        self._cleanup_session(session_id)
 
     async def push_text_input(self, session_id: str, text: str) -> None:
         """Feed transport text according to the session's declared input mode."""

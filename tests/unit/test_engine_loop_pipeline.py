@@ -142,6 +142,52 @@ class TestSessionTimeout:
         loop.close()
 
 
+class _ImmediateLoop:
+    def call_soon_threadsafe(self, callback, *args):
+        callback(*args)
+
+
+class TestSessionCancel:
+    def test_cancel_emits_session_done_and_removes_group(self, model_config):
+        inbox = queue.Queue()
+        loop = _ImmediateLoop()
+
+        class StubExecutor:
+            kv_pool = KVCachePool(
+                max_slots=4, config=model_config,
+                device=torch.device("cpu"), preallocate=False,
+            )
+
+        engine_loop = EngineLoop(
+            engine_inbox=inbox,
+            async_loop=loop,
+            executor=StubExecutor(),
+            max_batch_size=4,
+        )
+
+        result_queue = queue.Queue()
+        new_req = EngineRequest(
+            type=RequestType.NEW_SESSION,
+            session_id="cancel-me",
+            result_queue=result_queue,
+        )
+        engine_loop._handle_request(new_req)
+        assert "cancel-me" in engine_loop._groups
+
+        cancel_req = EngineRequest(
+            type=RequestType.CANCEL_SESSION,
+            session_id="cancel-me",
+        )
+        engine_loop._handle_request(cancel_req)
+
+        result = result_queue.get_nowait()
+        assert isinstance(result, EngineResult)
+        assert result.type == ResultType.SESSION_DONE
+        assert result.session_id == "cancel-me"
+        assert result.metrics == {"cancelled": True}
+        assert "cancel-me" not in engine_loop._groups
+
+
 class TestProcessStepOutput:
     def test_process_updates_slot_state(self, model_config):
         inbox = queue.Queue()

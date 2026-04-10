@@ -516,6 +516,12 @@ def _print_summary(results: list[TTSResult], label: str):
           f"= {effective_throughput:.2f}x realtime")
 
 
+def _p95(values: list[float]) -> float:
+    vals = sorted(values)
+    idx = min(len(vals) - 1, max(0, int(round(0.95 * (len(vals) - 1)))))
+    return vals[idx]
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Single smoke
 # ---------------------------------------------------------------------------
@@ -613,6 +619,104 @@ def test_concurrent(host: str, port: int, concurrency: int, output_dir: Path) ->
             _save_wav(r.audio, out_path)
 
     return results
+
+
+def stress_concurrent(
+    host: str,
+    port: int,
+    *,
+    concurrency: int,
+    rounds: int,
+    warmup_rounds: int = 0,
+) -> list[list[TTSResult]]:
+    print("\n" + "=" * 60)
+    print(
+        f"  Stress Test: Concurrent Requests "
+        f"(concurrency={concurrency}, warmup={warmup_rounds}, rounds={rounds})"
+    )
+    print("=" * 60)
+
+    all_rounds: list[list[TTSResult]] = []
+    measured_rounds: list[list[TTSResult]] = []
+
+    total_rounds = warmup_rounds + rounds
+    for round_idx in range(total_rounds):
+        measured = round_idx >= warmup_rounds
+        phase = "measure" if measured else "warmup"
+        label = f"{phase}-{round_idx - warmup_rounds + 1}" if measured else f"warmup-{round_idx + 1}"
+        print(f"\n  --- Round {round_idx + 1}/{total_rounds} ({label}) ---")
+
+        def _run_one(idx: int) -> TTSResult:
+            text = TEST_TEXTS[idx % len(TEST_TEXTS)]
+            return _synthesize_oneshot(
+                host,
+                port,
+                text=text,
+                speaker="Serena",
+                session_id=f"stress-{round_idx}-{idx}",
+            )
+
+        t0 = time.perf_counter()
+        round_results: list[TTSResult] = []
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = {executor.submit(_run_one, i): i for i in range(concurrency)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    result = future.result()
+                    round_results.append(result)
+                except Exception as e:
+                    round_results.append(
+                        TTSResult(session_id=f"stress-{round_idx}-{idx}", text="", error=str(e))
+                    )
+
+        wall_time = time.perf_counter() - t0
+        ok = sum(1 for r in round_results if r.error is None)
+        fail = len(round_results) - ok
+        first_chunks = [r.first_chunk_ms for r in round_results if r.error is None and r.first_chunk_ms is not None]
+        totals = [r.total_ms for r in round_results if r.error is None]
+        print(
+            f"  Round result: ok={ok}/{len(round_results)} fail={fail} "
+            f"wall={wall_time:.2f}s"
+        )
+        if first_chunks:
+            print(
+                f"  First-chunk: median={statistics.median(first_chunks):.0f}ms "
+                f"p95={_p95(first_chunks):.0f}ms max={max(first_chunks):.0f}ms"
+            )
+        if totals:
+            print(
+                f"  Total latency: median={statistics.median(totals):.0f}ms "
+                f"p95={_p95(totals):.0f}ms max={max(totals):.0f}ms"
+            )
+
+        all_rounds.append(round_results)
+        if measured:
+            measured_rounds.append(round_results)
+
+    if not measured_rounds:
+        return all_rounds
+
+    flat = [r for round_results in measured_rounds for r in round_results]
+    print("\n  --- Stress Aggregate ---")
+    _print_summary(
+        flat,
+        f"Stress x{concurrency} rounds={rounds}",
+    )
+
+    round_success = [
+        sum(1 for r in round_results if r.error is None) / len(round_results)
+        for round_results in measured_rounds
+        if round_results
+    ]
+    if round_success:
+        print(
+            f"  Round success-rate: min={min(round_success) * 100:.1f}% "
+            f"median={statistics.median(round_success) * 100:.1f}% "
+            f"max={max(round_success) * 100:.1f}%"
+        )
+
+    return all_rounds
 
 
 # ---------------------------------------------------------------------------
@@ -987,9 +1091,16 @@ def main():
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR),
                         help="Output directory for WAV files")
     parser.add_argument("--skip-streaming", action="store_true")
+    parser.add_argument("--skip-single", action="store_true")
     parser.add_argument("--skip-concurrent", action="store_true")
     parser.add_argument("--skip-long", action="store_true")
     parser.add_argument("--skip-badcase", action="store_true")
+    parser.add_argument("--stress-concurrency", type=int, default=0,
+                        help="Run repeated concurrent stress rounds at this concurrency; 0 disables")
+    parser.add_argument("--stress-rounds", type=int, default=0,
+                        help="Measured stress rounds to run when --stress-concurrency > 0")
+    parser.add_argument("--stress-warmup-rounds", type=int, default=1,
+                        help="Warmup rounds before measured stress rounds")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -1001,6 +1112,11 @@ def main():
     print("=" * 60)
     print(f"  Engine:      {args.host}:{args.port}")
     print(f"  Concurrency: {concurrency_levels}")
+    if args.stress_concurrency > 0:
+        print(
+            f"  Stress:      concurrency={args.stress_concurrency}, "
+            f"warmup={args.stress_warmup_rounds}, rounds={args.stress_rounds}"
+        )
     print(f"  Output:      {output_dir}")
 
     if not _check_server(args.host, args.port):
@@ -1019,8 +1135,9 @@ def main():
     all_results: dict[str, list[TTSResult]] = {}
 
     # Test 1: Single smoke
-    r = test_single_smoke(args.host, args.port, output_dir)
-    all_results["single"] = [r]
+    if not args.skip_single:
+        r = test_single_smoke(args.host, args.port, output_dir)
+        all_results["single"] = [r]
 
     # Test 2: Streaming text
     if not args.skip_streaming:
@@ -1042,6 +1159,20 @@ def main():
     if not args.skip_badcase:
         test_badcases(args.host, args.port, output_dir)
 
+    # Test 6: Stress
+    if args.stress_concurrency > 0 and args.stress_rounds > 0:
+        stress_rounds = stress_concurrent(
+            args.host,
+            args.port,
+            concurrency=args.stress_concurrency,
+            rounds=args.stress_rounds,
+            warmup_rounds=args.stress_warmup_rounds,
+        )
+        measured = stress_rounds[args.stress_warmup_rounds:]
+        all_results[f"stress_x{args.stress_concurrency}"] = [
+            r for round_results in measured for r in round_results
+        ]
+
     # Final summary
     print("\n" + "=" * 60)
     print("  FINAL SUMMARY")
@@ -1057,8 +1188,10 @@ def main():
     total_fail = sum(1 for results in all_results.values() for r in results if r.error is not None)
     print(f"\n  TOTAL: {total_ok} OK, {total_fail} FAILED")
     print(f"  Output: {output_dir.resolve()}")
-    print(f"\n  Play audio: aplay {output_dir}/test1_single_smoke.wav")
-    print(f"         or:  ffplay -autoexit {output_dir}/test1_single_smoke.wav")
+    smoke_wav = output_dir / "test1_single_smoke.wav"
+    if smoke_wav.exists():
+        print(f"\n  Play audio: aplay {smoke_wav}")
+        print(f"         or:  ffplay -autoexit {smoke_wav}")
 
     return 0 if total_fail == 0 else 1
 

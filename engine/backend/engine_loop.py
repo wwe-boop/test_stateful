@@ -405,6 +405,13 @@ class EngineLoop:
             self._check_session_done(group)
 
         elif req.type == RequestType.CANCEL_SESSION:
+            group = self._groups.get(req.session_id)
+            if group is not None:
+                self._send_result(group, EngineResult(
+                    type=ResultType.SESSION_DONE,
+                    session_id=req.session_id,
+                    metrics={"cancelled": True},
+                ))
             self._remove_session(req.session_id)
 
     # ------------------------------------------------------------------

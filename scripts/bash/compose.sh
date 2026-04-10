@@ -30,13 +30,16 @@ FORCE_PREPARE=false
 FOLLOW=false
 BUILD_BEFORE_UP=false
 USE_DEV_OVERLAY=false
+WATCH_NO_UP=false
+WATCH_QUIET=false
+WATCH_NO_PRUNE=false
 IMAGE_OVERRIDE=""
 CONTAINER_OVERRIDE=""
 
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
 ENGINE_HEALTH="${ENGINE_HEALTH_PORT:-8080}"
 ENGINE_DEVICE="${ENGINE_DEVICE:-0}"
-ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH_SIZE:-48}"
+ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH_SIZE:-128}"
 ENGINE_MAX_SESSIONS="${ENGINE_MAX_SESSIONS:-128}"
 ENGINE_MAX_SEQ_LEN="${ENGINE_MAX_SEQ_LEN:-}"
 
@@ -52,6 +55,7 @@ Commands:
   build                  Build compose image(s)
   prepare                Assemble Triton model_repository
   up                     Start compose service(s)
+  watch                  Watch files and auto refresh/rebuild service(s)
   down                   Stop/remove compose service(s)
   logs                   Show service logs
   ps                     Show compose status
@@ -76,6 +80,9 @@ Options:
   --build                Build before `up`
   --dev                  Enable compose.dev.yaml source bind mounts
   --prepare              Force Triton repo assembly before `up`
+  --no-up                For `watch`, do not start services before watching
+  --quiet                For `watch`, hide build output
+  --no-prune             For `watch`, keep dangling images after rebuild
   --no-health-check      Skip readiness wait after `up`
   --follow               Follow logs (for `logs`)
   --dry-run              Print the compose command instead of executing
@@ -286,6 +293,43 @@ cmd_up() {
     esac
 }
 
+cmd_watch() {
+    require_docker_compose
+
+    if $USE_DEV_OVERLAY; then
+        log_error "`watch` cannot be combined with --dev; use either bind mounts or compose watch"
+        exit 1
+    fi
+
+    case "$GATEWAY" in
+        engine)
+            resolve_variant_if_needed
+            ;;
+        triton)
+            ensure_triton_repo
+            ;;
+        all)
+            resolve_variant_if_needed
+            ensure_triton_repo
+            ;;
+    esac
+
+    export_compose_env
+
+    local args=(watch)
+    $WATCH_NO_UP && args+=(--no-up)
+    $WATCH_QUIET && args+=(--quiet)
+    $WATCH_NO_PRUNE && args+=(--prune=false)
+
+    case "$GATEWAY" in
+        engine) args+=(engine) ;;
+        triton) args+=(triton) ;;
+        all) args+=(engine triton) ;;
+    esac
+
+    compose_cmd "${args[@]}"
+}
+
 cmd_down() {
     require_docker_compose
     export_compose_env
@@ -357,6 +401,9 @@ while [[ $# -gt 0 ]]; do
         --build) BUILD_BEFORE_UP=true; shift ;;
         --dev) USE_DEV_OVERLAY=true; shift ;;
         --prepare) FORCE_PREPARE=true; shift ;;
+        --no-up) WATCH_NO_UP=true; shift ;;
+        --quiet) WATCH_QUIET=true; shift ;;
+        --no-prune) WATCH_NO_PRUNE=true; shift ;;
         --no-health-check) NO_HEALTH_CHECK=true; shift ;;
         --follow) FOLLOW=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
@@ -395,6 +442,7 @@ case "$COMMAND" in
     build) cmd_build ;;
     prepare) cmd_prepare ;;
     up) cmd_up ;;
+    watch) cmd_watch ;;
     down) cmd_down ;;
     logs) cmd_logs ;;
     ps) cmd_ps ;;

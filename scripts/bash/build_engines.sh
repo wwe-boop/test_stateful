@@ -25,7 +25,7 @@
 #
 #  Environment variables:
 #    NGC_IMAGE        Docker image override (default: auto-detect from driver)
-#    MAX_BATCH_SIZE   Max batch (default: 32)
+#    MAX_BATCH_SIZE   Max batch (default: 64)
 #    MAX_INPUT_LEN    Prefill len (default: 128)
 #    MAX_SEQ_LEN      Total seq len (default: 512)
 #    ENGINE_DTYPE     bfloat16|float16|float32|fp8 (default: bfloat16)
@@ -43,7 +43,7 @@ source "${SCRIPT_DIR}/tools.sh"
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 
 # ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=1024, batch=16) ──
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-32}"
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-128}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-128}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}" # 512/128 for 30.72s, 1024/256 for 61.44s 
 ENGINE_DTYPE="${ENGINE_DTYPE:-bfloat16}"

@@ -22,7 +22,7 @@ services:
       ENGINE_DEVICE: ${ENGINE_DEVICE:-0}
       ENGINE_GRPC_PORT: ${ENGINE_GRPC_PORT:-50051}
       ENGINE_HEALTH_PORT: ${ENGINE_HEALTH_PORT:-8080}
-      ENGINE_MAX_BATCH_SIZE: ${ENGINE_MAX_BATCH_SIZE:-48}
+      ENGINE_MAX_BATCH_SIZE: ${ENGINE_MAX_BATCH_SIZE:-128}
       ENGINE_MAX_SESSIONS: ${ENGINE_MAX_SESSIONS:-128}
       ENGINE_MAX_SEQ_LEN: ${ENGINE_MAX_SEQ_LEN:-}
       PYTHONUNBUFFERED: "1"
@@ -35,6 +35,27 @@ services:
     gpus: all
     shm_size: "4g"
     restart: unless-stopped
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./engine
+          target: /app/engine
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+        - action: sync+restart
+          path: ./engine.yaml
+          target: /app/engine.yaml
+        - action: sync+restart
+          path: ./scripts/compose
+          target: /app/scripts/compose
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+        - action: rebuild
+          path: ./Dockerfile.engine
+        - action: rebuild
+          path: ./.dockerignore
 
   triton:
     profiles: ["triton"]
@@ -47,7 +68,7 @@ services:
         TENSORRT_PYTHON_VERSION: ${TRITON_TENSORRT_PYTHON_VERSION:-10.15.1.29}
     container_name: ${TRITON_CONTAINER_NAME:-qwen3-tts-triton}
     environment:
-      MAX_BATCH_SLOTS: ${TRITON_MAX_BATCH_SLOTS:-32}
+      MAX_BATCH_SLOTS: ${TRITON_MAX_BATCH_SLOTS:-64}
       MAX_SESSIONS: ${TRITON_MAX_SESSIONS:-128}
       PYTORCH_CUDA_ALLOC_CONF: ${TRITON_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
     command:
@@ -64,3 +85,17 @@ services:
     gpus: all
     shm_size: "4g"
     restart: unless-stopped
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./engine
+          target: /opt/qwen3-tts/engine
+          ignore:
+            - __pycache__/
+            - "*.pyc"
+        - action: restart
+          path: ./workspace/model_repository
+        - action: rebuild
+          path: ./Dockerfile.triton
+        - action: rebuild
+          path: ./.dockerignore

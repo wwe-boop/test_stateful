@@ -54,7 +54,7 @@ DRY_RUN=false
 # Standalone options
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
 GPU_DEVICE=0
-MAX_BATCH=48
+MAX_BATCH=128
 MAX_SESSIONS=128
 FOREGROUND=false
 
@@ -89,7 +89,7 @@ Options:
   Standalone options:
     --port <N>           gRPC port (default: 50051)
     --device <N>         GPU device (default: 0)
-    --max-batch <N>      Max batch size (default: 48)
+    --max-batch <N>      Max batch size (default: 64)
     --max-sessions <N>   Max concurrent sessions (default: 128)
     --foreground         Run in foreground (don't daemonize)
 
