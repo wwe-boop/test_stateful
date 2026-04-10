@@ -12,9 +12,8 @@ pytest.importorskip("torch")
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ORCH_1 = REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"
-if str(ORCH_1) not in sys.path:
-    sys.path.insert(0, str(ORCH_1))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 WEIGHTS_DIR = REPO_ROOT / "workspace" / "exported" / "base-1.7b" / "weights"
 TOKENIZER_DIR = REPO_ROOT / "workspace" / "exported" / "tokenizer" / "Qwen3-TTS-Tokenizer-12Hz"
@@ -29,7 +28,7 @@ def _weights_dir():
 def _tokenizer():
     if not TOKENIZER_DIR.is_dir():
         pytest.skip(f"Tokenizer dir not found: {TOKENIZER_DIR}")
-    from lightweight_tokenizer import load_lightweight_tokenizer
+    from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
     tok = load_lightweight_tokenizer(str(TOKENIZER_DIR))
     if tok is None:
         pytest.skip("Lightweight tokenizer failed to load")
@@ -39,7 +38,7 @@ def _tokenizer():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_embedding_weights_load_and_bf16():
     """T1.3: EmbeddingWeights loads, all BF16 on GPU."""
-    from prefill_builder import EmbeddingWeights
+    from engine.backend.prefill import EmbeddingWeights
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     assert weights.text_embedding.weight.dtype == torch.bfloat16
     assert weights.text_projection.linear_fc1.weight.dtype == torch.bfloat16
@@ -50,7 +49,7 @@ def test_embedding_weights_load_and_bf16():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_embedding_weights_text_embed_shape():
     """T1.3: text_embed output shape and dtype."""
-    from prefill_builder import EmbeddingWeights
+    from engine.backend.prefill import EmbeddingWeights
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     ids = torch.tensor([[1, 2, 3]], device=weights.device, dtype=torch.int64)
     out = weights.text_embed(ids)
@@ -61,7 +60,7 @@ def test_embedding_weights_text_embed_shape():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_embedding_weights_codec_embed_shape():
     """T1.3: codec_embed output shape."""
-    from prefill_builder import EmbeddingWeights
+    from engine.backend.prefill import EmbeddingWeights
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     ids = torch.tensor([[0, 1]], device=weights.device, dtype=torch.int64)
     out = weights.codec_embed(ids)
@@ -71,7 +70,7 @@ def test_embedding_weights_codec_embed_shape():
 
 def test_embedding_weights_missing_pt_raises():
     """T1.3: Missing .pt raises FileNotFoundError."""
-    from prefill_builder import EmbeddingWeights
+    from engine.backend.prefill import EmbeddingWeights
     import tempfile
     pytest.importorskip("torch")
     if not torch.cuda.is_available():
@@ -89,7 +88,7 @@ def test_embedding_weights_missing_pt_raises():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_builder_voice_design():
     """T1.4a: VOICE_DESIGN path."""
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     builder = PrefillBuilder(weights, _tokenizer())
     embeds, trailing = builder.build(task_type=TaskType.VOICE_DESIGN, text="你好世界")
@@ -101,7 +100,7 @@ def test_prefill_builder_voice_design():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_plan_voice_design_exposes_cacheable_prefix():
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     builder = PrefillBuilder(weights, _tokenizer())
     plan = builder.build_plan(
@@ -118,7 +117,7 @@ def test_prefill_plan_voice_design_exposes_cacheable_prefix():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_builder_custom_voice():
     """T1.4b: CUSTOM_VOICE with speaker + instruct."""
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     builder = PrefillBuilder(weights, _tokenizer())
     embeds, trailing = builder.build(
@@ -133,7 +132,7 @@ def test_prefill_builder_custom_voice():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_plan_custom_voice_exposes_cacheable_prefix():
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     builder = PrefillBuilder(weights, _tokenizer())
     plan = builder.build_plan(
@@ -151,7 +150,7 @@ def test_prefill_plan_custom_voice_exposes_cacheable_prefix():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_builder_voice_clone_xvec():
     """T1.4c: VOICE_CLONE_XVEC with spk_embedding."""
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     builder = PrefillBuilder(weights, _tokenizer())
     fake_spk = torch.randn(1, 1024, device=weights.device, dtype=torch.bfloat16)
@@ -166,7 +165,7 @@ def test_prefill_builder_voice_clone_xvec():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_plan_voice_clone_xvec_exposes_cacheable_prefix():
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     builder = PrefillBuilder(weights, _tokenizer())
     fake_spk = torch.randn(1, 1024, device=weights.device, dtype=torch.bfloat16)
@@ -183,7 +182,7 @@ def test_prefill_plan_voice_clone_xvec_exposes_cacheable_prefix():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_builder_voice_clone_icl():
     """T1.4d: VOICE_CLONE_ICL (ref_codes + ref_text) - critical path."""
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     if weights.codec_embeddings_3d is None:
         pytest.skip("codec_embeddings_3d.pt required for ICL")
@@ -204,7 +203,7 @@ def test_prefill_builder_voice_clone_icl():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_prefill_plan_voice_clone_icl_has_no_cross_request_prefix_cache():
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     if weights.codec_embeddings_3d is None:
         pytest.skip("codec_embeddings_3d.pt required for ICL")
@@ -225,7 +224,7 @@ def test_prefill_plan_voice_clone_icl_has_no_cross_request_prefix_cache():
 
 def test_parse_task_type():
     """parse_task_type returns correct enum."""
-    from prefill_builder import parse_task_type, TaskType
+    from engine.backend.prefill import parse_task_type, TaskType
     assert parse_task_type("voice_design") == TaskType.VOICE_DESIGN
     assert parse_task_type("custom_voice") == TaskType.CUSTOM_VOICE
     assert parse_task_type("voice_clone", x_vector_only=True) == TaskType.VOICE_CLONE_XVEC
@@ -240,7 +239,7 @@ def test_parse_task_type():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_bf16_vs_fp32_prefill_output_atol():
     """T4.2: Compare prefill output BF16 vs FP32 (atol=1e-2). Skip: no FP32 weights in repo."""
-    from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights_bf16 = EmbeddingWeights(_weights_dir(), device_id=0)
     # Would load FP32 weights from a separate dir and compare prefill outputs
     pytest.skip("No FP32 weights dir for comparison")

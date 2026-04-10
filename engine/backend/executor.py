@@ -117,6 +117,23 @@ class TRTEngine:
                 outputs.append(name)
         return inputs, outputs
 
+    def get_input_profile_max_shape(
+        self, name: str, profile_idx: int = 0,
+    ) -> Optional[tuple[int, ...]]:
+        """Return the max profile shape for an input tensor if available."""
+        if self._engine is None:
+            return None
+        try:
+            shapes = self._engine.get_tensor_profile_shape(name, profile_idx)
+        except Exception:
+            return None
+        if not shapes or len(shapes) != 3:
+            return None
+        try:
+            return tuple(int(dim) for dim in shapes[2])
+        except TypeError:
+            return None
+
     def infer(
         self,
         inputs: Dict[str, torch.Tensor],
@@ -345,13 +362,11 @@ class Executor:
         self._repetition_penalty = repetition_penalty
 
         self._compute_stream = torch.cuda.Stream(device=self._device)
-        self._prefill_stream = torch.cuda.Stream(device=self._device)
 
         self._sampling_gen = torch.Generator(device=self._device)
         self._sampling_gen.manual_seed(random_seed)
 
         self._fused_engine: Optional[TRTEngine] = None
-        self._prefill_context = None
         self._embedding_weights = None
         self._kv_pool: Optional[KVCachePool] = None
         self._codec_eos_id: int = 2150
@@ -366,6 +381,10 @@ class Executor:
             "Executor created (device=%s, max_batch=%d, max_seq=%d)",
             self._device, max_batch_size, max_seq_len,
         )
+
+    @property
+    def max_seq_len(self) -> int:
+        return self._max_seq_len
 
     # ------------------------------------------------------------------
     # Initialization
@@ -390,14 +409,9 @@ class Executor:
                 str(fused_plan), self._device,
             )
             self._fused_engine.load()
+            self._apply_runtime_profile_limits()
             self._discover_c2w_io_names()
 
-            try:
-                self._prefill_context = self._fused_engine._engine.create_execution_context()
-                logger.info("Created separate prefill execution context")
-            except Exception:
-                self._prefill_context = None
-                logger.info("Prefill shares execution context with decode")
         else:
             logger.warning("No TRT plan found, running in stub mode")
 
@@ -406,13 +420,38 @@ class Executor:
             config=self._config,
             device=self._device,
         )
-        logger.info("Executor loaded (engine=%s)", "TRT" if self._fused_engine else "stub")
+        logger.info(
+            "Executor loaded (engine=%s, effective_max_seq=%d)",
+            "TRT" if self._fused_engine else "stub",
+            self._max_seq_len,
+        )
 
     def set_embedding_weights(self, weights) -> None:
         self._embedding_weights = weights
         if hasattr(weights, 'codec_eos_id'):
             self._codec_eos_id = int(weights.codec_eos_id)
             logger.info("codec_eos_id set to %d from weights", self._codec_eos_id)
+
+    def _apply_runtime_profile_limits(self) -> None:
+        """Clamp runtime max_seq_len so it never exceeds TRT profile bounds."""
+        if self._fused_engine is None:
+            return
+        shape = self._fused_engine.get_input_profile_max_shape("talker_past_kv")
+        if shape is None or len(shape) < 4:
+            return
+        profile_max_seq = int(shape[3])
+        if profile_max_seq <= 0:
+            return
+        if self._max_seq_len > profile_max_seq:
+            logger.warning(
+                "Requested max_seq_len=%d exceeds TRT profile max=%d for talker_past_kv; "
+                "clamping runtime max_seq_len to %d",
+                self._max_seq_len,
+                profile_max_seq,
+                profile_max_seq,
+            )
+            self._max_seq_len = profile_max_seq
+        self._config.max_seq_len = min(self._config.max_seq_len, self._max_seq_len)
 
     def _discover_c2w_io_names(self) -> None:
         """Detect c2w conv/transconv I/O names from the loaded TRT engine.
@@ -498,11 +537,11 @@ class Executor:
         slot: SlotKVState,
         prefill_embeds: torch.Tensor,
     ) -> tuple[Optional[bytes], bool]:
-        """Execute prefill for a single session on the dedicated prefill stream.
+        """Execute prefill for a single session on the shared CUDA stream.
 
-        Uses a separate CUDA stream so prefill does not block an
-        in-flight decode step.  When a separate TRT execution context is
-        available, prefill and decode can overlap on different streams.
+        Prefill and decode share the same TensorRT execution context and run
+        serially. This keeps Triton/standalone deployment memory lower by
+        avoiding a second execution context allocation.
 
         Results are written directly to the pre-allocated KV pool via
         scatter (no per-slot tensor references).
@@ -535,11 +574,10 @@ class Executor:
 
         out_names = self._build_output_names()
 
-        stream = self._prefill_stream
-        prefill_ctx = self._prefill_context
+        stream = self._compute_stream
         with torch.cuda.stream(stream):
             raw = self._fused_engine.infer(
-                inputs, out_names, stream, context=prefill_ctx,
+                inputs, out_names, stream,
             )
 
         stream.synchronize()
@@ -953,7 +991,6 @@ class Executor:
     def shutdown(self) -> None:
         """Release GPU resources."""
         self._fused_engine = None
-        self._prefill_context = None
         self._kv_pool = None
         torch.cuda.empty_cache()
         logger.info("Executor shutdown")

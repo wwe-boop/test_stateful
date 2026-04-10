@@ -2,20 +2,25 @@
 # ===========================================================================
 #  deploy.sh — Phase C: Deploy TTS service (standalone engine or Triton)
 #
-#  Unified entry point for deploying the TTS service. Supports two gateway
-#  modes as described in docs/engine_architecture_decision.md:
+#  Unified entry point for deploying the TTS service. Supports three gateway modes:
 #
 #  A) Standalone gRPC Server (--gateway standalone)
-#     Runs `python -m engine.server` directly. Zero external dependency.
+#     Runs `python -m engine.server` on the host (see ENGINE_PYTHON / conda).
 #     Best for: development, single-model production, low-latency.
 #
 #  B) Triton Backend (--gateway triton)
-#     Assembles model_repository + starts Triton container.
+#     Assembles model_repository + starts Triton via docker compose.
 #     Best for: multi-model serving, K8s, enterprise infrastructure.
+#
+#  C) Engine Docker (--gateway engine-docker)
+#     Builds (if missing) Dockerfile.engine and runs engine.server via docker compose;
+#     mounts workspace/ read-only. No host PyTorch required.
+#     Best for: portable deploy, matching TRT base with Phase B.
 #
 #  Usage:
 #    bash scripts/bash/deploy.sh run                               # standalone (default)
 #    bash scripts/bash/deploy.sh run --gateway triton               # Triton mode
+#    bash scripts/bash/deploy.sh run --gateway engine-docker      # Engine image + container
 #    bash scripts/bash/deploy.sh run --foreground                   # don't daemonize
 #    bash scripts/bash/deploy.sh stop                               # stop service
 #    bash scripts/bash/deploy.sh status                             # show status
@@ -27,8 +32,10 @@
 #    bash scripts/bash/deploy.sh build [--tag <image:tag>]
 #
 #  Environment variables:
-#    GATEWAY_MODE            Override default gateway (standalone|triton)
+#    GATEWAY_MODE            Override gateway: standalone | triton | engine-docker
 #    ENGINE_GRPC_PORT        Standalone gRPC port (default: 50051)
+#    ENGINE_PYTHON           Python binary for standalone engine (default: conda env qwen3-tts, else PATH)
+#    QWEN3_TTS_ENV_NAME      Conda env name for auto-resolve (default: qwen3-tts)
 #    TRITON_GRPC_PORT        Triton gRPC port (default: 8001)
 # ===========================================================================
 
@@ -54,6 +61,8 @@ FOREGROUND=false
 # Triton forwarding
 TRITON_ARGS=()
 
+# engine-docker: ENGINE_IMAGE is read by lib/engine.sh (default qwen3-engine:26.02).
+
 # ── Help ──
 
 usage() {
@@ -72,7 +81,8 @@ Commands:
     build                Build self-contained Docker image
 
 Options:
-  --gateway <mode>       Gateway mode: standalone | triton (default: standalone)
+  --gateway <mode>       Gateway: standalone | triton | engine-docker (default: standalone)
+  --engine-image <tag>   Image tag for engine-docker (default: qwen3-engine:26.02)
   --variant <name>       Model variant (default: auto-discover)
   --dry-run              Show what would be done
 
@@ -93,6 +103,7 @@ Examples:
   deploy.sh run                                  # standalone, auto-discover variant
   deploy.sh run --variant custom-1.7b            # standalone, specific variant
   deploy.sh run --gateway triton                 # Triton mode
+  deploy.sh run --gateway engine-docker          # Engine Dockerfile + container
   deploy.sh run --foreground                     # standalone, foreground
   deploy.sh stop                                 # stop whatever is running
   deploy.sh status                               # show status for both modes
@@ -144,6 +155,7 @@ while [[ $# -gt 0 ]]; do
         --gateway)        GATEWAY_MODE="$2"; shift 2 ;;
         --variant)        VARIANT="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=true; shift ;;
+        --engine-image)   ENGINE_IMAGE="$2"; shift 2 ;;
         --help|-h)        usage; exit 0 ;;
 
         # Standalone options
@@ -172,9 +184,9 @@ done
 
 # Validate gateway mode
 case "$GATEWAY_MODE" in
-    standalone|triton) ;;
+    standalone|triton|engine-docker) ;;
     *)
-        log_error "Unknown gateway mode: $GATEWAY_MODE (expected: standalone | triton)"
+        log_error "Unknown gateway mode: $GATEWAY_MODE (expected: standalone | triton | engine-docker)"
         exit 1
         ;;
 esac
@@ -190,6 +202,9 @@ cmd_run() {
             ;;
         triton)
             cmd_run_triton
+            ;;
+        engine-docker)
+            cmd_run_engine_docker
             ;;
     esac
 }
@@ -236,12 +251,77 @@ cmd_run_standalone() {
 }
 
 cmd_run_triton() {
-    local triton_cmd_args=()
-    [ -n "$VARIANT" ] && triton_cmd_args+=(--variant "$VARIANT")
-    $DRY_RUN && triton_cmd_args+=(--dry-run)
-    triton_cmd_args+=("${TRITON_ARGS[@]}")
+    local compose_args=(
+        up
+        --gateway triton
+    )
+    [ -n "$VARIANT" ] && compose_args+=(--variant "$VARIANT")
+    $DRY_RUN && compose_args+=(--dry-run)
+    compose_args+=("${TRITON_ARGS[@]}")
 
-    bash "${SCRIPT_DIR}/build_triton.sh" run "${triton_cmd_args[@]}"
+    bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}"
+}
+
+cmd_run_engine_docker() {
+    if ! command -v docker &>/dev/null; then
+        log_error "Docker is required for --gateway engine-docker"
+        exit 1
+    fi
+
+    local img="${ENGINE_IMAGE:-qwen3-engine:26.02}"
+
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would start engine Docker container (Dockerfile.engine)"
+        log_info "  Variant:     $VARIANT"
+        log_info "  Image:       $img"
+        log_info "  Port:        $ENGINE_PORT"
+        log_info "  Device:      $GPU_DEVICE"
+        log_info "  Max batch:   $MAX_BATCH"
+        log_info "  Max sess:    $MAX_SESSIONS"
+        return 0
+    fi
+
+    local need_build=false
+    if ! docker image inspect "$img" &>/dev/null; then
+        need_build=true
+    elif ! engine_docker_image_has_app "$img"; then
+        log_warn "镜像 $img 存在但未包含 /app 下的 engine 包（常见于把 TensorRT 基础镜像误打成同名 tag）。"
+        log_info "将按 Dockerfile.engine 重新构建..."
+        need_build=true
+    fi
+    if $need_build; then
+        bash "${SCRIPT_DIR}/compose.sh" build --gateway engine --image "$img" || exit 1
+    fi
+
+    local compose_args=(
+        up
+        --gateway engine
+        --variant "$VARIANT"
+        --image "$img"
+        --port "$ENGINE_PORT"
+        --device "$GPU_DEVICE"
+        --max-batch "$MAX_BATCH"
+        --max-sessions "$MAX_SESSIONS"
+    )
+    $DRY_RUN && compose_args+=(--dry-run)
+
+    bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}" || exit 1
+
+    echo ""
+    if engine_health_check "$ENGINE_PORT" 90; then
+        echo ""
+        log_step "Engine Docker Running"
+        log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
+        log_info "  Variant:        $VARIANT"
+        log_info "  Image:          $img"
+        log_info "  Container:      ${ENGINE_CONTAINER_NAME:-qwen3-engine}"
+        echo ""
+        log_info "Logs: bash scripts/bash/compose.sh logs --gateway engine --follow"
+        log_info "Stop: bash scripts/bash/deploy.sh stop"
+    else
+        log_warn "Container started but port not yet reachable"
+        log_info "Check: bash scripts/bash/compose.sh logs --gateway engine"
+    fi
 }
 
 cmd_stop() {
@@ -255,14 +335,10 @@ cmd_stop() {
         stopped=true
     fi
 
-    # Stop Triton container (if running)
-    if command -v docker &>/dev/null; then
-        local repo="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
-        local container_name="${CONTAINER_NAME:-qwen3-tts-triton}"
-        local cname
-        cname=$(triton_resolve_container_name "$repo" "$container_name" "${VARIANT:-}" 2>/dev/null || echo "$container_name")
-        if docker container inspect "$cname" &>/dev/null 2>&1; then
-            triton_stop "$cname"
+    # Stop compose-managed Docker services
+    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+        if docker compose -f "${REPO_ROOT}/compose.yaml" ps -q 2>/dev/null | grep -q .; then
+            bash "${SCRIPT_DIR}/compose.sh" down --gateway all
             stopped=true
         fi
     fi
@@ -280,26 +356,10 @@ cmd_status() {
     engine_show_status "$REPO_ROOT"
     echo ""
 
-    # Triton container status (reuse existing logic but don't fail if docker missing)
-    if command -v docker &>/dev/null; then
-        local repo="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
-        local container_name="${CONTAINER_NAME:-qwen3-tts-triton}"
-        local cname
-        cname=$(triton_resolve_container_name "$repo" "$container_name" "${VARIANT:-}" 2>/dev/null || echo "$container_name")
-
-        if docker ps --format "{{.Names}}" 2>/dev/null | grep -Fxq "$cname"; then
-            log_info "Triton container: RUNNING ($cname)"
-            local http_port="${TRITON_HTTP_PORT:-8000}"
-            if curl -sf "http://localhost:${http_port}/v2/health/ready" &>/dev/null; then
-                log_info "  Health: READY"
-            else
-                log_warn "  Health: NOT READY"
-            fi
-        else
-            log_info "Triton container: NOT RUNNING"
-        fi
+    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+        bash "${SCRIPT_DIR}/compose.sh" ps || true
     else
-        log_info "Triton container: Docker not available"
+        log_info "Docker Compose: not available"
     fi
 }
 

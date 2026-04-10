@@ -1,0 +1,72 @@
+#!/bin/bash
+
+set -euo pipefail
+
+variant="${MODEL_VARIANT:-}"
+if [[ -z "$variant" ]]; then
+    echo "MODEL_VARIANT is required" >&2
+    exit 1
+fi
+
+case "$variant" in
+    design-1.7b) tokenizer_subdir="Qwen3-TTS-12Hz-1.7B-VoiceDesign" ;;
+    custom-1.7b) tokenizer_subdir="Qwen3-TTS-12Hz-1.7B-CustomVoice" ;;
+    base-1.7b) tokenizer_subdir="Qwen3-TTS-12Hz-1.7B-Base" ;;
+    custom-0.6b) tokenizer_subdir="Qwen3-TTS-12Hz-0.6B-CustomVoice" ;;
+    base-0.6b) tokenizer_subdir="Qwen3-TTS-12Hz-0.6B-Base" ;;
+    *)
+        echo "Unsupported MODEL_VARIANT: $variant" >&2
+        exit 1
+        ;;
+esac
+
+tokenizer_dir="/data/models/${tokenizer_subdir}"
+weights_dir="/data/exported/${variant}/weights"
+engine_dir=""
+
+if [[ -f "/data/exported/${variant}/engines/talker_code2wav_fused/model.plan" ]] || \
+   [[ -f "/data/exported/${variant}/engines/talker_code2wav_fused/talker_code2wav_fused.engine" ]]; then
+    engine_dir="/data/exported/${variant}/engines/talker_code2wav_fused"
+elif [[ -f "/data/exported/${variant}/talker_code2wav_fused.engine" ]]; then
+    engine_dir="/data/exported/${variant}"
+fi
+
+if [[ ! -d "$tokenizer_dir" ]]; then
+    echo "Tokenizer directory not found: $tokenizer_dir" >&2
+    exit 1
+fi
+if [[ ! -d "$weights_dir" ]]; then
+    echo "Weights directory not found: $weights_dir" >&2
+    exit 1
+fi
+
+export ENGINE_SCHEDULER_MAX_BATCH_SIZE="${ENGINE_MAX_BATCH_SIZE:-48}"
+export ENGINE_SERVER_HEALTH_PORT="${ENGINE_HEALTH_PORT:-8080}"
+if [[ -n "${ENGINE_MAX_SEQ_LEN:-}" ]]; then
+    export ENGINE_SCHEDULER_MAX_SEQ_LEN="${ENGINE_MAX_SEQ_LEN}"
+fi
+
+cmd=(
+    python3 -m engine.server
+    --config /app/engine.yaml
+    --tokenizer-dir "$tokenizer_dir"
+    --weights-dir "$weights_dir"
+    --device "${ENGINE_DEVICE:-0}"
+    --max-batch "${ENGINE_MAX_BATCH_SIZE:-48}"
+    --max-sessions "${ENGINE_MAX_SESSIONS:-128}"
+    --port "${ENGINE_GRPC_PORT:-50051}"
+)
+if [[ -n "$engine_dir" ]]; then
+    cmd+=(--engine-dir "$engine_dir")
+fi
+
+echo "Starting engine for variant=${variant}" >&2
+echo "  tokenizer=${tokenizer_dir}" >&2
+echo "  weights=${weights_dir}" >&2
+if [[ -n "$engine_dir" ]]; then
+    echo "  engine_dir=${engine_dir}" >&2
+else
+    echo "  engine_dir=stub-mode" >&2
+fi
+
+exec "${cmd[@]}"

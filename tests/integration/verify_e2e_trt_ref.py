@@ -78,9 +78,9 @@ def main():
     trailing_list = []  # used in decode loop when built from official prefill
     if args.text:
         tokenizer_dir = str(path)  # model path has vocab.json + merges.txt
-        sys.path.insert(0, str(REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"))
+        sys.path.insert(0, str(REPO_ROOT))
         try:
-            from lightweight_tokenizer import load_lightweight_tokenizer
+            from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
             tokenizer = load_lightweight_tokenizer(tokenizer_dir)
         finally:
             sys.path.pop(0)

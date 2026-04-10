@@ -2,7 +2,7 @@ import json
 import logging
 
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from tokenizers import Tokenizer, AddedToken
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
@@ -123,9 +123,23 @@ class LightQwen3TTSTokenizer:
         return enc.ids, enc.tokens
     
     def encode_with_text(self, text: str, add_special_tokens: bool = True, **kwargs: Any) -> Tuple[List[int], List[str]]:
-        """Return token ids and the corresponding original text spans (via offsets)."""
+        """Return token ids and stable original-text spans derived from offsets.
+
+        Byte-level tokenizers can occasionally surface overlapping offsets for
+        mixed-language text. Normalize them into monotonic, non-overlapping
+        slices so joining the spans always reconstructs the original text.
+        """
         enc = self.encode(text, add_special_tokens=add_special_tokens, **kwargs)
-        spans = [text[s:e] for s, e in enc.offsets]
+        spans: List[str] = []
+        prev_end = 0
+        text_len = len(text)
+        for start, end in enc.offsets:
+            start = max(int(start), prev_end)
+            end = max(int(end), start)
+            if end > text_len:
+                end = text_len
+            spans.append(text[start:end])
+            prev_end = end
         return enc.ids, spans
     
     def __call__(self, text: str, return_tensors: str | None = None, **kwargs: Any) -> Dict[str, Any]:
@@ -143,4 +157,39 @@ class LightQwen3TTSTokenizer:
     def decode(self, ids: List[int], skip_special_tokens: bool = True) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
 
-__all__ = ("LightQwen3TTSTokenizer",)
+
+class _LegacyLightweightTokenizerAdapter:
+    """Compatibility adapter for older tests/scripts that expect numpy payloads."""
+
+    def __init__(self, tokenizer: LightQwen3TTSTokenizer):
+        self._tokenizer = tokenizer
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._tokenizer, name)
+
+    def __call__(self, text: str, return_tensors: str | None = None, **kwargs: Any) -> Dict[str, Any]:
+        ids = self._tokenizer.encode_ids(
+            text,
+            add_special_tokens=kwargs.get("add_special_tokens", True),
+        )
+        if return_tensors in ("pt", "np"):
+            import numpy as np
+
+            return {"input_ids": np.array(ids, dtype=np.int64).reshape(1, -1)}
+        return {"input_ids": ids}
+
+
+def load_lightweight_tokenizer(tokenizer_dir: str) -> Optional[Any]:
+    """Legacy loader kept for tests and verification scripts."""
+    try:
+        return _LegacyLightweightTokenizerAdapter(LightQwen3TTSTokenizer(tokenizer_dir))
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Failed to load lightweight tokenizer from %s",
+            tokenizer_dir,
+            exc_info=True,
+        )
+        return None
+
+
+__all__ = ("LightQwen3TTSTokenizer", "load_lightweight_tokenizer")

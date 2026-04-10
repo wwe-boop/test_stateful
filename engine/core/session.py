@@ -56,7 +56,8 @@ class Session:
     segments_done: int = 0
     segment_order: dict[int, SegmentOrderMeta] = field(default_factory=dict)
     segment_texts: dict[int, str] = field(default_factory=dict)
-    segment_start_emitted: set[int] = field(default_factory=set)
+    text_boundary_emitted: set[int] = field(default_factory=set)
+    segment_token_emitted_count: dict[int, int] = field(default_factory=dict)
     engine_tokens_done_sent: bool = False
 
     # Optional transport-layer callback hook (e.g. gRPC / Triton adapters)

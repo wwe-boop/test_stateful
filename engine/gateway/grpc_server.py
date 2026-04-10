@@ -14,6 +14,8 @@ To regenerate proto stubs:
         --python_out=engine/gateway \
         --grpc_python_out=engine/gateway \
         engine/gateway/tts.proto
+Afterwards, replace ``import tts_pb2`` with ``from . import tts_pb2`` in ``tts_pb2_grpc.py``
+(protoc emits a top-level import that breaks the ``engine.gateway`` package).
 """
 
 from __future__ import annotations

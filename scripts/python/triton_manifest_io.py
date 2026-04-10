@@ -52,6 +52,7 @@ def variant_orchestrator_defaults(variant: str) -> Dict[str, str]:
         "max_decode_steps": "4096",
         "audio_chunk_frames": "25",
         "first_chunk_frames": "4",
+        "engine_dir": "/models/tts_orchestrator/1/runtime",
         "weights_dir": "/models/tts_orchestrator/1/weights",
         "tokenizer_dir": "/models/tts_orchestrator/1/tokenizer",
     }

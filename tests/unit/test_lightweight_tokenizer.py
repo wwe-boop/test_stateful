@@ -8,9 +8,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ORCH_1 = REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"
-if str(ORCH_1) not in sys.path:
-    sys.path.insert(0, str(ORCH_1))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 TOKENIZER_DIR = REPO_ROOT / "workspace" / "exported" / "tokenizer" / "Qwen3-TTS-Tokenizer-12Hz"
 
@@ -24,7 +23,7 @@ def tokenizer_dir():
 def lightweight_tok(tokenizer_dir):
     if not Path(tokenizer_dir).is_dir():
         pytest.skip(f"Tokenizer dir not found: {tokenizer_dir} (run export/download first)")
-    from lightweight_tokenizer import load_lightweight_tokenizer
+    from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
     tok = load_lightweight_tokenizer(tokenizer_dir)
     if tok is None:
         pytest.skip("load_lightweight_tokenizer returned None (tokenizer.json or vocab+merges missing)")
@@ -78,7 +77,7 @@ def test_lightweight_vs_hf_tokenizer_consistency(tokenizer_dir):
         from transformers import AutoTokenizer
     except ImportError:
         pytest.skip("transformers not installed")
-    from lightweight_tokenizer import load_lightweight_tokenizer
+    from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
     import numpy as np
 
     hf_tok = AutoTokenizer.from_pretrained(tokenizer_dir, trust_remote_code=True)

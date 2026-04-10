@@ -99,6 +99,7 @@ class TestEncodeWithText:
     @pytest.mark.parametrize("text", [
         "你好世界",
         "中英混合 test 123",
+        "你好，这是 token player + audio 并行流式测试。",
         "Hello, how are you?",
         "  leading spaces",
         "trailing spaces  ",

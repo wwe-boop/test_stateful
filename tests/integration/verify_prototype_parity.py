@@ -226,11 +226,11 @@ def main():
 
     # Prefer tokenizer from model dir (vocab.json + merges.txt); fallback to dedicated tokenizer dir
     tokenizer_dir = str(path)  # model path has vocab.json + merges.txt for TTS models
-    sys.path.insert(0, str(REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"))
+    sys.path.insert(0, str(REPO_ROOT))
     try:
-        from lightweight_tokenizer import load_lightweight_tokenizer
-        from prefill_builder import EmbeddingWeights, PrefillBuilder
-        from prefill_builder import TaskType
+        from engine.backend.prefill import EmbeddingWeights, PrefillBuilder
+        from engine.backend.prefill import TaskType
+        from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
     finally:
         sys.path.pop(0)
 

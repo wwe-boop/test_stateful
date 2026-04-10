@@ -39,7 +39,8 @@
 #      --dtype <type>        Engine precision: bf16|fp16|fp32 (default: bf16)
 #
 #    Phase C (forwarded to deploy.sh):
-#      --gateway <mode>      Gateway: standalone (default) | triton
+#      --gateway <mode>      Gateway: standalone | triton | engine-docker
+#      --engine-image <tag>  engine-docker image tag (optional)
 #      --port <port>         Standalone gRPC port (default: 50051)
 #      --grpc-port <port>    Triton gRPC port (default: 8001)
 #      --http-port <port>    Triton HTTP port (default: 8000)
@@ -84,6 +85,7 @@ ENGINE_DTYPE=""
 DEPLOY_ARGS=()
 GATEWAY_MODE=""
 ENGINE_PORT=""
+ENGINE_DOCKER_IMAGE=""
 GRPC_PORT=""
 HTTP_PORT=""
 
@@ -103,7 +105,7 @@ Commands:
   update-matrix     Update NGC compatibility matrix from NVIDIA website
   help              Show this help
 
-If no command is given, launches interactive mode.
+If no command is given, launches interactive mode (Phase C: standalone | triton | engine-docker).
 If a model variant name is given without a command, runs the full pipeline.
 
 Options:
@@ -131,8 +133,9 @@ Phase B options (forwarded to build_engines.sh):
                           Use fp32 if Triton reports dtype mismatch (e.g. TYPE_FP32 vs TYPE_BF16).
 
 Phase C options (forwarded to deploy.sh):
-  --gateway <mode>        Gateway: standalone (default) | triton
-  --port <port>           Standalone gRPC port (default: 50051)
+  --gateway <mode>        Gateway: standalone | triton | engine-docker (default: standalone)
+  --engine-image <tag>    Image for engine-docker (default: qwen3-engine:26.02)
+  --port <port>           Standalone / engine-docker gRPC port (default: 50051)
   --grpc-port <port>      Triton gRPC port (default: 8001)
   --http-port <port>      Triton HTTP port (default: 8000)
 
@@ -146,7 +149,8 @@ Examples:
   autorun.sh build -m custom-1.7b --dtype fp16    # Phase B with fp16
   autorun.sh build --target-driver 575.57   # build for production driver
   autorun.sh deploy                   # Phase C (standalone engine)
-  autorun.sh deploy --gateway triton  # Phase C (Triton container)
+  autorun.sh deploy --gateway triton         # Phase C (Triton)
+  autorun.sh deploy --gateway engine-docker  # Phase C (engine container image)
   autorun.sh status                   # show pipeline status
   autorun.sh update-matrix            # fetch latest NGC compat data
 EOF
@@ -183,6 +187,7 @@ parse_args() {
 
             # Phase C
             --gateway)          GATEWAY_MODE="$2"; shift 2 ;;
+            --engine-image)      ENGINE_DOCKER_IMAGE="$2"; shift 2 ;;
             --port)             ENGINE_PORT="$2"; shift 2 ;;
             --grpc-port)        GRPC_PORT="$2"; shift 2 ;;
             --http-port)        HTTP_PORT="$2"; shift 2 ;;
@@ -259,6 +264,7 @@ build_forward_args() {
         DEPLOY_ARGS+=(--variant "$VARIANT")
     fi
     if [ -n "$GATEWAY_MODE" ]; then DEPLOY_ARGS+=(--gateway "$GATEWAY_MODE"); fi
+    if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
     if [ -n "$ENGINE_PORT" ]; then DEPLOY_ARGS+=(--port "$ENGINE_PORT"); fi
     if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
     if [ -n "$GRPC_PORT" ]; then
@@ -380,6 +386,7 @@ show_run_banner() {
     echo ""
     echo "  模式:      $description"
     [ -n "$VARIANT" ] && echo "  变体:      $VARIANT"
+    [ -n "${GATEWAY_MODE:-}" ] && echo "  阶段 C:    $GATEWAY_MODE"
     [ -n "$ENGINE_DTYPE" ] && echo "  精度:      $ENGINE_DTYPE"
     [ -n "$TARGET_DRIVER" ] && echo "  目标驱动:  $TARGET_DRIVER"
     $DRY_RUN && echo "  预演:      是"
@@ -441,6 +448,32 @@ interactive_mode() {
         if [ -n "$_dtyp" ]; then
             ENGINE_DTYPE="$_dtyp"
         fi
+    fi
+
+    # Phase C gateway: standalone | Triton | engine Docker image
+    local will_deploy=false
+    case "${choice:-1}" in
+        1|4|5) will_deploy=true ;;
+    esac
+    if $will_deploy && [ -z "$GATEWAY_MODE" ] && [ -t 0 ]; then
+        echo ""
+        echo "  阶段 C — 部署方式:"
+        echo "    [1] standalone    — 本机 Python 运行 engine（需 Phase A conda / torch）"
+        echo "    [2] triton        — Docker 内 Triton Server + 组装 model_repository"
+        echo "    [3] engine-docker — 独立引擎镜像 (Dockerfile.engine)，挂载 workspace，不依赖本机 PyTorch"
+        echo ""
+        local gwch=""
+        read -rp "  请选择 [1-3] (默认: 1 standalone, 30s 后选默认): " -t 30 gwch || true
+        gwch="${gwch:-1}"
+        case "$gwch" in
+            2) GATEWAY_MODE="triton" ;;
+            3) GATEWAY_MODE="engine-docker" ;;
+            *) GATEWAY_MODE="standalone" ;;
+        esac
+        log_info "已选择部署方式: $GATEWAY_MODE"
+    fi
+    if $will_deploy && [ -z "$GATEWAY_MODE" ]; then
+        GATEWAY_MODE="standalone"
     fi
 
     build_forward_args

@@ -274,12 +274,15 @@ class FrontendInterface:
                         metrics = {
                             str(k): str(v) for k, v in (result.metrics or {}).items()
                         }
+                        segment_text = session.segment_texts.pop(seg_idx, "")
+                        session.segment_token_emitted_count.pop(seg_idx, None)
+                        session.text_boundary_emitted.discard(seg_idx)
                         await on_event(
                             session.session_id,
                             {
                                 "type": "segment_end",
                                 "segment_idx": seg_idx,
-                                "text": session.segment_texts.pop(seg_idx, ""),
+                                "text": segment_text,
                                 "meta": metrics,
                             },
                         )
@@ -346,7 +349,8 @@ class FrontendInterface:
             return
         self._record_segment_text(actions, session)
         await self._dispatcher.dispatch_segment_actions(session, actions)
-        await self._emit_segment_start_events(session, actions)
+        await self._emit_text_token_events(session, actions)
+        await self._emit_text_boundary_events(session, actions)
 
     def _record_segment_text(self, actions: list, session: Session) -> None:
         for sa in actions:
@@ -355,27 +359,60 @@ class FrontendInterface:
                     session.segment_texts.get(sa.segment_idx, "") + sa.token_text
                 )
 
-    async def _emit_segment_start_events(self, session: Session, actions: list) -> None:
+    @staticmethod
+    def _segment_event_meta(sa) -> dict[str, str]:
+        return {
+            "group_idx": str(sa.group_idx),
+            "local_idx": str(sa.local_idx),
+            "group_final": "true" if sa.group_final else "false",
+        }
+
+    async def _emit_text_token_events(self, session: Session, actions: list) -> None:
         on_event = session.event_callback
         if on_event is None:
             return
         for sa in actions:
-            if sa.action.type != ActionType.PREFILL:
+            if sa.action.type not in (ActionType.PREFILL, ActionType.DECODE):
                 continue
-            if sa.segment_idx in session.segment_start_emitted:
+            if not sa.token_text:
                 continue
-            session.segment_start_emitted.add(sa.segment_idx)
+            token_idx = session.segment_token_emitted_count.get(sa.segment_idx, 0)
+            session.segment_token_emitted_count[sa.segment_idx] = token_idx + 1
             await on_event(
                 session.session_id,
                 {
-                    "type": "segment_start",
+                    "type": "text_token",
+                    "segment_idx": sa.segment_idx,
+                    "text": sa.token_text,
+                    "meta": {
+                        **self._segment_event_meta(sa),
+                        "token_idx": str(token_idx),
+                        "punct_level": str(Spliter.classify_punct_level(sa.token_text)),
+                        "text_complete": "false",
+                    },
+                },
+            )
+
+    async def _emit_text_boundary_events(self, session: Session, actions: list) -> None:
+        on_event = session.event_callback
+        if on_event is None:
+            return
+        for sa in actions:
+            if sa.action.type not in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
+                continue
+            if sa.segment_idx in session.text_boundary_emitted:
+                continue
+            session.text_boundary_emitted.add(sa.segment_idx)
+            await on_event(
+                session.session_id,
+                {
+                    "type": "text_boundary_commit",
                     "segment_idx": sa.segment_idx,
                     "text": session.segment_texts.get(sa.segment_idx, ""),
                     "meta": {
-                        "group_idx": str(sa.group_idx),
-                        "local_idx": str(sa.local_idx),
-                        "group_final": "true" if sa.group_final else "false",
-                        "text_complete": "false",
+                        **self._segment_event_meta(sa),
+                        "boundary_reason": sa.action.type.value,
+                        "text_complete": "true",
                     },
                 },
             )

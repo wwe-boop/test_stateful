@@ -175,6 +175,82 @@ async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
     assert second_response.WhichOneof("response") == "audio"
 
 
+@pytest.mark.asyncio
+async def test_streaming_text_protocol_events_are_forwarded():
+    class _StubEngine:
+        def __init__(self):
+            self._on_audio = None
+            self._on_done = None
+            self._on_event = None
+
+        def describe_capabilities(self):
+            return {}
+
+        async def start_session(self, session_id, *, config, on_audio=None, on_done=None, on_event=None):
+            self._on_audio = on_audio
+            self._on_done = on_done
+            self._on_event = on_event
+            return session_id
+
+        async def push_text_input(self, session_id, text):
+            await self._on_event(
+                session_id,
+                {
+                    "type": "text_token",
+                    "segment_idx": 0,
+                    "text": "你",
+                    "meta": {"token_idx": "0", "text_complete": "false"},
+                },
+            )
+            await self._on_event(
+                session_id,
+                {
+                    "type": "text_boundary_commit",
+                    "segment_idx": 0,
+                    "text": "你好。",
+                    "meta": {"boundary_reason": "flush_eos", "text_complete": "true"},
+                },
+            )
+            await self._on_audio(session_id, b"\x00\x00\x00\x00")
+
+        async def mark_input_complete(self, session_id):
+            await self._on_done(session_id, {})
+
+        async def cancel(self, session_id):
+            return None
+
+    servicer = TTSServicer(_StubEngine())
+
+    async def request_gen():
+        yield tts_pb2.SynthesizeRequest(
+            start=tts_pb2.StartRequest(
+                session_id="sid-events",
+                config=tts_pb2.SessionConfig(task_type="custom_voice"),
+            )
+        )
+        yield tts_pb2.SynthesizeRequest(text=tts_pb2.TextChunk(text="你好。"))
+        yield tts_pb2.SynthesizeRequest(end=tts_pb2.EndRequest())
+
+    responses = []
+    async for response in servicer.SynthesizeStream(request_gen(), context=None):
+        responses.append(response)
+
+    event_types = [
+        response.event.type
+        for response in responses
+        if response.WhichOneof("response") == "event"
+    ]
+    assert event_types[:3] == ["start", "text_token", "text_boundary_commit"]
+    assert "done" in event_types
+    boundary = next(
+        response.event for response in responses
+        if response.WhichOneof("response") == "event"
+        and response.event.type == "text_boundary_commit"
+    )
+    assert boundary.text == "你好。"
+    assert boundary.meta["boundary_reason"] == "flush_eos"
+
+
 def test_oneshot_request_forces_full_text_semantics():
     request = tts_pb2.SynthesizeOnceRequest(
         session_id="sid-2",

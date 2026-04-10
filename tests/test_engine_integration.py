@@ -476,6 +476,61 @@ class TestEngineIntegration:
         ))
         await asyncio.sleep(0)
 
+    @pytest.mark.asyncio
+    async def test_streaming_text_events_support_token_player(self):
+        from engine.core.types import EngineResult, InputMode, ResultType, SessionConfig
+        from engine.frontend.interface import FrontendInterface
+
+        class _FakeTokenizer:
+            def encode_ids(self, text, add_special_tokens=False):
+                return [ord(ch) for ch in text]
+
+            def encode_with_text(self, text, add_special_tokens=False):
+                ids = [ord(ch) for ch in text]
+                return ids, list(text)
+
+        async_inbox = asyncio.Queue(maxsize=32)
+        interface = FrontendInterface(
+            engine_inbox=async_inbox,
+            tokenizer=_FakeTokenizer(),
+            max_sessions=4,
+            engine_max_decode_len=200,
+        )
+
+        events = []
+
+        async def on_event(sid: str, event: dict):
+            events.append(event)
+
+        session = await interface.create_session(
+            "token-player-001",
+            config=SessionConfig(
+                task_type="custom_voice",
+                speaker="Serena",
+                input_mode=InputMode.CLAUSE,
+            ),
+            on_event=on_event,
+        )
+
+        await interface.push_text_input("token-player-001", "你好。")
+        await interface.mark_input_complete("token-player-001")
+        await asyncio.sleep(0)
+
+        event_types = [event["type"] for event in events]
+        token_text = "".join(event["text"] for event in events if event["type"] == "text_token")
+
+        assert token_text == "你好。"
+        assert "text_boundary_commit" in event_types
+        boundary = next(event for event in events if event["type"] == "text_boundary_commit")
+        assert boundary["text"] == "你好。"
+        assert boundary["meta"]["text_complete"] == "true"
+
+        await session.result_queue.put(EngineResult(
+            type=ResultType.SESSION_DONE,
+            session_id="token-player-001",
+        ))
+        await asyncio.sleep(0)
+
     @SKIP_NO_TOKENIZER
     @pytest.mark.asyncio
     async def test_multi_session_stub(self):

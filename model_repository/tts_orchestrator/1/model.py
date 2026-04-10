@@ -42,6 +42,13 @@ for _root in _IMPORT_ROOTS:
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
+# Fallback when engine/ is baked into the Triton deploy image (Dockerfile.triton → /opt/qwen3-tts/engine).
+_BAKED_REPO = Path("/opt/qwen3-tts")
+if (_BAKED_REPO / "engine").is_dir():
+    _br = str(_BAKED_REPO)
+    if _br not in sys.path:
+        sys.path.append(_br)
+
 from engine.config import EngineConfig, load_model_manifest
 from engine.core.types import AudioConfig, AudioEncoding, GroupPolicy, InputMode, SessionConfig
 from engine.server import TTSEngine
@@ -215,12 +222,11 @@ class TritonPythonModel:
         self.variant = _param_string(params, "model_variant", "unknown")
         self.device_id = int(_param_string(params, "device_id", os.environ.get("CUDA_DEVICE", "0")))
 
-        model_repo_dir = _MODEL_VERSION_DIR.parents[1]
         self._engine_dir = Path(
             _param_string(
                 params,
                 "engine_dir",
-                str(model_repo_dir / "talker_code2wav_fused" / "1"),
+                str(_MODEL_VERSION_DIR / "runtime"),
             )
         )
         self._weights_dir = Path(
@@ -238,7 +244,7 @@ class TritonPythonModel:
             _param_string(params, "max_batch_slots", os.environ.get("MAX_BATCH_SLOTS", "48"))
         )
         cfg.server.max_sessions = int(
-            _param_string(params, "max_batch_slots", os.environ.get("MAX_BATCH_SLOTS", "128"))
+            _param_string(params, "max_sessions", os.environ.get("MAX_SESSIONS", "128"))
         )
         cfg.scheduler.max_seq_len = int(
             _param_string(

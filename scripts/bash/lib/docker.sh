@@ -18,9 +18,9 @@
 #    Phase B + C: nvcr.io/nvidia/tritonserver:xx.yy-py3
 #      - Phase B: trtexec at /usr/src/tensorrt/bin/trtexec (from libnvinfer-bin)
 #      - Phase C: Triton server with tensorrt + onnxruntime + python backends
-#                 + torch/tokenizers/scipy/soundfile (installed via Dockerfile.triton)
+#                 + torch/tokenizers + COPY engine/ (Dockerfile.triton)
 #
-#  Deploy image: qwen3-tts-triton:xx.yy (built from -py3 + pip deps)
+#  Deploy image: qwen3-tts-triton:xx.yy (Triton base + pip + bundled engine/)
 # ===========================================================================
 
 [[ -n "${_LIB_DOCKER_LOADED:-}" ]] && return 0
@@ -406,20 +406,16 @@ build_triton_deploy_image() {
         return 1
     fi
 
-    local build_ctx
-    build_ctx=$(mktemp -d)
-
-    if ! docker build \
+    # Build context must include engine/ for Dockerfile.triton COPY (see repo root Dockerfile.triton).
+    if ! DOCKER_BUILDKIT=1 docker build \
         --build-arg "BASE_IMAGE=$base_image" \
         --build-arg "TENSORRT_PYTHON_VERSION=$trt_python_version" \
         -t "$deploy_tag" \
         -f "$dockerfile" \
-        "$build_ctx"; then
-        rm -rf "$build_ctx"
+        "$repo_root"; then
         log_error "Failed to build deploy image"
         return 1
     fi
-    rm -rf "$build_ctx"
 
     local size
     size=$(docker image inspect "$deploy_tag" --format '{{.Size}}' 2>/dev/null)

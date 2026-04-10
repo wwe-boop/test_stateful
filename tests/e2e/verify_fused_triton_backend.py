@@ -28,10 +28,10 @@ import onnxruntime as ort
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT / "model_repository" / "tts_orchestrator" / "1"))
+sys.path.insert(0, str(REPO_ROOT))
 
-from lightweight_tokenizer import load_lightweight_tokenizer
-from prefill_builder import EmbeddingWeights, PrefillBuilder, TaskType
+from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
+from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:

@@ -21,6 +21,48 @@ ENGINE_GRPC_PORT="${ENGINE_GRPC_PORT:-50051}"
 ENGINE_HEALTH_PORT="${ENGINE_HEALTH_PORT:-8080}"
 ENGINE_IMAGE="${ENGINE_IMAGE:-qwen3-engine:26.02}"
 ENGINE_CONTAINER_NAME="${ENGINE_CONTAINER_NAME:-qwen3-engine}"
+# Standalone engine: interpreter selection (Phase A conda env is not auto-activated for deploy).
+#   ENGINE_PYTHON        If set, must be an executable python with torch + deps.
+#   QWEN3_TTS_ENV_NAME   Conda env name to look up (default: qwen3-tts).
+
+# ---------------------------------------------------------------------------
+#  resolve_engine_python_bin <repo_root>
+#  Prints a python executable path for engine.server. Prefers ENGINE_PYTHON,
+#  then <repo>/.venv/bin/python, then conda env QWEN3_TTS_ENV_NAME, else python3.
+# ---------------------------------------------------------------------------
+resolve_engine_python_bin() {
+    local repo_root="$1"
+    local env_name="${QWEN3_TTS_ENV_NAME:-qwen3-tts}"
+
+    if [ -n "${ENGINE_PYTHON:-}" ] && [ -x "$ENGINE_PYTHON" ]; then
+        printf '%s\n' "$ENGINE_PYTHON"
+        return 0
+    fi
+    if [ -x "$repo_root/.venv/bin/python" ]; then
+        printf '%s\n' "$repo_root/.venv/bin/python"
+        return 0
+    fi
+    local list_cmd=""
+    command -v conda &>/dev/null && list_cmd=conda
+    [ -z "$list_cmd" ] && command -v mamba &>/dev/null && list_cmd=mamba
+    if [ -n "$list_cmd" ]; then
+        local prefix
+        prefix=$($list_cmd env list 2>/dev/null | awk -v n="$env_name" '$1 == n { print $NF; exit }')
+        if [ -n "$prefix" ] && [ -x "$prefix/bin/python" ]; then
+            printf '%s\n' "$prefix/bin/python"
+            return 0
+        fi
+    fi
+    if command -v python3 &>/dev/null; then
+        command -v python3
+        return 0
+    fi
+    if command -v python &>/dev/null; then
+        command -v python
+        return 0
+    fi
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 #  resolve_variant_model_dir <variant>
@@ -158,7 +200,20 @@ engine_start() {
 
     resolve_engine_paths "$repo_root" "$variant" || return 1
 
+    local pybin
+    pybin=$(resolve_engine_python_bin "$repo_root") || {
+        log_error "No python interpreter found for standalone engine"
+        return 1
+    }
+    if ! "$pybin" -c "import torch" 2>/dev/null; then
+        log_error "Selected Python cannot import torch: $pybin"
+        log_error "Activate Phase A environment: conda activate ${QWEN3_TTS_ENV_NAME:-qwen3-tts}"
+        log_error "Or set ENGINE_PYTHON to a Python that has PyTorch (and project deps) installed."
+        return 1
+    fi
+
     log_step "Starting Standalone TTS Engine"
+    log_info "  Python:       $pybin"
     log_info "  Variant:      $variant"
     log_info "  Tokenizer:    $_ENGINE_TOKENIZER_DIR"
     log_info "  Weights:      $_ENGINE_WEIGHTS_DIR"
@@ -169,7 +224,7 @@ engine_start() {
     log_info "  gRPC Port:    $port"
 
     local cmd=(
-        python -m engine.server
+        "$pybin" -m engine.server
         --tokenizer-dir "$_ENGINE_TOKENIZER_DIR"
         --weights-dir "$_ENGINE_WEIGHTS_DIR"
         --device "$device"
@@ -307,6 +362,17 @@ engine_health_check() {
 }
 
 # ---------------------------------------------------------------------------
+#  engine_docker_image_has_app <image_tag>
+#  Returns 0 if the image was built from Dockerfile.engine (bundled engine/ under /app).
+#  Returns 1 if the tag points at a wrong image (e.g. base TensorRT retagged as qwen3-engine).
+# ---------------------------------------------------------------------------
+engine_docker_image_has_app() {
+    local image="$1"
+    docker run --rm --entrypoint "" "$image" \
+        python3 -c "import engine.server" &>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 #  engine_build_image <repo_root> [image_tag]
 #  Builds the Docker image for the standalone engine.
 # ---------------------------------------------------------------------------
@@ -321,7 +387,8 @@ engine_build_image() {
     fi
 
     log_step "Building engine Docker image: $image_tag"
-    docker build -t "$image_tag" -f "$dockerfile" "$repo_root" \
+    # BuildKit: enables RUN --mount cache for pip (faster rebuilds; see Dockerfile.engine).
+    DOCKER_BUILDKIT=1 docker build -t "$image_tag" -f "$dockerfile" "$repo_root" \
         || { log_error "Docker build failed"; return 1; }
     log_info "Image built: $image_tag"
 }
@@ -342,7 +409,7 @@ engine_start_docker() {
     local device=0
     local max_batch=48
     local max_sessions=128
-    local max_seq_len=2048
+    local max_seq_len=""
     local image="$ENGINE_IMAGE"
     local container_name="$ENGINE_CONTAINER_NAME"
 
@@ -379,30 +446,53 @@ engine_start_docker() {
     log_info "  GPU Device:   $device"
     log_info "  Max Batch:    $max_batch"
     log_info "  Max Sessions: $max_sessions"
+    log_info "  Max Seq Len:  ${max_seq_len:-auto}"
     log_info "  gRPC Port:    $port"
 
-    local ws="/workspace"
-    local tk_mount="$ws/workspace/models/$(resolve_variant_model_dir "$variant")"
-    local wt_mount="$ws/workspace/exported/$variant/weights"
-    local eng_mount="$ws/workspace/exported/$variant"
+    # Image bundles engine/ + engine.yaml under /app; mount only workspace/ for data.
+    local workspace_host="$repo_root/workspace"
+    local tk_mount="/data/models/$(basename "$_ENGINE_TOKENIZER_DIR")"
+    local wt_mount="/data/exported/$variant/weights"
+    local eng_mount=""
+    if [[ -n "${_ENGINE_DIR:-}" ]]; then
+        eng_mount="/data${_ENGINE_DIR#"$workspace_host"}"
+    fi
+
+    local -a run_cmd=(
+        python3 -m engine.server
+        --config /app/engine.yaml
+        --tokenizer-dir "$tk_mount"
+        --weights-dir "$wt_mount"
+    )
+    if [[ -n "$eng_mount" ]]; then
+        run_cmd+=( --engine-dir "$eng_mount" )
+    fi
+    run_cmd+=(
+        --device "$device"
+        --max-batch "$max_batch"
+        --max-sessions "$max_sessions"
+        --port "$port"
+    )
+
+    local -a env_args=(
+        -e "ENGINE_SCHEDULER_MAX_BATCH_SIZE=$max_batch"
+        -e "ENGINE_SERVER_HEALTH_PORT=$health_port"
+    )
+    if [[ -n "$max_seq_len" ]]; then
+        env_args+=( -e "ENGINE_SCHEDULER_MAX_SEQ_LEN=$max_seq_len" )
+    fi
 
     docker run --gpus all -d \
         --name "$container_name" \
-        -v "$repo_root:$ws" \
+        -w /app \
+        -e "PYTHONPATH=/app" \
+        -v "$workspace_host:/data:ro" \
         -p "${port}:${port}" \
         -p "${health_port}:${health_port}" \
         --shm-size=4g \
-        -e "ENGINE_SCHEDULER_MAX_BATCH_SIZE=$max_batch" \
-        -e "ENGINE_SCHEDULER_MAX_SEQ_LEN=$max_seq_len" \
+        "${env_args[@]}" \
         "$image" \
-        python3 -m engine.server \
-            --tokenizer-dir "$tk_mount" \
-            --weights-dir "$wt_mount" \
-            --engine-dir "$eng_mount" \
-            --device "$device" \
-            --max-batch "$max_batch" \
-            --max-sessions "$max_sessions" \
-            --port "$port" \
+        "${run_cmd[@]}" \
         || { log_error "Docker run failed"; return 1; }
 
     log_info "Container started: $container_name"

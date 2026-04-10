@@ -36,6 +36,60 @@ The launcher will:
 2. Ask which model variant to deploy
 3. Run all three phases automatically
 
+## Docker Compose Deployment
+
+Docker deployment is now standardized on `compose.yaml` plus the wrapper `scripts/bash/compose.sh`.
+
+There are now two supported deployment tracks:
+
+- `engine`: pure `TTSEngine`, used for internal testing and protocol iteration.
+- `triton`: Triton Server + thin Python adapter, used for ops-facing deployment.
+
+For the standalone engine container:
+
+```bash
+# Build and start engine.server in Docker
+bash scripts/bash/compose.sh up --gateway engine --variant custom-1.7b
+
+# Logs / status / stop
+bash scripts/bash/compose.sh logs --gateway engine --follow
+bash scripts/bash/compose.sh ps
+bash scripts/bash/compose.sh down --gateway engine
+```
+
+For Triton:
+
+```bash
+# Assemble workspace/model_repository from exported artifacts
+bash scripts/bash/compose.sh prepare --gateway triton --variant custom-1.7b
+
+# Build and start Triton with the mounted model repository
+bash scripts/bash/compose.sh up --gateway triton --variant custom-1.7b
+
+# Logs / status / stop
+bash scripts/bash/compose.sh logs --gateway triton --follow
+bash scripts/bash/compose.sh ps
+bash scripts/bash/compose.sh down --gateway triton
+```
+
+The higher-level deploy entry point still works:
+
+```bash
+bash scripts/bash/deploy.sh run --gateway engine-docker --variant custom-1.7b
+bash scripts/bash/deploy.sh run --gateway triton --variant custom-1.7b
+```
+
+Those Docker-based deploy modes now call the compose workflow internally.
+
+## Streaming Protocol Notes
+
+The streaming contract now carries two text-side events in parallel with audio:
+
+- `text_token`: incremental committed text token, suitable for a token-player style UI.
+- `text_boundary_commit`: a text boundary is now known and committed, while audio may still be streaming.
+
+`segment_end` remains the audio-completion signal for a committed text segment.
+
 ### Specify a Model Variant
 
 ```bash

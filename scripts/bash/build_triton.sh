@@ -256,20 +256,41 @@ cmd_run() {
         log_info "Model repository not found, will assemble (engine_mode=$ENGINE_MODE) ..."
     else
         local stale=false
-        local ext; [ "$ENGINE_MODE" = "trt" ] && ext="engine" || ext="onnx"
-        for src_engine in "$EXPORTED_DIR/$VARIANT"/*."$ext" "$EXPORTED_DIR/tokenizer"/*."$ext"; do
-            [ -f "$src_engine" ] || continue
-            local base_name
-            base_name=$(basename "$src_engine" ".$ext")
-            local repo_name="$base_name"
-            [ "$repo_name" = "code2wav_decoder" ] && repo_name="code2wav"
-            local target; [ "$ENGINE_MODE" = "trt" ] && target="model.plan" || target="model.onnx"
-            local dst="$MODEL_REPO_DIR/$repo_name/1/$target"
-            if [ ! -f "$dst" ] || [ ! -s "$dst" ] || [ "$src_engine" -nt "$dst" ]; then
+        local target_artifact
+        if [ "$ENGINE_MODE" = "trt" ]; then
+            target_artifact="$MODEL_REPO_DIR/tts_orchestrator/1/runtime/model.plan"
+            local src_engine="$EXPORTED_DIR/$VARIANT/talker_code2wav_fused.engine"
+            if [ -f "$src_engine" ] && { [ ! -f "$target_artifact" ] || [ ! -s "$target_artifact" ] || [ "$src_engine" -nt "$target_artifact" ]; }; then
                 stale=true
+                log_warn "Runtime fused TRT engine is missing or stale"
+            fi
+        else
+            target_artifact="$MODEL_REPO_DIR/tts_orchestrator/1/runtime/model.onnx"
+            local src_engine="$EXPORTED_DIR/$VARIANT/talker_code2wav_fused.onnx"
+            if [ -f "$src_engine" ] && { [ ! -f "$target_artifact" ] || [ ! -s "$target_artifact" ] || [ "$src_engine" -nt "$target_artifact" ]; }; then
+                stale=true
+                log_warn "Runtime fused ONNX is missing or stale"
+            fi
+        fi
+        local src_runtime_onnx
+        local dst_runtime_onnx
+        for src_runtime_onnx in \
+            "$EXPORTED_DIR/$VARIANT/speaker_encoder.onnx" \
+            "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.onnx"; do
+            [ -f "$src_runtime_onnx" ] || continue
+            dst_runtime_onnx="$MODEL_REPO_DIR/tts_orchestrator/1/runtime/$(basename "$src_runtime_onnx")"
+            if [ ! -f "$dst_runtime_onnx" ] || [ "$src_runtime_onnx" -nt "$dst_runtime_onnx" ]; then
+                stale=true
+                log_warn "Runtime ONNX asset is missing or stale: $(basename "$src_runtime_onnx")"
                 break
             fi
         done
+        if [ -f "$EXPORTED_DIR/$VARIANT/triton_manifest.json" ] && \
+            { [ ! -f "$MODEL_REPO_DIR/tts_orchestrator/1/runtime/triton_manifest.json" ] || \
+              [ "$EXPORTED_DIR/$VARIANT/triton_manifest.json" -nt "$MODEL_REPO_DIR/tts_orchestrator/1/runtime/triton_manifest.json" ]; }; then
+            stale=true
+            log_warn "Runtime manifest is missing or stale"
+        fi
         # Also re-assemble when orchestrator Python source (e.g. model.py) is newer
         local orch_src="$REPO_ROOT/model_repository/tts_orchestrator/1/model.py"
         local orch_dst="$MODEL_REPO_DIR/tts_orchestrator/1/model.py"
@@ -341,33 +362,29 @@ cmd_run() {
         return 0
     fi
 
-    triton_run "$MODEL_REPO_DIR" "$TRITON_IMAGE" "$CONTAINER_NAME" \
-        || exit 1
-
-    if ! $NO_HEALTH_CHECK; then
-        if triton_health_check "localhost" "$TRITON_HTTP_PORT" "$HEALTH_TIMEOUT"; then
-            echo ""
-            log_step "Triton Server Running"
-            log_info "  gRPC endpoint:    localhost:${TRITON_GRPC_PORT}"
-            log_info "  HTTP endpoint:    localhost:${TRITON_HTTP_PORT}"
-            log_info "  Metrics endpoint: localhost:${TRITON_METRICS_PORT}/metrics"
-            log_info "  Container:        $resolved_cname"
-            echo ""
-            log_info "Loaded models:"
-            curl -s "http://localhost:${TRITON_HTTP_PORT}/v2/models" 2>/dev/null \
-                | python3 -m json.tool 2>/dev/null \
-                || log_warn "Could not query model list (server may still be loading)"
-            echo ""
-            log_info "Stop server: bash scripts/bash/build_triton.sh stop"
-        else
-            log_error "Server failed to become ready within ${HEALTH_TIMEOUT}s"
-            log_info "Check logs: docker logs $resolved_cname"
-            exit 1
-        fi
-    else
-        log_info "Health check skipped. Check manually:"
-        log_info "  curl http://localhost:${TRITON_HTTP_PORT}/v2/health/ready"
+    local compose_args=(
+        up
+        --gateway triton
+        --variant "$VARIANT"
+        --repo-dir "$MODEL_REPO_DIR"
+        --image "$TRITON_IMAGE"
+    )
+    if [[ -n "${CONTAINER_NAME:-}" ]]; then
+        compose_args+=(--container "$CONTAINER_NAME")
     fi
+    if $NO_HEALTH_CHECK; then
+        compose_args+=(--no-health-check)
+    fi
+    bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}" || exit 1
+
+    echo ""
+    log_step "Triton Server Running"
+    log_info "  gRPC endpoint:    localhost:${TRITON_GRPC_PORT}"
+    log_info "  HTTP endpoint:    localhost:${TRITON_HTTP_PORT}"
+    log_info "  Metrics endpoint: localhost:${TRITON_METRICS_PORT}/metrics"
+    log_info "  Container:        ${CONTAINER_NAME:-qwen3-tts-triton}"
+    echo ""
+    log_info "Stop server: bash scripts/bash/build_triton.sh stop"
 }
 
 cmd_build_image() {
@@ -418,35 +435,20 @@ cmd_build() {
 }
 
 cmd_stop() {
-    local cname
-    cname=$(triton_resolve_container_name "$MODEL_REPO_DIR" "$CONTAINER_NAME" "${VARIANT:-}")
-    triton_stop "$cname"
+    local compose_args=(down --gateway triton --repo-dir "$MODEL_REPO_DIR")
+    if [[ -n "${CONTAINER_NAME:-}" ]]; then
+        compose_args+=(--container "$CONTAINER_NAME")
+    fi
+    bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}"
 }
 
 cmd_status() {
     log_step "Triton Container Status"
-
-    local cname
-    cname=$(triton_resolve_container_name "$MODEL_REPO_DIR" "$CONTAINER_NAME" "${VARIANT:-}")
-
-    # Exact name match (avoid docker name= substring filter matching other triton containers)
-    if docker ps --format "{{.Names}}" | grep -Fxq "$cname"; then
-        log_info "Container running:"
-        docker ps --format "{{.Names}}\t{{.Status}}\t{{.Ports}}" | awk -F'\t' -v n="$cname" '$1==n {printf "  Name:    %s\n  Status:  %s\n  Ports:   %s\n", $1, $2, $3}'
-        echo ""
-        if curl -sf "http://localhost:${TRITON_HTTP_PORT}/v2/health/ready" &>/dev/null; then
-            log_info "Health: READY"
-            echo ""
-            log_info "Loaded models:"
-            curl -s "http://localhost:${TRITON_HTTP_PORT}/v2/models" 2>/dev/null \
-                | python3 -m json.tool 2>/dev/null \
-                || true
-        else
-            log_warn "Health: NOT READY (still loading or unhealthy)"
-        fi
-    else
-        log_info "Container '$cname' is not running"
+    local compose_args=(ps --gateway triton --repo-dir "$MODEL_REPO_DIR")
+    if [[ -n "${CONTAINER_NAME:-}" ]]; then
+        compose_args+=(--container "$CONTAINER_NAME")
     fi
+    bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}"
 }
 
 # ── Main dispatch ──

@@ -1,0 +1,60 @@
+name: qwen3-tts
+
+services:
+  engine:
+    profiles: ["engine"]
+    image: ${ENGINE_IMAGE:-qwen3-engine:26.02}
+    build:
+      context: .
+      dockerfile: Dockerfile.engine
+      args:
+        BASE_IMAGE: ${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:26.02-py3}
+    container_name: ${ENGINE_CONTAINER_NAME:-qwen3-engine}
+    working_dir: /app
+    command: ["/bin/bash", "/app/scripts/compose/engine-entrypoint.sh"]
+    environment:
+      MODEL_VARIANT: ${MODEL_VARIANT:-}
+      ENGINE_DEVICE: ${ENGINE_DEVICE:-0}
+      ENGINE_GRPC_PORT: ${ENGINE_GRPC_PORT:-50051}
+      ENGINE_HEALTH_PORT: ${ENGINE_HEALTH_PORT:-8080}
+      ENGINE_MAX_BATCH_SIZE: ${ENGINE_MAX_BATCH_SIZE:-48}
+      ENGINE_MAX_SESSIONS: ${ENGINE_MAX_SESSIONS:-128}
+      ENGINE_MAX_SEQ_LEN: ${ENGINE_MAX_SEQ_LEN:-}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${ENGINE_GRPC_PORT:-50051}:${ENGINE_GRPC_PORT:-50051}"
+      - "${ENGINE_HEALTH_PORT:-8080}:${ENGINE_HEALTH_PORT:-8080}"
+    volumes:
+      - ./workspace:/data:ro
+    gpus: all
+    shm_size: "4g"
+    restart: unless-stopped
+
+  triton:
+    profiles: ["triton"]
+    image: ${TRITON_IMAGE:-qwen3-tts-triton:26.01}
+    build:
+      context: .
+      dockerfile: Dockerfile.triton
+      args:
+        BASE_IMAGE: ${TRITON_BASE_IMAGE:-nvcr.io/nvidia/tritonserver:26.01-py3}
+        TENSORRT_PYTHON_VERSION: ${TRITON_TENSORRT_PYTHON_VERSION:-10.15.1.29}
+    container_name: ${TRITON_CONTAINER_NAME:-qwen3-tts-triton}
+    environment:
+      MAX_BATCH_SLOTS: ${TRITON_MAX_BATCH_SLOTS:-32}
+      MAX_SESSIONS: ${TRITON_MAX_SESSIONS:-128}
+      PYTORCH_CUDA_ALLOC_CONF: ${TRITON_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+    command:
+      - tritonserver
+      - --model-repository=/models
+      - --strict-model-config=false
+      - --log-verbose=1
+    ports:
+      - "${TRITON_HTTP_PORT:-8000}:8000"
+      - "${TRITON_GRPC_PORT:-8001}:8001"
+      - "${TRITON_METRICS_PORT:-8002}:8002"
+    volumes:
+      - ${TRITON_MODEL_REPO_DIR:-./workspace/model_repository}:/models:ro
+    gpus: all
+    shm_size: "4g"
+    restart: unless-stopped

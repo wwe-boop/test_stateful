@@ -1,7 +1,7 @@
 """
 Quick integration test for the TTS Orchestrator on Triton.
 
-Sends a VoiceDesign request and collects streaming audio chunks.
+Sends a request and collects streaming audio chunks.
 Saves the result as a WAV file for playback verification.
 
 Usage:
@@ -18,15 +18,21 @@ import wave
 import numpy as np
 
 
-def test_http_non_streaming(url: str, text: str, output_path: str):
+def _build_request(text: str, task_type: str, language: str) -> str:
+    payload = {
+        "text": text,
+        "language": language,
+    }
+    if task_type:
+        payload["task_type"] = task_type
+    return json.dumps(payload)
+
+
+def test_http_non_streaming(url: str, text: str, output_path: str, task_type: str, language: str):
     """Test via HTTP (non-streaming, will get first response only)."""
     import requests
 
-    req_json = json.dumps({
-        "task_type": "voice_design",
-        "text": text,
-        "language": "auto",
-    })
+    req_json = _build_request(text=text, task_type=task_type, language=language)
 
     payload = {
         "inputs": [
@@ -73,7 +79,14 @@ def test_http_non_streaming(url: str, text: str, output_path: str):
     return True
 
 
-def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
+def test_grpc_streaming(
+    host: str,
+    port: int,
+    text: str,
+    output_path: str,
+    task_type: str,
+    language: str,
+):
     """Test via gRPC streaming (decoupled model)."""
     try:
         import tritonclient.grpc as grpcclient
@@ -92,12 +105,9 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
 
     print(f"Server ready. Sending TTS request ...")
     print(f"  Text: {text}")
+    print(f"  Task type: {task_type or '<auto>'}")
 
-    req_json = json.dumps({
-        "task_type": "voice_design",
-        "text": text,
-        "language": "auto",
-    })
+    req_json = _build_request(text=text, task_type=task_type, language=language)
 
     req_input = grpcclient.InferInput("request", [1], "BYTES")
     req_input.set_data_from_numpy(np.array([req_json], dtype=object))
@@ -108,6 +118,7 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
     final_output = grpcclient.InferRequestedOutput("is_final")
 
     audio_chunks = []
+    text_tokens = []
     errors = []
     done = False
     audio_format = {"encoding": "pcm_f32", "sample_rate": 24000}
@@ -147,6 +158,12 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
             audio_chunks.append(chunk)
             print(f"  Chunk {len(audio_chunks)}: {chunk.shape} samples, "
                   f"final={is_final.flatten()[0]}")
+        elif et == "text_token":
+            token_text = payload.get("text", "")
+            text_tokens.append(token_text)
+            print(f"  Text token #{payload.get('meta', {}).get('token_idx', '?')}: {token_text!r}")
+        elif et == "text_boundary_commit":
+            print(f"  Text boundary commit: {payload.get('text', '')}")
         elif et == "segment_end":
             print(f"  Segment end: {payload.get('text', '')}")
         elif et == "error":
@@ -180,14 +197,17 @@ def test_grpc_streaming(host: str, port: int, text: str, output_path: str):
         return False
 
     all_audio = np.concatenate(audio_chunks)
-    print(f"\n  Total audio: {len(all_audio)} samples ({len(all_audio)/24000:.2f}s at 24kHz)")
+    sample_rate = int(audio_format.get("sample_rate", 24000) or 24000)
+    print(f"\n  Total audio: {len(all_audio)} samples ({len(all_audio)/sample_rate:.2f}s at {sample_rate}Hz)")
     print(f"  Latency: {elapsed:.2f}s")
     print(f"  Audio range: [{all_audio.min():.4f}, {all_audio.max():.4f}]")
+    if text_tokens:
+        print(f"  Token player text: {''.join(text_tokens)}")
 
     if np.all(all_audio == 0):
         print("  WARNING: Audio is all zeros!")
 
-    save_wav(all_audio, output_path, sample_rate=24000)
+    save_wav(all_audio, output_path, sample_rate=sample_rate)
     print(f"  Saved: {output_path}")
     return True
 
@@ -213,6 +233,10 @@ def main():
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--grpc-port", type=int, default=8001)
     parser.add_argument("--http-port", type=int, default=8000)
+    parser.add_argument("--task-type", default="",
+                        help="Optional task type. Leave empty to let the server bind to the loaded model type.")
+    parser.add_argument("--language", default="auto",
+                        help="Language field sent in the request payload")
     parser.add_argument("--mode", choices=["grpc", "http"], default="grpc",
                         help="Client mode")
     args = parser.parse_args()
@@ -222,10 +246,22 @@ def main():
     print("=" * 60)
 
     if args.mode == "grpc":
-        ok = test_grpc_streaming(args.host, args.grpc_port, args.text, args.output)
+        ok = test_grpc_streaming(
+            args.host,
+            args.grpc_port,
+            args.text,
+            args.output,
+            args.task_type,
+            args.language,
+        )
     else:
         ok = test_http_non_streaming(
-            f"http://{args.host}:{args.http_port}", args.text, args.output)
+            f"http://{args.host}:{args.http_port}",
+            args.text,
+            args.output,
+            args.task_type,
+            args.language,
+        )
 
     print()
     if ok:

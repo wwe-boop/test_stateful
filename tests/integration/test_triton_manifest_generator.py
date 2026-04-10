@@ -58,12 +58,14 @@ def test_render_orchestrator_custom_variant():
         "max_decode_steps": "4096",
         "audio_chunk_frames": "25",
         "first_chunk_frames": "4",
+        "engine_dir": "/models/tts_orchestrator/1/runtime",
         "weights_dir": "/models/tts_orchestrator/1/weights",
         "tokenizer_dir": "/models/tts_orchestrator/1/tokenizer",
     }
     text = render_orchestrator("custom-1.7b", orch)
     assert 'string_value: "custom-1.7b"' in text
     assert 'string_value: "custom_voice"' in text
+    assert 'string_value: "/models/tts_orchestrator/1/runtime"' in text
 
 
 def test_render_speech_tokenizer_encoder_trt():
@@ -90,6 +92,7 @@ def test_load_manifest_merges_orchestrator_defaults(tmp_path):
     )
     m = load_manifest(mpath, output_repo=None)
     assert m["orchestrator"]["tts_model_type"] == "custom_voice"
+    assert m["orchestrator"]["engine_dir"] == "/models/tts_orchestrator/1/runtime"
 
 
 def test_build_manifest_for_export_roundtrip():
@@ -122,22 +125,12 @@ def test_generate_configs_minimal_repo(tmp_path):
     if not FIXTURE_MANIFEST.is_file():
         pytest.fail("missing fixture manifest")
     manifest = json.loads(FIXTURE_MANIFEST.read_text(encoding="utf-8"))
-    # Minimal fake repo: only fused + orchestrator
-    for name in ("talker_code2wav_fused", "tts_orchestrator"):
-        (tmp_path / name / "1").mkdir(parents=True)
-    (tmp_path / "talker_code2wav_fused" / "1" / "model.plan").write_text("stub")
-    (tmp_path / "tts_orchestrator" / "1" / ".keep").write_text("")
+    # Minimal fake repo: only orchestrator is exposed to Triton.
+    (tmp_path / "tts_orchestrator" / "1" / "runtime").mkdir(parents=True)
+    (tmp_path / "tts_orchestrator" / "1" / "runtime" / "model.plan").write_text("stub")
     generate_configs(manifest, tmp_path, "trt", engine_dtype="bf16")
-    fused_cfg = (tmp_path / "talker_code2wav_fused" / "config.pbtxt").read_text()
-    assert "tensorrt" in fused_cfg
-    assert 'name: "input_embeds"' in fused_cfg
-    assert 'name: "cache_position"' in fused_cfg
-    assert 'name: "wav"' in fused_cfg
-    assert 'name: "talker_past_kv"' in fused_cfg
-    assert 'name: "c2w_past_kv"' in fused_cfg
-    assert 'name: "talker_present_kv"' in fused_cfg
-    assert 'name: "c2w_present_kv"' in fused_cfg
-    assert "TYPE_BF16" in fused_cfg
     orch_cfg = (tmp_path / "tts_orchestrator" / "config.pbtxt").read_text()
     assert "tts_orchestrator" in orch_cfg
     assert "custom-1.7b" in orch_cfg
+    assert '/models/tts_orchestrator/1/runtime' in orch_cfg
+    assert not (tmp_path / "talker_code2wav_fused" / "config.pbtxt").exists()

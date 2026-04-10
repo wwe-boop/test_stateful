@@ -2,9 +2,9 @@
 # ===========================================================================
 #  L2 test T2.2: Dockerfile.triton build and runtime checks.
 #
-#  Verifies (per updated plan: no transformers, tokenizers + scipy + soundfile):
+#  Verifies the slim Triton runtime image:
 #    - Build succeeds (qwen3-tts-triton:<tag> or custom BUILD_TAG)
-#    - Container can import torch, tokenizers, scipy, soundfile
+#    - Container can import torch, tokenizers, tensorrt
 #    - tritonserver --help works
 #
 #  Run from repo root:
@@ -42,18 +42,24 @@ if ! docker image inspect "$BUILD_TAG" &>/dev/null; then
   fi
 fi
 
-log_info "Checking torch, tokenizers, scipy, soundfile..."
+log_info "Checking torch, tokenizers, tensorrt..."
 docker run --rm "$BUILD_TAG" python3 -c "
 import sys
 import torch
 print(f'torch {torch.__version__}', file=sys.stderr)
 import tokenizers
 print(f'tokenizers {tokenizers.__version__}', file=sys.stderr)
-import scipy
-print(f'scipy {scipy.__version__}', file=sys.stderr)
-import soundfile
-print(f'soundfile {soundfile.__version__}', file=sys.stderr)
-" || { log_error "torch/tokenizers/scipy/soundfile check failed"; exit 1; }
+import tensorrt
+print(f'tensorrt {tensorrt.__version__}', file=sys.stderr)
+" || { log_error "torch/tokenizers/tensorrt check failed"; exit 1; }
+
+log_info "Checking baked engine package under /opt/qwen3-tts..."
+docker run --rm "$BUILD_TAG" python3 -c "
+import sys
+sys.path.insert(0, '/opt/qwen3-tts')
+import engine
+print('engine OK', file=sys.stderr)
+" || { log_error "baked engine import failed"; exit 1; }
 
 log_info "Checking tritonserver..."
 # Triton may exit non-zero when no GPU is present; verify it runs and prints version/help

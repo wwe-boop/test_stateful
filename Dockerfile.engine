@@ -1,19 +1,39 @@
+# syntax=docker/dockerfile:1
+# Standalone TTS engine: TRT base + Python deps + bundled application code.
+# Large artifacts (tokenizer, exported weights, TRT engines) are NOT baked in;
+# mount host workspace/ at runtime (see scripts/bash/lib/engine.sh engine_start_docker).
+#
+# Layer order: pip deps (cached by Docker if unchanged) then COPY app.
+# Rebuilds after only editing engine/ reuse the deps layer — no re-download.
+# For repeated clean builds on the same host, enable BuildKit + pip cache mount
+# (see RUN below): wheels stay under Docker's build cache, not in the image.
 ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt:26.02-py3
 FROM ${BASE_IMAGE}
 
-RUN pip install --no-cache-dir \
+WORKDIR /app
+ENV PYTHONPATH=/app
+
+# BuildKit: persist ~/.cache/pip across builds so torch/grpc wheels are not re-fetched every time.
+# Requires: DOCKER_BUILDKIT=1 (set in engine_build_image).
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
     --trusted-host mirrors.bfsu.edu.cn \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     torch \
     tokenizers \
     pyyaml \
+    numpy \
     grpcio \
     grpcio-tools \
     && python3 -c "\
 import tensorrt as trt; \
-import torch, tokenizers, yaml, grpc; \
+import torch, tokenizers, yaml, grpc, numpy; \
 print(f'TRT {trt.__version__}'); \
 print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
 print(f'tokenizers {tokenizers.__version__}'); \
 print(f'grpcio {grpc.__version__}')"
+
+COPY engine.yaml /app/engine.yaml
+COPY engine/ /app/engine/
+COPY scripts/compose/ /app/scripts/compose/

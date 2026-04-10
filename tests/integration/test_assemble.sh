@@ -3,10 +3,11 @@
 #  L2 test T2.4: assemble_model_repo ONNX/TRT dual mode and validate.
 #
 #  Verifies:
-#    - ONNX mode: .onnx + .onnx.data copy, tokenizer assets, TTSEngine payload in
-#                 tts_orchestrator/1/engine, and the thin model.py adapter
-#    - TRT mode:  talker_code2wav_fused config has TYPE_BF16, same adapter payload
-#    - Both: first_chunk_frames in tts_orchestrator config, weights/ .pt files
+#    - ONNX mode: fused runtime ONNX is copied under tts_orchestrator/1/runtime/,
+#                 tokenizer assets and TTSEngine payload are present
+#    - TRT mode:  fused runtime TRT plan is copied under tts_orchestrator/1/runtime/
+#    - Both: orchestrator config carries engine_dir/first_chunk_frames and no
+#            top-level talker_code2wav_fused Triton model is exposed
 #
 #  Run from repo root:
 #    bash tests/integration/test_assemble.sh
@@ -45,17 +46,23 @@ validate_model_repo "${TEST_REPO_ONNX}" || { log_error "validate (onnx) failed";
 
 # Assert ONNX-specific
 ORCH_1="${TEST_REPO_ONNX}/tts_orchestrator/1"
+RUNTIME_ONNX="${ORCH_1}/runtime"
 [ -f "${ORCH_1}/model.py" ] || { log_error "Missing ${ORCH_1}/model.py"; exit 1; }
 [ -f "${ORCH_1}/engine/server.py" ] || { log_error "Missing TTSEngine payload: engine/server.py"; exit 1; }
 [ -f "${ORCH_1}/engine/frontend/interface.py" ] || { log_error "Missing TTSEngine payload: engine/frontend/interface.py"; exit 1; }
 [ -f "${ORCH_1}/engine/backend/engine_loop.py" ] || { log_error "Missing TTSEngine payload: engine/backend/engine_loop.py"; exit 1; }
 [ -f "${ORCH_1}/weights/config.json" ] || { log_error "Missing orchestrator weights/config.json"; exit 1; }
+[ -f "${RUNTIME_ONNX}/triton_manifest.json" ] || { log_error "Missing runtime manifest"; exit 1; }
+[ -f "${RUNTIME_ONNX}/model.onnx" ] || { log_error "Missing runtime/model.onnx"; exit 1; }
+[ ! -e "${TEST_REPO_ONNX}/talker_code2wav_fused" ] || { log_error "Unexpected top-level talker_code2wav_fused model in ONNX repo"; exit 1; }
 for legacy in __pycache__ greedy_tokenizer.py batch_decode_scheduler.py text_segmenter.py \
               prefill_builder.py audio_utils.py lightweight_tokenizer.py \
               session_manager.py decode_fsm.py ratio_tracker.py mlfq_scheduler.py; do
   [ ! -e "${ORCH_1}/${legacy}" ] || { log_error "Unexpected legacy BLS payload remained: ${ORCH_1}/${legacy}"; exit 1; }
 done
 grep -q "first_chunk_frames" "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config missing first_chunk_frames"; exit 1; }
+grep -q 'key: "engine_dir"' "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config missing engine_dir"; exit 1; }
+grep -q '/models/tts_orchestrator/1/runtime' "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config has wrong engine_dir"; exit 1; }
 if [ -d "${ORCH_1}/tokenizer" ]; then
   if [ -f "${ORCH_1}/tokenizer/tokenizer.json" ]; then
     log_info "  tokenizer.json present in orchestrator"
@@ -69,14 +76,12 @@ if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${E
   rm -rf "${TEST_REPO_TRT}"
   assemble_model_repo "${EXPORTED_DIR}" "${VARIANT}" "${TEST_REPO_TRT}" "trt" || { log_error "assemble (trt) failed"; exit 1; }
   validate_model_repo "${TEST_REPO_TRT}" || { log_error "validate (trt) failed"; exit 1; }
-  # triton_io_float_dtype in manifest drives Triton float tensor types (default bf16 with export_09).
-  grep -q 'name: "input_embeds"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
-    && grep -qE "TYPE_BF16|TYPE_FP16|TYPE_FP32" "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
-    || { log_error "talker_code2wav_fused TRT config missing float input_embeds type"; exit 1; }
-  grep -q 'name: "talker_past_kv"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
-    || { log_error "talker_code2wav_fused TRT config missing packed talker_past_kv"; exit 1; }
-  grep -q 'name: "c2w_past_kv"' "${TEST_REPO_TRT}/talker_code2wav_fused/config.pbtxt" \
-    || { log_error "talker_code2wav_fused TRT config missing packed c2w_past_kv"; exit 1; }
+  RUNTIME_TRT="${TEST_REPO_TRT}/tts_orchestrator/1/runtime"
+  [ -f "${RUNTIME_TRT}/triton_manifest.json" ] || { log_error "Missing TRT runtime manifest"; exit 1; }
+  [ -f "${RUNTIME_TRT}/model.plan" ] || { log_error "Missing TRT runtime/model.plan"; exit 1; }
+  [ ! -e "${TEST_REPO_TRT}/talker_code2wav_fused" ] || { log_error "Unexpected top-level talker_code2wav_fused model in TRT repo"; exit 1; }
+  grep -q 'key: "engine_dir"' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config missing engine_dir"; exit 1; }
+  grep -q '/models/tts_orchestrator/1/runtime' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config has wrong engine_dir"; exit 1; }
   log_info "TRT assemble checks passed"
 else
   log_warn "No talker_code2wav_fused.engine/.plan found; skipping TRT assemble test"

@@ -37,6 +37,8 @@ import queue
 import signal
 from typing import AsyncIterator, Optional
 
+import torch
+
 from .config import (
     EngineConfig, ModelArchConfig, load_config, load_model_manifest, to_model_config,
 )
@@ -112,22 +114,6 @@ class TTSEngine:
 
         self._tokenizer = LightQwen3TTSTokenizer(self._tokenizer_dir)
 
-        sc = self._cfg.spliter
-        self._frontend = FrontendInterface(
-            engine_inbox=self._async_inbox,
-            tokenizer=self._tokenizer,
-            max_sessions=self._max_sessions,
-            engine_max_decode_len=self._max_seq_len,
-            prefill_len=sc.prefill_len,
-            ema_ratio=sc.ema_ratio_initial,
-            max_concurrent_segments=sc.max_concurrent_segments,
-            ema_alpha=sc.ema_alpha,
-            ema_overflow_alpha=sc.ema_overflow_alpha,
-            ema_min_ratio=sc.ema_min_ratio,
-            ema_max_ratio=sc.ema_max_ratio,
-            safety_margin=sc.safety_margin,
-        )
-
         model_config = to_model_config(self._model_arch, self._cfg)
         sampling = self._cfg.sampling
         self._executor = Executor(
@@ -143,12 +129,27 @@ class TTSEngine:
             random_seed=sampling.random_seed,
         )
         self._executor.load()
+        self._max_seq_len = self._executor.max_seq_len
+
+        sc = self._cfg.spliter
+        self._frontend = FrontendInterface(
+            engine_inbox=self._async_inbox,
+            tokenizer=self._tokenizer,
+            max_sessions=self._max_sessions,
+            engine_max_decode_len=self._max_seq_len,
+            prefill_len=sc.prefill_len,
+            ema_ratio=sc.ema_ratio_initial,
+            max_concurrent_segments=sc.max_concurrent_segments,
+            ema_alpha=sc.ema_alpha,
+            ema_overflow_alpha=sc.ema_overflow_alpha,
+            ema_min_ratio=sc.ema_min_ratio,
+            ema_max_ratio=sc.ema_max_ratio,
+            safety_margin=sc.safety_margin,
+        )
         self._ref_audio_processor = ReferenceAudioProcessor(
             self._engine_dir,
             self._model_arch.variant,
         )
-
-        self._executor.warmup(n_rounds=self._cfg.server.warmup_rounds)
 
         prefill_builder = None
         if self._weights_dir:
@@ -165,6 +166,10 @@ class TTSEngine:
                 logger.info("PrefillBuilder loaded from %s", self._weights_dir)
             except Exception as e:
                 logger.warning("Could not load embedding weights: %s", e)
+
+        if self._cfg.server.warmup_rounds > 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._executor.warmup(n_rounds=self._cfg.server.warmup_rounds)
 
         sched = self._cfg.scheduler
         pc = self._cfg.prefix_cache

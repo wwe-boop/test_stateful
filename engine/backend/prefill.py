@@ -265,6 +265,38 @@ class PrefillBuilder:
             include_eos=include_eos,
         )
 
+    def build(
+        self,
+        task_type: TaskType,
+        text: str,
+        language: str = "auto",
+        speaker: Optional[str] = None,
+        instruct: Optional[str] = None,
+        instruct_token_ids: Optional[list[int]] = None,
+        spk_embedding: Optional[torch.Tensor] = None,
+        ref_codes: Optional[torch.Tensor] = None,
+        ref_text: Optional[str] = None,
+        ref_text_token_ids: Optional[list[int]] = None,
+        ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        include_eos: bool = True,
+    ) -> tuple[torch.Tensor, list]:
+        """Compatibility wrapper for older tests and verification scripts."""
+        plan = self.build_plan(
+            task_type=task_type,
+            text=text,
+            language=language,
+            speaker=speaker,
+            instruct=instruct,
+            instruct_token_ids=instruct_token_ids,
+            spk_embedding=spk_embedding,
+            ref_codes=ref_codes,
+            ref_text=ref_text,
+            ref_text_token_ids=ref_text_token_ids,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+            include_eos=include_eos,
+        )
+        return plan.prefill_embeds, plan.trailing
+
     def build_plan_from_ids(
         self,
         task_type: TaskType,

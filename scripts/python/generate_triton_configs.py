@@ -539,6 +539,7 @@ def render_orchestrator(variant: str, orch: Dict[str, str]) -> str:
     max_decode = orch.get("max_decode_steps", "4096")
     achunk = orch.get("audio_chunk_frames", "25")
     fchunk = orch.get("first_chunk_frames", "4")
+    edir = orch.get("engine_dir", "/models/tts_orchestrator/1/runtime")
     wdir = orch.get("weights_dir", "/models/tts_orchestrator/1/weights")
     tdir = orch.get("tokenizer_dir", "/models/tts_orchestrator/1/tokenizer")
     return f'''name: "tts_orchestrator"
@@ -599,6 +600,10 @@ parameters: {{
 parameters: {{
   key: "supported_task_types"
   value: {{ string_value: "{tasks}" }}
+}}
+parameters: {{
+  key: "engine_dir"
+  value: {{ string_value: "{edir}" }}
 }}
 parameters: {{
   key: "weights_dir"

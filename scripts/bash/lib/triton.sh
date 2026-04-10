@@ -19,11 +19,11 @@ source "${_LIB_DIR}/logging.sh"
 source "${_LIB_DIR}/utils.sh"
 source "${_LIB_DIR}/docker.sh"
 
-# Default production layout (optional: ASSEMBLE_VERIFICATION_MODELS=1 adds tokenizer/talker_unified/code2wav)
-_TRITON_MODELS=(
-    "speaker_encoder"
-    "speech_tokenizer_codec_fused"
-    "talker_code2wav_fused"
+# Default production layout: only the Python orchestrator is exposed to Triton.
+# Runtime assets (fused engine, optional voice-clone ONNX exports, manifest) live
+# under tts_orchestrator/1/runtime. ASSEMBLE_VERIFICATION_MODELS=1 can still add
+# standalone verification models such as talker_unified/code2wav.
+_TRITON_REQUIRED_MODELS=(
     "tts_orchestrator"
 )
 
@@ -76,9 +76,10 @@ _link_or_copy() {
 #  TRT mode:  copies .engine → model.plan, backend tensorrt
 #  ONNX mode: copies .onnx → model.onnx, backend onnxruntime
 #
-#  Default layout: speaker_encoder, speech_tokenizer_codec_fused (base ICL),
-#  talker_code2wav_fused, tts_orchestrator. ASSEMBLE_VERIFICATION_MODELS=1 adds
-#  speech_tokenizer_encoder, talker_unified, code2wav.
+#  Default layout: only tts_orchestrator is exposed to Triton. The fused runtime
+#  engine and optional voice-clone ONNX exports are copied into
+#  tts_orchestrator/1/runtime/. ASSEMBLE_VERIFICATION_MODELS=1 adds standalone
+#  speech_tokenizer_encoder, talker_unified, code2wav models for debugging.
 # ---------------------------------------------------------------------------
 assemble_model_repo() {
     local exported_dir="$1"
@@ -112,9 +113,9 @@ assemble_model_repo() {
 
     mkdir -p "$repo_dir"
     rm -rf \
+        "$repo_dir/talker_code2wav_fused" \
         "$repo_dir/speaker_encoder" \
         "$repo_dir/speech_tokenizer_codec_fused" \
-        "$repo_dir/talker_code2wav_fused" \
         "$repo_dir/speech_tokenizer_encoder" \
         "$repo_dir/talker_unified" \
         "$repo_dir/code2wav" \
@@ -152,35 +153,54 @@ assemble_model_repo() {
         return 1
     }
 
-    # ── 1. Speaker Encoder (optional — only needed for voice clone) ──
-    local spk_src
-    if spk_src="$(_resolve_model_src "$variant_dir/speaker_encoder")"; then
-        _place_model "speaker_encoder" "$spk_src"
-        log_info "  speaker_encoder: OK"
+    local runtime_dir="$repo_dir/tts_orchestrator/1/runtime"
+    mkdir -p "$runtime_dir"
+
+    # ── 1. Optional voice-clone runtime ONNX assets ──
+    # These are consumed directly by the Python backend and should not be
+    # exposed as standalone Triton models.
+    if [ -f "$variant_dir/speaker_encoder.onnx" ]; then
+        _link_or_copy "$variant_dir/speaker_encoder.onnx" "$runtime_dir/speaker_encoder.onnx"
+        [ -f "$variant_dir/speaker_encoder.onnx.data" ] \
+            && _link_or_copy "$variant_dir/speaker_encoder.onnx.data" "$runtime_dir/speaker_encoder.onnx.data"
+        log_info "  runtime/speaker_encoder.onnx: OK"
     else
-        log_warn "  speaker_encoder: SKIPPED (${engine_mode} file not found — only needed for voice clone)"
+        log_warn "  runtime/speaker_encoder.onnx: SKIPPED (only needed for voice clone)"
     fi
 
-    # ── 2. Speech Tokenizer + Codec 3D fused (optional — base ICL) ──
-    local stcodec_src
-    if stcodec_src="$(_resolve_model_src "$variant_dir/speech_tokenizer_codec_fused")"; then
-        _place_model "speech_tokenizer_codec_fused" "$stcodec_src"
-        log_info "  speech_tokenizer_codec_fused: OK"
+    if [ -f "$variant_dir/speech_tokenizer_codec_fused.onnx" ]; then
+        _link_or_copy \
+            "$variant_dir/speech_tokenizer_codec_fused.onnx" \
+            "$runtime_dir/speech_tokenizer_codec_fused.onnx"
+        [ -f "$variant_dir/speech_tokenizer_codec_fused.onnx.data" ] \
+            && _link_or_copy \
+                "$variant_dir/speech_tokenizer_codec_fused.onnx.data" \
+                "$runtime_dir/speech_tokenizer_codec_fused.onnx.data"
+        log_info "  runtime/speech_tokenizer_codec_fused.onnx: OK"
     else
-        log_warn "  speech_tokenizer_codec_fused: SKIPPED (not required for non-base / non-ICL)"
+        log_warn "  runtime/speech_tokenizer_codec_fused.onnx: SKIPPED (not required for non-base / non-ICL)"
     fi
 
-    # ── 3. Talker + Code2Wav fused (required — production single engine) ──
+    # ── 2. Talker + Code2Wav fused (required — production single runtime engine) ──
     local fused_src
     if fused_src="$(_resolve_model_src "$variant_dir/talker_code2wav_fused")"; then
-        _place_model "talker_code2wav_fused" "$fused_src"
-        log_info "  talker_code2wav_fused: OK"
+        if [ "$engine_mode" = "trt" ]; then
+            _link_or_copy "$fused_src" "$runtime_dir/model.plan"
+            log_info "  runtime/model.plan: OK"
+        else
+            _link_or_copy "$fused_src" "$runtime_dir/model.onnx"
+            if [ -f "${fused_src}.data" ]; then
+                _link_or_copy "${fused_src}.data" "$runtime_dir/$(basename "${fused_src}.data")"
+                log_info "    + copied runtime external data: $(basename "${fused_src}.data")"
+            fi
+            log_info "  runtime/model.onnx: OK"
+        fi
     else
         log_error "  talker_code2wav_fused: MISSING ${engine_mode} file (required). Run export_09 + Phase B."
         return 1
     fi
 
-    # ── 4. Verification-only models (optional) ──
+    # ── 3. Verification-only models (optional) ──
     if [ "${ASSEMBLE_VERIFICATION_MODELS:-0}" = "1" ]; then
         local stoken_src
         if stoken_src="$(_resolve_model_src "$tokenizer_dir/speech_tokenizer_encoder")"; then
@@ -252,10 +272,8 @@ assemble_model_repo() {
     _write_tts_orchestrator_stub_if_missing "$repo_dir"
 
     _link_or_copy "$variant_dir/triton_manifest.json" "$repo_dir/triton_manifest.json"
-    mkdir -p "$repo_dir/tts_orchestrator/1"
-    _link_or_copy "$variant_dir/triton_manifest.json" \
-        "$repo_dir/tts_orchestrator/1/triton_manifest.json"
-    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/1)"
+    _link_or_copy "$variant_dir/triton_manifest.json" "$runtime_dir/triton_manifest.json"
+    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/1/runtime)"
 
     # Keep the Triton Python backend payload minimal.  Only the new adapter,
     # engine package, tokenizer / weights, and manifest should enter the container.
@@ -264,7 +282,7 @@ assemble_model_repo() {
         ! -name "engine" \
         ! -name "tokenizer" \
         ! -name "weights" \
-        ! -name "triton_manifest.json" \
+        ! -name "runtime" \
         -exec rm -rf {} +
     find "$repo_dir/tts_orchestrator/1" -type d -name "__pycache__" -prune -exec rm -rf {} +
     log_info "  tts_orchestrator/python: pruned legacy payload"
@@ -323,8 +341,8 @@ sync_trt_configs() {
 
 # ---------------------------------------------------------------------------
 #  validate_model_repo <model_repo_dir>
-#  Quick sanity check: each expected model has config.pbtxt + version dir.
-#  Returns 0 if all critical models present, 1 otherwise.
+#  Quick sanity check for the thin Python backend layout.
+#  Returns 0 if all critical assets are present, 1 otherwise.
 # ---------------------------------------------------------------------------
 validate_model_repo() {
     local repo_dir="$1"
@@ -333,32 +351,64 @@ validate_model_repo() {
 
     log_step "Validating model repository: $repo_dir"
 
-    for model in "${_TRITON_MODELS[@]}"; do
+    for model in "${_TRITON_REQUIRED_MODELS[@]}"; do
         local model_dir="$repo_dir/$model"
         if [ ! -f "$model_dir/config.pbtxt" ]; then
-            if [[ "$model" == "speaker_encoder" || "$model" == "speech_tokenizer_codec_fused" ]]; then
-                log_warn "  $model: no config.pbtxt (optional)"
-                warned=$((warned + 1))
-            else
-                log_error "  $model: no config.pbtxt (required)"
-                missing=$((missing + 1))
-            fi
+            log_error "  $model: no config.pbtxt (required)"
+            missing=$((missing + 1))
             continue
         fi
 
         if [ ! -d "$model_dir/1" ]; then
-            if [[ "$model" == "speaker_encoder" || "$model" == "speech_tokenizer_codec_fused" ]]; then
-                log_warn "  $model: no version directory (optional)"
-                warned=$((warned + 1))
-            else
-                log_error "  $model: no version directory (1/)"
-                missing=$((missing + 1))
-            fi
+            log_error "  $model: no version directory (1/)"
+            missing=$((missing + 1))
             continue
         fi
 
         log_info "  $model: OK"
     done
+
+    local orch_dir="$repo_dir/tts_orchestrator/1"
+    local runtime_dir="$orch_dir/runtime"
+    if [ ! -f "$orch_dir/model.py" ]; then
+        log_error "  tts_orchestrator/1/model.py: missing"
+        missing=$((missing + 1))
+    else
+        log_info "  tts_orchestrator/1/model.py: OK"
+    fi
+    if [ ! -d "$orch_dir/engine" ]; then
+        log_error "  tts_orchestrator/1/engine/: missing"
+        missing=$((missing + 1))
+    else
+        log_info "  tts_orchestrator/1/engine/: OK"
+    fi
+    if [ ! -f "$runtime_dir/triton_manifest.json" ]; then
+        log_error "  tts_orchestrator/1/runtime/triton_manifest.json: missing"
+        missing=$((missing + 1))
+    else
+        log_info "  tts_orchestrator/1/runtime/triton_manifest.json: OK"
+    fi
+
+    local runtime_engine=""
+    if [ -f "$runtime_dir/model.plan" ]; then
+        runtime_engine="$runtime_dir/model.plan"
+    elif [ -f "$runtime_dir/model.onnx" ]; then
+        runtime_engine="$runtime_dir/model.onnx"
+    elif [ -f "$runtime_dir/talker_code2wav_fused.engine" ]; then
+        runtime_engine="$runtime_dir/talker_code2wav_fused.engine"
+    fi
+    if [ -z "$runtime_engine" ]; then
+        log_error "  tts_orchestrator/1/runtime/{model.plan|model.onnx|talker_code2wav_fused.engine}: missing"
+        missing=$((missing + 1))
+    else
+        log_info "  runtime engine: OK ($(basename "$runtime_engine"))"
+    fi
+
+    if [ -d "$repo_dir/talker_code2wav_fused" ]; then
+        log_error "  legacy top-level model detected: $repo_dir/talker_code2wav_fused"
+        log_error "  re-run assemble so the fused engine lives under tts_orchestrator/1/runtime/"
+        missing=$((missing + 1))
+    fi
 
     if [ "$missing" -gt 0 ]; then
         log_error "Validation failed: $missing required model(s) missing"
@@ -392,11 +442,14 @@ build_triton_image() {
     fi
 
     local model_repo="$repo_root/workspace/model_repository"
+    local runtime_dir="$model_repo/tts_orchestrator/1/runtime"
     local fused_artifact=""
-    if [ -f "$model_repo/talker_code2wav_fused/1/model.plan" ]; then
-        fused_artifact="$model_repo/talker_code2wav_fused/1/model.plan"
-    elif [ -f "$model_repo/talker_code2wav_fused/1/model.onnx" ]; then
-        fused_artifact="$model_repo/talker_code2wav_fused/1/model.onnx"
+    if [ -f "$runtime_dir/model.plan" ]; then
+        fused_artifact="$runtime_dir/model.plan"
+    elif [ -f "$runtime_dir/model.onnx" ]; then
+        fused_artifact="$runtime_dir/model.onnx"
+    elif [ -f "$runtime_dir/talker_code2wav_fused.engine" ]; then
+        fused_artifact="$runtime_dir/talker_code2wav_fused.engine"
     fi
 
     if [ ! -f "$model_repo/tts_orchestrator/1/model.py" ] \
@@ -406,7 +459,7 @@ build_triton_image() {
         log_error "Expected:"
         log_error "  $model_repo/tts_orchestrator/1/model.py"
         log_error "  $model_repo/tts_orchestrator/1/engine/"
-        log_error "  $model_repo/talker_code2wav_fused/1/model.plan or model.onnx"
+        log_error "  $runtime_dir/model.plan or model.onnx"
         return 1
     fi
 
@@ -425,8 +478,6 @@ RUN python3 -m pip install --no-cache-dir \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     torch \
     tokenizers \
-    scipy \
-    soundfile \
     "tensorrt==\${TENSORRT_PYTHON_VERSION}"
 
 COPY workspace/model_repository /models

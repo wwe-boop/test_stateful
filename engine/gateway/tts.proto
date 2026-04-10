@@ -145,7 +145,7 @@ message AudioChunk {
 }
 
 message StreamEvent {
-  string type = 1;          // start | segment_start | segment_end | warning | done | error
+  string type = 1;          // start | text_token | text_boundary_commit | segment_end | warning | done | error
   string session_id = 2;
   int32 segment_id = 3;     // -1 when not segment-scoped
   string text = 4;

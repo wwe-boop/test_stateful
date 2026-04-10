@@ -249,25 +249,22 @@ class EngineLoop:
             # iteration, instead of waiting until the next one. ---
             self._drain_inbox()
 
-            # --- Phase 2: Launch decode for existing active slots FIRST.
-            # GPU starts computing on compute_stream while CPU proceeds
-            # to prefill on the separate prefill_stream. ---
-            active_slots = self._get_active_slots_mlfq()
-            gpu_future = None
-            if active_slots:
-                gpu_future = self._executor.launch_decode_step(active_slots)
-
-            # --- Phase 3: Prefill ALL pending sessions (not just one).
-            # Uses the dedicated prefill_stream + separate TRT execution
-            # context, so prefill overlaps with the in-flight decode on
-            # compute_stream.  First audio chunk is produced during
+            # --- Phase 2: Prefill pending sessions FIRST.
+            # Prefill and decode share one TRT execution context, so they
+            # must run serially. First audio chunk is still produced during
             # prefill, so first_chunk_latency = time-to-prefill. ---
             try:
                 self._try_prefill_pending()
             except Exception:
                 logger.exception("Prefill failed unexpectedly")
 
-            # --- Phase 4: While GPU computes, do CPU housekeeping ---
+            # --- Phase 3: Launch decode for active slots. ---
+            active_slots = self._get_active_slots_mlfq()
+            gpu_future = None
+            if active_slots:
+                gpu_future = self._executor.launch_decode_step(active_slots)
+
+            # --- Phase 4: While decode runs, do CPU housekeeping ---
             self._drain_inbox()
             self._try_evict_idle_slots()
             self._try_timeout_sessions()
