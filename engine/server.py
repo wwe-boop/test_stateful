@@ -129,6 +129,7 @@ class TTSEngine:
             random_seed=sampling.random_seed,
         )
         self._executor.load()
+        self._max_batch = self._executor.max_batch_size
         self._max_seq_len = self._executor.max_seq_len
 
         sc = self._cfg.spliter
@@ -145,6 +146,9 @@ class TTSEngine:
             ema_min_ratio=sc.ema_min_ratio,
             ema_max_ratio=sc.ema_max_ratio,
             safety_margin=sc.safety_margin,
+            l1_split_cap_ratio=sc.l1_split_cap_ratio,
+            l2_split_cap_ratio=sc.l2_split_cap_ratio,
+            l3_split_cap_ratio=sc.l3_split_cap_ratio,
         )
         self._ref_audio_processor = ReferenceAudioProcessor(
             self._engine_dir,

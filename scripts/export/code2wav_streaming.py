@@ -35,6 +35,7 @@ class SlidingWindowKVCache:
         window_size: int = 72,
     ):
         self._past = list(past_key_values)
+        self._delta: list[Tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(self._past)
         self.window_size = window_size
 
     def update(
@@ -45,6 +46,7 @@ class SlidingWindowKVCache:
         cache_kwargs: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         past_k, past_v = self._past[layer_idx]
+        self._delta[layer_idx] = (key_states, value_states)
         full_k = torch.cat([past_k, key_states], dim=2)
         full_v = torch.cat([past_v, value_states], dim=2)
         if self.window_size is not None and self.window_size > 0:
@@ -55,6 +57,12 @@ class SlidingWindowKVCache:
 
     def get_present(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._past[layer_idx]
+
+    def get_delta(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        delta = self._delta[layer_idx]
+        if delta is None:
+            raise RuntimeError(f"Delta KV not populated for layer {layer_idx}")
+        return delta
 
 
 # -----------------------------------------------------------------------------
@@ -590,7 +598,13 @@ class Code2WavStreamingWrapper(nn.Module):
     output wav [B, 7680] + updated states (layout matches get_initial_state_shapes).
     """
 
-    def __init__(self, decoder: nn.Module, window_size: int = 72):
+    def __init__(
+        self,
+        decoder: nn.Module,
+        window_size: int = 72,
+        *,
+        emit_delta_kv: bool = False,
+    ):
         super().__init__()
         self.decoder = decoder
         patch_decoder_snakebeta_for_export(self.decoder)
@@ -599,6 +613,7 @@ class Code2WavStreamingWrapper(nn.Module):
         self.window_size = window_size
         cfg = decoder.config
         self.num_layers = num_code2wav_hidden_layers(decoder)
+        self.emit_delta_kv = emit_delta_kv
         # KV states are 2 * num_layers; conv/transconv follow immediately (not a fixed 16-slot pad).
         self._num_kv_state_tensors = 2 * self.num_layers
         self.hidden_size = getattr(cfg, "hidden_size", 512)
@@ -786,7 +801,10 @@ class Code2WavStreamingWrapper(nn.Module):
         # Pack new states
         new_kv = []
         for i in range(self.num_layers):
-            k, v = cache.get_present(i)
+            if self.emit_delta_kv:
+                k, v = cache.get_delta(i)
+            else:
+                k, v = cache.get_present(i)
             new_kv.append(k)
             new_kv.append(v)
         return (wav,) + tuple(new_kv) + tuple(conv_states) + tuple(transconv_states)

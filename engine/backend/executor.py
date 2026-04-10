@@ -22,17 +22,14 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
-import numpy as np
 
 from .batch_helper import (
     pad_packed_kv,
     padded_attention_bias,
-    split_packed_kv,
     uniform_past_seq_lens,
-    zeros_attention_bias,
 )
 from .kv_cache_pool import KVCachePool, ModelConfig, SlotKVState
 
@@ -40,6 +37,20 @@ logger = logging.getLogger(__name__)
 
 FUSED_CHUNK_T = 1
 _FUSED_DUMMY_PAST_LEN = 1
+
+
+def _append_c2w_delta(
+    current_kv: torch.Tensor,
+    delta_kv: torch.Tensor,
+    max_past_len: int,
+) -> torch.Tensor:
+    if current_kv is None:
+        out = delta_kv
+    else:
+        out = torch.cat([current_kv, delta_kv], dim=3)
+    if out.shape[3] > max_past_len:
+        out = out[:, :, :, -max_past_len:, :]
+    return out.contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +247,7 @@ class GPUFuture:
     def wait(self) -> StepOutput:
         """Synchronize GPU and extract results.
 
-        Returns batch-level KV tensors for pool scatter (no per-slot splitting).
+        Returns batch-level delta KV tensors for pool scatter.
         Conv/transconv states are still split per-slot (heterogeneous shapes).
         """
         if self._compute_stream is not None:
@@ -288,8 +299,8 @@ class GPUFuture:
             slots=self._slots,
             eos_flags=eos_flags,
             audio_chunks=audio_chunks,
-            batch_talker_kv=raw.get("talker_present_kv"),
-            batch_c2w_kv=raw.get("c2w_present_kv"),
+            batch_talker_kv=raw.get("talker_new_kv"),
+            batch_c2w_kv=raw.get("c2w_new_kv"),
             original_past_lens=self._original_past_lens,
             padded_past_len=self._padded_past_len,
             split_c2w_conv=split_c2w_conv,
@@ -304,8 +315,8 @@ class GPUFuture:
 class StepOutput:
     """Results from one decode step.
 
-    Talker/C2W KV are kept as batch-level tensors for direct pool scatter
-    (no per-slot splitting).  Conv/transconv states are split per-slot
+    Talker/C2W KV are kept as batch-level delta tensors for direct append
+    into per-slot cache state. Conv/transconv states are split per-slot
     because they have heterogeneous shapes.
 
     When ``used_pingpong`` is True, TRT wrote conv/transconv outputs
@@ -383,6 +394,10 @@ class Executor:
         )
 
     @property
+    def max_batch_size(self) -> int:
+        return self._max_batch
+
+    @property
     def max_seq_len(self) -> int:
         return self._max_seq_len
 
@@ -433,14 +448,25 @@ class Executor:
             logger.info("codec_eos_id set to %d from weights", self._codec_eos_id)
 
     def _apply_runtime_profile_limits(self) -> None:
-        """Clamp runtime max_seq_len so it never exceeds TRT profile bounds."""
+        """Clamp runtime batch/seq so they never exceed TRT profile bounds."""
         if self._fused_engine is None:
             return
         shape = self._fused_engine.get_input_profile_max_shape("talker_past_kv")
         if shape is None or len(shape) < 4:
             return
+        profile_max_batch = int(shape[0])
         profile_max_seq = int(shape[3])
+        if profile_max_batch > 0 and self._max_batch > profile_max_batch:
+            logger.warning(
+                "Requested max_batch_size=%d exceeds TRT profile max=%d for talker_past_kv; "
+                "clamping runtime max_batch_size to %d",
+                self._max_batch,
+                profile_max_batch,
+                profile_max_batch,
+            )
+            self._max_batch = profile_max_batch
         if profile_max_seq <= 0:
+            self._config.max_seq_len = min(self._config.max_seq_len, self._max_seq_len)
             return
         if self._max_seq_len > profile_max_seq:
             logger.warning(
@@ -582,18 +608,18 @@ class Executor:
 
         stream.synchronize()
 
-        talker_kv = raw.get("talker_present_kv")
+        talker_kv = raw.get("talker_new_kv")
         if talker_kv is not None:
-            stripped = talker_kv[:, :, :, 1:, :].contiguous()
+            stripped = talker_kv.contiguous()
             if self._kv_pool._preallocate:
                 self._kv_pool.scatter_prefill_kv(slot.slot_id, stripped, seq)
             else:
                 slot.talker_kv = stripped
         slot.past_len = seq
 
-        c2w_kv = raw.get("c2w_present_kv")
+        c2w_kv = raw.get("c2w_new_kv")
         if c2w_kv is not None:
-            c2w_kv = c2w_kv[:, :, :, 1:, :].contiguous()
+            c2w_kv = c2w_kv.contiguous()
             if self._kv_pool._preallocate:
                 self._kv_pool.scatter_prefill_c2w_kv(slot.slot_id, c2w_kv)
             slot.c2w_kv = c2w_kv
@@ -926,7 +952,7 @@ class Executor:
         names = [
             "wav", "codec_sum", "full_codec", "hidden", "logits",
             "updated_token_counts",
-            "talker_present_kv", "c2w_present_kv",
+            "talker_new_kv", "c2w_new_kv",
         ]
         names.extend(self._c2w_conv_output_names)
         names.extend(self._c2w_transconv_output_names)
@@ -968,10 +994,24 @@ class Executor:
                 future = self.launch_decode_step([dummy_slot])
                 output = future.wait()
                 if self._kv_pool._preallocate and output.batch_talker_kv is not None:
-                    self._kv_pool.scatter_talker_kv(
+                    self._kv_pool.scatter_talker_kv_delta(
                         [dummy_slot.slot_id], output.batch_talker_kv,
-                        [dummy_slot.past_len], output.padded_past_len, 1,
+                        [dummy_slot.past_len],
                     )
+                elif output.batch_talker_kv is not None:
+                    dummy_slot.talker_kv = torch.cat(
+                        [dummy_slot.talker_kv, output.batch_talker_kv[:1]],
+                        dim=3,
+                    )
+                if output.batch_c2w_kv is not None:
+                    if dummy_slot.c2w_kv is None:
+                        dummy_slot.c2w_kv = output.batch_c2w_kv[:1].clone()
+                    else:
+                        dummy_slot.c2w_kv = _append_c2w_delta(
+                            dummy_slot.c2w_kv,
+                            output.batch_c2w_kv[:1],
+                            self._config.c2w_sliding_window - 1,
+                        )
                 if output.used_pingpong and dummy_slot.pingpong_ready:
                     dummy_slot.flip_c2w_buffers()
                 dummy_slot.past_len += 1

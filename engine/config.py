@@ -121,6 +121,10 @@ class SpliterConfig:
     max_concurrent_segments: int = 2
     prefill_len: int = 12
     safety_margin: int = 8
+    # Punct-tier split mins as fractions of dynamic cap (see spliter/driver.compute_thresholds)
+    l1_split_cap_ratio: float = 0.70
+    l2_split_cap_ratio: float = 0.80
+    l3_split_cap_ratio: float = 0.90
 
 
 @dataclass

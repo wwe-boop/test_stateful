@@ -8,7 +8,7 @@
 # For repeated clean builds on the same host, enable BuildKit + pip cache mount
 # (see RUN below): wheels stay under Docker's build cache, not in the image.
 ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt:26.02-py3
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS engine-deps
 
 WORKDIR /app
 ENV PYTHONPATH=/app
@@ -33,6 +33,8 @@ print(f'TRT {trt.__version__}'); \
 print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
 print(f'tokenizers {tokenizers.__version__}'); \
 print(f'grpcio {grpc.__version__}')"
+
+FROM engine-deps AS engine-runtime
 
 COPY engine.yaml /app/engine.yaml
 COPY engine/ /app/engine/

@@ -125,6 +125,34 @@ class TestScatterC2WKV:
         assert torch.allclose(g1[0], present[1])
 
 
+class TestScatterTalkerKVDelta:
+    def test_appends_delta(self, pool):
+        s0 = pool.allocate("s0")
+        base = torch.full((1, 4, 2, 3, 4), 1.0)
+        delta = torch.full((1, 4, 2, 2, 4), 9.0)
+        pool.scatter_prefill_kv(s0.slot_id, base, 3)
+
+        pool.scatter_talker_kv_delta([s0.slot_id], delta, [3])
+
+        gathered = pool.gather_talker_kv([s0.slot_id], 5)
+        assert torch.allclose(gathered[0, :, :, :3, :], base[0])
+        assert torch.allclose(gathered[0, :, :, 3:5, :], delta[0])
+
+
+class TestScatterC2WKVDelta:
+    def test_appends_and_crops_window(self, pool):
+        s0 = pool.allocate("s0")
+        base = torch.arange(1, 1 + 4 * 2 * 7 * 4, dtype=DTYPE).reshape(1, 4, 2, 7, 4)
+        delta = torch.full((1, 4, 2, 2, 4), 99.0)
+        pool.scatter_prefill_c2w_kv(s0.slot_id, base)
+
+        pool.scatter_c2w_kv_delta([s0.slot_id], delta, [7])
+
+        gathered = pool.gather_c2w_kv([s0.slot_id], 7)
+        expected = torch.cat([base[:, :, :, -5:, :], delta], dim=3)
+        assert torch.allclose(gathered, expected)
+
+
 class TestStepOutputFields:
     def test_step_output_has_batch_kv(self):
         from engine.backend.executor import StepOutput

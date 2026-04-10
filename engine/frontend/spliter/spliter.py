@@ -95,6 +95,9 @@ class Spliter:
         ema_overflow_alpha: float = 0.5,
         ema_min_ratio: float = 2.0,
         ema_max_ratio: float = 10.0,
+        l1_split_cap_ratio: float = 0.70,
+        l2_split_cap_ratio: float = 0.80,
+        l3_split_cap_ratio: float = 0.90,
     ) -> None:
         self._engine_max = engine_max_decode_len
         self._prefill_len = prefill_len
@@ -105,6 +108,9 @@ class Spliter:
         self._ema_overflow_alpha = ema_overflow_alpha
         self._ema_min_ratio = ema_min_ratio
         self._ema_max_ratio = ema_max_ratio
+        self._l1_split_cap_ratio = l1_split_cap_ratio
+        self._l2_split_cap_ratio = l2_split_cap_ratio
+        self._l3_split_cap_ratio = l3_split_cap_ratio
 
         # Offline pre-split groups. Each group may still yield multiple
         # backend segments because the Driver remains the final decider.
@@ -149,7 +155,12 @@ class Spliter:
     def _make_thresholds(self) -> SplitThresholds:
         remaining_kv = self._engine_max - self._prefill_len
         return compute_thresholds(
-            remaining_kv, self._ema_ratio, self._safety_margin,
+            remaining_kv,
+            self._ema_ratio,
+            self._safety_margin,
+            l1_cap_ratio=self._l1_split_cap_ratio,
+            l2_cap_ratio=self._l2_split_cap_ratio,
+            l3_cap_ratio=self._l3_split_cap_ratio,
         )
 
     def _create_driver(
@@ -217,8 +228,8 @@ class Spliter:
         for optimal prosody and fewer segments.
 
         Algorithm:
-          1. Greedy scan; split at L1 punctuation when token_count >= a.
-          2. If threshold_d is reached without an L1 split, prefer L1 only;
+          1. Greedy scan; split at L1 punctuation when token_count >= min_tokens_l1.
+          2. If force_split_at is reached without an L1 split, prefer L1 only;
              otherwise hard-cut at the current position instead of snapping
              to L2/L3 punctuation. This avoids exaggerated prosodic breaks
              on commas / formatting newlines in fully-known long sentences.
@@ -249,9 +260,9 @@ class Spliter:
             if token.punct_level == 1:
                 last_l1 = n - 1
 
-            if token.punct_level == 1 and n >= th.a:
+            if token.punct_level == 1 and n >= th.min_tokens_l1:
                 _flush_at(n - 1)
-            elif n >= th.d:
+            elif n >= th.force_split_at:
                 if last_l1 >= 0:
                     _flush_at(last_l1)
                 else:
@@ -557,8 +568,13 @@ class Spliter:
             refreshed += 1
         if refreshed:
             logger.debug(
-                "Refreshed thresholds for %d active driver(s): a=%d b=%d c=%d d=%d",
-                refreshed, new_th.a, new_th.b, new_th.c, new_th.d,
+                "Refreshed thresholds for %d active driver(s): "
+                "L1=%d L2=%d L3=%d force=%d",
+                refreshed,
+                new_th.min_tokens_l1,
+                new_th.min_tokens_l2,
+                new_th.min_tokens_l3,
+                new_th.force_split_at,
             )
 
     # ------------------------------------------------------------------

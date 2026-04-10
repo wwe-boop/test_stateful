@@ -796,13 +796,11 @@ class EngineLoop:
         # Batch-level KV scatter to pool (single operation, avoids per-slot split)
         if use_pool and output.batch_talker_kv is not None:
             slot_ids = [s.slot_id for s in output.slots]
-            kv_pool.scatter_talker_kv(
-                slot_ids, output.batch_talker_kv,
-                output.original_past_lens, output.padded_past_len, 1,
+            kv_pool.scatter_talker_kv_delta(
+                slot_ids,
+                output.batch_talker_kv,
+                output.original_past_lens,
             )
-        if use_pool and output.batch_c2w_kv is not None:
-            slot_ids = [s.slot_id for s in output.slots]
-            kv_pool.scatter_c2w_kv(slot_ids, output.batch_c2w_kv)
 
         batch_size = len(output.slots)
         for i, slot in enumerate(output.slots):
@@ -816,12 +814,21 @@ class EngineLoop:
             if output.batch_c2w_kv is not None:
                 kv = output.batch_c2w_kv[i:i+1]
                 c2w_max_past = self._executor._config.c2w_sliding_window - 1
-                if kv.shape[3] > c2w_max_past:
-                    kv = kv[:, :, :, -c2w_max_past:, :]
-                slot.c2w_kv = kv.clone()
+                if slot.c2w_kv is None:
+                    slot.c2w_kv = kv.clone()
+                else:
+                    slot.c2w_kv = torch.cat([slot.c2w_kv, kv], dim=3)
+                    if slot.c2w_kv.shape[3] > c2w_max_past:
+                        slot.c2w_kv = slot.c2w_kv[:, :, :, -c2w_max_past:, :].contiguous()
+                    else:
+                        slot.c2w_kv = slot.c2w_kv.contiguous()
             if not use_pool:
                 if output.batch_talker_kv is not None:
-                    slot.talker_kv = output.batch_talker_kv[i:i+1]
+                    kv = output.batch_talker_kv[i:i+1]
+                    if slot.talker_kv is None:
+                        slot.talker_kv = kv.clone()
+                    else:
+                        slot.talker_kv = torch.cat([slot.talker_kv, kv], dim=3).contiguous()
 
             if output.used_pingpong and slot.pingpong_ready:
                 # batch=1 zero-copy: TRT wrote directly to write bufs

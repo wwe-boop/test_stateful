@@ -20,15 +20,27 @@ case "$variant" in
         ;;
 esac
 
-tokenizer_dir="/data/models/${tokenizer_subdir}"
-weights_dir="/data/exported/${variant}/weights"
-engine_dir=""
+model_root="${MODEL_ROOT:-/models}"
+exported_root="${EXPORTED_ROOT:-/exported}"
 
-if [[ -f "/data/exported/${variant}/engines/talker_code2wav_fused/model.plan" ]] || \
-   [[ -f "/data/exported/${variant}/engines/talker_code2wav_fused/talker_code2wav_fused.engine" ]]; then
-    engine_dir="/data/exported/${variant}/engines/talker_code2wav_fused"
-elif [[ -f "/data/exported/${variant}/talker_code2wav_fused.engine" ]]; then
-    engine_dir="/data/exported/${variant}"
+tokenizer_dir="${TOKENIZER_DIR:-}"
+weights_dir="${WEIGHTS_DIR:-}"
+engine_dir="${ENGINE_RUNTIME_DIR:-}"
+
+if [[ -z "$tokenizer_dir" ]]; then
+    tokenizer_dir="${model_root}/${tokenizer_subdir}"
+fi
+if [[ -z "$weights_dir" ]]; then
+    weights_dir="${exported_root}/${variant}/weights"
+fi
+
+if [[ -z "$engine_dir" ]]; then
+    if [[ -f "${exported_root}/${variant}/engines/talker_code2wav_fused/model.plan" ]] || \
+       [[ -f "${exported_root}/${variant}/engines/talker_code2wav_fused/talker_code2wav_fused.engine" ]]; then
+        engine_dir="${exported_root}/${variant}/engines/talker_code2wav_fused"
+    elif [[ -f "${exported_root}/${variant}/talker_code2wav_fused.engine" ]]; then
+        engine_dir="${exported_root}/${variant}"
+    fi
 fi
 
 if [[ ! -d "$tokenizer_dir" ]]; then
@@ -63,6 +75,8 @@ fi
 echo "Starting engine for variant=${variant}" >&2
 echo "  tokenizer=${tokenizer_dir}" >&2
 echo "  weights=${weights_dir}" >&2
+echo "  model_root=${model_root}" >&2
+echo "  exported_root=${exported_root}" >&2
 if [[ -n "$engine_dir" ]]; then
     echo "  engine_dir=${engine_dir}" >&2
 else

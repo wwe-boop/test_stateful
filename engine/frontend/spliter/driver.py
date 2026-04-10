@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, List, Optional
 
@@ -36,43 +36,51 @@ class ActionResult:
 
 @dataclass
 class SplitThresholds:
-    """Three-tier punctuation thresholds + forced cut."""
-    a: int   # L1 only  (。！？)
-    b: int   # L1 + L2  (，；：)
-    c: int   # L1+L2+L3 (\n——)
-    d: int   # forced cut (= max_tokens)
+    """Min text-token counts before split at punct tier + forced upper bound.
+
+    Aligns with ``Spliter.classify_punct_level`` / ``SpliterEvent.punct_level``:
+    L1 (。！？), L2 (，；：), L3 (weaker breaks).  ``force_split_at`` caps segment
+    length regardless of punctuation.
+    """
+    min_tokens_l1: int
+    min_tokens_l2: int
+    min_tokens_l3: int
+    force_split_at: int
 
 
 def compute_thresholds(
     remaining_kv: int,
     ema_ratio: float,
     safety_margin: int = 8,
-    a_ratio: float = 0.70,
-    b_ratio: float = 0.80,
-    c_ratio: float = 0.90,
+    l1_cap_ratio: float = 0.70,
+    l2_cap_ratio: float = 0.80,
+    l3_cap_ratio: float = 0.90,
 ) -> SplitThresholds:
     """Compute split thresholds from remaining KV budget and EMA ratio.
 
-    phase_a_cap = remaining_kv / (ema_ratio + 1)
-    — the +1 accounts for the fact that each text token needs ~ema_ratio
-    audio decode steps *plus* the text step itself.
+    ``cap`` scales with remaining KV and ~1/ema_ratio (text vs audio steps).
+    Tier mins are ``cap * lN_cap_ratio``, then clamped so
+    min_tokens_l1 < min_tokens_l2 < min_tokens_l3 < force_split_at.
     """
     remaining = max(1, remaining_kv - max(4, safety_margin // 4))
     denom = max(1.0, ema_ratio)
     cap = max(8, int(remaining / denom))
 
-    a = max(6, int(cap * a_ratio))
-    b = max(a + 4, int(cap * b_ratio))
-    c = max(b + 4, int(cap * c_ratio))
-    d = max(c + 1, cap)
+    t1 = max(6, int(cap * l1_cap_ratio))
+    t2 = max(t1 + 4, int(cap * l2_cap_ratio))
+    t3 = max(t2 + 4, int(cap * l3_cap_ratio))
+    t_force = max(t3 + 1, cap)
 
-    d = min(d, remaining - 2)
-    c = min(c, d - 1)
-    b = min(b, c - 1)
-    a = min(a, b - 1)
+    t_force = min(t_force, remaining - 2)
+    t3 = min(t3, t_force - 1)
+    t2 = min(t2, t3 - 1)
+    t1 = min(t1, t2 - 1)
 
     return SplitThresholds(
-        a=max(1, a), b=max(2, b), c=max(3, c), d=max(4, d),
+        min_tokens_l1=max(1, t1),
+        min_tokens_l2=max(2, t2),
+        min_tokens_l3=max(3, t3),
+        force_split_at=max(4, t_force),
     )
 
 
@@ -83,14 +91,14 @@ def compute_thresholds(
 Three-tier punctuation threshold state machine
 ================================================
 
-The Driver uses 4 thresholds (a < b < c < d) computed from remaining
-KV budget and the EMA audio:text ratio.
+The Driver uses 4 thresholds (min_tokens_l1 < … < force_split_at) computed
+from remaining KV budget and the EMA audio:text ratio.
 
 TEXT_INPUTING transitions on punctuation:
-  - token_count >= a  AND  punct_level == 1 (L1)  → split
-  - token_count >= b  AND  punct_level <= 2 (L2)  → split
-  - token_count >= c  AND  punct_level <= 3 (L3)  → split
-  - token_count >= d  (any token)                  → forced split
+  - token_count >= min_tokens_l1  AND  punct_level == 1 (L1)  → split
+  - token_count >= min_tokens_l2  AND  punct_level <= 2 (L2)  → split
+  - token_count >= min_tokens_l3  AND  punct_level <= 3 (L3)  → split
+  - token_count >= force_split_at (any token)                  → forced split
 
 ```mermaid
 stateDiagram-v2
@@ -107,8 +115,8 @@ stateDiagram-v2
     TEXT_INPUTING --> TEXT_INPUTING : unknown/START/start_token / ()
     TEXT_INPUTING --> PAD_TEXT_EOS : END signal / set_final()
     TEXT_INPUTING --> PAD_TEXT_NOP : end_token / decode()
-    TEXT_INPUTING --> PAD_TEXT_EOS : normal [>=d] / decode()
-    TEXT_INPUTING --> TEXT_INPUTING : normal [<d] / decode()
+    TEXT_INPUTING --> PAD_TEXT_EOS : normal [>=force_split_at] / decode()
+    TEXT_INPUTING --> TEXT_INPUTING : normal [<force_split_at] / decode()
     TEXT_INPUTING --> PAD_TEXT_EOS : punct [threshold met] / decode()
     TEXT_INPUTING --> TEXT_INPUTING : punct [threshold not met] / decode()
 
@@ -152,11 +160,11 @@ class StreamingDriver:
     def _meets_split_threshold(self, e: SpliterEvent) -> bool:
         tc = self._token_count
         pl = e.punct_level
-        if pl == 1 and tc >= self.thresholds.a:
+        if pl == 1 and tc >= self.thresholds.min_tokens_l1:
             return True
-        if pl == 2 and tc >= self.thresholds.b:
+        if pl == 2 and tc >= self.thresholds.min_tokens_l2:
             return True
-        if pl == 3 and tc >= self.thresholds.c:
+        if pl == 3 and tc >= self.thresholds.min_tokens_l3:
             return True
         return False
 
@@ -167,10 +175,10 @@ class StreamingDriver:
         return lambda e: e.type in s
 
     def _normal_overflow(self, e: SpliterEvent) -> bool:
-        return e.type == ET.NORMAL_TOKEN and self._token_count >= self.thresholds.d
+        return e.type == ET.NORMAL_TOKEN and self._token_count >= self.thresholds.force_split_at
 
     def _normal_no_overflow(self, e: SpliterEvent) -> bool:
-        return e.type == ET.NORMAL_TOKEN and self._token_count < self.thresholds.d
+        return e.type == ET.NORMAL_TOKEN and self._token_count < self.thresholds.force_split_at
 
     def _punct_should_split(self, e: SpliterEvent) -> bool:
         return (e.type == ET.PUNCTUATION_TOKEN

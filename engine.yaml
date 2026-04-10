@@ -26,7 +26,7 @@ server:
   warmup_rounds: 3               # dummy inferences at startup to warm TRT cache
 
 scheduler:
-  max_batch_size: 48
+  max_batch_size: 32
   max_seq_len: 512
   # MLFQ dynamic priority
   mlfq_q1_threshold: 50     # steps before demotion Q0→Q1
@@ -44,11 +44,15 @@ prefix_cache:
   max_prefix_len: 512        # max token length for a cached prefix
 
 spliter:
-  ema_ratio_initial: 5.5
+  ema_ratio_initial: 4.0
   ema_alpha: 0.1
   ema_overflow_alpha: 0.5
   max_concurrent_segments: 2
   prefill_len: 12
+  # Min tokens before split at L1/L2/L3 punct — each is cap * ratio
+  l1_split_cap_ratio: 0.70
+  l2_split_cap_ratio: 0.80
+  l3_split_cap_ratio: 0.90
 
 sampling:
   do_sample: true

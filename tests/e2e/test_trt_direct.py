@@ -176,8 +176,8 @@ def main():
     wav_out = raw["wav"]
     token_counts = raw["updated_token_counts"].clone()
 
-    talker_past_kv = raw["talker_present_kv"][:, :, :, _DUMMY_PAST_LEN:, :].contiguous()
-    c2w_past_kv = raw["c2w_present_kv"][:, :, :, _DUMMY_PAST_LEN:, :].contiguous()
+    talker_past_kv = raw["talker_new_kv"].contiguous()
+    c2w_past_kv = raw["c2w_new_kv"].contiguous()
 
     c2w_states = {in_n: raw[out_n].clone()
                   for in_n, out_n in zip(c2w_in_names, c2w_out_names)}
@@ -215,11 +215,10 @@ def main():
         wav_out = raw["wav"]
         token_counts = raw["updated_token_counts"].clone()
 
-        new_kv = raw["talker_present_kv"]
-        real_len = past_len + 1
-        talker_past_kv = new_kv[:, :, :, :real_len, :].contiguous()
+        new_kv = raw["talker_new_kv"]
+        talker_past_kv = torch.cat([talker_past_kv, new_kv], dim=3).contiguous()
 
-        c2w_past_kv = raw["c2w_present_kv"].clone()
+        c2w_past_kv = torch.cat([c2w_past_kv, raw["c2w_new_kv"]], dim=3).contiguous()
         kv_max = max(1, SLIDING_WINDOW - 1)
         if c2w_past_kv.shape[3] > kv_max:
             c2w_past_kv = c2w_past_kv[:, :, :, -kv_max:, :].contiguous()

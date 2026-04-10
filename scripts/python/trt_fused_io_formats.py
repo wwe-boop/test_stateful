@@ -73,7 +73,7 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
 
         Outputs: wav, codec_sum, full_codec(i64), hidden, logits,
                  updated_token_counts(i64),
-                 talker_present_kv, c2w_present_kv,
+                 talker_new_kv, c2w_new_kv,
                  c2w_new_conv_state_* (17), c2w_new_transconv_overlap_* (4)
     """
     c2w = manifest.get("code2wav_fused") or {}
@@ -107,8 +107,8 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
         fp_spec,        # hidden
         fp_spec,        # logits
         i64,            # updated_token_counts
-        fp_spec,        # talker_present_kv (packed)
-        fp_spec,        # c2w_present_kv (packed)
+        fp_spec,        # talker_new_kv (packed delta)
+        fp_spec,        # c2w_new_kv (packed delta)
     ]
     out_parts.extend([fp_spec] * len(c2w_out))
 

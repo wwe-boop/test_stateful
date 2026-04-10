@@ -27,6 +27,7 @@ class UnifiedKVCache:
 
     def __init__(self, past_key_values: List[Tuple[torch.Tensor, torch.Tensor]]):
         self._past = list(past_key_values)
+        self._delta: list[Tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(self._past)
 
     def get_seq_length(self) -> int:
         if self._past[0] is None or self._past[0][0] is None:
@@ -41,6 +42,7 @@ class UnifiedKVCache:
         cache_kwargs: dict = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         past_k, past_v = self._past[layer_idx]
+        self._delta[layer_idx] = (key_states, value_states)
         full_k = torch.cat([past_k, key_states], dim=2)
         full_v = torch.cat([past_v, value_states], dim=2)
         self._past[layer_idx] = (full_k, full_v)
@@ -48,6 +50,12 @@ class UnifiedKVCache:
 
     def get_present(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._past[layer_idx]
+
+    def get_delta(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        delta = self._delta[layer_idx]
+        if delta is None:
+            raise RuntimeError(f"Delta KV not populated for layer {layer_idx}")
+        return delta
 
 
 def build_codec_embedding_sum_from_model(model, device, dtype=torch.float32):
@@ -223,13 +231,14 @@ def _run_talker_layer_export(
 class TalkerUnifiedONNX(nn.Module):
     """Talker backbone for both prefill and decode: single path with dynamic S and S_past."""
 
-    def __init__(self, talker_model, codec_head):
+    def __init__(self, talker_model, codec_head, *, emit_delta_kv: bool = False):
         super().__init__()
         self.layers = talker_model.layers
         self.norm = talker_model.norm
         self.rotary_emb = talker_model.rotary_emb
         self.codec_head = codec_head
         self.num_layers = len(self.layers)
+        self.emit_delta_kv = emit_delta_kv
 
     def forward(
         self,
@@ -302,7 +311,10 @@ class TalkerUnifiedONNX(nn.Module):
 
         outputs = [hidden, logits]
         for i in range(n):
-            k, v = cache.get_present(i)
+            if self.emit_delta_kv:
+                k, v = cache.get_delta(i)
+            else:
+                k, v = cache.get_present(i)
             outputs.append(k)
             outputs.append(v)
         return tuple(outputs)
@@ -391,7 +403,11 @@ def build_talker_backbone_module(model, device: str = "cpu") -> Tuple[TalkerUnif
 
     talker_model = talker.model.to(device).eval()
     codec_head = talker.codec_head.to(device).eval()
-    backbone = TalkerUnifiedONNX(talker_model, codec_head).to(device).eval()
+    backbone = TalkerUnifiedONNX(
+        talker_model,
+        codec_head,
+        emit_delta_kv=False,
+    ).to(device).eval()
 
     num_layers = talker_config.num_hidden_layers
     hidden_size = talker_config.hidden_size
@@ -413,7 +429,11 @@ def build_talker_unified_fused_module(model, device: str = "cpu") -> Tuple[Talke
 
     talker_model = talker.model.to(device).eval()
     codec_head = talker.codec_head.to(device).eval()
-    backbone = TalkerUnifiedONNX(talker_model, codec_head).to(device).eval()
+    backbone = TalkerUnifiedONNX(
+        talker_model,
+        codec_head,
+        emit_delta_kv=True,
+    ).to(device).eval()
 
     code_predictor = talker.code_predictor.to(device).eval()
     talker_codec_emb = talker.model.codec_embedding.to(device).eval()

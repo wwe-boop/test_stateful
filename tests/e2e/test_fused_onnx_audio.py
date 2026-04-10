@@ -168,16 +168,12 @@ def main():
     wav_chunk = outs["wav"]
     token_counts = outs["updated_token_counts"].copy()
 
-    talker_past_kv = outs["talker_present_kv"].copy()
-    c2w_past_kv = outs["c2w_present_kv"].copy()
+    talker_past_kv = outs["talker_new_kv"].copy()
+    c2w_past_kv = outs["c2w_new_kv"].copy()
     kv_max = max(1, SLIDING_WINDOW - 1)
     if c2w_past_kv.shape[3] > kv_max:
         c2w_past_kv = c2w_past_kv[:, :, :, -kv_max:, :].copy()
-    c2w_states_np = [outs[name].copy() for name in c2w_out_names
-                     if not name.startswith("c2w_present_kv") and not name.startswith("c2w_new_conv") and not name.startswith("c2w_new_transconv")]
-    c2w_states_np = []
-    for name in c2w_out_names:
-        c2w_states_np.append(outs[name].copy())
+    c2w_states_np = [outs[name].copy() for name in c2w_out_names]
 
     if wav_chunk is not None and wav_chunk.size > 0:
         wav_chunks.append(wav_chunk.flatten())
@@ -206,8 +202,8 @@ def main():
         wav_chunk = outs["wav"]
         token_counts = outs["updated_token_counts"].copy()
 
-        talker_past_kv = outs["talker_present_kv"].copy()
-        c2w_past_kv = outs["c2w_present_kv"].copy()
+        talker_past_kv = np.concatenate([talker_past_kv, outs["talker_new_kv"]], axis=3).copy()
+        c2w_past_kv = np.concatenate([c2w_past_kv, outs["c2w_new_kv"]], axis=3).copy()
         if c2w_past_kv.shape[3] > kv_max:
             c2w_past_kv = c2w_past_kv[:, :, :, -kv_max:, :].copy()
         c2w_states_np = [outs[name].copy() for name in c2w_out_names]

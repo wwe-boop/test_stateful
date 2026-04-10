@@ -415,6 +415,50 @@ class KVCachePool:
                 s_len = c2w_max_past
             self._c2w_kv_pool[slot_id, :, :, :s_len, :] = kv[0, :, :, :s_len, :]
 
+    def scatter_talker_kv_delta(
+        self,
+        slot_ids: list[int],
+        delta_kv: torch.Tensor,
+        original_past_lens: list[int],
+    ) -> None:
+        """Append talker delta KV to the pre-allocated pool."""
+        if self._talker_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        cap = self._config.max_seq_len
+        delta_len = int(delta_kv.shape[3])
+        for i, (slot_id, orig_pl) in enumerate(zip(slot_ids, original_past_lens)):
+            if orig_pl >= cap or delta_len <= 0:
+                continue
+            write_len = min(delta_len, cap - orig_pl)
+            end = orig_pl + write_len
+            self._talker_kv_pool[slot_id, :, :, orig_pl:end, :] = (
+                delta_kv[i, :, :, :write_len, :]
+            )
+
+    def scatter_c2w_kv_delta(
+        self,
+        slot_ids: list[int],
+        delta_kv: torch.Tensor,
+        original_past_lens: list[int],
+    ) -> None:
+        """Append code2wav delta KV to the pre-allocated pool with sliding-window crop."""
+        if self._c2w_kv_pool is None:
+            raise RuntimeError("Pool not pre-allocated")
+        window = self._config.c2w_sliding_window - 1
+        delta_len = int(delta_kv.shape[3])
+        for i, (slot_id, orig_pl) in enumerate(zip(slot_ids, original_past_lens)):
+            if delta_len <= 0:
+                continue
+            keep_past = min(orig_pl, max(0, window - delta_len))
+            write_len = min(delta_len, window)
+            if keep_past > 0:
+                self._c2w_kv_pool[slot_id, :, :, :keep_past, :] = (
+                    self._c2w_kv_pool[slot_id, :, :, orig_pl - keep_past:orig_pl, :]
+                )
+            self._c2w_kv_pool[slot_id, :, :, keep_past:keep_past + write_len, :] = (
+                delta_kv[i, :, :, delta_len - write_len:, :]
+            )
+
     # ------------------------------------------------------------------
     # Slot eviction
     # ------------------------------------------------------------------

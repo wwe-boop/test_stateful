@@ -18,8 +18,8 @@ Inputs:
 
 Outputs:
     wav, codec_sum, full_codec, hidden, logits, updated_token_counts,
-    talker_present_kv  — [B, num_layers*2, kv_heads, S_total, head_dim]
-    c2w_present_kv     — [B, n_c2w*2, c2w_heads, S_c2w_total, c2w_head_dim]
+    talker_new_kv      — [B, num_layers*2, kv_heads, S_step, head_dim]
+    c2w_new_kv         — [B, n_c2w*2, c2w_heads, chunk_t, c2w_head_dim]
     c2w_new_conv_state_*, c2w_new_transconv_overlap_*
 
 Depends on: tokenizer (code2wav decoder) + TTS variant (talker).
@@ -136,8 +136,8 @@ class TalkerCode2WavFusedONNX(nn.Module):
             )
         )
 
-        # Pack talker present KV: list of [B, H, S_total, D] -> [B, L*2, H, S_total, D]
-        talker_present_kv = torch.stack(present_kv, dim=1)
+        # Pack talker delta KV: list of [B, H, S_step, D] -> [B, L*2, H, S_step, D]
+        talker_new_kv = torch.stack(present_kv, dim=1)
 
         # Unpack C2W KV: [B, N*2, H, S, D] -> list of [B, H, S, D]
         c2w_kv_list = [c2w_past_kv[:, i, :, :, :] for i in range(n_c2w * 2)]
@@ -152,15 +152,15 @@ class TalkerCode2WavFusedONNX(nn.Module):
         )
         wav = c2w_out[0]
 
-        # Pack C2W present KV
+        # Pack C2W delta KV
         c2w_new_kv = list(c2w_out[1:1 + 2 * n_c2w])
-        c2w_present_kv = torch.stack(c2w_new_kv, dim=1)
+        c2w_new_kv = torch.stack(c2w_new_kv, dim=1)
 
         new_conv_transconv = c2w_out[1 + 2 * n_c2w:]
 
         return (
             wav, codec_sum, full_codec, hidden, logits, updated_token_counts,
-            talker_present_kv, c2w_present_kv,
+            talker_new_kv, c2w_new_kv,
             *new_conv_transconv,
         )
 
@@ -178,7 +178,10 @@ def _export_talker_code2wav_fused_onnx(
     tokenizer_model = load_speech_tokenizer(tokenizer_path, device=device, dtype=torch.float32)
     decoder = tokenizer_model.decoder.to(device).eval()
     patch_decoder_transconv_for_trt(decoder)
-    code2wav = Code2WavStreamingWrapper(decoder).to(device).eval()
+    code2wav = Code2WavStreamingWrapper(
+        decoder,
+        emit_delta_kv=True,
+    ).to(device).eval()
 
     talker_fused, num_layers, hidden_size, num_kv_heads, head_dim = build_talker_unified_fused_module(
         model, device=device
@@ -287,7 +290,7 @@ def _export_talker_code2wav_fused_onnx(
     output_names = [
         "wav", "codec_sum", "full_codec", "hidden", "logits",
         "updated_token_counts",
-        "talker_present_kv", "c2w_present_kv",
+        "talker_new_kv", "c2w_new_kv",
     ]
     for i in range(NUM_CONV):
         output_names.append(f"c2w_new_conv_state_{i}")
@@ -313,8 +316,8 @@ def _export_talker_code2wav_fused_onnx(
         "hidden": {0: "batch", 1: "seq"},
         "logits": {0: "batch", 1: "seq"},
         "updated_token_counts": {0: "batch"},
-        "talker_present_kv": {0: "batch", 3: "S_total"},
-        "c2w_present_kv": {0: "batch", 3: "c2w_total_len"},
+        "talker_new_kv": {0: "batch", 3: "S_step"},
+        "c2w_new_kv": {0: "batch", 3: "chunk_t"},
     }
     for name in conv_transconv_names_cold:
         key = f"c2w_{name}"

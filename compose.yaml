@@ -13,7 +13,12 @@ services:
     working_dir: /app
     command: ["/bin/bash", "/app/scripts/compose/engine-entrypoint.sh"]
     environment:
-      MODEL_VARIANT: ${MODEL_VARIANT:-}
+      MODEL_VARIANT: ${MODEL_VARIANT:-custom-1.7b}
+      MODEL_ROOT: /models
+      EXPORTED_ROOT: /exported
+      TOKENIZER_DIR: ${ENGINE_TOKENIZER_DIR:-}
+      WEIGHTS_DIR: ${ENGINE_WEIGHTS_DIR:-}
+      ENGINE_RUNTIME_DIR: ${ENGINE_RUNTIME_DIR:-}
       ENGINE_DEVICE: ${ENGINE_DEVICE:-0}
       ENGINE_GRPC_PORT: ${ENGINE_GRPC_PORT:-50051}
       ENGINE_HEALTH_PORT: ${ENGINE_HEALTH_PORT:-8080}
@@ -25,19 +30,20 @@ services:
       - "${ENGINE_GRPC_PORT:-50051}:${ENGINE_GRPC_PORT:-50051}"
       - "${ENGINE_HEALTH_PORT:-8080}:${ENGINE_HEALTH_PORT:-8080}"
     volumes:
-      - ./workspace:/data:ro
+      - ${ENGINE_MODELS_DIR:-./workspace/models}:/models:ro
+      - ${ENGINE_EXPORTED_DIR:-./workspace/exported}:/exported:ro
     gpus: all
     shm_size: "4g"
     restart: unless-stopped
 
   triton:
     profiles: ["triton"]
-    image: ${TRITON_IMAGE:-qwen3-tts-triton:26.01}
+    image: ${TRITON_IMAGE:-qwen3-tts-triton:26.02}
     build:
       context: .
       dockerfile: Dockerfile.triton
       args:
-        BASE_IMAGE: ${TRITON_BASE_IMAGE:-nvcr.io/nvidia/tritonserver:26.01-py3}
+        BASE_IMAGE: ${TRITON_BASE_IMAGE:-nvcr.io/nvidia/tritonserver:26.02-py3}
         TENSORRT_PYTHON_VERSION: ${TRITON_TENSORRT_PYTHON_VERSION:-10.15.1.29}
     container_name: ${TRITON_CONTAINER_NAME:-qwen3-tts-triton}
     environment:

@@ -407,12 +407,12 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
     if packed_kv:
         parts.append("output [")
         parts.append(
-            f'  {{ name: "talker_present_kv"  data_type: {io_ft}  dims: [ -1, {nl * 2}, {kv}, -1, {hd} ] }}'
+            f'  {{ name: "talker_new_kv"  data_type: {io_ft}  dims: [ -1, {nl * 2}, {kv}, -1, {hd} ] }}'
         )
         parts.append("]")
         parts.append("output [")
         parts.append(
-            f'  {{ name: "c2w_present_kv"  data_type: {io_ft}  dims: [ -1, {n_c2w_layers * 2}, {c2w_kv_heads}, -1, {c2w_head_dim} ] }}'
+            f'  {{ name: "c2w_new_kv"  data_type: {io_ft}  dims: [ -1, {n_c2w_layers * 2}, {c2w_kv_heads}, -1, {c2w_head_dim} ] }}'
         )
         parts.append("]")
     else:

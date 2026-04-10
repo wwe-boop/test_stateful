@@ -300,6 +300,27 @@ class TritonPythonModel:
         cfg.spliter.ema_max_ratio = float(
             _param_string(params, "ratio_max", os.environ.get("RATIO_MAX", "10.0"))
         )
+        cfg.spliter.l1_split_cap_ratio = float(
+            _param_string(
+                params,
+                "l1_split_cap_ratio",
+                os.environ.get("L1_SPLIT_CAP_RATIO", str(cfg.spliter.l1_split_cap_ratio)),
+            )
+        )
+        cfg.spliter.l2_split_cap_ratio = float(
+            _param_string(
+                params,
+                "l2_split_cap_ratio",
+                os.environ.get("L2_SPLIT_CAP_RATIO", str(cfg.spliter.l2_split_cap_ratio)),
+            )
+        )
+        cfg.spliter.l3_split_cap_ratio = float(
+            _param_string(
+                params,
+                "l3_split_cap_ratio",
+                os.environ.get("L3_SPLIT_CAP_RATIO", str(cfg.spliter.l3_split_cap_ratio)),
+            )
+        )
         cfg.prefill.default_speaker = _param_string(
             params,
             "default_speaker",

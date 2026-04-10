@@ -68,6 +68,9 @@ class FrontendInterface:
         ema_min_ratio: float = 2.0,
         ema_max_ratio: float = 10.0,
         safety_margin: int = 8,
+        l1_split_cap_ratio: float = 0.70,
+        l2_split_cap_ratio: float = 0.80,
+        l3_split_cap_ratio: float = 0.90,
     ):
         self._dispatcher = Dispatcher(engine_inbox)
         self._tokenizer = tokenizer
@@ -81,6 +84,9 @@ class FrontendInterface:
         self._ema_min_ratio = ema_min_ratio
         self._ema_max_ratio = ema_max_ratio
         self._safety_margin = safety_margin
+        self._l1_split_cap_ratio = l1_split_cap_ratio
+        self._l2_split_cap_ratio = l2_split_cap_ratio
+        self._l3_split_cap_ratio = l3_split_cap_ratio
 
         self._sessions: Dict[str, Session] = {}
         self._consumer_tasks: Dict[str, asyncio.Task] = {}
@@ -129,6 +135,9 @@ class FrontendInterface:
             ema_min_ratio=self._ema_min_ratio,
             ema_max_ratio=self._ema_max_ratio,
             safety_margin=self._safety_margin,
+            l1_split_cap_ratio=self._l1_split_cap_ratio,
+            l2_split_cap_ratio=self._l2_split_cap_ratio,
+            l3_split_cap_ratio=self._l3_split_cap_ratio,
         )
         session.reorder = AudioReorder()
         session.event_callback = on_event

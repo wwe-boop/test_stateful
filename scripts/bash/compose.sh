@@ -14,7 +14,10 @@ REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 source "${SCRIPT_DIR}/tools.sh"
 
 COMPOSE_FILE="${REPO_ROOT}/compose.yaml"
+COMPOSE_DEV_FILE="${REPO_ROOT}/compose.dev.yaml"
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
+ENGINE_MODELS_DIR="${ENGINE_MODELS_DIR:-${REPO_ROOT}/workspace/models}"
+ENGINE_EXPORTED_DIR="${ENGINE_EXPORTED_DIR:-${REPO_ROOT}/workspace/exported}"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
 
 COMMAND=""
@@ -26,6 +29,7 @@ NO_HEALTH_CHECK=false
 FORCE_PREPARE=false
 FOLLOW=false
 BUILD_BEFORE_UP=false
+USE_DEV_OVERLAY=false
 IMAGE_OVERRIDE=""
 CONTAINER_OVERRIDE=""
 
@@ -70,6 +74,7 @@ Options:
   --max-sessions <N>     Engine max sessions
   --max-seq-len <N>      Optional engine scheduler max seq len override
   --build                Build before `up`
+  --dev                  Enable compose.dev.yaml source bind mounts
   --prepare              Force Triton repo assembly before `up`
   --no-health-check      Skip readiness wait after `up`
   --follow               Follow logs (for `logs`)
@@ -130,7 +135,12 @@ compose_cmd() {
             ;;
     esac
 
-    local cmd=(docker compose -f "$COMPOSE_FILE" "${profile_args[@]}")
+    local compose_files=(-f "$COMPOSE_FILE")
+    if $USE_DEV_OVERLAY && [[ -f "$COMPOSE_DEV_FILE" ]]; then
+        compose_files+=(-f "$COMPOSE_DEV_FILE")
+    fi
+
+    local cmd=(docker compose "${compose_files[@]}" "${profile_args[@]}")
     cmd+=("$@")
 
     if $DRY_RUN; then
@@ -146,6 +156,8 @@ compose_cmd() {
 export_compose_env() {
     export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-qwen3-tts}"
     export MODEL_VARIANT="$VARIANT"
+    export ENGINE_MODELS_DIR="$ENGINE_MODELS_DIR"
+    export ENGINE_EXPORTED_DIR="$ENGINE_EXPORTED_DIR"
     export TRITON_MODEL_REPO_DIR="$MODEL_REPO_DIR"
 
     export ENGINE_GRPC_PORT="$ENGINE_PORT"
@@ -343,6 +355,7 @@ while [[ $# -gt 0 ]]; do
         --max-sessions) ENGINE_MAX_SESSIONS="$2"; shift 2 ;;
         --max-seq-len) ENGINE_MAX_SEQ_LEN="$2"; shift 2 ;;
         --build) BUILD_BEFORE_UP=true; shift ;;
+        --dev) USE_DEV_OVERLAY=true; shift ;;
         --prepare) FORCE_PREPARE=true; shift ;;
         --no-health-check) NO_HEALTH_CHECK=true; shift ;;
         --follow) FOLLOW=true; shift ;;

@@ -4,9 +4,9 @@
 #
 # Order: RUN pip first (layer cached when deps unchanged), COPY engine/ last (code edits cheap).
 # BuildKit pip cache: DOCKER_BUILDKIT=1 (see build_triton_deploy_image in docker.sh).
-ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.01-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.02-py3
 ARG TENSORRT_PYTHON_VERSION=10.15.1.29
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS triton-deps
 ARG TENSORRT_PYTHON_VERSION
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -16,11 +16,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     torch \
     tokenizers \
+    pyyaml \
+    numpy \
+    grpcio \
     "tensorrt==${TENSORRT_PYTHON_VERSION}" \
     && python3 -c "\
-import torch, tokenizers, tensorrt; \
+import torch, tokenizers, tensorrt, yaml, grpc, numpy; \
 print(f'torch {torch.__version__}, CUDA {torch.version.cuda}'); \
 print(f'tokenizers {tokenizers.__version__}'); \
-print(f'tensorrt {tensorrt.__version__}')"
+print(f'tensorrt {tensorrt.__version__}'); \
+print(f'grpcio {grpc.__version__}, pyyaml {yaml.__version__}, numpy {numpy.__version__}')"
+
+FROM triton-deps AS triton-runtime
 
 COPY engine/ /opt/qwen3-tts/engine/

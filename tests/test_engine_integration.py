@@ -53,9 +53,14 @@ class TestSpliter:
         from engine.frontend.spliter.driver import compute_thresholds
 
         th = compute_thresholds(remaining_kv=500, ema_ratio=5.0)
-        assert th.a < th.b < th.c < th.d
-        assert th.a >= 1
-        assert th.d <= 500
+        assert (
+            th.min_tokens_l1
+            < th.min_tokens_l2
+            < th.min_tokens_l3
+            < th.force_split_at
+        )
+        assert th.min_tokens_l1 >= 1
+        assert th.force_split_at <= 500
 
     def test_pre_split_short_text(self):
         """Short text → single segment, no split."""
@@ -75,7 +80,7 @@ class TestSpliter:
         th = spliter._make_thresholds()
 
         tokens = []
-        for i in range(th.a + 5):
+        for i in range(th.min_tokens_l1 + 5):
             tokens.append((i, f"tok{i}"))
         tokens.append((999, "句号。"))
         tokens.append((1000, "后续"))
@@ -91,7 +96,7 @@ class TestSpliter:
         spliter = Spliter(engine_max_decode_len=100, ema_ratio=2.0)
         th = spliter._make_thresholds()
 
-        tokens = [(i, f"tok{i}") for i in range(th.d - 2)]
+        tokens = [(i, f"tok{i}") for i in range(th.force_split_at - 2)]
         tokens.append((900, "逗号，"))
         tokens.append((901, "后续甲"))
         tokens.append((902, "后续乙"))
@@ -109,7 +114,7 @@ class TestSpliter:
         spliter = Spliter(engine_max_decode_len=100, ema_ratio=2.0)
         th = spliter._make_thresholds()
 
-        tokens = [(i, f"tok{i}") for i in range(th.a + 2)]
+        tokens = [(i, f"tok{i}") for i in range(th.min_tokens_l1 + 2)]
         tokens.append((999, "。"))
 
         actions = spliter.feed_tokens(tokens)
@@ -127,7 +132,7 @@ class TestSpliter:
         th = spliter._make_thresholds()
 
         tokens = []
-        for i in range(th.a + 2):
+        for i in range(th.min_tokens_l1 + 2):
             tokens.append((i, f"tok{i}"))
         tokens.append((100, "。"))
         for i in range(5):
