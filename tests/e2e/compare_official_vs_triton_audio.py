@@ -56,10 +56,6 @@ logging.basicConfig(
 logger = logging.getLogger("compare_official_triton")
 
 
-def _non_streaming_for_variant(variant: str) -> bool:
-    return "design" in variant.lower()
-
-
 def _build_triton_request(
     variant: str,
     text: str,
@@ -81,6 +77,7 @@ def _build_triton_request(
             "task_type": "custom_voice",
             "language": language,
             "speaker": speaker,
+            "instruct": instruct,
         }
     raise ValueError(
         f"Variant '{variant}' not supported here (add voice_clone + ref_audio separately). "
@@ -199,7 +196,9 @@ def main():
         gen_kwargs["repetition_penalty"] = 1.0
         gen_kwargs["subtalker_dosample"] = False
 
-    non_streaming = _non_streaming_for_variant(args.variant)
+    # Keep the official path aligned with the engine/orchestrator streaming-text
+    # semantics for like-for-like listening on long-form cases.
+    non_streaming = "design" in args.variant.lower()
     with torch.no_grad():
         if "design" in args.variant.lower():
             wavs, sr = wrapper.generate_voice_design(
@@ -214,6 +213,7 @@ def main():
                 text=args.text,
                 speaker=args.speaker,
                 language=args.language,
+                instruct=args.instruct,
                 non_streaming_mode=non_streaming,
                 **gen_kwargs,
             )

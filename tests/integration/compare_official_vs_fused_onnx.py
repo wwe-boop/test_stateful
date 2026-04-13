@@ -572,6 +572,7 @@ def main():
                 text=args.text,
                 speaker=args.speaker,
                 language=args.language,
+                instruct=args.instruct,
                 non_streaming_mode=non_streaming,
                 **gen_kwargs,
             )
@@ -584,6 +585,13 @@ def main():
     input_ids = tok_out["input_ids"].to(device=device, dtype=torch.long)
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
+    instruct_ids = None
+    if args.instruct:
+        instruct_text = wrapper._build_instruct_text(args.instruct)
+        instruct_tok = processor(text=instruct_text, return_tensors="pt", padding=True)
+        instruct_ids = instruct_tok["input_ids"].to(device=device, dtype=torch.long)
+        if instruct_ids.dim() == 1:
+            instruct_ids = instruct_ids.unsqueeze(0)
 
     prefill_embeds, trailing_list = build_prefill_like_official(
         model,
@@ -591,6 +599,7 @@ def main():
         args.language,
         args.speaker or "",
         device,
+        instruct_ids=instruct_ids,
         non_streaming_mode=non_streaming,
     )
 

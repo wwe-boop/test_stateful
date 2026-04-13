@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,11 @@ from . import tts_pb2, tts_pb2_grpc
 
 if TYPE_CHECKING:
     from ..server import TTSEngine
+
+
+_GRPC_AUDIO_QUEUE_MAXSIZE = int(
+    os.environ.get("ENGINE_GRPC_AUDIO_QUEUE_MAXSIZE", "4096") or "4096"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +162,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
     async def SynthesizeOnce(self, request, context):
         """Handle unary full-text requests with streamed audio output."""
         session_id = None
-        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=_GRPC_AUDIO_QUEUE_MAXSIZE)
 
         try:
             config = _session_config_from_oneshot_request(request)
@@ -191,7 +197,7 @@ class TTSServicer(tts_pb2_grpc.TTSServiceServicer):
         - ``EndRequest`` / legacy ``TextComplete`` signals no more transport input.
         """
         session_id = None
-        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+        audio_queue: asyncio.Queue = asyncio.Queue(maxsize=_GRPC_AUDIO_QUEUE_MAXSIZE)
         request_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
         got_done = False
         got_cancel = False

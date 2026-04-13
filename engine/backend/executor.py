@@ -31,6 +31,7 @@ from .batch_helper import (
     padded_attention_bias,
     uniform_past_seq_lens,
 )
+from .debug_dump import EngineDebugDumper
 from .kv_cache_pool import KVCachePool, ModelConfig, SlotKVState
 
 logger = logging.getLogger(__name__)
@@ -243,6 +244,9 @@ class GPUFuture:
     _c2w_transconv_output_names: List[str] = field(default_factory=list)
     _codec_eos_id: int = 2150
     _used_pingpong: bool = False
+    _inputs: Dict[str, Any] = field(default_factory=dict)
+    _dump_meta: Dict[str, Any] = field(default_factory=dict)
+    _debug_dumper: Optional[EngineDebugDumper] = None
 
     def wait(self) -> StepOutput:
         """Synchronize GPU and extract results.
@@ -255,6 +259,14 @@ class GPUFuture:
 
         batch_size = len(self._slots)
         raw = self._raw
+
+        if self._debug_dumper is not None and self._dump_meta:
+            self._debug_dumper.dump_call(
+                metadata=self._dump_meta,
+                inputs=self._inputs,
+                outputs=raw,
+                inputs_snapshotted=True,
+            )
 
         wav = raw.get("wav")
         codec_sum = raw.get("codec_sum")
@@ -387,6 +399,11 @@ class Executor:
         self._c2w_transconv_input_names: list[str] = []
         self._c2w_transconv_output_names: list[str] = []
         self._manifest: dict = {}
+        self._debug_dumper = EngineDebugDumper(
+            engine_dir=self._engine_dir,
+            weights_dir=self._weights_dir,
+            device=self._device,
+        )
 
         logger.info(
             "Executor created (device=%s, max_batch=%d, max_seq=%d)",
@@ -599,6 +616,9 @@ class Executor:
         )
 
         out_names = self._build_output_names()
+        input_snapshot = None
+        if self._debug_dumper.enabled:
+            input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
 
         stream = self._compute_stream
         with torch.cuda.stream(stream):
@@ -607,6 +627,22 @@ class Executor:
             )
 
         stream.synchronize()
+
+        dump_meta = self._build_dump_metadata(
+            stage="prefill",
+            slots=[slot],
+            seq=seq,
+            use_dummy_kv=True,
+            original_past_lens=[slot.past_len],
+            padded_talker_past_len=int(inputs["talker_past_kv"].shape[3]),
+        )
+        if self._debug_dumper.enabled:
+            self._debug_dumper.dump_call(
+                metadata=dump_meta,
+                inputs=input_snapshot if input_snapshot is not None else inputs,
+                outputs=raw,
+                inputs_snapshotted=input_snapshot is not None,
+            )
 
         talker_kv = raw.get("talker_new_kv")
         if talker_kv is not None:
@@ -619,7 +655,7 @@ class Executor:
 
         c2w_kv = raw.get("c2w_new_kv")
         if c2w_kv is not None:
-            c2w_kv = c2w_kv.contiguous()
+            c2w_kv = c2w_kv.clone().contiguous()
             if self._kv_pool._preallocate:
                 self._kv_pool.scatter_prefill_c2w_kv(slot.slot_id, c2w_kv)
             slot.c2w_kv = c2w_kv
@@ -632,6 +668,136 @@ class Executor:
             "updated_token_counts",
             torch.zeros(1, self._config.codec_vocab_size,
                         device=self._device, dtype=torch.int64),
+        )
+        codec_sum = raw.get("codec_sum")
+        if codec_sum is not None:
+            slot.next_embed = codec_sum
+            slot.last_codec_sum = None
+
+        wav = raw.get("wav")
+        full_codec = raw.get("full_codec")
+        prefill_audio: Optional[bytes] = None
+        prefill_eos = False
+        if wav is not None:
+            prefill_audio = wav.cpu().float().reshape(-1).numpy().tobytes()
+        if full_codec is not None and int(full_codec[0, 0].item()) == self._codec_eos_id:
+            prefill_eos = True
+        return prefill_audio, prefill_eos
+
+    def prefill_from_prefix(
+        self,
+        slot: SlotKVState,
+        request_prefill_embeds: torch.Tensor,
+    ) -> tuple[Optional[bytes], bool]:
+        """Consume the cached-prefix suffix token and emit the first c2w frame."""
+        self._kv_pool.init_kv_tensors(slot)
+
+        if self._fused_engine is None:
+            slot.past_len += int(request_prefill_embeds.shape[1])
+            slot.c2w_conv_states = []
+            slot.c2w_transconv_states = []
+            slot.frame_idx = 1
+            return None, False
+
+        seq = int(request_prefill_embeds.shape[1])
+        if seq != 1:
+            raise ValueError(
+                f"prefill_from_prefix expects seq=1, got seq={seq}"
+            )
+
+        original_past_len = int(slot.past_len)
+        if self._kv_pool._preallocate:
+            batched_talker_kv = self._kv_pool.gather_talker_kv(
+                [slot.slot_id],
+                max(original_past_len, 1),
+            )
+        else:
+            if slot.talker_kv is None:
+                raise RuntimeError("Cached-prefix slot is missing talker_kv")
+            batched_talker_kv = slot.talker_kv.contiguous()
+        past_seq_lens = torch.tensor(
+            [original_past_len],
+            device=self._device,
+            dtype=torch.long,
+        )
+
+        inputs = self._build_fused_inputs(
+            input_embeds=request_prefill_embeds.to(self._config.dtype),
+            slots=[slot],
+            batched_talker_kv=batched_talker_kv,
+            past_seq_lens=past_seq_lens,
+            use_dummy_kv=False,
+        )
+
+        out_names = self._build_output_names()
+        input_snapshot = None
+        if self._debug_dumper.enabled:
+            input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
+
+        stream = self._compute_stream
+        with torch.cuda.stream(stream):
+            raw = self._fused_engine.infer(
+                inputs, out_names, stream,
+            )
+
+        stream.synchronize()
+
+        dump_meta = self._build_dump_metadata(
+            stage="prefill_from_prefix",
+            slots=[slot],
+            seq=seq,
+            use_dummy_kv=False,
+            original_past_lens=[original_past_len],
+            padded_talker_past_len=int(inputs["talker_past_kv"].shape[3]),
+        )
+        if self._debug_dumper.enabled:
+            self._debug_dumper.dump_call(
+                metadata=dump_meta,
+                inputs=input_snapshot if input_snapshot is not None else inputs,
+                outputs=raw,
+                inputs_snapshotted=input_snapshot is not None,
+            )
+
+        talker_kv = raw.get("talker_new_kv")
+        if talker_kv is not None:
+            talker_kv = talker_kv.contiguous()
+            if self._kv_pool._preallocate:
+                self._kv_pool.scatter_talker_kv_delta(
+                    [slot.slot_id],
+                    talker_kv,
+                    [original_past_len],
+                )
+            elif slot.talker_kv is None:
+                slot.talker_kv = talker_kv
+            else:
+                slot.talker_kv = torch.cat(
+                    [slot.talker_kv, talker_kv], dim=3
+                ).contiguous()
+        slot.past_len = original_past_len + seq
+
+        c2w_kv = raw.get("c2w_new_kv")
+        if c2w_kv is not None:
+            c2w_kv = c2w_kv.clone().contiguous()
+            if self._kv_pool._preallocate:
+                self._kv_pool.scatter_c2w_kv_delta(
+                    [slot.slot_id],
+                    c2w_kv,
+                    [0],
+                )
+            slot.c2w_kv = c2w_kv
+        slot.c2w_conv_states = [raw[n].clone() for n in self._c2w_conv_output_names]
+        slot.c2w_transconv_states = [raw[n].clone() for n in self._c2w_transconv_output_names]
+        slot.init_pingpong_buffers()
+
+        slot.frame_idx = 1
+        slot.token_counts = raw.get(
+            "updated_token_counts",
+            torch.zeros(
+                1,
+                self._config.codec_vocab_size,
+                device=self._device,
+                dtype=torch.int64,
+            ),
         )
         codec_sum = raw.get("codec_sum")
         if codec_sum is not None:
@@ -706,12 +872,27 @@ class Executor:
         # Build ping-pong output overrides: TRT writes directly into
         # each slot's write buffers, avoiding post-step clone/copy.
         output_overrides = self._build_pingpong_overrides(slots)
+        input_snapshot = {}
+        if self._debug_dumper.enabled and self._debug_dumper.should_dump(
+            s.session_id or "" for s in slots
+        ):
+            input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
 
         with torch.cuda.stream(self._compute_stream):
             raw = self._fused_engine.infer(
                 inputs, out_names, self._compute_stream,
                 output_overrides=output_overrides,
             )
+
+        dump_meta = self._build_dump_metadata(
+            stage="decode",
+            slots=slots,
+            seq=1,
+            use_dummy_kv=False,
+            original_past_lens=original_past_lens,
+            padded_talker_past_len=padded_past_len,
+            output_overrides=output_overrides,
+        )
 
         return GPUFuture(
             _compute_stream=self._compute_stream,
@@ -724,6 +905,9 @@ class Executor:
             _c2w_transconv_output_names=self._c2w_transconv_output_names,
             _codec_eos_id=self._codec_eos_id,
             _used_pingpong=output_overrides is not None,
+            _inputs=input_snapshot,
+            _dump_meta=dump_meta,
+            _debug_dumper=self._debug_dumper if self._debug_dumper.enabled else None,
         )
 
     def _build_pingpong_overrides(
@@ -957,6 +1141,58 @@ class Executor:
         names.extend(self._c2w_conv_output_names)
         names.extend(self._c2w_transconv_output_names)
         return names
+
+    def _build_dump_metadata(
+        self,
+        *,
+        stage: str,
+        slots: List[SlotKVState],
+        seq: int,
+        use_dummy_kv: bool,
+        original_past_lens: List[int],
+        padded_talker_past_len: int,
+        output_overrides: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "stage": stage,
+            "batch_size": len(slots),
+            "seq_len": seq,
+            "use_dummy_kv": use_dummy_kv,
+            "slot_ids": [int(s.slot_id) for s in slots],
+            "slot_session_ids": [s.session_id or "" for s in slots],
+            "slot_segment_indices": [int(s.segment_idx) for s in slots],
+            "slot_prefill_sources": [str(s.prefill_source or "") for s in slots],
+            "slot_past_len_before": [int(s.past_len) for s in slots],
+            "slot_frame_idx_before": [int(s.frame_idx) for s in slots],
+            "slot_text_idx_before": [int(s.text_idx) for s in slots],
+            "slot_trailing_len": [len(s.trailing) for s in slots],
+            "slot_has_next_embed": [s.next_embed is not None for s in slots],
+            "slot_has_last_codec_sum": [s.last_codec_sum is not None for s in slots],
+            "slot_c2w_len_before": [
+                int(s.c2w_kv.shape[3]) if s.c2w_kv is not None else 0
+                for s in slots
+            ],
+            "original_talker_past_lens": [int(v) for v in original_past_lens],
+            "padded_talker_past_len": int(padded_talker_past_len),
+            "c2w_conv_input_names": list(self._c2w_conv_input_names),
+            "c2w_conv_output_names": list(self._c2w_conv_output_names),
+            "c2w_transconv_input_names": list(self._c2w_transconv_input_names),
+            "c2w_transconv_output_names": list(self._c2w_transconv_output_names),
+            "output_override_names": sorted(output_overrides.keys()) if output_overrides else [],
+            "config": {
+                "num_layers": int(self._config.num_layers),
+                "kv_heads": int(self._config.kv_heads),
+                "head_dim": int(self._config.head_dim),
+                "hidden_size": int(self._config.hidden_size),
+                "codec_vocab_size": int(self._config.codec_vocab_size),
+                "codec_eos_id": int(self._codec_eos_id),
+                "logits_topk": int(self._config.logits_topk),
+                "n_c2w_layers": int(self._config.n_c2w_layers),
+                "c2w_kv_heads": int(self._config.c2w_kv_heads),
+                "c2w_head_dim": int(self._config.c2w_head_dim),
+                "c2w_sliding_window": int(self._config.c2w_sliding_window),
+            },
+        }
 
     # ------------------------------------------------------------------
     # Warmup

@@ -8,11 +8,20 @@ Supports both streaming (non_streaming_mode=False) and non-streaming
 Use when model has talker_config (e.g. loaded from HuggingFace TTS model dir).
 """
 
+from typing import Optional
+
 import torch
 
 
 def build_prefill_like_official(
-    model, input_id, language, speaker, device, *, non_streaming_mode=False
+    model,
+    input_id,
+    language,
+    speaker,
+    device,
+    *,
+    instruct_ids: Optional[torch.Tensor] = None,
+    non_streaming_mode=False,
 ):
     """
     Build talker prefill and trailing_text_hidden exactly like model.generate() L2086-2232.
@@ -21,6 +30,9 @@ def build_prefill_like_official(
     the prefill embedding; trailing_list contains only [tts_pad_embed].
     When non_streaming_mode=False (streaming): only the first text token is in prefill;
     remaining text tokens form trailing_list for step-wise injection during decode.
+
+    `instruct_ids` must already be wrapped in the official user template
+    (`<|im_start|>user ... <|im_end|>`), matching the high-level API path.
 
     Returns (talker_input_embed [1, S, H], trailing_list list[Tensor[1,1,H]]).
     """
@@ -110,6 +122,14 @@ def build_prefill_like_official(
         dim=1,
     ) + codec_input_emebdding[:, :-1]
     talker_input_embed = torch.cat((_talker_input_embed_role, _talker_input_embed), dim=1)
+    if instruct_ids is not None:
+        instruct_ids = instruct_ids.to(device=device, dtype=input_id.dtype)
+        if instruct_ids.dim() == 1:
+            instruct_ids = instruct_ids.unsqueeze(0)
+        instruct_embed = talker.text_projection(
+            talker.get_text_embeddings()(instruct_ids)
+        )
+        talker_input_embed = torch.cat((instruct_embed, talker_input_embed), dim=1)
 
     # Append first text token + codec_bos
     talker_input_embed = torch.cat(

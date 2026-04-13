@@ -158,8 +158,6 @@ def _seg_key(session_id: str, segment_idx: int) -> str:
 class EngineLoop:
     """GPU-owning engine thread with pipelined decode and priority scheduling."""
 
-    MAX_SLOTS_PER_SESSION = 2
-
     def __init__(
         self,
         engine_inbox: queue.Queue,
@@ -175,6 +173,7 @@ class EngineLoop:
         max_queue_size: int = 256,
         session_timeout_sec: float = 300.0,
         min_pad_steps: int = 4,
+        max_slots_per_session: int = 2,
     ):
         self._inbox = engine_inbox
         self._async_loop = async_loop
@@ -185,6 +184,7 @@ class EngineLoop:
         self._max_queue_size = max_queue_size
         self._session_timeout_sec = session_timeout_sec
         self._min_pad_steps = min_pad_steps
+        self._max_slots_per_session = max(1, int(max_slots_per_session))
 
         self._groups: Dict[str, EngineSessionGroup] = {}
         self._seg_by_slot: Dict[int, EngineSegment] = {}
@@ -448,7 +448,7 @@ class EngineLoop:
         best_group: Optional[EngineSessionGroup] = None
 
         for group in self._groups.values():
-            if group.active_slot_count >= self.MAX_SLOTS_PER_SESSION:
+            if group.active_slot_count >= self._max_slots_per_session:
                 continue
             for seg in group.segments.values():
                 if seg.state != "pending_prefill":
@@ -466,6 +466,7 @@ class EngineLoop:
         if slot is None:
             return False
         best.slot = slot
+        slot.segment_idx = int(best.segment_idx)
         self._seg_by_slot[slot.slot_id] = best
         self._mlfq.on_segment_created(best.mlfq_meta)
 
@@ -521,11 +522,18 @@ class EngineLoop:
                     slot, cached, req_embeds, trailing,
                 )
                 best.eos_trailing_added = best.input_complete
-                prefill_audio = None
-                prefill_eos = False
+                prefill_audio, prefill_eos = self._executor.prefill_from_prefix(
+                    slot, req_embeds,
+                )
+                if slot.next_embed is not None and slot.trailing:
+                    first_trail = slot.trailing[0].to(slot.next_embed.dtype)
+                    slot.next_embed = (
+                        slot.next_embed + first_trail
+                    ).to(torch.float32)
+                    slot.text_idx = 1
                 logger.info(
                     "Prefix cache hit: copied %d KV tokens for %s "
-                    "(slot=%d, %d text tokens embedded directly)",
+                    "(slot=%d, %d text tokens embedded directly, suffix prefill consumed)",
                     cached.prefix_len, best.session_id,
                     slot.slot_id, len(best.pending_token_ids),
                 )
@@ -551,6 +559,7 @@ class EngineLoop:
                     include_eos=best.input_complete,
                 )
                 best.prefill_plan = plan
+                slot.prefill_source = "full_prefill"
 
                 if plan.warnings:
                     for warning_msg in plan.warnings:
@@ -649,9 +658,10 @@ class EngineLoop:
         else:
             slot.talker_kv = cached.talker_kv.clone()
         slot.past_len = prefix_len
-        # Match Executor.prefill(): one fused forward has consumed the prefill
-        # chunk; frame_idx feeds cache_position for the vocoder on decode steps.
-        slot.frame_idx = 1
+        slot.prefill_source = "prefix_cache_suffix"
+        # This path has only restored talker prefix KV. The request-specific
+        # suffix token still needs one fused step to align with a real prefill.
+        slot.frame_idx = 0
 
         slot.c2w_kv = None
         slot.c2w_conv_states = self._executor.make_zero_conv_states()

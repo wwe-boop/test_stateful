@@ -294,6 +294,7 @@ def main():
         else:
             wavs_proto, sr = wrapper.generate_custom_voice(
                 text=args.text, speaker=speaker, language=language,
+                instruct=args.instruct,
                 non_streaming_mode=non_streaming, **gen_kwargs,
             )
     wav_proto = wavs_proto[0]
@@ -307,11 +308,19 @@ def main():
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
     logger.info("  input_ids shape: %s (official format)", input_ids.shape)
+    instruct_ids = None
+    if args.instruct:
+        instruct_text = wrapper._build_instruct_text(args.instruct)
+        instruct_tok = processor(text=instruct_text, return_tensors="pt", padding=True)
+        instruct_ids = instruct_tok["input_ids"].to(device=device, dtype=torch.long)
+        if instruct_ids.dim() == 1:
+            instruct_ids = instruct_ids.unsqueeze(0)
 
     # ---- (2) Manual PyTorch decode loop ----
     logger.info("(2) Manual PyTorch decode loop (non_streaming=%s) ...", non_streaming)
     prefill_embeds, trailing_list = build_prefill_like_official(
         model, input_ids, language, speaker, device,
+        instruct_ids=instruct_ids,
         non_streaming_mode=non_streaming,
     )
     tts_pad_token_id = getattr(model.config, "tts_pad_token_id", 0)

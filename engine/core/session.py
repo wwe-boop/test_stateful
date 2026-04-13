@@ -10,14 +10,19 @@ No GPU tensors, no torch imports.
 from __future__ import annotations
 
 import asyncio
-import time
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .types import EngineResult, SessionConfig, SessionState
 
 logger = logging.getLogger(__name__)
+
+_SESSION_RESULT_QUEUE_MAXSIZE = int(
+    os.environ.get("ENGINE_SESSION_RESULT_QUEUE_MAXSIZE", "4096") or "4096"
+)
 
 
 @dataclass
@@ -44,7 +49,7 @@ class Session:
 
     # Engine thread pushes EngineResult here; asyncio consumer reads them
     result_queue: asyncio.Queue[EngineResult] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=256)
+        default_factory=lambda: asyncio.Queue(maxsize=_SESSION_RESULT_QUEUE_MAXSIZE)
     )
 
     # Accumulated text that hasn't been tokenized yet (streaming buffer)

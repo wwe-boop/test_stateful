@@ -74,7 +74,9 @@ class SlotKVState:
     """
     slot_id: int
     session_id: Optional[str] = None
+    segment_idx: int = -1
     is_free: bool = True
+    prefill_source: str = ""
 
     # Talker KV: [1, num_layers*2, kv_heads, cur_len, head_dim]
     talker_kv: Optional[torch.Tensor] = None
@@ -250,7 +252,9 @@ class KVCachePool:
         slot_id = self._free_slots.pop()
         slot = self._slots[slot_id]
         slot.session_id = session_id
+        slot.segment_idx = -1
         slot.is_free = False
+        slot.prefill_source = ""
         slot.past_len = 0
         slot.frame_idx = 0
         slot.text_idx = 0
@@ -269,7 +273,9 @@ class KVCachePool:
         """Return a slot to the pool."""
         slot = self._slots[slot_id]
         slot.session_id = None
+        slot.segment_idx = -1
         slot.is_free = True
+        slot.prefill_source = ""
         slot.past_len = 0
         slot.frame_idx = 0
         slot.text_idx = 0

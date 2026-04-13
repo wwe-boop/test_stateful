@@ -75,10 +75,6 @@ logging.basicConfig(
 logger = logging.getLogger("full_chain_listen")
 
 
-def _non_streaming_for_variant(variant: str) -> bool:
-    return "design" in variant.lower()
-
-
 def _slug(s: str, max_len: int = 40) -> str:
     s = re.sub(r"\s+", "_", s.strip())
     s = re.sub(r"[^\w\u4e00-\u9fff_-]", "", s)
@@ -102,6 +98,7 @@ def _build_triton_request(
             "task_type": "custom_voice",
             "language": language,
             "speaker": speaker,
+            "instruct": instruct,
         }
     raise ValueError(
         f"Variant '{variant}' not supported (use custom-* or design-* for this script)."
@@ -271,7 +268,7 @@ def main() -> None:
         gen_kwargs["repetition_penalty"] = 1.0
         gen_kwargs["subtalker_dosample"] = False
 
-    non_streaming = _non_streaming_for_variant(args.variant)
+    non_streaming = "design" in args.variant.lower()
     with torch.no_grad():
         if "design" in args.variant.lower():
             wavs, sr = wrapper.generate_voice_design(
@@ -286,6 +283,7 @@ def main() -> None:
                 text=text,
                 speaker=args.speaker,
                 language=args.language,
+                instruct=args.instruct,
                 non_streaming_mode=non_streaming,
                 **gen_kwargs,
             )
@@ -298,6 +296,13 @@ def main() -> None:
     input_ids = tok_out["input_ids"].to(device=device, dtype=torch.long)
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
+    instruct_ids = None
+    if args.instruct:
+        instruct_text = wrapper._build_instruct_text(args.instruct)
+        instruct_tok = processor(text=instruct_text, return_tensors="pt", padding=True)
+        instruct_ids = instruct_tok["input_ids"].to(device=device, dtype=torch.long)
+        if instruct_ids.dim() == 1:
+            instruct_ids = instruct_ids.unsqueeze(0)
 
     prefill_embeds, trailing_list = build_prefill_like_official(
         model,
@@ -305,6 +310,7 @@ def main() -> None:
         args.language,
         args.speaker or "",
         device,
+        instruct_ids=instruct_ids,
         non_streaming_mode=non_streaming,
     )
 

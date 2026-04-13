@@ -197,6 +197,7 @@ class TTSEngine:
             max_queue_size=sched.max_queue_size,
             session_timeout_sec=sched.session_timeout_sec,
             min_pad_steps=sched.min_pad_steps,
+            max_slots_per_session=self._cfg.spliter.max_concurrent_segments,
         )
         self._engine_loop.start()
 

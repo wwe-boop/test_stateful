@@ -5,6 +5,7 @@ E2E test & benchmark for the standalone TTS engine (gRPC on port 50051).
 Tests the engine with:
   1. Single-request smoke test
   2. Streaming text input (init -> text chunks -> text_complete)
+  2b. CustomVoice + instruct (preset speaker + style instruction; skipped on 0.6b)
   3. Multi-session concurrent requests (1, 2, 4 sessions)
   4. Long text rollover (medium / very long / streaming long)
   5. BadCase tests (empty text, whitespace, invalid task_type, etc.)
@@ -17,6 +18,7 @@ Usage (CLI — generates WAV files):
     python tests/e2e/test_engine_standalone.py --host localhost --port 50051
     python tests/e2e/test_engine_standalone.py --concurrency 1,2,4,8
     python tests/e2e/test_engine_standalone.py --skip-concurrent --skip-badcase
+    python tests/e2e/test_engine_standalone.py --skip-custom-instruct
 
 Usage (pytest — auto-skip if engine not reachable):
     pytest tests/e2e/test_engine_standalone.py -v
@@ -134,6 +136,10 @@ LONG_TEXT = (
     "为人类创造更多的可能性。"
 )
 
+# CustomVoice optional instruct (style / emotion); not supported on 0.6b upstream.
+CUSTOM_VOICE_INSTRUCT_ZH = "用温柔、舒缓的语气朗读。"
+CUSTOM_VOICE_INSTRUCT_EN = "Speak in a calm and friendly tone."
+
 VERY_LONG_TEXT = (
     "在遥远的古代，人类就开始仰望星空，思考宇宙的奥秘。"
     "从古希腊的哲学家到中国的天文学家，人们不断探索着这个世界的本质。"
@@ -196,6 +202,7 @@ def _make_session_config(
     *,
     task_type: str,
     speaker: str = "",
+    instruct: str = "",
     input_mode=None,
     group_policy=None,
     sample_rate: int = SAMPLE_RATE,
@@ -210,6 +217,7 @@ def _make_session_config(
     return tts_pb2.SessionConfig(
         task_type=task_type,
         speaker=speaker,
+        instruct=instruct or "",
         input_mode=input_mode,
         group_policy=group_policy,
         audio=tts_pb2.AudioFormat(
@@ -269,11 +277,24 @@ def _get_capabilities(host: str, port: int) -> dict:
         channel.close()
 
 
+def _custom_voice_instruct_supported(host: str, port: int) -> bool:
+    """True when engine is custom_voice and not 0.6b (upstream disables instruct for 0.6b)."""
+    cap = _get_capabilities(host, port)
+    mtype = (cap.get("loaded_model_type") or "").strip()
+    if mtype != "custom_voice":
+        return False
+    v = (cap.get("variant") or "").lower()
+    if "0.6" in v or "0b6" in v:
+        return False
+    return True
+
+
 def _synthesize_oneshot(
     host: str, port: int,
     text: str,
     speaker: str = "Serena",
     task_type: str = "custom_voice",
+    instruct: str = "",
     session_id: str = "",
     timeout: float = 120.0,
 ) -> TTSResult:
@@ -298,6 +319,7 @@ def _synthesize_oneshot(
             config=_make_session_config(
                 task_type=task_type,
                 speaker=speaker,
+                instruct=instruct,
                 input_mode=tts_pb2.INPUT_MODE_FULL_TEXT,
             ),
         )
@@ -338,6 +360,7 @@ async def _synthesize_streaming(
     init_speaker: str,
     init_task_type: str,
     text_chunks: list[str],
+    init_instruct: str = "",
     input_mode=tts_pb2.INPUT_MODE_LONG_SEGMENT,
     chunk_delay_ms: float = 50.0,
     session_id: str = "",
@@ -367,6 +390,7 @@ async def _synthesize_streaming(
                 config=_make_session_config(
                     task_type=init_task_type,
                     speaker=init_speaker,
+                    instruct=init_instruct,
                     input_mode=input_mode,
                 ),
             )
@@ -575,6 +599,68 @@ def test_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
         print(f"  Saved: {out_path}")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Test 2b: CustomVoice + instruct (optional style control)
+# ---------------------------------------------------------------------------
+
+def test_custom_voice_instruct(host: str, port: int, output_dir: Path) -> list[TTSResult]:
+    print("\n" + "=" * 60)
+    print("  Test 2b: CustomVoice + Instruct")
+    print("=" * 60)
+
+    if not _custom_voice_instruct_supported(host, port):
+        cap = _get_capabilities(host, port)
+        print(
+            "  SKIPPED: need loaded_model_type=custom_voice and non-0.6b variant "
+            f"(got type={cap.get('loaded_model_type')!r} variant={cap.get('variant')!r})"
+        )
+        return []
+
+    results: list[TTSResult] = []
+
+    print("\n  --- 2b-1: SynthesizeOnce with instruct (ZH) ---")
+    r1 = _synthesize_oneshot(
+        host,
+        port,
+        text="你好，这是带指令的预置音色测试。",
+        speaker="Serena",
+        instruct=CUSTOM_VOICE_INSTRUCT_ZH,
+        session_id="custom-instruct-oneshot",
+    )
+    _print_result(r1, "instruct-oneshot")
+    if r1.audio is not None and r1.audio.size > 0:
+        out_path = str(output_dir / "test2b_custom_instruct_oneshot.wav")
+        _save_wav(r1.audio, out_path)
+        print(f"  Saved: {out_path}")
+    results.append(r1)
+
+    print("\n  --- 2b-2: Streaming with instruct (EN instruct + EN text) ---")
+    r2 = asyncio.run(
+        _synthesize_streaming(
+            host,
+            port,
+            init_speaker="Serena",
+            init_task_type="custom_voice",
+            init_instruct=CUSTOM_VOICE_INSTRUCT_EN,
+            input_mode=tts_pb2.INPUT_MODE_CLAUSE,
+            text_chunks=[
+                "Hello, this is a streaming test ",
+                "with instruct for preset voice.",
+            ],
+            chunk_delay_ms=150,
+            session_id="custom-instruct-stream",
+        )
+    )
+    _print_result(r2, "instruct-stream")
+    if r2.audio is not None and r2.audio.size > 0:
+        out_path = str(output_dir / "test2b_custom_instruct_stream.wav")
+        _save_wav(r2.audio, out_path)
+        print(f"  Saved: {out_path}")
+    results.append(r2)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +878,7 @@ def test_long_text(host: str, port: int, output_dir: Path) -> list[TTSResult]:
         r4 = _synthesize_oneshot(host, port,
             text=story_text, speaker="Serena", session_id="longtext-story",
             timeout=600,
+            instruct=CUSTOM_VOICE_INSTRUCT_ZH,
         )
         _print_result(r4, "story")
         if r4.audio is not None and r4.audio.size > 0:
@@ -1023,6 +1110,43 @@ class TestEngineSmokeAndStreaming:
         assert r.total_samples >= SAMPLE_RATE * 0.1
 
 
+class TestEngineCustomVoiceInstruct:
+    """CustomVoice + instruct (skipped for non-custom_voice or 0.6b)."""
+
+    def test_custom_instruct_oneshot(self, engine_addr):
+        host, port = engine_addr
+        if not _custom_voice_instruct_supported(host, port):
+            pytest.skip("custom instruct needs custom_voice 1.7b+ (not 0.6b)")
+        r = _synthesize_oneshot(
+            host,
+            port,
+            text="你好，带风格指令的测试。",
+            speaker="Serena",
+            instruct=CUSTOM_VOICE_INSTRUCT_ZH,
+        )
+        assert r.error is None, f"Synthesis failed: {r.error}"
+        assert r.total_samples >= SAMPLE_RATE * 0.1
+
+    def test_custom_instruct_streaming(self, engine_addr):
+        host, port = engine_addr
+        if not _custom_voice_instruct_supported(host, port):
+            pytest.skip("custom instruct needs custom_voice 1.7b+ (not 0.6b)")
+        r = asyncio.run(
+            _synthesize_streaming(
+                host,
+                port,
+                init_speaker="Ethan",
+                init_task_type="custom_voice",
+                init_instruct=CUSTOM_VOICE_INSTRUCT_EN,
+                input_mode=tts_pb2.INPUT_MODE_CLAUSE,
+                text_chunks=["Hello, ", "instruct streaming test."],
+                chunk_delay_ms=80,
+            )
+        )
+        assert r.error is None, f"Streaming failed: {r.error}"
+        assert r.total_samples >= SAMPLE_RATE * 0.1
+
+
 class TestEngineLongText:
     """Long text rollover tests."""
 
@@ -1091,6 +1215,11 @@ def main():
     parser.add_argument("--output-dir", default=str(OUTPUT_DIR),
                         help="Output directory for WAV files")
     parser.add_argument("--skip-streaming", action="store_true")
+    parser.add_argument(
+        "--skip-custom-instruct",
+        action="store_true",
+        help="Skip CustomVoice + instruct tests (2b)",
+    )
     parser.add_argument("--skip-single", action="store_true")
     parser.add_argument("--skip-concurrent", action="store_true")
     parser.add_argument("--skip-long", action="store_true")
@@ -1143,6 +1272,12 @@ def main():
     if not args.skip_streaming:
         r = test_streaming_text(args.host, args.port, output_dir)
         all_results["streaming"] = [r]
+
+    # Test 2b: CustomVoice + instruct
+    if not args.skip_custom_instruct:
+        instruct_results = test_custom_voice_instruct(args.host, args.port, output_dir)
+        if instruct_results:
+            all_results["custom_instruct"] = instruct_results
 
     # Test 3: Concurrent
     if not args.skip_concurrent:
