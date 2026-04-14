@@ -110,6 +110,7 @@ class TalkerCode2WavFusedONNX(nn.Module):
         attention_bias: torch.Tensor,
         token_counts: torch.Tensor,
         gumbel_noise: torch.Tensor,
+        cp_gumbel_noise: torch.Tensor,
         temperature: torch.Tensor,
         penalty: torch.Tensor,
         cache_position: torch.Tensor,
@@ -131,7 +132,7 @@ class TalkerCode2WavFusedONNX(nn.Module):
 
         codec_sum, full_codec, hidden, logits, updated_token_counts, *present_kv = (
             self.talker_fused(
-                input_embeds, position_ids, token_counts, gumbel_noise,
+                input_embeds, position_ids, token_counts, gumbel_noise, cp_gumbel_noise,
                 temperature, penalty, attention_bias, *past_kv,
             )
         )
@@ -187,6 +188,7 @@ def _export_talker_code2wav_fused_onnx(
         model, device=device
     )
     vocab_size = model.talker.model.config.vocab_size
+    cp_num_stages = talker_fused.cp.num_stages
     n_c2w = num_code2wav_hidden_layers(decoder)
 
     c2w_cfg = decoder.config
@@ -206,6 +208,9 @@ def _export_talker_code2wav_fused_onnx(
 
     dummy_token_counts = torch.zeros(B, vocab_size, device=device, dtype=torch.int64)
     dummy_gumbel_noise = torch.zeros(B, LOGITS_TOPK, device=device, dtype=torch.float32)
+    dummy_cp_gumbel_noise = torch.zeros(
+        B, cp_num_stages, LOGITS_TOPK, device=device, dtype=torch.float32,
+    )
     dummy_temperature = torch.ones(B, 1, device=device, dtype=torch.float32)
     dummy_penalty = torch.full((B, 1), 1.05, device=device, dtype=torch.float32)
 
@@ -258,6 +263,7 @@ def _export_talker_code2wav_fused_onnx(
         attention_bias,
         dummy_token_counts,
         dummy_gumbel_noise,
+        dummy_cp_gumbel_noise,
         dummy_temperature,
         dummy_penalty,
         cache_position,
@@ -277,6 +283,7 @@ def _export_talker_code2wav_fused_onnx(
         "attention_bias",
         "token_counts",
         "gumbel_noise",
+        "cp_gumbel_noise",
         "temperature",
         "penalty",
         "cache_position",
@@ -304,6 +311,7 @@ def _export_talker_code2wav_fused_onnx(
         "attention_bias": {0: "batch", 2: "seq", 3: "key_total"},
         "token_counts": {0: "batch"},
         "gumbel_noise": {0: "batch"},
+        "cp_gumbel_noise": {0: "batch"},
         "temperature": {0: "batch"},
         "penalty": {0: "batch"},
         "cache_position": {0: "batch", 1: "chunk_t"},
@@ -362,6 +370,7 @@ def _export_talker_code2wav_fused_onnx(
         "c2w_head_dim": c2w_head_dim,
         "c2w_sliding_window": c2w_sliding_window,
         "logits_topk": LOGITS_TOPK,
+        "cp_num_stages": cp_num_stages,
     }
 
     weights_cfg_path = output_dir / "weights" / "config.json"
@@ -409,6 +418,7 @@ def _export_talker_code2wav_fused_onnx(
     cpu_bias2[0, :, :, :2] = -1.0e4
     cpu_tc2 = torch.zeros(B2, vocab_size, dtype=torch.int64)
     cpu_gn2 = torch.zeros(B2, LOGITS_TOPK, dtype=torch.float32)
+    cpu_cp_gn2 = torch.zeros(B2, cp_num_stages, LOGITS_TOPK, dtype=torch.float32)
     cpu_temp2 = torch.ones(B2, 1, dtype=torch.float32)
     cpu_pen2 = torch.full((B2, 1), 1.05, dtype=torch.float32)
     cpu_cache2 = torch.zeros(B2, FUSED_CHUNK_T, dtype=torch.float32)
@@ -436,7 +446,7 @@ def _export_talker_code2wav_fused_onnx(
             )
 
     cpu_inputs_2 = (
-        cpu_embeds2, cpu_pos2, cpu_bias2, cpu_tc2, cpu_gn2, cpu_temp2, cpu_pen2,
+        cpu_embeds2, cpu_pos2, cpu_bias2, cpu_tc2, cpu_gn2, cpu_cp_gn2, cpu_temp2, cpu_pen2,
         cpu_cache2, cpu_c2w_bias2, talker_kv2, c2w_kv2,
         *conv_transconv_tensors2,
     )

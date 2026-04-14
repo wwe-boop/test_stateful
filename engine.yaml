@@ -44,7 +44,7 @@ prefix_cache:
   max_prefix_len: 512        # max token length for a cached prefix
 
 spliter:
-  ema_ratio_initial: 4.0
+  ema_ratio_initial: 6.0
   ema_alpha: 0.1
   ema_overflow_alpha: 0.5
   max_concurrent_segments: 2

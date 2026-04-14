@@ -104,6 +104,7 @@ class TestModelManifest:
                 "head_dim": 128,
                 "codec_vocab_size": 3072,
                 "logits_topk": 50,
+                "cp_num_stages": 15,
             },
         }
         manifest_file = tmp_path / "triton_manifest.json"
@@ -114,6 +115,7 @@ class TestModelManifest:
         assert arch.hidden_size == 2048
         assert arch.head_dim == 128
         assert arch.codec_vocab_size == 3072
+        assert arch.cp_num_stages == 15
 
     def test_legacy_manifest_compat(self, tmp_path):
         """v1 manifest without architecture section still works."""
@@ -170,6 +172,7 @@ class TestToModelConfig:
         mc = to_model_config(arch, cfg)
         assert mc.num_layers == arch.num_layers
         assert mc.kv_heads == arch.kv_heads
+        assert mc.cp_num_stages == arch.cp_num_stages
         assert mc.c2w_sliding_window == arch.c2w_sliding_window
         assert mc.max_seq_len == cfg.scheduler.max_seq_len
 

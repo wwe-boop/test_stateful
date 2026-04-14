@@ -42,7 +42,7 @@ def main() -> None:
     parser.add_argument("--case", choices=["4a", "story"], required=True)
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=50051)
-    parser.add_argument("--speaker", default="Serena")
+    parser.add_argument("--speaker", default="Vivian")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--timeout", type=float, default=None)

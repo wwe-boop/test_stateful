@@ -54,13 +54,14 @@ VOCAB_SIZE = 3072
 C2W_KV_HEADS = 16
 C2W_HEAD_DIM = 64
 C2W_SLIDING_WINDOW = 72
+CP_NUM_STAGES = 15
 
 
 def main():
     if len(sys.argv) < 6:
         print(
             "Usage: trt_fused_talk_c2w_profiles.py H KV_HEADS HEAD_DIM NUM_LAYERS MAX_BATCH "
-            "[MAX_INPUT_LEN] [MAX_SEQ_LEN] [NUM_C2W_DECODER_LAYERS]",
+            "[MAX_INPUT_LEN] [MAX_SEQ_LEN] [NUM_C2W_DECODER_LAYERS] [CP_NUM_STAGES]",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -68,6 +69,7 @@ def main():
     max_in = sys.argv[6] if len(sys.argv) > 6 else "128"
     max_seq = sys.argv[7] if len(sys.argv) > 7 else "512"
     n_c2w = int(sys.argv[8]) if len(sys.argv) > 8 else 8
+    n_cp = int(sys.argv[9]) if len(sys.argv) > 9 else CP_NUM_STAGES
     nl = int(NL)
     Bopt = "1"
     opt_spast = "128"
@@ -83,6 +85,7 @@ def main():
         "attention_bias:1x1x1x1",
         f"token_counts:1x{V}",
         f"gumbel_noise:1x{K}",
+        f"cp_gumbel_noise:1x{n_cp}x{K}",
         "temperature:1x1",
         "penalty:1x1",
         "cache_position:1x1",
@@ -96,6 +99,7 @@ def main():
         f"attention_bias:{Bopt}x1x1x{int(opt_spast) + 1}",
         f"token_counts:{Bopt}x{V}",
         f"gumbel_noise:{Bopt}x{K}",
+        f"cp_gumbel_noise:{Bopt}x{n_cp}x{K}",
         f"temperature:{Bopt}x1",
         f"penalty:{Bopt}x1",
         f"cache_position:{Bopt}x1",
@@ -109,6 +113,7 @@ def main():
         f"attention_bias:{Bmax}x1x{max_in}x{int(max_seq) + int(max_in)}",
         f"token_counts:{Bmax}x{V}",
         f"gumbel_noise:{Bmax}x{K}",
+        f"cp_gumbel_noise:{Bmax}x{n_cp}x{K}",
         f"temperature:{Bmax}x1",
         f"penalty:{Bmax}x1",
         f"cache_position:{Bmax}x1",

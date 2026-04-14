@@ -69,7 +69,8 @@
         "c2w_kv_heads": { "type": "integer" },
         "c2w_head_dim": { "type": "integer" },
         "c2w_sliding_window": { "type": "integer" },
-        "logits_topk": { "type": "integer" }
+        "logits_topk": { "type": "integer" },
+        "cp_num_stages": { "type": "integer" }
       }
     },
     "orchestrator": {

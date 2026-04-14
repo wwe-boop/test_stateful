@@ -22,7 +22,7 @@ export ENGINE_DUMP_TEXT="${ENGINE_DUMP_TEXT:-1}"
 export ENGINE_DUMP_SUMMARY="${ENGINE_DUMP_SUMMARY:-1}"
 export ENGINE_DUMP_INCLUDE_WAV="${ENGINE_DUMP_INCLUDE_WAV:-0}"
 export ENGINE_DUMP_TEXT_MAX_ELEMENTS="${ENGINE_DUMP_TEXT_MAX_ELEMENTS:-0}"
-export ENGINE_DUMP_INPUT_KEYS="${ENGINE_DUMP_INPUT_KEYS:-input_embeds,position_ids,token_counts,gumbel_noise,temperature,penalty,attention_bias,talker_past_kv,cache_position,c2w_attention_bias,c2w_past_kv,c2w_conv_state_*,c2w_transconv_overlap_*}"
+export ENGINE_DUMP_INPUT_KEYS="${ENGINE_DUMP_INPUT_KEYS:-input_embeds,position_ids,token_counts,gumbel_noise,cp_gumbel_noise,temperature,penalty,attention_bias,talker_past_kv,cache_position,c2w_attention_bias,c2w_past_kv,c2w_conv_state_*,c2w_transconv_overlap_*}"
 export ENGINE_DUMP_OUTPUT_KEYS="${ENGINE_DUMP_OUTPUT_KEYS:-full_codec,codec_sum,updated_token_counts,talker_new_kv,c2w_new_kv,c2w_new_conv_state_*,c2w_new_transconv_overlap_*}"
 export ENGINE_DUMP_EXCLUDE_KEYS="${ENGINE_DUMP_EXCLUDE_KEYS:-hidden,logits,wav}"
 

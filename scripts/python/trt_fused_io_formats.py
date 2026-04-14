@@ -66,7 +66,8 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
 
     Packed KV layout:
         Inputs:  input_embeds, position_ids(i64), attention_bias,
-                 token_counts(i64), gumbel_noise(fp32), temperature(fp32), penalty(fp32),
+                 token_counts(i64), gumbel_noise(fp32), cp_gumbel_noise(fp32),
+                 temperature(fp32), penalty(fp32),
                  cache_position(fp32), c2w_attention_bias,
                  talker_past_kv, c2w_past_kv,
                  c2w_conv_state_* (17), c2w_transconv_overlap_* (4)
@@ -91,6 +92,7 @@ def fused_input_output_io_format_strings(manifest: Dict[str, Any]) -> Tuple[str,
         fp_spec,        # attention_bias
         i64,            # token_counts
         "fp32:chw",     # gumbel_noise
+        "fp32:chw",     # cp_gumbel_noise
         "fp32:chw",     # temperature
         "fp32:chw",     # penalty
         "fp32:chw",     # cache_position

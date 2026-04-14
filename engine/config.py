@@ -50,6 +50,7 @@ class ModelArchConfig:
     head_dim: int = 128
     codec_vocab_size: int = 3072
     logits_topk: int = 50
+    cp_num_stages: int = 15
     n_c2w_layers: int = 8
     c2w_kv_heads: int = 16
     c2w_head_dim: int = 64
@@ -431,6 +432,7 @@ def to_model_config(arch: ModelArchConfig, cfg: EngineConfig):
         dtype=torch_dtype(arch.dtype),
         codec_vocab_size=arch.codec_vocab_size,
         logits_topk=arch.logits_topk,
+        cp_num_stages=arch.cp_num_stages,
         n_c2w_layers=arch.n_c2w_layers,
         c2w_kv_heads=arch.c2w_kv_heads,
         c2w_head_dim=arch.c2w_head_dim,

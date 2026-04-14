@@ -170,7 +170,8 @@
     "c2w_kv_heads": 16,
     "c2w_head_dim": 64,
     "c2w_sliding_window": 72,
-    "logits_topk": 50
+    "logits_topk": 50,
+    "cp_num_stages": 15
   },
   "orchestrator": {
     "tts_model_type": "custom_voice",
@@ -188,6 +189,7 @@
     "head_dim": 128,
     "codec_vocab_size": 3072,
     "logits_topk": 50,
+    "cp_num_stages": 15,
     "n_c2w_layers": 8,
     "c2w_kv_heads": 16,
     "c2w_head_dim": 64,

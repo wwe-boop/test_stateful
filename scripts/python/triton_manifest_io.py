@@ -115,6 +115,7 @@ def build_manifest_for_export(
         "head_dim": talker["head_dim"],
         "codec_vocab_size": talker["vocab_size"],
         "logits_topk": code2wav_layout.get("logits_topk", 50),
+        "cp_num_stages": code2wav_layout.get("cp_num_stages", 15),
         "n_c2w_layers": code2wav_layout["num_code2wav_hidden_layers"],
         "c2w_kv_heads": code2wav_layout.get("c2w_kv_heads", 16),
         "c2w_head_dim": code2wav_layout.get("c2w_head_dim", 64),
@@ -148,6 +149,7 @@ def build_manifest_for_export(
             "c2w_head_dim": int(code2wav_layout.get("c2w_head_dim", 64)),
             "c2w_sliding_window": int(code2wav_layout.get("c2w_sliding_window", 72)),
             "logits_topk": int(code2wav_layout.get("logits_topk", 50)),
+            "cp_num_stages": int(code2wav_layout.get("cp_num_stages", 15)),
         },
         "orchestrator": orch,
     }

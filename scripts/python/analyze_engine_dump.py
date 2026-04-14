@@ -156,6 +156,15 @@ def _build_talker_reference(
     }
     talker_past = inputs["talker_past_kv"]
     past_kv = [talker_past[:, i, :, :, :] for i in range(num_layers * 2)]
+    cp_gumbel = inputs.get("cp_gumbel_noise")
+    if cp_gumbel is None:
+        cp_gumbel = torch.zeros(
+            inputs["input_embeds"].shape[0],
+            fused.cp.num_stages,
+            inputs["gumbel_noise"].shape[-1],
+            device=inputs["gumbel_noise"].device,
+            dtype=inputs["gumbel_noise"].dtype,
+        )
 
     with torch.no_grad():
         ref = fused(
@@ -163,6 +172,7 @@ def _build_talker_reference(
             inputs["position_ids"],
             inputs["token_counts"],
             inputs["gumbel_noise"],
+            cp_gumbel,
             inputs["temperature"],
             inputs["penalty"],
             inputs["attention_bias"],

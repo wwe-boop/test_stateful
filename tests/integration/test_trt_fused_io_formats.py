@@ -39,20 +39,22 @@ def test_fused_io_format_counts_and_int_positions():
     out_parts = out.split(",")
     n_c2w_in = len(m["code2wav_fused"]["c2w_state_input_names"])
     n_c2w_out = len(m["code2wav_fused"]["c2w_state_output_names"])
-    assert len(in_parts) == 11 + n_c2w_in
+    assert len(in_parts) == 12 + n_c2w_in
     assert len(out_parts) == 8 + n_c2w_out
     # input_embeds, position_ids, attention_bias,
-    # token_counts(i64), gumbel_noise(fp32), temperature(fp32), penalty(fp32),
+    # token_counts(i64), gumbel_noise(fp32), cp_gumbel_noise(fp32),
+    # temperature(fp32), penalty(fp32),
     # cache_position(fp32), c2w_attention_bias
     assert in_parts[0] == "bf16:chw"    # input_embeds
     assert in_parts[1] == "int64:chw"   # position_ids
     assert in_parts[2] == "bf16:chw"    # attention_bias
     assert in_parts[3] == "int64:chw"   # token_counts
     assert in_parts[4] == "fp32:chw"    # gumbel_noise
-    assert in_parts[5] == "fp32:chw"    # temperature
-    assert in_parts[6] == "fp32:chw"    # penalty
-    assert in_parts[7] == "fp32:chw"    # cache_position
-    assert in_parts[8] == "bf16:chw"    # c2w_attention_bias
+    assert in_parts[5] == "fp32:chw"    # cp_gumbel_noise
+    assert in_parts[6] == "fp32:chw"    # temperature
+    assert in_parts[7] == "fp32:chw"    # penalty
+    assert in_parts[8] == "fp32:chw"    # cache_position
+    assert in_parts[9] == "bf16:chw"    # c2w_attention_bias
     # outputs: wav, codec_sum, full_codec(i64), hidden, logits, updated_token_counts(i64)
     assert out_parts[0] == "bf16:chw"   # wav
     assert out_parts[1] == "bf16:chw"   # codec_sum
@@ -66,7 +68,7 @@ def test_fused_io_fp32_float_tokens():
     m = _load_fixture()
     m["triton_io_float_dtype"] = "fp32"
     inp, out = fused_input_output_io_format_strings(m)
-    assert inp.startswith("fp32:chw,int64:chw,fp32:chw,int64:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,")
+    assert inp.startswith("fp32:chw,int64:chw,fp32:chw,int64:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,fp32:chw,")
     assert "fp32:chw" in out.split(",")[0]
 
 

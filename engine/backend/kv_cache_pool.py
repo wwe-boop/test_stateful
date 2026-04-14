@@ -45,6 +45,7 @@ class ModelConfig:
     dtype: torch.dtype = torch.bfloat16
     codec_vocab_size: int = 3072
     logits_topk: int = 50
+    cp_num_stages: int = 15
 
     # Code2Wav
     n_c2w_layers: int = 8

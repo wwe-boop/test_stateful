@@ -861,7 +861,7 @@ class CodePredictorUnrolled(nn.Module):
     See architecture.md §5.4 for design rationale.
     """
 
-    def __init__(self, code_predictor, talker_codec_embedding):
+    def __init__(self, code_predictor, talker_codec_embedding, logits_topk: int = 50):
         super().__init__()
         self.transformer_layers = code_predictor.model.layers
         self.norm = code_predictor.model.norm
@@ -874,6 +874,7 @@ class CodePredictorUnrolled(nn.Module):
 
         self.num_stages = len(self.lm_heads)
         self.hidden_size = code_predictor.config.hidden_size
+        self.logits_topk = int(logits_topk)
 
     def _transformer_forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, D = x.shape
@@ -904,11 +905,36 @@ class CodePredictorUnrolled(nn.Module):
 
         return self.norm(hidden)
 
-    def forward(self, past_hidden: torch.Tensor, codec_token_0: torch.Tensor) -> torch.Tensor:
+    def _select_token(
+        self,
+        logits: torch.Tensor,
+        *,
+        temperature: Optional[torch.Tensor] = None,
+        gumbel_noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if gumbel_noise is None:
+            return logits.argmax(dim=-1).squeeze(-1)
+
+        stage_logits = logits.squeeze(1)
+        topk_k = min(self.logits_topk, int(stage_logits.shape[-1]))
+        topk_vals, topk_idx = stage_logits.topk(topk_k, dim=-1)
+        scores = topk_vals / temperature
+        selected = (scores + gumbel_noise[:, :topk_k]).argmax(dim=-1)
+        return topk_idx.gather(1, selected.unsqueeze(1)).squeeze(1)
+
+    def forward(
+        self,
+        past_hidden: torch.Tensor,
+        codec_token_0: torch.Tensor,
+        cp_gumbel_noise: Optional[torch.Tensor] = None,
+        temperature: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             past_hidden:   [B, 1, talker_hidden_size] - last hidden from Talker
             codec_token_0: [B] - first codec token (sampled from Talker logits)
+            cp_gumbel_noise: [B, num_stages, logits_topk] - per-stage Gumbel noise for CP sampling
+            temperature:    [B, 1] - shared temperature for talker/CP sampling
         Returns:
             codec_tokens:  [B, num_stages] - predicted codec tokens for codebooks 1..num_code_groups-1
         """
@@ -919,7 +945,14 @@ class CodePredictorUnrolled(nn.Module):
         for stage in range(self.num_stages):
             hidden = self._transformer_forward(sequence)
             logits = self.lm_heads[stage](hidden[:, -1:, :])
-            token = logits.argmax(dim=-1).squeeze(-1)
+            stage_noise = None
+            if cp_gumbel_noise is not None:
+                stage_noise = cp_gumbel_noise[:, stage, :]
+            token = self._select_token(
+                logits,
+                temperature=temperature,
+                gumbel_noise=stage_noise,
+            )
             output_tokens.append(token)
 
             if stage < self.num_stages - 1:

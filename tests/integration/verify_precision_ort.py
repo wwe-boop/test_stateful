@@ -129,6 +129,11 @@ def main():
     feed = {
         "input_embeds": inputs_embeds,
         "position_ids": position_ids_prefill,
+        "token_counts": np.zeros((B, 3072), dtype=np.float32),
+        "gumbel_noise": np.zeros((B, 50), dtype=np.float32),
+        "cp_gumbel_noise": np.zeros((B, 15, 50), dtype=np.float32),
+        "temperature": np.zeros((B, 1), dtype=np.float32),
+        "penalty": np.ones((B, 1), dtype=np.float32),
     }
     for i in range(num_layers):
         feed[f"past_kv_{i}_k"] = np.zeros(
@@ -192,6 +197,11 @@ def main():
         dec_feed = {
             "input_embeds": current_codec_sum,
             "position_ids": pos_step,
+            "token_counts": np.zeros((B, 3072), dtype=np.float32),
+            "gumbel_noise": np.zeros((B, 50), dtype=np.float32),
+            "cp_gumbel_noise": np.zeros((B, 15, 50), dtype=np.float32),
+            "temperature": np.zeros((B, 1), dtype=np.float32),
+            "penalty": np.ones((B, 1), dtype=np.float32),
         }
         for i in range(num_layers):
             dec_feed[f"past_kv_{i}_k"] = past_kv[2 * i]

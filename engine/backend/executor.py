@@ -1065,6 +1065,10 @@ class Executor:
                 batch, cfg.logits_topk,
                 device=self._device, dtype=torch.float32,
             )
+            cp_gumbel = torch.zeros(
+                batch, cfg.cp_num_stages, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+            )
             temperature = torch.ones(
                 batch, 1, device=self._device, dtype=torch.float32,
             )
@@ -1078,6 +1082,12 @@ class Executor:
                 generator=self._sampling_gen,
             ).clamp(1e-8, 1.0)
             gumbel = -torch.log(-torch.log(gumbel))
+            cp_gumbel = torch.rand(
+                batch, cfg.cp_num_stages, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+                generator=self._sampling_gen,
+            ).clamp(1e-8, 1.0)
+            cp_gumbel = -torch.log(-torch.log(cp_gumbel))
             temperature = torch.full(
                 (batch, 1), self._temperature,
                 device=self._device, dtype=torch.float32,
@@ -1089,6 +1099,10 @@ class Executor:
         else:
             gumbel = torch.zeros(
                 batch, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+            )
+            cp_gumbel = torch.zeros(
+                batch, cfg.cp_num_stages, cfg.logits_topk,
                 device=self._device, dtype=torch.float32,
             )
             temperature = torch.ones(
@@ -1105,6 +1119,7 @@ class Executor:
             "attention_bias": attn_bias.contiguous(),
             "token_counts": tc.contiguous(),
             "gumbel_noise": gumbel.contiguous(),
+            "cp_gumbel_noise": cp_gumbel.contiguous(),
             "temperature": temperature.contiguous(),
             "penalty": penalty.contiguous(),
             "cache_position": cache_position.contiguous(),
@@ -1272,6 +1287,7 @@ class Executor:
                 "codec_vocab_size": int(self._config.codec_vocab_size),
                 "codec_eos_id": int(self._codec_eos_id),
                 "logits_topk": int(self._config.logits_topk),
+                "cp_num_stages": int(self._config.cp_num_stages),
                 "n_c2w_layers": int(self._config.n_c2w_layers),
                 "c2w_kv_heads": int(self._config.c2w_kv_heads),
                 "c2w_head_dim": int(self._config.c2w_head_dim),

@@ -41,6 +41,7 @@ source "${SCRIPT_DIR}/tools.sh"
 
 # trtexec path inside NGC tritonserver image
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
+DOCKER_GPU_ARGS=(--gpus all)
 
 # ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=1024, batch=16) ──
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-128}"
@@ -86,6 +87,37 @@ _trtexec_io_format() {
         fp8)  echo "fp8:chw" ;;
         *)    echo "fp32:chw" ;;
     esac
+}
+
+_detect_docker_gpu_args() {
+    local image="$1"
+    local err=""
+
+    if docker run --rm --gpus all "$image" /bin/true >/dev/null 2>&1; then
+        DOCKER_GPU_ARGS=(--gpus all)
+        log_info "Docker GPU launch mode: --gpus all"
+        return 0
+    fi
+
+    err=$(docker run --rm \
+        --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        "$image" /bin/true 2>&1) && {
+        DOCKER_GPU_ARGS=(
+            --runtime=nvidia
+            -e NVIDIA_VISIBLE_DEVICES=all
+            -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
+        )
+        log_warn "Docker GPU launch fallback enabled: --runtime=nvidia"
+        return 0
+    }
+
+    log_error "Docker GPU smoke test failed for image: $image"
+    if [ -n "$err" ]; then
+        echo "$err" >&2
+    fi
+    return 1
 }
 
 # Talker dimensions for trtexec. Read from model config.json, else fallback.
@@ -224,13 +256,15 @@ build_talker_code2wav_fused_trt() {
         return 1
     fi
     local n_c2w=8
+    local n_cp=15
     if [ -f "$variant_dir/triton_manifest.json" ]; then
         n_c2w=$(python3 -c "import json; d=json.load(open('$variant_dir/triton_manifest.json')); print(int(d['code2wav_fused']['num_code2wav_hidden_layers']))")
+        n_cp=$(python3 -c "import json; d=json.load(open('$variant_dir/triton_manifest.json')); print(int(d.get('architecture', {}).get('cp_num_stages', 15)))")
     fi
     local fused_min fused_opt fused_max
-    fused_min=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" | sed -n '1p')
-    fused_opt=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" | sed -n '2p')
-    fused_max=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" | sed -n '3p')
+    fused_min=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" "$n_cp" | sed -n '1p')
+    fused_opt=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" "$n_cp" | sed -n '2p')
+    fused_max=$(python3 "$profile_py" "$H" "$KV_HEADS" "$HEAD_DIM" "$NUM_LAYERS" "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$n_c2w" "$n_cp" | sed -n '3p')
 
     log_step "Building talker_code2wav_fused.engine: $variant"
     if $DRY_RUN; then
@@ -255,7 +289,7 @@ build_talker_code2wav_fused_trt() {
         prec_flag=$(_trtexec_precision_flags)
     fi
     if [ -n "$fused_io_in" ] && [ -n "$fused_io_out" ]; then
-        if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
             $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
             --saveEngine=/mnt/model/talker_code2wav_fused.engine \
             $prec_flag \
@@ -269,7 +303,7 @@ build_talker_code2wav_fused_trt() {
             return 1
         fi
     else
-        if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
             $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
             --saveEngine=/mnt/model/talker_code2wav_fused.engine \
             $prec_flag \
@@ -296,7 +330,7 @@ build_speech_tokenizer_codec_fused_trt() {
         log_info "[DRY RUN] trtexec speech_tokenizer_codec_fused"
         return 0
     fi
-    if ! docker run --rm --gpus all -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
+    if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
         $TRTEXEC --onnx=/mnt/model/speech_tokenizer_codec_fused.onnx \
         --saveEngine=/mnt/model/speech_tokenizer_codec_fused.engine \
         --minShapes=waveform:1x1x960 \
@@ -327,7 +361,7 @@ build_peripheral_engines() {
     # maxShapes 192000 = 8s @24kHz. With 8s cap, workspace ~1.7GB; 6GB leaves margin.
     if [ -f "$TOKENIZER_DIR/speech_tokenizer_encoder.onnx" ]; then
         log_info "Building speech_tokenizer_encoder.engine ..."
-        if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
+        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$TOKENIZER_DIR:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/speech_tokenizer_encoder.onnx \
             --saveEngine=/mnt/model/speech_tokenizer_encoder.engine \
             --minShapes=waveform:1x1x960 \
@@ -382,7 +416,7 @@ build_peripheral_engines() {
             i=$((i+1))
         done
         # Force I/O type to match engine precision; Triton config must match.
-        if ! docker run --rm --gpus all -v "$TOKENIZER_DIR:/mnt/model" "$image" \
+        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$TOKENIZER_DIR:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/code2wav_decoder.onnx \
             --saveEngine=/mnt/model/code2wav_decoder.engine \
             $(_trtexec_precision_flags) \
@@ -429,7 +463,7 @@ build_speaker_encoders_all() {
         local variant_name
         variant_name=$(basename "$vdir")
         log_info "Building speaker_encoder.engine for $variant_name ..."
-        if ! docker run --rm --gpus all -v "$vdir:/mnt/model" "$image" \
+        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$vdir:/mnt/model" "$image" \
             $TRTEXEC --onnx=/mnt/model/speaker_encoder.onnx \
             --saveEngine=/mnt/model/speaker_encoder.engine \
             $(_trtexec_precision_flags) \
@@ -500,6 +534,7 @@ else
         || { log_error "Cannot determine NGC container. Use --image."; exit 1; }
 fi
 ensure_ngc_image "$NGC_IMAGE" || exit 1
+_detect_docker_gpu_args "$NGC_IMAGE" || exit 1
 
 if $PULL_ONLY; then
     log_info "Image ready. Re-run without --pull-only to build engines."

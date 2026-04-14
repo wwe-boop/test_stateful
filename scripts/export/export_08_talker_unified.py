@@ -44,6 +44,7 @@ def _export_talker_unified_onnx(
         model, device=device
     )
     vocab_size = fused.vocab_size
+    cp_num_stages = fused.cp.num_stages
 
     B, one, S_past = 1, 1, 0
     dummy_embeds = torch.randn(B, one, hidden_size, device=device, dtype=ONNX_EXPORT_DTYPE)
@@ -51,6 +52,7 @@ def _export_talker_unified_onnx(
 
     token_counts = torch.zeros(B, vocab_size, device=device, dtype=ONNX_EXPORT_DTYPE)
     gumbel_noise = torch.zeros(B, LOGITS_TOPK, device=device, dtype=ONNX_EXPORT_DTYPE)
+    cp_gumbel_noise = torch.zeros(B, cp_num_stages, LOGITS_TOPK, device=device, dtype=ONNX_EXPORT_DTYPE)
     temperature = torch.ones(B, 1, device=device, dtype=ONNX_EXPORT_DTYPE)
     penalty = torch.ones(B, 1, device=device, dtype=ONNX_EXPORT_DTYPE)
 
@@ -64,7 +66,16 @@ def _export_talker_unified_onnx(
         )
 
     with torch.no_grad():
-        out = fused(dummy_embeds, position_ids, token_counts, gumbel_noise, temperature, penalty, *past_list)
+        out = fused(
+            dummy_embeds,
+            position_ids,
+            token_counts,
+            gumbel_noise,
+            cp_gumbel_noise,
+            temperature,
+            penalty,
+            *past_list,
+        )
 
     codec_sum, full_codec, hidden, logits, updated_token_counts = out[0], out[1], out[2], out[3], out[4]
     ref_nan = torch.isnan(hidden).any().item() or torch.isnan(logits).any().item()
@@ -86,7 +97,15 @@ def _export_talker_unified_onnx(
         output_names.append(f"present_kv_{i}_k")
         output_names.append(f"present_kv_{i}_v")
 
-    input_names = ["input_embeds", "position_ids", "token_counts", "gumbel_noise", "temperature", "penalty"]
+    input_names = [
+        "input_embeds",
+        "position_ids",
+        "token_counts",
+        "gumbel_noise",
+        "cp_gumbel_noise",
+        "temperature",
+        "penalty",
+    ]
     for i in range(num_layers):
         input_names.append(f"past_kv_{i}_k")
         input_names.append(f"past_kv_{i}_v")
@@ -96,6 +115,7 @@ def _export_talker_unified_onnx(
         "position_ids": {0: "batch", 1: "three", 2: "seq"},
         "token_counts": {0: "batch"},
         "gumbel_noise": {0: "batch"},
+        "cp_gumbel_noise": {0: "batch"},
         "temperature": {0: "batch"},
         "penalty": {0: "batch"},
         "codec_sum": {0: "batch"},
@@ -111,7 +131,16 @@ def _export_talker_unified_onnx(
         dynamic_axes[f"present_kv_{i}_v"] = {0: "batch", 2: "S_total"}
 
     onnx_path = str(output_dir / "talker_unified.onnx")
-    dummy_inputs = (dummy_embeds, position_ids, token_counts, gumbel_noise, temperature, penalty, *past_list)
+    dummy_inputs = (
+        dummy_embeds,
+        position_ids,
+        token_counts,
+        gumbel_noise,
+        cp_gumbel_noise,
+        temperature,
+        penalty,
+        *past_list,
+    )
     export_onnx(
         model=fused,
         dummy_inputs=dummy_inputs,
@@ -129,6 +158,7 @@ def _export_talker_unified_onnx(
         "position_ids": position_ids.cpu().numpy(),
         "token_counts": to_numpy(token_counts),
         "gumbel_noise": to_numpy(gumbel_noise),
+        "cp_gumbel_noise": to_numpy(cp_gumbel_noise),
         "temperature": to_numpy(temperature),
         "penalty": to_numpy(penalty),
     }

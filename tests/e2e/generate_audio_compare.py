@@ -90,6 +90,7 @@ def run_ort_decode_loop(
     codec_eos_id,
     codec_vocab_size=3072,
     logits_topk=50,
+    cp_num_stages=15,
 ):
     """Run ORT talker_unified prefill + decode, return (codes [T, 16], eos_step)."""
     B, S = 1, seq_len
@@ -100,6 +101,7 @@ def run_ort_decode_loop(
 
     token_counts = np.zeros((B, codec_vocab_size), dtype=np.float32)
     gumbel_noise = np.zeros((B, logits_topk), dtype=np.float32)
+    cp_gumbel_noise = np.zeros((B, cp_num_stages, logits_topk), dtype=np.float32)
     temperature = np.zeros((B, 1), dtype=np.float32)
     penalty = np.ones((B, 1), dtype=np.float32)
 
@@ -108,6 +110,7 @@ def run_ort_decode_loop(
         "position_ids": position_ids_prefill,
         "token_counts": token_counts,
         "gumbel_noise": gumbel_noise,
+        "cp_gumbel_noise": cp_gumbel_noise,
         "temperature": temperature,
         "penalty": penalty,
     }
@@ -155,6 +158,7 @@ def run_ort_decode_loop(
             "position_ids": pos_step,
             "token_counts": token_counts,
             "gumbel_noise": gumbel_noise,
+            "cp_gumbel_noise": cp_gumbel_noise,
             "temperature": temperature,
             "penalty": penalty,
         }

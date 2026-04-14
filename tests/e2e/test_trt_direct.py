@@ -98,6 +98,7 @@ def main():
                   for name, shape in zip(c2w_in_names, init_shapes)}
 
     gumbel = torch.zeros(batch, 50, device=device, dtype=torch.float32)
+    cp_gumbel = torch.zeros(batch, 15, 50, device=device, dtype=torch.float32)
     temperature = torch.ones(batch, 1, device=device, dtype=torch.float32)
     penalty = torch.ones(batch, 1, device=device, dtype=torch.float32)
     token_counts = torch.zeros(batch, codec_vocab_size, device=device, dtype=torch.int64)
@@ -134,6 +135,7 @@ def main():
             "attention_bias": attn.contiguous(),
             "token_counts": tc.contiguous(),
             "gumbel_noise": gumbel.contiguous(),
+            "cp_gumbel_noise": cp_gumbel.contiguous(),
             "temperature": temperature.contiguous(),
             "penalty": penalty.contiguous(),
             "cache_position": torch.full((batch, chunk_t), cache_pos_val,

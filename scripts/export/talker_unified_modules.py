@@ -360,6 +360,7 @@ class TalkerUnifiedFusedONNX(nn.Module):
         position_ids: torch.Tensor,
         token_counts: torch.Tensor,
         gumbel_noise: torch.Tensor,
+        cp_gumbel_noise: torch.Tensor,
         temperature: torch.Tensor,
         penalty: torch.Tensor,
         *inputs: torch.Tensor,
@@ -386,7 +387,12 @@ class TalkerUnifiedFusedONNX(nn.Module):
         one_hot = F.one_hot(codec_token_0, self.vocab_size).to(token_counts.dtype)
         updated_token_counts = token_counts + one_hot
 
-        cp_tokens = self.cp(hidden[:, -1:, :], codec_token_0)
+        cp_tokens = self.cp(
+            hidden[:, -1:, :],
+            codec_token_0,
+            cp_gumbel_noise=cp_gumbel_noise,
+            temperature=temperature,
+        )
         full_codec = torch.cat(
             [codec_token_0.unsqueeze(1), cp_tokens.long()], dim=1
         )
@@ -437,7 +443,11 @@ def build_talker_unified_fused_module(model, device: str = "cpu") -> Tuple[Talke
 
     code_predictor = talker.code_predictor.to(device).eval()
     talker_codec_emb = talker.model.codec_embedding.to(device).eval()
-    cp_unrolled = CodePredictorUnrolled(code_predictor, talker_codec_emb).to(device).eval()
+    cp_unrolled = CodePredictorUnrolled(
+        code_predictor,
+        talker_codec_emb,
+        logits_topk=LOGITS_TOPK,
+    ).to(device).eval()
 
     codec_sum_module = build_codec_embedding_sum_from_model(model, device)
 

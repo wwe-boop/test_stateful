@@ -304,6 +304,7 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
     n_c2w_layers = int(c2w.get("num_code2wav_hidden_layers", 8))
     c2w_kv_heads = int(c2w.get("c2w_kv_heads", kv))
     c2w_head_dim = int(c2w.get("c2w_head_dim", hd))
+    cp_num_stages = int(c2w.get("cp_num_stages", manifest.get("architecture", {}).get("cp_num_stages", 15)))
 
     init_shapes: List[List[int]] = []
     for row in init_shapes_raw:
@@ -340,6 +341,9 @@ def render_talker_code2wav_fused_trt(manifest: Dict[str, Any], engine_dtype: str
         "]",
         "input [",
         '  { name: "gumbel_noise"  data_type: TYPE_FP32  dims: [ -1, 50 ] }',
+        "]",
+        "input [",
+        f'  {{ name: "cp_gumbel_noise"  data_type: TYPE_FP32  dims: [ -1, {cp_num_stages}, 50 ] }}',
         "]",
         "input [",
         '  { name: "temperature"  data_type: TYPE_FP32  dims: [ -1, 1 ] }',

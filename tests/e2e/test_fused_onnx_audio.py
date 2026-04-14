@@ -123,6 +123,7 @@ def main():
     )
 
     gumbel_noise = np.zeros((batch, 50), dtype=np.float32)
+    cp_gumbel_noise = np.zeros((batch, 15, 50), dtype=np.float32)
     temperature = np.zeros((batch, 1), dtype=np.float32)
     penalty = np.ones((batch, 1), dtype=np.float32)
     token_counts = np.zeros((batch, codec_vocab_size), dtype=np.int64)
@@ -139,6 +140,7 @@ def main():
             "attention_bias": np.zeros((batch, 1, cur_seq, past_len + cur_seq), dtype=np.float32),
             "token_counts": tc.astype(np.int64),
             "gumbel_noise": gumbel_noise,
+            "cp_gumbel_noise": cp_gumbel_noise,
             "temperature": temperature,
             "penalty": penalty,
             "cache_position": np.full((batch, chunk_t), cache_pos_val, dtype=np.float32),
