@@ -684,6 +684,75 @@ class Executor:
             prefill_eos = True
         return prefill_audio, prefill_eos
 
+    def prefill_prefix_only(
+        self,
+        slot: SlotKVState,
+        prefill_embeds: torch.Tensor,
+    ) -> None:
+        """Build talker KV for a cacheable prefix without committing codec state.
+
+        This supports the semantic split:
+          prefill: fixed prefix only
+          decode0: consume the first text token + codec BOS
+
+        The fused engine still executes once, but sampling/C2W outputs are
+        treated as scratch and must not affect the live slot state.
+        """
+        self._kv_pool.init_kv_tensors(slot)
+
+        if self._fused_engine is None:
+            slot.past_len = int(prefill_embeds.shape[1])
+            return
+
+        seq = int(prefill_embeds.shape[1])
+
+        inputs = self._build_fused_inputs(
+            input_embeds=prefill_embeds.to(self._config.dtype),
+            slots=[slot],
+            batched_talker_kv=None,
+            past_seq_lens=None,
+            use_dummy_kv=True,
+            sampling_mode="disabled",
+        )
+
+        out_names = self._build_output_names()
+        input_snapshot = None
+        if self._debug_dumper.enabled:
+            input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
+
+        stream = self._compute_stream
+        with torch.cuda.stream(stream):
+            raw = self._fused_engine.infer(
+                inputs, out_names, stream,
+            )
+
+        stream.synchronize()
+
+        dump_meta = self._build_dump_metadata(
+            stage="prefill_prefix_only",
+            slots=[slot],
+            seq=seq,
+            use_dummy_kv=True,
+            original_past_lens=[slot.past_len],
+            padded_talker_past_len=int(inputs["talker_past_kv"].shape[3]),
+        )
+        if self._debug_dumper.enabled:
+            self._debug_dumper.dump_call(
+                metadata=dump_meta,
+                inputs=input_snapshot if input_snapshot is not None else inputs,
+                outputs=raw,
+                inputs_snapshotted=input_snapshot is not None,
+            )
+
+        talker_kv = raw.get("talker_new_kv")
+        if talker_kv is not None:
+            stripped = talker_kv.contiguous()
+            if self._kv_pool._preallocate:
+                self._kv_pool.scatter_prefill_kv(slot.slot_id, stripped, seq)
+            else:
+                slot.talker_kv = stripped
+        slot.past_len = seq
+
     def prefill_from_prefix(
         self,
         slot: SlotKVState,
@@ -948,6 +1017,7 @@ class Executor:
         batched_talker_kv: Optional[torch.Tensor],
         past_seq_lens: Optional[torch.Tensor],
         use_dummy_kv: bool,
+        sampling_mode: str = "default",
     ) -> Dict[str, torch.Tensor]:
         """Build the full input dict for the fused TRT engine.
 
@@ -990,7 +1060,18 @@ class Executor:
             for s in slots
         ], dim=0)
 
-        if self._do_sample:
+        if sampling_mode == "disabled":
+            gumbel = torch.zeros(
+                batch, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+            )
+            temperature = torch.ones(
+                batch, 1, device=self._device, dtype=torch.float32,
+            )
+            penalty = torch.ones(
+                batch, 1, device=self._device, dtype=torch.float32,
+            )
+        elif self._do_sample:
             gumbel = torch.rand(
                 batch, cfg.logits_topk,
                 device=self._device, dtype=torch.float32,
@@ -1001,6 +1082,10 @@ class Executor:
                 (batch, 1), self._temperature,
                 device=self._device, dtype=torch.float32,
             )
+            penalty = torch.full(
+                (batch, 1), self._repetition_penalty,
+                device=self._device, dtype=torch.float32,
+            )
         else:
             gumbel = torch.zeros(
                 batch, cfg.logits_topk,
@@ -1009,10 +1094,10 @@ class Executor:
             temperature = torch.ones(
                 batch, 1, device=self._device, dtype=torch.float32,
             )
-        penalty = torch.full(
-            (batch, 1), self._repetition_penalty,
-            device=self._device, dtype=torch.float32,
-        )
+            penalty = torch.full(
+                (batch, 1), self._repetition_penalty,
+                device=self._device, dtype=torch.float32,
+            )
 
         d: Dict[str, torch.Tensor] = {
             "input_embeds": input_embeds.contiguous(),

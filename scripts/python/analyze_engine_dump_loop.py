@@ -133,6 +133,10 @@ def _append_with_window(past: torch.Tensor, delta: torch.Tensor, max_past: int) 
     return out.contiguous()
 
 
+def _is_prefix_only_stage(meta: Dict[str, Any]) -> bool:
+    return str(meta.get("stage", "")) == "prefill_prefix_only"
+
+
 def _expected_talker_next(cur: Dict[str, Any], nxt: Dict[str, Any]) -> torch.Tensor:
     meta = cur["payload"]["metadata"]
     row = int(cur["row_idx"])
@@ -155,6 +159,8 @@ def _expected_talker_next(cur: Dict[str, Any], nxt: Dict[str, Any]) -> torch.Ten
 
 def _expected_c2w_next(cur: Dict[str, Any], nxt: Dict[str, Any]) -> torch.Tensor:
     meta = cur["payload"]["metadata"]
+    if _is_prefix_only_stage(meta):
+        return torch.zeros_like(_get_tensor(nxt, "inputs", "c2w_past_kv"))
     row = int(cur["row_idx"])
     cfg = meta["config"]
     max_past = int(cfg["c2w_sliding_window"]) - 1
@@ -194,6 +200,14 @@ def _check_position_ids(entry: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _check_cache_position(prev: Dict[str, Any], nxt: Dict[str, Any]) -> Dict[str, Any]:
+    prev_meta = prev["payload"]["metadata"]
+    if _is_prefix_only_stage(prev_meta):
+        next_cp = int(_get_tensor(nxt, "inputs", "cache_position")[0, 0].item())
+        return {
+            "expected_next": 0,
+            "actual_next": next_cp,
+            "match": next_cp == 0,
+        }
     prev_cp = int(_get_tensor(prev, "inputs", "cache_position")[0, 0].item())
     next_cp = int(_get_tensor(nxt, "inputs", "cache_position")[0, 0].item())
     return {
@@ -244,6 +258,12 @@ def _pairwise_checks(cur: Dict[str, Any], nxt: Dict[str, Any]) -> Dict[str, Any]
     nxt_meta = nxt["payload"]["metadata"]
     cur_row = int(cur["row_idx"])
     nxt_row = int(nxt["row_idx"])
+    prefix_only_reset = _is_prefix_only_stage(cur_meta)
+
+    if prefix_only_reset:
+        token_counts_expected = torch.zeros_like(_get_tensor(nxt, "inputs", "token_counts"))
+    else:
+        token_counts_expected = _get_tensor(cur, "outputs", "updated_token_counts")
 
     result: Dict[str, Any] = {
         "current_dump_id": int(cur_meta["dump_id"]),
@@ -251,10 +271,11 @@ def _pairwise_checks(cur: Dict[str, Any], nxt: Dict[str, Any]) -> Dict[str, Any]
         "current_stage": cur_meta["stage"],
         "next_stage": nxt_meta["stage"],
         "session": cur_meta["slot_session_ids"][cur_row],
+        "prefix_only_reset": prefix_only_reset,
         "talker_kv": _tensor_stats(_expected_talker_next(cur, nxt), _get_tensor(nxt, "inputs", "talker_past_kv")),
         "c2w_kv": _tensor_stats(_expected_c2w_next(cur, nxt), _get_tensor(nxt, "inputs", "c2w_past_kv")),
         "token_counts": _tensor_stats(
-            _get_tensor(cur, "outputs", "updated_token_counts"),
+            token_counts_expected,
             _get_tensor(nxt, "inputs", "token_counts"),
         ),
         "cache_position": _check_cache_position(cur, nxt),
@@ -267,7 +288,9 @@ def _pairwise_checks(cur: Dict[str, Any], nxt: Dict[str, Any]) -> Dict[str, Any]
     )
     result["conv_states"] = {
         f"{out_name}->{in_name}": _tensor_stats(
-            _get_tensor(cur, "outputs", out_name),
+            torch.zeros_like(_get_tensor(nxt, "inputs", in_name))
+            if prefix_only_reset
+            else _get_tensor(cur, "outputs", out_name),
             _get_tensor(nxt, "inputs", in_name),
         )
         for out_name, in_name in conv_pairs
@@ -278,7 +301,9 @@ def _pairwise_checks(cur: Dict[str, Any], nxt: Dict[str, Any]) -> Dict[str, Any]
     )
     result["transconv_states"] = {
         f"{out_name}->{in_name}": _tensor_stats(
-            _get_tensor(cur, "outputs", out_name),
+            torch.zeros_like(_get_tensor(nxt, "inputs", in_name))
+            if prefix_only_reset
+            else _get_tensor(cur, "outputs", out_name),
             _get_tensor(nxt, "inputs", in_name),
         )
         for out_name, in_name in trans_pairs

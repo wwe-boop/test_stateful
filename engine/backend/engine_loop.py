@@ -511,7 +511,7 @@ class EngineLoop:
             cached = self._prefix_cache.get(cache_key)
 
             if cached is not None and best.pending_token_ids:
-                # ── Cache HIT: embed token IDs directly, skip TRT ──
+                # ── Cache HIT: restore prefix KV and let decode consume first text token ──
                 req_embeds, trailing = (
                     self._prefill_builder.build_suffix_from_ids(
                         best.pending_token_ids,
@@ -522,20 +522,12 @@ class EngineLoop:
                     slot, cached, req_embeds, trailing,
                 )
                 best.eos_trailing_added = best.input_complete
-                prefill_audio, prefill_eos = self._executor.prefill_from_prefix(
-                    slot, req_embeds,
-                )
-                if slot.next_embed is not None and slot.trailing:
-                    first_trail = slot.trailing[0].to(slot.next_embed.dtype)
-                    slot.next_embed = (
-                        slot.next_embed + first_trail
-                    ).to(torch.float32)
-                    slot.text_idx = 1
+                prefill_audio, prefill_eos = None, False
                 logger.info(
                     "Prefix cache hit: copied %d KV tokens for %s "
-                    "(slot=%d, %d text tokens embedded directly, suffix prefill consumed)",
+                    "(slot=%d, decode will consume first text token in batch)",
                     cached.prefix_len, best.session_id,
-                    slot.slot_id, len(best.pending_token_ids),
+                    slot.slot_id,
                 )
             else:
                 # ── Cache MISS: full token-native plan + TRT prefill ──
@@ -570,9 +562,21 @@ class EngineLoop:
                             warning_msg=str(warning_msg),
                         ))
 
-                prefill_audio, prefill_eos = self._executor.prefill(
-                    slot, plan.prefill_embeds,
+                split_prefix_prefill = (
+                    plan.cacheable_prefix_embeds is not None
+                    and plan.request_prefill_embeds is not None
+                    and int(plan.request_prefill_embeds.shape[1]) == 1
                 )
+
+                if split_prefix_prefill:
+                    self._executor.prefill_prefix_only(
+                        slot, plan.cacheable_prefix_embeds,
+                    )
+                    prefill_audio, prefill_eos = None, False
+                else:
+                    prefill_audio, prefill_eos = self._executor.prefill(
+                        slot, plan.prefill_embeds,
+                    )
                 # Populate cache — read from pool when preallocated
                 effective_key = plan.prefix_cache_key or cache_key
                 if (
@@ -586,16 +590,25 @@ class EngineLoop:
                             effective_key, prefix_kv, prefix_len,
                         )
 
-                slot.trailing = plan.trailing
-                best.eos_trailing_added = best.input_complete
+                if split_prefix_prefill:
+                    self._prime_decode_after_prefix_prefill(
+                        slot,
+                        plan.request_prefill_embeds,
+                        plan.trailing,
+                        source="full_prefill_prefix_only",
+                    )
+                    best.eos_trailing_added = best.input_complete
+                else:
+                    slot.trailing = plan.trailing
+                    best.eos_trailing_added = best.input_complete
 
-                # Combine codec_sum (TRT output) with first trailing text token
-                if slot.next_embed is not None and slot.trailing:
-                    first_trail = slot.trailing[0].to(slot.next_embed.dtype)
-                    slot.next_embed = (
-                        slot.next_embed + first_trail
-                    ).to(torch.float32)
-                    slot.text_idx = 1
+                    # Legacy path: prefill already consumed first text token.
+                    if slot.next_embed is not None and slot.trailing:
+                        first_trail = slot.trailing[0].to(slot.next_embed.dtype)
+                        slot.next_embed = (
+                            slot.next_embed + first_trail
+                        ).to(torch.float32)
+                        slot.text_idx = 1
         else:
             prefill_audio, prefill_eos = self._executor.prefill(slot, torch.zeros(
                 1, 1, 1536, device=torch.device("cuda"), dtype=torch.bfloat16,
@@ -658,16 +671,39 @@ class EngineLoop:
         else:
             slot.talker_kv = cached.talker_kv.clone()
         slot.past_len = prefix_len
-        slot.prefill_source = "prefix_cache_suffix"
-        # This path has only restored talker prefix KV. The request-specific
-        # suffix token still needs one fused step to align with a real prefill.
+        self._prime_decode_after_prefix_prefill(
+            slot,
+            request_prefill_embeds,
+            trailing,
+            source="prefix_cache_prefix_only",
+        )
+
+    def _prime_decode_after_prefix_prefill(
+        self,
+        slot: SlotKVState,
+        request_prefill_embeds: torch.Tensor,
+        trailing: list,
+        *,
+        source: str,
+    ) -> None:
+        """Prepare slot so decode step0 consumes the first text token."""
+        slot.prefill_source = source
         slot.frame_idx = 0
+        slot.pad_start_frame = -1
+        slot.pad_consecutive_silence = 0
 
         slot.c2w_kv = None
         slot.c2w_conv_states = self._executor.make_zero_conv_states()
         slot.c2w_transconv_states = self._executor.make_zero_transconv_states()
         slot.init_pingpong_buffers()
 
+        cfg = self._executor._config
+        slot.token_counts = torch.zeros(
+            1,
+            cfg.codec_vocab_size,
+            device=request_prefill_embeds.device,
+            dtype=torch.int64,
+        )
         slot.next_embed = request_prefill_embeds.to(torch.float32)
         slot.last_codec_sum = None
         slot.trailing = trailing

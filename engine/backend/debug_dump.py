@@ -492,7 +492,7 @@ class EngineDebugDumper:
         if tensor.ndim == 0:
             scalar = tensor.item()
             path.write_text(
-                f"{float(scalar) if tensor.is_floating_point() else scalar}\n",
+                f"{float(scalar) if tensor.is_floating_point() else scalar: .6f}\n",
                 encoding="utf-8",
             )
             return

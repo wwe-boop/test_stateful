@@ -4,11 +4,13 @@ import asyncio
 import queue
 import time
 import threading
+from types import SimpleNamespace
 
 import torch
 import pytest
 
 from engine.backend.kv_cache_pool import KVCachePool, ModelConfig, SlotKVState
+from engine.backend.prefill import PrefillPlan
 from engine.backend.executor import StepOutput
 from engine.backend.engine_loop import (
     EngineLoop,
@@ -252,3 +254,243 @@ class TestConfigNewFields:
         from engine.config import SchedulerConfig
         sc = SchedulerConfig()
         assert sc.session_timeout_sec == 300.0
+
+
+class _StubPrefillBuilder:
+    def __init__(
+        self,
+        *,
+        plan: PrefillPlan | None = None,
+        suffix: tuple[torch.Tensor, list[torch.Tensor]] | None = None,
+        cache_key: str = "cache-key",
+        hidden_size: int = 2048,
+    ):
+        self._plan = plan
+        self._suffix = suffix
+        self._cache_key = cache_key
+        self.w = SimpleNamespace(
+            tts_pad_embed=torch.zeros(1, 1, hidden_size, dtype=torch.bfloat16),
+        )
+
+    def compute_cache_key(self, *args, **kwargs):
+        return self._cache_key
+
+    def build_plan_from_ids(self, **kwargs):
+        if self._plan is None:
+            raise AssertionError("build_plan_from_ids should not be called")
+        return self._plan
+
+    def build_suffix_from_ids(self, token_ids, include_eos=True):
+        if self._suffix is None:
+            raise AssertionError("build_suffix_from_ids should not be called")
+        return self._suffix
+
+
+class _StubExecutorForPrefill:
+    def __init__(self, model_config):
+        self._config = model_config
+        self.kv_pool = KVCachePool(
+            max_slots=4,
+            config=model_config,
+            device=torch.device("cpu"),
+            preallocate=False,
+        )
+        self.prefill_inputs: list[torch.Tensor] = []
+        self.prefill_prefix_only_inputs: list[torch.Tensor] = []
+        self.prefill_from_prefix_inputs: list[torch.Tensor] = []
+
+    def make_zero_conv_states(self):
+        return [torch.zeros(1, 1, 1)]
+
+    def make_zero_transconv_states(self):
+        return [torch.zeros(1, 1, 1)]
+
+    def prefill(self, slot, embeds):
+        self.prefill_inputs.append(embeds.clone())
+        seq = int(embeds.shape[1])
+        slot.talker_kv = torch.zeros(
+            1,
+            self._config.num_layers * 2,
+            self._config.kv_heads,
+            seq,
+            self._config.head_dim,
+        )
+        slot.past_len = seq
+        slot.frame_idx = 1
+        slot.next_embed = torch.full(
+            (1, 1, self._config.hidden_size),
+            10.0,
+        )
+        slot.c2w_conv_states = self.make_zero_conv_states()
+        slot.c2w_transconv_states = self.make_zero_transconv_states()
+        slot.init_pingpong_buffers()
+        slot.token_counts = torch.zeros(
+            1,
+            self._config.codec_vocab_size,
+            dtype=torch.int64,
+        )
+        return b"", False
+
+    def prefill_prefix_only(self, slot, embeds):
+        self.prefill_prefix_only_inputs.append(embeds.clone())
+        seq = int(embeds.shape[1])
+        slot.talker_kv = torch.zeros(
+            1,
+            self._config.num_layers * 2,
+            self._config.kv_heads,
+            seq,
+            self._config.head_dim,
+        )
+        slot.past_len = seq
+
+    def prefill_from_prefix(self, slot, embeds):
+        self.prefill_from_prefix_inputs.append(embeds.clone())
+        seq = int(embeds.shape[1])
+        slot.talker_kv = torch.zeros(
+            1,
+            self._config.num_layers * 2,
+            self._config.kv_heads,
+            slot.past_len + seq,
+            self._config.head_dim,
+        )
+        slot.past_len += seq
+        slot.frame_idx = 1
+        slot.next_embed = torch.full(
+            (1, 1, self._config.hidden_size),
+            7.0,
+        )
+        slot.token_counts = torch.ones(
+            1,
+            self._config.codec_vocab_size,
+            dtype=torch.int64,
+        )
+        return b"audio", False
+
+
+class TestPrefillBoundary:
+    def test_full_prefill_can_prime_decode0_from_prefix_only_state(self, model_config):
+        loop = _ImmediateLoop()
+        executor = _StubExecutorForPrefill(model_config)
+        hidden = model_config.hidden_size
+
+        prefill = torch.randn(1, 3, hidden)
+        trailing = [torch.full((1, 1, hidden), 2.0)]
+        plan = PrefillPlan(
+            prefill_embeds=prefill,
+            trailing=trailing,
+            prefix_cache_key="cache-key",
+            cacheable_prefix_embeds=prefill[:, :2, :].clone(),
+            request_prefill_embeds=prefill[:, 2:, :].clone(),
+        )
+        builder = _StubPrefillBuilder(plan=plan, hidden_size=hidden)
+
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=loop,
+            executor=executor,
+            prefill_builder=builder,
+            max_batch_size=4,
+        )
+
+        result_queue = queue.Queue()
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.NEW_SESSION,
+                session_id="s1",
+                task_type="custom_voice",
+                result_queue=result_queue,
+            )
+        )
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.START_TOKENS,
+                session_id="s1",
+                segment_idx=0,
+                token_ids=[1, 2, 3],
+            )
+        )
+
+        assert engine_loop._try_prefill_one() is True
+
+        seg = engine_loop._groups["s1"].segments[0]
+        slot = seg.slot
+        assert slot is not None
+        assert executor.prefill_inputs == []
+        assert len(executor.prefill_prefix_only_inputs) == 1
+        torch.testing.assert_close(
+            executor.prefill_prefix_only_inputs[0],
+            prefill[:, :2, :],
+        )
+        assert executor.prefill_from_prefix_inputs == []
+        assert slot.prefill_source == "full_prefill_prefix_only"
+        assert slot.past_len == 2
+        assert slot.frame_idx == 0
+        assert slot.text_idx == 0
+        torch.testing.assert_close(
+            slot.next_embed,
+            prefill[:, 2:, :].to(torch.float32),
+        )
+
+    def test_prefix_cache_hit_restores_prefix_and_lets_decode0_consume_text(self, model_config):
+        loop = _ImmediateLoop()
+        executor = _StubExecutorForPrefill(model_config)
+        hidden = model_config.hidden_size
+
+        req_embeds = torch.randn(1, 1, hidden)
+        trailing = [torch.full((1, 1, hidden), 2.0)]
+        builder = _StubPrefillBuilder(
+            suffix=(req_embeds, trailing),
+            cache_key="cache-key",
+            hidden_size=hidden,
+        )
+
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=loop,
+            executor=executor,
+            prefill_builder=builder,
+            max_batch_size=4,
+        )
+        cached_kv = torch.zeros(
+            1,
+            model_config.num_layers * 2,
+            model_config.kv_heads,
+            2,
+            model_config.head_dim,
+        )
+        engine_loop._prefix_cache.put("cache-key", cached_kv, 2)
+
+        result_queue = queue.Queue()
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.NEW_SESSION,
+                session_id="s1",
+                task_type="custom_voice",
+                result_queue=result_queue,
+            )
+        )
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.START_TOKENS,
+                session_id="s1",
+                segment_idx=0,
+                token_ids=[1, 2],
+            )
+        )
+
+        assert engine_loop._try_prefill_one() is True
+
+        seg = engine_loop._groups["s1"].segments[0]
+        slot = seg.slot
+        assert slot is not None
+        assert executor.prefill_inputs == []
+        assert executor.prefill_prefix_only_inputs == []
+        assert executor.prefill_from_prefix_inputs == []
+        assert slot.prefill_source == "prefix_cache_prefix_only"
+        assert slot.past_len == 2
+        assert slot.frame_idx == 0
+        assert slot.text_idx == 0
+        torch.testing.assert_close(
+            slot.next_embed,
+            req_embeds.to(torch.float32),
+        )
