@@ -632,6 +632,74 @@ parameters: {{
 '''
 
 
+def render_orchestrator_http(variant: str, orch: Dict[str, str]) -> str:
+    tts = orch.get("tts_model_type", "unknown")
+    tasks = orch.get("supported_task_types", "unknown")
+    return f'''name: "tts_orchestrator_http"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {{
+    name: "request"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }}
+]
+
+output [
+  {{
+    name: "audio_chunk"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }},
+  {{
+    name: "event_type"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }},
+  {{
+    name: "event_json"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  }},
+  {{
+    name: "is_final"
+    data_type: TYPE_BOOL
+    dims: [ 1 ]
+  }}
+]
+
+instance_group [
+  {{
+    count: 1
+    kind: KIND_CPU
+  }}
+]
+
+parameters: {{
+  key: "model_variant"
+  value: {{ string_value: "{variant}" }}
+}}
+parameters: {{
+  key: "tts_model_type"
+  value: {{ string_value: "{tts}" }}
+}}
+parameters: {{
+  key: "supported_task_types"
+  value: {{ string_value: "{tasks}" }}
+}}
+parameters: {{
+  key: "target_model"
+  value: {{ string_value: "tts_orchestrator" }}
+}}
+parameters: {{
+  key: "bls_timeout_ms"
+  value: {{ string_value: "600000" }}
+}}
+'''
+
+
 def model_has_engine(model_dir: Path) -> Tuple[bool, bool]:
     """Returns (has_plan, has_onnx)."""
     v1 = model_dir / "1"
@@ -708,6 +776,12 @@ def generate_configs(
         otxt = render_orchestrator(variant, orch)
         (orch_dir / "config.pbtxt").write_text(otxt, encoding="utf-8")
         logger.info("Wrote %s", orch_dir / "config.pbtxt")
+
+    orch_http_dir = output_repo / "tts_orchestrator_http"
+    if orch_http_dir.is_dir():
+        otxt = render_orchestrator_http(variant, orch)
+        (orch_http_dir / "config.pbtxt").write_text(otxt, encoding="utf-8")
+        logger.info("Wrote %s", orch_http_dir / "config.pbtxt")
 
 
 def main() -> None:

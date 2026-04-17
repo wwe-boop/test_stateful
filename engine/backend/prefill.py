@@ -82,6 +82,7 @@ class EmbeddingWeights:
         weights_dir: str,
         device_id: int = 0,
         *,
+        device: Optional[str | torch.device] = None,
         default_speaker: Optional[str] = None,
         fallback_speaker: Optional[str] = None,
     ):
@@ -116,8 +117,13 @@ class EmbeddingWeights:
             else self.config.get("fallback_speaker", "vivian"),
         ).strip()
 
-        self.device = torch.device("cuda", device_id)
-        dtype = torch.bfloat16
+        self.device = (
+            torch.device(device)
+            if device is not None
+            else torch.device("cuda", device_id)
+        )
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.dtype = dtype
 
         text_emb_sd = torch.load(
             weights_dir / "text_embedding.pt", map_location=self.device, weights_only=True,
@@ -161,9 +167,21 @@ class EmbeddingWeights:
         special = torch.load(
             weights_dir / "special_embeddings.pt", map_location=self.device, weights_only=True,
         )
-        self.tts_pad_embed = special["tts_pad_embed"].to(device=self.device, dtype=dtype)
-        self.tts_bos_embed = special["tts_bos_embed"].to(device=self.device, dtype=dtype)
-        self.tts_eos_embed = special["tts_eos_embed"].to(device=self.device, dtype=dtype)
+        self.tts_pad_token_id = int(special["tts_pad_token_id"])
+        self.tts_bos_token_id = int(special["tts_bos_token_id"])
+        self.tts_eos_token_id = int(special["tts_eos_token_id"])
+        with torch.no_grad():
+            # Recompute specials with the loaded BF16 modules so runtime prefill matches
+            # live-model inference instead of inheriting tiny export-time FP32 deltas.
+            special_ids = torch.tensor(
+                [[self.tts_pad_token_id, self.tts_bos_token_id, self.tts_eos_token_id]],
+                device=self.device,
+                dtype=torch.int64,
+            )
+            special_projected = self.text_projection(self.text_embedding(special_ids))
+        self.tts_pad_embed = special_projected[:, 0:1, :].to(device=self.device, dtype=dtype)
+        self.tts_bos_embed = special_projected[:, 1:2, :].to(device=self.device, dtype=dtype)
+        self.tts_eos_embed = special_projected[:, 2:3, :].to(device=self.device, dtype=dtype)
 
         path_3d = weights_dir / "codec_embeddings_3d.pt"
         self.codec_embeddings_3d = None
@@ -220,9 +238,25 @@ class PrefillBuilder:
       - ICL (voice clone): reference codec + text into prefill
     """
 
-    def __init__(self, weights: EmbeddingWeights, tokenizer: Any):
+    def __init__(
+        self,
+        weights: EmbeddingWeights,
+        tokenizer: Any,
+        *,
+        output_device: Optional[str | torch.device] = None,
+    ):
         self.w = weights
         self.tokenizer = tokenizer
+        self.output_device = (
+            torch.device(output_device)
+            if output_device is not None
+            else weights.device
+        )
+        self.output_dtype = (
+            weights.dtype
+            if self.output_device.type != "cuda"
+            else torch.bfloat16
+        )
         self._assistant_role_ids: Optional[list[int]] = None
         self._prompt_wrapper_ids: dict[tuple[str, str], list[int]] = {}
         with torch.no_grad():
@@ -232,6 +266,15 @@ class PrefillBuilder:
                     device=weights.device, dtype=torch.int64,
                 ),
             )
+
+    def _move_tensor(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        dtype = self.output_dtype if tensor.is_floating_point() else tensor.dtype
+        return tensor.to(device=self.output_device, dtype=dtype)
+
+    def _move_trailing(self, trailing: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [self._move_tensor(t) for t in trailing]
 
     def build_plan(
         self,
@@ -518,6 +561,11 @@ class PrefillBuilder:
                 cacheable_prefix_embeds = None
                 request_prefill_embeds = None
 
+        prefill = self._move_tensor(prefill)
+        trailing = self._move_trailing(trailing)
+        cacheable_prefix_embeds = self._move_tensor(cacheable_prefix_embeds)
+        request_prefill_embeds = self._move_tensor(request_prefill_embeds)
+
         return PrefillPlan(
             prefill_embeds=prefill,
             trailing=trailing,
@@ -586,7 +634,8 @@ class PrefillBuilder:
                 text_embed = w.tts_eos_embed
             else:
                 return []
-        return [text_embed[:, i:i+1, :].clone() for i in range(text_embed.shape[1])]
+        trailing = [text_embed[:, i:i+1, :].clone() for i in range(text_embed.shape[1])]
+        return self._move_trailing(trailing)
 
     def _encode_text_ids(self, text: str) -> list[int]:
         if hasattr(self.tokenizer, "encode_ids"):
@@ -683,7 +732,7 @@ class PrefillBuilder:
             trailing_text[:, i : i + 1, :].clone()
             for i in range(trailing_text.shape[1])
         ]
-        return request_prefill_embeds, trailing
+        return self._move_tensor(request_prefill_embeds), self._move_trailing(trailing)
 
     def _normalize_prompt_token_ids(
         self,

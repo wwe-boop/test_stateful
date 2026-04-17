@@ -18,6 +18,7 @@ source "${_LIB_DIR}/logging.sh"
 source "${_LIB_DIR}/utils.sh"
 
 ENGINE_GRPC_PORT="${ENGINE_GRPC_PORT:-50051}"
+ENGINE_WEBSOCKET_PORT="${ENGINE_WEBSOCKET_PORT:-50052}"
 ENGINE_HEALTH_PORT="${ENGINE_HEALTH_PORT:-8080}"
 ENGINE_IMAGE="${ENGINE_IMAGE:-qwen3-engine:26.02}"
 ENGINE_CONTAINER_NAME="${ENGINE_CONTAINER_NAME:-qwen3-engine}"
@@ -154,6 +155,7 @@ engine_log_file() {
 #  Starts the standalone TTS engine server as a background process.
 #  Options:
 #    --port <N>            gRPC port (default: $ENGINE_GRPC_PORT)
+#    --ws-port <N>         WebSocket port (default: $ENGINE_WEBSOCKET_PORT)
 #    --device <N>          GPU device (default: 0)
 #    --max-batch <N>       Max batch size (default: 48)
 #    --max-sessions <N>    Max concurrent sessions (default: 128)
@@ -165,6 +167,7 @@ engine_start() {
     shift 2
 
     local port="$ENGINE_GRPC_PORT"
+    local ws_port="$ENGINE_WEBSOCKET_PORT"
     local device=0
     local max_batch=48
     local max_sessions=128
@@ -173,6 +176,7 @@ engine_start() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --port)          port="$2"; shift 2 ;;
+            --ws-port)       ws_port="$2"; shift 2 ;;
             --device)        device="$2"; shift 2 ;;
             --max-batch)     max_batch="$2"; shift 2 ;;
             --max-sessions)  max_sessions="$2"; shift 2 ;;
@@ -222,6 +226,7 @@ engine_start() {
     log_info "  Max Batch:    $max_batch"
     log_info "  Max Sessions: $max_sessions"
     log_info "  gRPC Port:    $port"
+    log_info "  WS Port:      $ws_port"
 
     local cmd=(
         "$pybin" -m engine.server
@@ -231,6 +236,7 @@ engine_start() {
         --max-batch "$max_batch"
         --max-sessions "$max_sessions"
         --port "$port"
+        --ws-port "$ws_port"
     )
 
     if [ -n "$_ENGINE_DIR" ]; then
@@ -405,6 +411,7 @@ engine_start_docker() {
     shift 2
 
     local port="$ENGINE_GRPC_PORT"
+    local ws_port="$ENGINE_WEBSOCKET_PORT"
     local health_port="$ENGINE_HEALTH_PORT"
     local device=0
     local max_batch=48
@@ -416,6 +423,7 @@ engine_start_docker() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --port)          port="$2"; shift 2 ;;
+            --ws-port)       ws_port="$2"; shift 2 ;;
             --device)        device="$2"; shift 2 ;;
             --max-batch)     max_batch="$2"; shift 2 ;;
             --max-sessions)  max_sessions="$2"; shift 2 ;;
@@ -448,6 +456,7 @@ engine_start_docker() {
     log_info "  Max Sessions: $max_sessions"
     log_info "  Max Seq Len:  ${max_seq_len:-auto}"
     log_info "  gRPC Port:    $port"
+    log_info "  WS Port:      $ws_port"
 
     # Image bundles engine/ + engine.yaml under /app; mount only workspace/ for data.
     local workspace_host="$repo_root/workspace"
@@ -472,10 +481,12 @@ engine_start_docker() {
         --max-batch "$max_batch"
         --max-sessions "$max_sessions"
         --port "$port"
+        --ws-port "$ws_port"
     )
 
     local -a env_args=(
         -e "ENGINE_SCHEDULER_MAX_BATCH_SIZE=$max_batch"
+        -e "ENGINE_SERVER_WEBSOCKET_PORT=$ws_port"
         -e "ENGINE_SERVER_HEALTH_PORT=$health_port"
     )
     if [[ -n "$max_seq_len" ]]; then
@@ -488,6 +499,7 @@ engine_start_docker() {
         -e "PYTHONPATH=/app" \
         -v "$workspace_host:/data:ro" \
         -p "${port}:${port}" \
+        -p "${ws_port}:${ws_port}" \
         -p "${health_port}:${health_port}" \
         --shm-size=4g \
         "${env_args[@]}" \

@@ -11,6 +11,7 @@ Applies to: ALL variants
 """
 
 import argparse
+import copy
 import json
 import logging
 import sys
@@ -118,17 +119,26 @@ def export_embeddings(
     )
     logger.info(f"  codec_embeddings_3d.npz: saved to {path_3d_npz}")
 
-    # 4. Special Embeddings (tts_pad, tts_bos, tts_eos) — computed in FP32, saved in target dtype
+    # 4. Special Embeddings (tts_pad, tts_bos, tts_eos) — compute with target-dtype
+    # modules so the saved tensors match runtime BF16 prefill exactly.
     with torch.no_grad():
+        text_embedding_runtime = copy.deepcopy(talker.model.text_embedding).to(
+            device=device, dtype=dtype
+        )
+        text_projection_runtime = copy.deepcopy(talker.text_projection).to(
+            device=device, dtype=dtype
+        )
+        text_embedding_runtime.eval()
+        text_projection_runtime.eval()
         special_ids = torch.tensor(
             [[config.tts_pad_token_id, config.tts_bos_token_id, config.tts_eos_token_id]],
             device=device,
         )
-        special_text_embed = talker.model.text_embedding(special_ids)
-        special_projected = talker.text_projection(special_text_embed)
-        tts_pad_embed = special_projected[:, 0:1, :].to(dtype)
-        tts_bos_embed = special_projected[:, 1:2, :].to(dtype)
-        tts_eos_embed = special_projected[:, 2:3, :].to(dtype)
+        special_text_embed = text_embedding_runtime(special_ids)
+        special_projected = text_projection_runtime(special_text_embed)
+        tts_pad_embed = special_projected[:, 0:1, :]
+        tts_bos_embed = special_projected[:, 1:2, :]
+        tts_eos_embed = special_projected[:, 2:3, :]
 
     special = {
         "tts_pad_embed": tts_pad_embed.cpu(),

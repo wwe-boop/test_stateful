@@ -4,7 +4,7 @@ Architecture:
 
     ┌────────── asyncio event loop (main thread) ──────────┐
     │                                                       │
-    │  gRPC aio server  ──►  FrontendInterface ─► Dispatcher │
+    │  gRPC / WebSocket  ─►  FrontendInterface ─► Dispatcher │
     │                                       │         │      │
     │       ▲                                    │          │
     │       │ audio chunks                       │          │
@@ -62,6 +62,13 @@ _EXTERNAL_TO_INTERNAL_TASK_TYPE = {
     "voice_design": "voice_design",
     "instruct": "voice_design",
 }
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc).lower()
+    return "cuda out of memory" in msg or "out of memory" in msg and "cuda" in msg
 
 
 class TTSEngine:
@@ -159,15 +166,41 @@ class TTSEngine:
         if self._weights_dir:
             try:
                 pf = self._cfg.prefill
-                emb_weights = EmbeddingWeights(
-                    self._weights_dir,
-                    self._device_id,
-                    default_speaker=pf.default_speaker,
-                    fallback_speaker=pf.fallback_speaker,
-                )
+                try:
+                    emb_weights = EmbeddingWeights(
+                        self._weights_dir,
+                        self._device_id,
+                        default_speaker=pf.default_speaker,
+                        fallback_speaker=pf.fallback_speaker,
+                    )
+                except Exception as exc:
+                    if not _is_cuda_oom(exc):
+                        raise
+                    logger.warning(
+                        "Loading embedding weights on CUDA failed with OOM; retrying on CPU: %s",
+                        exc,
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    emb_weights = EmbeddingWeights(
+                        self._weights_dir,
+                        self._device_id,
+                        device="cpu",
+                        default_speaker=pf.default_speaker,
+                        fallback_speaker=pf.fallback_speaker,
+                    )
                 self._executor.set_embedding_weights(emb_weights)
-                prefill_builder = PrefillBuilder(emb_weights, self._tokenizer)
-                logger.info("PrefillBuilder loaded from %s", self._weights_dir)
+                prefill_builder = PrefillBuilder(
+                    emb_weights,
+                    self._tokenizer,
+                    output_device=self._executor._device,
+                )
+                logger.info(
+                    "PrefillBuilder loaded from %s (weights_device=%s, output_device=%s)",
+                    self._weights_dir,
+                    emb_weights.device,
+                    self._executor._device,
+                )
             except Exception as e:
                 logger.warning("Could not load embedding weights: %s", e)
 
@@ -197,6 +230,8 @@ class TTSEngine:
             max_queue_size=sched.max_queue_size,
             session_timeout_sec=sched.session_timeout_sec,
             min_pad_steps=sched.min_pad_steps,
+            pad_silence_peak_threshold=sched.pad_silence_peak_threshold,
+            pad_silence_mean_abs_threshold=sched.pad_silence_mean_abs_threshold,
             max_slots_per_session=self._cfg.spliter.max_concurrent_segments,
         )
         self._engine_loop.start()
@@ -474,6 +509,10 @@ def main():
                         help="Override server.max_sessions")
     parser.add_argument("--port", type=int, default=0,
                         help="Override server.port")
+    parser.add_argument("--ws-port", type=int, default=-1,
+                        help="Override server.websocket_port (-1 keeps config)")
+    parser.add_argument("--ws-path", default="",
+                        help="Override server.websocket_path")
     args = parser.parse_args()
 
     cli_overrides: dict = {}
@@ -489,6 +528,10 @@ def main():
         cli_overrides.setdefault("server", {})["max_sessions"] = args.max_sessions
     if args.port > 0:
         cli_overrides.setdefault("server", {})["port"] = args.port
+    if args.ws_port >= 0:
+        cli_overrides.setdefault("server", {})["websocket_port"] = args.ws_port
+    if args.ws_path:
+        cli_overrides.setdefault("server", {})["websocket_path"] = args.ws_path
 
     cfg = load_config(args.config, cli_overrides=cli_overrides)
 
@@ -510,9 +553,12 @@ def main():
             loop.add_signal_handler(sig, stop_event.set)
 
         port = cfg.server.port
+        websocket_port = cfg.server.websocket_port
+        websocket_path = cfg.server.websocket_path
         health_port = cfg.server.health_port
 
         grpc_task = None
+        websocket_task = None
         health_task = None
 
         try:
@@ -523,6 +569,25 @@ def main():
             logger.info("gRPC server launched on port %d", port)
         except Exception as e:
             logger.warning("gRPC server not started: %s", e)
+
+        if websocket_port > 0:
+            try:
+                from .gateway.websocket_server import serve as websocket_serve
+                websocket_task = asyncio.create_task(
+                    websocket_serve(
+                        engine,
+                        websocket_port,
+                        stop_event=stop_event,
+                        path=websocket_path,
+                    ),
+                )
+                logger.info(
+                    "WebSocket server launched on port %d path %s",
+                    websocket_port,
+                    websocket_path,
+                )
+            except Exception as e:
+                logger.warning("WebSocket server not started: %s", e)
 
         if health_port > 0:
             health_task = asyncio.create_task(
@@ -537,6 +602,11 @@ def main():
                 await grpc_task
             except Exception as e:
                 logger.warning("gRPC server shutdown: %s", e)
+        if websocket_task:
+            try:
+                await websocket_task
+            except Exception as e:
+                logger.warning("WebSocket server shutdown: %s", e)
         if health_task:
             try:
                 await health_task

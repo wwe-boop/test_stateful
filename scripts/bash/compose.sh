@@ -37,6 +37,7 @@ IMAGE_OVERRIDE=""
 CONTAINER_OVERRIDE=""
 
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
+ENGINE_WEBSOCKET="${ENGINE_WEBSOCKET_PORT:-50052}"
 ENGINE_HEALTH="${ENGINE_HEALTH_PORT:-8080}"
 ENGINE_DEVICE="${ENGINE_DEVICE:-0}"
 ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH_SIZE:-128}"
@@ -69,6 +70,7 @@ Options:
   --image <tag>          Override service image tag for selected gateway
   --container <name>     Override container name for selected gateway
   --port <N>             Engine gRPC port
+  --ws-port <N>          Engine WebSocket port
   --health-port <N>      Engine health port
   --grpc-port <N>        Triton gRPC port
   --http-port <N>        Triton HTTP port
@@ -168,6 +170,7 @@ export_compose_env() {
     export TRITON_MODEL_REPO_DIR="$MODEL_REPO_DIR"
 
     export ENGINE_GRPC_PORT="$ENGINE_PORT"
+    export ENGINE_WEBSOCKET_PORT="$ENGINE_WEBSOCKET"
     export ENGINE_HEALTH_PORT="$ENGINE_HEALTH"
     export ENGINE_DEVICE="$ENGINE_DEVICE"
     export ENGINE_MAX_BATCH_SIZE="$ENGINE_MAX_BATCH"
@@ -390,6 +393,7 @@ while [[ $# -gt 0 ]]; do
         --image) IMAGE_OVERRIDE="$2"; shift 2 ;;
         --container) CONTAINER_OVERRIDE="$2"; shift 2 ;;
         --port) ENGINE_PORT="$2"; shift 2 ;;
+        --ws-port) ENGINE_WEBSOCKET="$2"; shift 2 ;;
         --health-port) ENGINE_HEALTH="$2"; shift 2 ;;
         --grpc-port) TRITON_GRPC="$2"; shift 2 ;;
         --http-port) TRITON_HTTP="$2"; shift 2 ;;

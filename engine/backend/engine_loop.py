@@ -173,6 +173,8 @@ class EngineLoop:
         max_queue_size: int = 256,
         session_timeout_sec: float = 300.0,
         min_pad_steps: int = 4,
+        pad_silence_peak_threshold: float = 5e-4,
+        pad_silence_mean_abs_threshold: float = 2e-4,
         max_slots_per_session: int = 2,
     ):
         self._inbox = engine_inbox
@@ -184,6 +186,8 @@ class EngineLoop:
         self._max_queue_size = max_queue_size
         self._session_timeout_sec = session_timeout_sec
         self._min_pad_steps = min_pad_steps
+        self._pad_silence_peak_threshold = float(pad_silence_peak_threshold)
+        self._pad_silence_mean_abs_threshold = float(pad_silence_mean_abs_threshold)
         self._max_slots_per_session = max(1, int(max_slots_per_session))
 
         self._groups: Dict[str, EngineSessionGroup] = {}
@@ -206,10 +210,22 @@ class EngineLoop:
         self._total_timeouts: int = 0
         self._total_evictions: int = 0
 
+        self._embed_device = self._executor._device
+        self._embed_dtype = self._executor._config.dtype
+        self._hidden_size = self._executor._config.hidden_size
         self._tts_pad_embed = (
-            prefill_builder.w.tts_pad_embed.clone()
+            prefill_builder.w.tts_pad_embed.to(
+                device=self._embed_device,
+                dtype=self._embed_dtype,
+            ).clone()
             if prefill_builder is not None
-            else torch.zeros(1, 1, 1536)
+            else torch.zeros(
+                1,
+                1,
+                self._hidden_size,
+                device=self._embed_device,
+                dtype=self._embed_dtype,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -611,7 +627,11 @@ class EngineLoop:
                         slot.text_idx = 1
         else:
             prefill_audio, prefill_eos = self._executor.prefill(slot, torch.zeros(
-                1, 1, 1536, device=torch.device("cuda"), dtype=torch.bfloat16,
+                1,
+                1,
+                self._hidden_size,
+                device=self._embed_device,
+                dtype=self._embed_dtype,
             ))
 
         best.state = "active"
@@ -701,12 +721,15 @@ class EngineLoop:
         slot.token_counts = torch.zeros(
             1,
             cfg.codec_vocab_size,
-            device=request_prefill_embeds.device,
+            device=self._embed_device,
             dtype=torch.int64,
         )
-        slot.next_embed = request_prefill_embeds.to(torch.float32)
+        slot.next_embed = self._coerce_embed_tensor(
+            request_prefill_embeds,
+            dtype=torch.float32,
+        )
         slot.last_codec_sum = None
-        slot.trailing = trailing
+        slot.trailing = [self._coerce_embed_tensor(t) for t in trailing]
         slot.text_idx = 0
 
     def _resume_streaming_segment_if_ready(self, seg: EngineSegment) -> None:
@@ -764,7 +787,10 @@ class EngineLoop:
                     continue
                 if slot.next_embed is None:
                     if slot.trailing and slot.text_idx < len(slot.trailing):
-                        slot.next_embed = slot.trailing[slot.text_idx]
+                        slot.next_embed = self._coerce_embed_tensor(
+                            slot.trailing[slot.text_idx],
+                            dtype=torch.float32,
+                        )
                         slot.text_idx += 1
                     else:
                         continue
@@ -960,8 +986,7 @@ class EngineLoop:
 
                 if in_pad:
                     if audio is not None and len(audio) > 0:
-                        audio_np = np.frombuffer(audio, dtype=np.float32)
-                        if audio_np.size > 0 and np.max(np.abs(audio_np)) < 1e-4:
+                        if self._is_pad_silence(audio):
                             slot.pad_consecutive_silence += 1
                         else:
                             slot.pad_consecutive_silence = 0
@@ -1005,6 +1030,26 @@ class EngineLoop:
         if remaining_kv > 20:
             return 3
         return 1
+
+    def _is_pad_silence(self, audio: bytes) -> bool:
+        """Detect near-silent pad-phase audio frames.
+
+        The previous peak-only `1e-4` threshold missed pathological pad loops
+        that produce almost-flat chunks with tiny residual noise around
+        `3e-4 ~ 5e-4`. Use both peak and mean absolute amplitude so we catch
+        repeated near-silence without clipping normal quiet speech too
+        aggressively.
+        """
+        audio_np = np.frombuffer(audio, dtype=np.float32)
+        if audio_np.size == 0:
+            return False
+        abs_audio = np.abs(audio_np)
+        peak = float(abs_audio.max(initial=0.0))
+        mean_abs = float(abs_audio.mean())
+        return (
+            peak <= self._pad_silence_peak_threshold
+            and mean_abs <= self._pad_silence_mean_abs_threshold
+        )
 
     def _handle_segment_eos(
         self, group: EngineSessionGroup, seg: EngineSegment,
@@ -1122,6 +1167,7 @@ class EngineLoop:
         )
         with torch.no_grad():
             embed = w.text_embed(ids_tensor)
+        embed = self._coerce_embed_tensor(embed)
         for i in range(embed.shape[1]):
             slot.trailing.append(embed[:, i : i + 1, :].clone())
         logger.debug(
@@ -1132,11 +1178,25 @@ class EngineLoop:
     def _append_eos_trailing(self, seg: EngineSegment) -> None:
         """Append tts_eos_embed to trailing when SEGMENT_TOKENS_DONE arrives post-prefill."""
         w = self._prefill_builder.w
-        seg.slot.trailing.append(w.tts_eos_embed.clone())
+        seg.slot.trailing.append(self._coerce_embed_tensor(w.tts_eos_embed).clone())
         seg.eos_trailing_added = True
         logger.debug(
             "Appended EOS trailing for seg=%d (total=%d)",
             seg.segment_idx, len(seg.slot.trailing),
+        )
+
+    def _coerce_embed_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        target_dtype = dtype
+        if target_dtype is None and tensor.is_floating_point():
+            target_dtype = self._embed_dtype
+        return tensor.to(
+            device=self._embed_device,
+            dtype=target_dtype if target_dtype is not None else tensor.dtype,
         )
 
     # ------------------------------------------------------------------

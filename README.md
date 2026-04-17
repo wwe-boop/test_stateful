@@ -57,6 +57,12 @@ bash scripts/bash/compose.sh ps
 bash scripts/bash/compose.sh down --gateway engine
 ```
 
+Default standalone engine transport endpoints:
+
+- gRPC: `localhost:50051`
+- WebSocket: `ws://localhost:50052/v1/ws`
+- Capabilities over HTTP: `http://localhost:50052/v1/capabilities`
+
 For Triton:
 
 ```bash
@@ -89,6 +95,21 @@ The streaming contract now carries two text-side events in parallel with audio:
 - `text_boundary_commit`: a text boundary is now known and committed, while audio may still be streaming.
 
 `segment_end` remains the audio-completion signal for a committed text segment.
+
+The standalone engine now exposes the same streaming semantics over both `gRPC` and `WebSocket`.
+
+WebSocket client frames are JSON control messages:
+
+```json
+{"type":"start","session_id":"demo","config":{"task_type":"custom_voice","speaker":"Serena"}}
+{"type":"text","text":"你好，世界。"}
+{"type":"end"}
+```
+
+Server frames are:
+
+- JSON text frames for protocol events: `{"type":"event","event":{...}}`
+- Binary frames for raw PCM audio chunks, matching the `audio` format announced in the `start` event
 
 ### Specify a Model Variant
 

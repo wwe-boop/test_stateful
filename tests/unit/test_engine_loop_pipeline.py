@@ -61,6 +61,8 @@ class TestEngineLoopHealth:
                 max_slots=4, config=model_config,
                 device=torch.device("cpu"), preallocate=False,
             )
+            _device = torch.device("cpu")
+            _config = model_config
 
         engine_loop = EngineLoop(
             engine_inbox=inbox,
@@ -90,6 +92,8 @@ class TestSessionTimeout:
                 max_slots=4, config=model_config,
                 device=torch.device("cpu"), preallocate=False,
             )
+            _device = torch.device("cpu")
+            _config = model_config
 
         engine_loop = EngineLoop(
             engine_inbox=inbox,
@@ -124,6 +128,8 @@ class TestSessionTimeout:
                 max_slots=4, config=model_config,
                 device=torch.device("cpu"), preallocate=False,
             )
+            _device = torch.device("cpu")
+            _config = model_config
 
         engine_loop = EngineLoop(
             engine_inbox=inbox,
@@ -159,6 +165,8 @@ class TestSessionCancel:
                 max_slots=4, config=model_config,
                 device=torch.device("cpu"), preallocate=False,
             )
+            _device = torch.device("cpu")
+            _config = model_config
 
         engine_loop = EngineLoop(
             engine_inbox=inbox,
@@ -202,6 +210,8 @@ class TestProcessStepOutput:
 
         class StubExecutor:
             kv_pool = pool
+            _device = torch.device("cpu")
+            _config = model_config
 
         engine_loop = EngineLoop(
             engine_inbox=inbox,
@@ -250,10 +260,42 @@ class TestConfigNewFields:
         assert sc.warmup_rounds == 3
         assert sc.health_port == 8080
 
-    def test_scheduler_config_has_timeout(self):
+    def test_scheduler_config_has_timeout_and_pad_silence_thresholds(self):
         from engine.config import SchedulerConfig
         sc = SchedulerConfig()
         assert sc.session_timeout_sec == 300.0
+        assert sc.pad_silence_peak_threshold == 5e-4
+        assert sc.pad_silence_mean_abs_threshold == 2e-4
+
+
+class TestPadSilenceDetection:
+    def test_pad_silence_detection_uses_peak_and_mean_abs(self, model_config):
+        inbox = queue.Queue()
+        loop = asyncio.new_event_loop()
+
+        class StubExecutor:
+            kv_pool = KVCachePool(
+                max_slots=4, config=model_config,
+                device=torch.device("cpu"), preallocate=False,
+            )
+            _device = torch.device("cpu")
+            _config = model_config
+
+        engine_loop = EngineLoop(
+            engine_inbox=inbox,
+            async_loop=loop,
+            executor=StubExecutor(),
+            max_batch_size=4,
+        )
+
+        near_silence = torch.full((1920,), 1.5e-4, dtype=torch.float32)
+        near_silence[0] = 4.5e-4
+        assert engine_loop._is_pad_silence(near_silence.numpy().tobytes()) is True
+
+        audible = torch.full((1920,), 1.5e-4, dtype=torch.float32)
+        audible[0] = 8e-4
+        assert engine_loop._is_pad_silence(audible.numpy().tobytes()) is False
+        loop.close()
 
 
 class _StubPrefillBuilder:
@@ -289,6 +331,7 @@ class _StubPrefillBuilder:
 class _StubExecutorForPrefill:
     def __init__(self, model_config):
         self._config = model_config
+        self._device = torch.device("cpu")
         self.kv_pool = KVCachePool(
             max_slots=4,
             config=model_config,

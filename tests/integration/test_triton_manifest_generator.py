@@ -16,6 +16,7 @@ from generate_triton_configs import (  # noqa: E402
     generate_configs,
     render_code2wav_streaming,
     render_orchestrator,
+    render_orchestrator_http,
     render_speech_tokenizer_encoder_trt,
     render_talker_unified_trt,
     triton_io_float_pbtxt_from_manifest,
@@ -66,6 +67,18 @@ def test_render_orchestrator_custom_variant():
     assert 'string_value: "custom-1.7b"' in text
     assert 'string_value: "custom_voice"' in text
     assert 'string_value: "/models/tts_orchestrator/1/runtime"' in text
+
+
+def test_render_orchestrator_http_custom_variant():
+    orch = {
+        "tts_model_type": "custom_voice",
+        "supported_task_types": "custom_voice",
+    }
+    text = render_orchestrator_http("custom-1.7b", orch)
+    assert 'name: "tts_orchestrator_http"' in text
+    assert 'kind: KIND_CPU' in text
+    assert 'string_value: "tts_orchestrator"' in text
+    assert 'name: "audio_chunk"' in text
 
 
 def test_render_speech_tokenizer_encoder_trt():
@@ -127,10 +140,14 @@ def test_generate_configs_minimal_repo(tmp_path):
     manifest = json.loads(FIXTURE_MANIFEST.read_text(encoding="utf-8"))
     # Minimal fake repo: only orchestrator is exposed to Triton.
     (tmp_path / "tts_orchestrator" / "1" / "runtime").mkdir(parents=True)
+    (tmp_path / "tts_orchestrator_http" / "1").mkdir(parents=True)
     (tmp_path / "tts_orchestrator" / "1" / "runtime" / "model.plan").write_text("stub")
     generate_configs(manifest, tmp_path, "trt", engine_dtype="bf16")
     orch_cfg = (tmp_path / "tts_orchestrator" / "config.pbtxt").read_text()
+    orch_http_cfg = (tmp_path / "tts_orchestrator_http" / "config.pbtxt").read_text()
     assert "tts_orchestrator" in orch_cfg
     assert "custom-1.7b" in orch_cfg
     assert '/models/tts_orchestrator/1/runtime' in orch_cfg
+    assert 'name: "tts_orchestrator_http"' in orch_http_cfg
+    assert 'string_value: "tts_orchestrator"' in orch_http_cfg
     assert not (tmp_path / "talker_code2wav_fused" / "config.pbtxt").exists()

@@ -314,6 +314,9 @@ optional = {
     "safetensors":  "safetensors",
     "onnx":         "onnx",
     "onnxruntime":  "onnxruntime",
+    "aiohttp":      "aiohttp",
+    "grpc":         "grpcio",
+    "requests":     "requests",
 }
 
 ok, fail = 0, 0

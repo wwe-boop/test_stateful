@@ -15,21 +15,37 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-WEIGHTS_DIR = REPO_ROOT / "workspace" / "exported" / "base-1.7b" / "weights"
-TOKENIZER_DIR = REPO_ROOT / "workspace" / "exported" / "tokenizer" / "Qwen3-TTS-Tokenizer-12Hz"
+WEIGHTS_DIR_CANDIDATES = [
+    REPO_ROOT / "workspace" / "exported" / "custom-1.7b" / "weights",
+    REPO_ROOT / "workspace" / "exported" / "base-1.7b" / "weights",
+]
+TOKENIZER_DIR_CANDIDATES = [
+    REPO_ROOT / "workspace" / "models" / "Qwen3-TTS-Tokenizer-12Hz",
+    REPO_ROOT / "workspace" / "exported" / "tokenizer" / "Qwen3-TTS-Tokenizer-12Hz",
+    REPO_ROOT / "workspace" / "exported" / "tokenizer",
+]
 
 
 def _weights_dir():
-    if not WEIGHTS_DIR.is_dir():
-        pytest.skip(f"Weights dir not found: {WEIGHTS_DIR} (run export_01_embeddings.py)")
-    return str(WEIGHTS_DIR)
+    for path in WEIGHTS_DIR_CANDIDATES:
+        if path.is_dir():
+            return str(path)
+    pytest.skip(
+        "Weights dir not found in candidates: "
+        + ", ".join(str(p) for p in WEIGHTS_DIR_CANDIDATES)
+        + " (run export_01_embeddings.py)"
+    )
 
 
 def _tokenizer():
-    if not TOKENIZER_DIR.is_dir():
-        pytest.skip(f"Tokenizer dir not found: {TOKENIZER_DIR}")
+    tokenizer_dir = next((p for p in TOKENIZER_DIR_CANDIDATES if p.is_dir()), None)
+    if tokenizer_dir is None:
+        pytest.skip(
+            "Tokenizer dir not found in candidates: "
+            + ", ".join(str(p) for p in TOKENIZER_DIR_CANDIDATES)
+        )
     from engine.frontend.spliter.tokenizer import load_lightweight_tokenizer
-    tok = load_lightweight_tokenizer(str(TOKENIZER_DIR))
+    tok = load_lightweight_tokenizer(str(tokenizer_dir))
     if tok is None:
         pytest.skip("Lightweight tokenizer failed to load")
     return tok
@@ -58,6 +74,23 @@ def test_embedding_weights_text_embed_shape():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_embedding_weights_specials_match_runtime_projection():
+    """Special embeds should be recomputed from loaded BF16 modules for runtime parity."""
+    from engine.backend.prefill import EmbeddingWeights
+
+    weights = EmbeddingWeights(_weights_dir(), device_id=0)
+    special_ids = torch.tensor(
+        [[weights.tts_pad_token_id, weights.tts_bos_token_id, weights.tts_eos_token_id]],
+        device=weights.device,
+        dtype=torch.int64,
+    )
+    projected = weights.text_embed(special_ids)
+    torch.testing.assert_close(weights.tts_pad_embed, projected[:, 0:1, :], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(weights.tts_bos_embed, projected[:, 1:2, :], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(weights.tts_eos_embed, projected[:, 2:3, :], atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_embedding_weights_codec_embed_shape():
     """T1.3: codec_embed output shape."""
     from engine.backend.prefill import EmbeddingWeights
@@ -83,6 +116,18 @@ def test_embedding_weights_missing_pt_raises():
         )
         with pytest.raises(FileNotFoundError, match="text_embedding.pt"):
             EmbeddingWeights(str(path), device_id=0)
+
+
+def test_embedding_weights_load_on_cpu_fp32():
+    """EmbeddingWeights should support CPU fallback with fp32 modules."""
+    from engine.backend.prefill import EmbeddingWeights
+
+    weights = EmbeddingWeights(_weights_dir(), device="cpu")
+    assert weights.device.type == "cpu"
+    assert weights.dtype == torch.float32
+    assert weights.text_embedding.weight.dtype == torch.float32
+    assert weights.text_projection.linear_fc1.weight.dtype == torch.float32
+    assert weights.tts_pad_embed.dtype == torch.float32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -199,6 +244,32 @@ def test_prefill_builder_voice_clone_icl():
     assert embeds.shape[1] > 10
     assert embeds.dtype == torch.bfloat16
     assert len(trailing) >= 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefill_builder_moves_cpu_weights_outputs_to_cuda():
+    """CPU embedding weights should still produce CUDA bf16 prefill outputs."""
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
+
+    class _StubTokenizer:
+        def encode_ids(self, text, add_special_tokens=False):
+            return [max(1, ord(ch) % 256) for ch in text]
+
+    weights = EmbeddingWeights(_weights_dir(), device="cpu")
+    builder = PrefillBuilder(weights, _StubTokenizer(), output_device="cuda:0")
+    plan = builder.build_plan(
+        task_type=TaskType.CUSTOM_VOICE,
+        text="测试文本",
+        speaker="zhitian",
+        instruct="用温柔的语气说",
+    )
+
+    assert plan.prefill_embeds.device.type == "cuda"
+    assert plan.prefill_embeds.dtype == torch.bfloat16
+    assert plan.request_prefill_embeds is not None
+    assert plan.request_prefill_embeds.device.type == "cuda"
+    assert all(t.device.type == "cuda" for t in plan.trailing)
+    assert all(t.dtype == torch.bfloat16 for t in plan.trailing)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

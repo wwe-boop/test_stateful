@@ -25,6 +25,7 @@ source "${_LIB_DIR}/docker.sh"
 # standalone verification models such as talker_unified/code2wav.
 _TRITON_REQUIRED_MODELS=(
     "tts_orchestrator"
+    "tts_orchestrator_http"
 )
 
 # Default Triton gRPC / HTTP / metrics ports
@@ -246,6 +247,16 @@ assemble_model_repo() {
         log_warn "  tts_orchestrator/python: source dir not found, using stub"
     fi
 
+    local orch_http_py_dir="$repo_root/model_repository/tts_orchestrator_http/1"
+    mkdir -p "$repo_dir/tts_orchestrator_http/1"
+    if [ -d "$orch_http_py_dir" ] && [ -f "$orch_http_py_dir/model.py" ]; then
+        cp "$orch_http_py_dir/model.py" "$repo_dir/tts_orchestrator_http/1/model.py"
+        log_info "  tts_orchestrator_http/python: OK (copied offline HTTP aggregator)"
+    else
+        log_error "  tts_orchestrator_http/model.py missing in source tree"
+        return 1
+    fi
+
     # Copy text tokenizer files for orchestrator
     local model_base_dir
     model_base_dir="$(cd "$(dirname "$exported_dir")" && pwd)/models"
@@ -408,6 +419,14 @@ validate_model_repo() {
         log_error "  legacy top-level model detected: $repo_dir/talker_code2wav_fused"
         log_error "  re-run assemble so the fused engine lives under tts_orchestrator/1/runtime/"
         missing=$((missing + 1))
+    fi
+
+    local orch_http_dir="$repo_dir/tts_orchestrator_http/1"
+    if [ ! -f "$orch_http_dir/model.py" ]; then
+        log_error "  tts_orchestrator_http/1/model.py: missing"
+        missing=$((missing + 1))
+    else
+        log_info "  tts_orchestrator_http/1/model.py: OK"
     fi
 
     if [ "$missing" -gt 0 ]; then

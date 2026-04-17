@@ -45,6 +45,17 @@ class TestEnvOverrides:
             _apply_env_overrides(raw)
         assert raw["scheduler"]["max_batch_size"] == 32
 
+    def test_applies_server_websocket_overrides(self):
+        raw: dict = {"server": {"websocket_port": 0, "websocket_path": "/v1/ws"}}
+        env = {
+            "ENGINE_SERVER_WEBSOCKET_PORT": "50052",
+            "ENGINE_SERVER_WEBSOCKET_PATH": "/stream/ws",
+        }
+        with _patch_env(env):
+            _apply_env_overrides(raw)
+        assert raw["server"]["websocket_port"] == 50052
+        assert raw["server"]["websocket_path"] == "/stream/ws"
+
     def test_ignores_non_engine(self):
         raw: dict = {}
         env = {"OTHER_VAR": "123"}
@@ -85,6 +96,18 @@ class TestLoadConfig:
     def test_missing_file_uses_defaults(self):
         cfg = load_config("/nonexistent/path.yaml")
         assert cfg.scheduler.max_batch_size == 48
+
+    def test_websocket_defaults_from_cli_overrides(self):
+        cfg = load_config(
+            cli_overrides={
+                "server": {
+                    "websocket_port": 50052,
+                    "websocket_path": "/stream/ws",
+                }
+            }
+        )
+        assert cfg.server.websocket_port == 50052
+        assert cfg.server.websocket_path == "/stream/ws"
 
 
 class TestModelManifest:

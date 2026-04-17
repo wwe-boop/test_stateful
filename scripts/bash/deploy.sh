@@ -34,6 +34,7 @@
 #  Environment variables:
 #    GATEWAY_MODE            Override gateway: standalone | triton | engine-docker
 #    ENGINE_GRPC_PORT        Standalone gRPC port (default: 50051)
+#    ENGINE_WEBSOCKET_PORT   Standalone WebSocket port (default: 50052)
 #    ENGINE_PYTHON           Python binary for standalone engine (default: conda env qwen3-tts, else PATH)
 #    QWEN3_TTS_ENV_NAME      Conda env name for auto-resolve (default: qwen3-tts)
 #    TRITON_GRPC_PORT        Triton gRPC port (default: 8001)
@@ -53,6 +54,7 @@ DRY_RUN=false
 
 # Standalone options
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
+ENGINE_WS_PORT="${ENGINE_WEBSOCKET_PORT:-50052}"
 GPU_DEVICE=0
 MAX_BATCH=128
 MAX_SESSIONS=128
@@ -88,6 +90,7 @@ Options:
 
   Standalone options:
     --port <N>           gRPC port (default: 50051)
+    --ws-port <N>        WebSocket port (default: 50052)
     --device <N>         GPU device (default: 0)
     --max-batch <N>      Max batch size (default: 64)
     --max-sessions <N>   Max concurrent sessions (default: 128)
@@ -160,6 +163,7 @@ while [[ $# -gt 0 ]]; do
 
         # Standalone options
         --port)           ENGINE_PORT="$2"; shift 2 ;;
+        --ws-port)        ENGINE_WS_PORT="$2"; shift 2 ;;
         --device)         GPU_DEVICE="$2"; shift 2 ;;
         --max-batch)      MAX_BATCH="$2"; shift 2 ;;
         --max-sessions)   MAX_SESSIONS="$2"; shift 2 ;;
@@ -214,6 +218,7 @@ cmd_run_standalone() {
         log_info "[DRY RUN] Would start standalone engine:"
         log_info "  Variant:    $VARIANT"
         log_info "  Port:       $ENGINE_PORT"
+        log_info "  WS Port:    $ENGINE_WS_PORT"
         log_info "  Device:     $GPU_DEVICE"
         log_info "  Max Batch:  $MAX_BATCH"
         log_info "  Max Sess:   $MAX_SESSIONS"
@@ -223,6 +228,7 @@ cmd_run_standalone() {
 
     local start_args=(
         --port "$ENGINE_PORT"
+        --ws-port "$ENGINE_WS_PORT"
         --device "$GPU_DEVICE"
         --max-batch "$MAX_BATCH"
         --max-sessions "$MAX_SESSIONS"
@@ -239,6 +245,7 @@ cmd_run_standalone() {
             echo ""
             log_step "Standalone TTS Engine Running"
             log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
+            log_info "  WebSocket:      ws://localhost:${ENGINE_WS_PORT}/v1/ws"
             log_info "  Variant:        $VARIANT"
             log_info "  Log file:       $(engine_log_file "$REPO_ROOT")"
             echo ""
@@ -275,6 +282,7 @@ cmd_run_engine_docker() {
         log_info "  Variant:     $VARIANT"
         log_info "  Image:       $img"
         log_info "  Port:        $ENGINE_PORT"
+        log_info "  WS Port:     $ENGINE_WS_PORT"
         log_info "  Device:      $GPU_DEVICE"
         log_info "  Max batch:   $MAX_BATCH"
         log_info "  Max sess:    $MAX_SESSIONS"
@@ -299,6 +307,7 @@ cmd_run_engine_docker() {
         --variant "$VARIANT"
         --image "$img"
         --port "$ENGINE_PORT"
+        --ws-port "$ENGINE_WS_PORT"
         --device "$GPU_DEVICE"
         --max-batch "$MAX_BATCH"
         --max-sessions "$MAX_SESSIONS"
@@ -312,6 +321,7 @@ cmd_run_engine_docker() {
         echo ""
         log_step "Engine Docker Running"
         log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
+        log_info "  WebSocket:      ws://localhost:${ENGINE_WS_PORT}/v1/ws"
         log_info "  Variant:        $VARIANT"
         log_info "  Image:          $img"
         log_info "  Container:      ${ENGINE_CONTAINER_NAME:-qwen3-engine}"

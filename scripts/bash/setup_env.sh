@@ -188,6 +188,10 @@ install_dependencies() {
     # Standalone TTS engine (python -m engine.server) loads .engine from Phase B;
     # TensorRT plan format is tied to the trtexec version in the NGC build image.
     install_tensorrt_for_standalone_engine
+
+    # Serving / protocol test deps used by the standalone engine gateway and
+    # the unified endpoint test tools.
+    pip_install aiohttp grpcio grpcio-tools requests "tritonclient[grpc]"
 }
 
 # ---- Step 4: Model download ----------------------------------------------

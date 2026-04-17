@@ -72,6 +72,7 @@ class TRTEngine:
         self._device = device
         self._engine = None
         self._context = None
+        self._input_names: set[str] = set()
         self._output_dtypes: Dict[str, torch.dtype] = {}
         self._prev_input_shapes: Dict[str, tuple] = {}
         self._output_buffers: Dict[str, torch.Tensor] = {}
@@ -103,9 +104,20 @@ class TRTEngine:
             )
 
         self._context = self._engine.create_execution_context()
+        self._cache_io_names()
         self._cache_output_dtypes()
         logger.info("Loaded TRT engine: %s (%d I/O tensors)",
                      plan_path.name, self._engine.num_io_tensors)
+
+    def _cache_io_names(self) -> None:
+        """Cache input tensor names once at load time."""
+        import tensorrt as trt
+
+        self._input_names.clear()
+        for i in range(self._engine.num_io_tensors):
+            name = self._engine.get_tensor_name(i)
+            if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self._input_names.add(name)
 
     def _cache_output_dtypes(self) -> None:
         """Cache output tensor dtypes once at load time."""
@@ -173,20 +185,53 @@ class TRTEngine:
         ctx = context if context is not None else self._context
         use_cache = context is None
 
+        valid_input_names = self._input_names
+        if not valid_input_names and self._engine is not None:
+            self._cache_io_names()
+            valid_input_names = self._input_names
+
+        if valid_input_names:
+            missing_inputs = sorted(name for name in valid_input_names if name not in inputs)
+            if missing_inputs:
+                raise RuntimeError(
+                    "TRT inference missing required inputs: "
+                    f"{missing_inputs}. Provided inputs: {sorted(inputs.keys())}"
+                )
+
+        input_shapes: Dict[str, tuple] = {}
+        shape_changed = False
         for name, tensor in inputs.items():
+            if valid_input_names and name not in valid_input_names:
+                continue
             tensor = tensor.contiguous()
             shape = tuple(tensor.shape)
+            input_shapes[name] = shape
             if use_cache:
                 if self._prev_input_shapes.get(name) != shape:
                     ctx.set_input_shape(name, shape)
                     self._prev_input_shapes[name] = shape
+                    shape_changed = True
             else:
                 ctx.set_input_shape(name, shape)
+                shape_changed = True
             ctx.set_tensor_address(name, tensor.data_ptr())
+
+        if shape_changed and hasattr(ctx, "infer_shapes"):
+            unresolved = ctx.infer_shapes()
+            if unresolved:
+                raise RuntimeError(
+                    "TensorRT shape inference could not resolve tensors "
+                    f"{list(unresolved)} for inputs {input_shapes}"
+                )
 
         outputs = {}
         for name in output_names:
             shape = tuple(ctx.get_tensor_shape(name))
+            if any(int(dim) < 0 for dim in shape):
+                raise RuntimeError(
+                    "TensorRT produced unresolved output shape "
+                    f"{shape} for output '{name}' with inputs {input_shapes}"
+                )
             dtype_torch = self._output_dtypes.get(name, torch.float32)
 
             override = output_overrides.get(name) if output_overrides else None

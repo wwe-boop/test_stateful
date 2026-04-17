@@ -78,6 +78,8 @@ class PathsConfig:
 class ServerConfig:
     """gRPC server settings."""
     port: int = 50051
+    websocket_port: int = 0
+    websocket_path: str = "/v1/ws"
     health_port: int = 8080
     max_sessions: int = 128
     request_timeout_sec: float = 120.0
@@ -101,6 +103,9 @@ class SchedulerConfig:
     session_timeout_sec: float = 300.0
     # Pad phase: minimum pad steps before silence detection activates
     min_pad_steps: int = 4
+    # Pad-phase near-silence detection thresholds.
+    pad_silence_peak_threshold: float = 5e-4
+    pad_silence_mean_abs_threshold: float = 2e-4
 
 
 @dataclass
