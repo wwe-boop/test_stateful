@@ -298,6 +298,168 @@ Interpretation:
 - on these representative end-to-end reruns, the fixed branch does not reproduce an obvious runaway-length failure
 - if a hallucination is still audible, the next useful reproduction should target the exact offending text / speaker / request path and capture dumps at that point
 
+### 14. Real 4a greedy+punish dump still diverges from the ONNX reference in the CP tail
+
+Experiments:
+- `workspace/engine_dumps/4a_greedy_dump_fix_20260416_202542`
+- fused ONNX replay on bad dump steps `000003`, `000004`, `000008`
+
+Observed:
+- `updated_token_counts` still matches between dump and ONNX replay
+- `codec_0` can still match while CP tail already differs
+- representative step `000003`
+  - dump full codec:
+    `[1085, 1989, 550, 206, 767, 1943, 1731, 1977, 327, 948, 294, 269, 761, 1761, 224, 412]`
+  - ONNX / PyTorch reference:
+    `[1085, 1989, 550, 206, 767, 1943, 287, 176, 433, 948, 294, 1167, 761, 693, 224, 179]`
+- representative step `000008`
+  - dump full codec:
+    `[44, 1558, 1582, 1837, 624, 676, 1699, 1, 287, 223, 1017, 1062, 77, 1320, 499, 1365]`
+  - ONNX / PyTorch reference:
+    `[44, 581, 1999, 1280, 624, 1928, 1699, 898, 1199, 117, 682, 454, 953, 118, 1050, 551]`
+
+Interpretation:
+- after fixing the exported special-embedding bug, the remaining 4a bad dump is no longer explained by a local PyTorch rollout mismatch
+- the divergence now shows up specifically in the TRT execution path, first in the CP tail rather than in the penalty bookkeeping
+
+### 15. Standalone `code_predictor_unrolled` shows the same BF16 TRT problem, while FP32 TRT matches ORT
+
+Experiments:
+- built with TensorRT 10.15.1 (`nvcr.io/nvidia/tritonserver:26.02-py3`)
+  - `code_predictor_unrolled_bf16.engine`
+  - `code_predictor_unrolled_fp32.engine`
+- random-trial parity:
+  - `python tests/integration/verify_code_predictor_trt.py --engine ...code_predictor_unrolled_bf16.engine --trials 10`
+  - `python tests/integration/verify_code_predictor_trt.py --engine ...code_predictor_unrolled_fp32.engine --trials 10`
+- bad-state parity:
+  - same script in dump mode on `000003`, `000004`, `000008`
+
+Observed:
+- standalone BF16 TRT vs ORT on random inputs:
+  - mismatches `7 / 10`
+- standalone FP32 TRT vs ORT on random inputs:
+  - mismatches `0 / 10`
+- on real bad dump state `000003`
+  - ORT tail:
+    `[1989, 550, 206, 767, 1943, 287, 176, 433, 948, 294, 1167, 761, 693, 224, 179]`
+  - standalone BF16 TRT tail:
+    `[1989, 550, 206, 767, 1943, 1731, 1977, 327, 948, 294, 269, 761, 1761, 224, 412]`
+  - standalone FP32 TRT tail:
+    `[1989, 550, 206, 767, 1943, 287, 176, 433, 948, 294, 1167, 761, 693, 224, 179]`
+- on real bad dump state `000008`
+  - standalone BF16 TRT still diverges from ORT (first tail divergence at stage `7`)
+  - standalone BF16 TRT does **not** exactly match the fused TRT dump tail
+  - standalone FP32 TRT exactly matches ORT
+- on real bad dump state `000004`
+  - standalone BF16 TRT still diverges from ORT, but does not exactly match the fused dump tail
+  - standalone FP32 TRT matches ORT
+
+Interpretation:
+- the remaining issue is not “official cached CP vs our unrolled CP”
+- the remaining issue is not “fused ONNX export semantics”
+- the remaining issue is not “penalty parameters only”
+- the strongest current explanation is:
+  - **TensorRT BF16 execution of `code_predictor_unrolled` is itself numerically/semantically unstable**
+  - the fused BF16 engine inherits that CP instability
+  - FP32 TRT is a valid control: on tested standalone CP inputs it matches ORT exactly
+
+### 16. Direct `official BF16` vs `TRT BF16` comparison still shows TRT mismatch
+
+Important correction:
+- `ORT(fp32)` is only a high-precision control, not the final arbiter for the production comparison
+- the more relevant question is whether `TRT BF16` matches the official PyTorch BF16 behavior on the same CP inputs
+
+Experiments:
+- loaded official local model in `torch.bfloat16`
+- compared:
+  - official cached CP under BF16 autocast
+  - standalone TRT `code_predictor_unrolled_bf16.engine`
+- same fixed inputs for both sides:
+  - random `past_hidden + codec_token_0`
+  - 4a bad-state inputs reconstructed from fused dump inputs to isolate the CP branch
+
+Observed on random CP inputs:
+- tested seeds `42..49`
+- official cached BF16 vs TRT BF16 mismatched on `7 / 8` trials
+- representative seed `42`, `codec_token_0=[1809]`
+  - official cached BF16:
+    `[841, 1591, 305, 889, 943, 1212, 931, 61, 89, 266, 16, 637, 175, 242, 928]`
+  - TRT BF16:
+    `[841, 1591, 305, 1468, 490, 245, 559, 880, 89, 1014, 481, 1190, 1105, 831, 313]`
+
+Observed on 4a bad-state-derived CP inputs:
+- step `000003`
+  - official cached BF16:
+    `[1989, 550, 206, 767, 1943, 287, 176, 433, 948, 294, 1167, 761, 369, 224, 179]`
+  - TRT BF16:
+    `[1989, 550, 206, 767, 1943, 1731, 1977, 327, 948, 294, 269, 761, 1761, 224, 412]`
+  - first divergence at stage `5`
+- step `000004`
+  - official cached BF16:
+    `[1542, 1628, 1804, 1774, 1788, 16, 403, 113, 924, 299, 947, 1183, 815, 891, 29]`
+  - TRT BF16:
+    `[1542, 1628, 271, 21, 1297, 39, 403, 910, 924, 2026, 640, 481, 1007, 1229, 32]`
+  - first divergence at stage `2`
+
+Interpretation:
+- even after removing `ORT(fp32)` from the role of final baseline, `TRT BF16` still fails to match official BF16 on the same CP inputs
+- so the earlier conclusion survives the stricter comparison:
+  - the remaining problem is still in the TRT BF16 execution of the CP branch, not just in parameter choice
+
+### 17. On the original greedy+punish dump path, `updated_token_counts` matches official BF16 but `full_codec` does not
+
+Tooling updates:
+- fixed `scripts/export/talker_unified_modules.py` so BF16 replay uses FP32 softmax and casts back before the value matmul
+- made `scripts/python/analyze_engine_dump.py` skip optional outputs like `hidden/logits` when the dump does not store them
+
+Experiments:
+- replayed the real `4a_greedy_dump_fix_20260416_202542` dumps through:
+  - original TRT engine `talker_code2wav_fused.engine`
+  - official fused PyTorch replay in `torch.bfloat16`
+- command shape:
+  - `python scripts/python/analyze_engine_dump.py --dump ... --dtype bfloat16 --model-path workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice`
+
+Observed:
+- original TRT rerun exactly reproduces the saved dump outputs on `000003`, `000004`, `000008`
+- official BF16 replay does **not** reproduce `full_codec`
+  - `000003`: `num_mismatch=13`
+  - `000004`: `num_mismatch=26`
+  - `000008`: `num_mismatch=21`
+- but official BF16 replay does reproduce the talker-side bookkeeping:
+  - `updated_token_counts: match=True` on all three dumps
+  - `talker_new_kv` cosine stays around `0.99994 ~ 0.99995`
+- representative first divergence positions in `full_codec`:
+  - `000003` row0: first diff at index `6`
+  - `000004` row0: first diff at index `3`
+  - `000008` row0: first diff at index `1`
+
+Interpretation:
+- under greedy+punish, the **talker/token0 + repetition-penalty bookkeeping is aligned**
+- the remaining mismatch is in the **CP tail tokens after token0**, not in `token_counts` / `penalty`
+- therefore “both sides become silent, so this must be only a parameter issue” is **not** supported by the token evidence:
+  - the actual `full_codec` sequences are still not aligned with official BF16
+
+### 18. The `hidden/logits -> fp32` debug fused engine is not behavior-preserving
+
+Experiments:
+- built debug engine:
+  - `workspace/exported/custom-1.7b/talker_code2wav_fused.hiddenlogits_fp32.engine`
+- reran the same `4a_greedy_dump_fix` dumps through:
+  - original fused engine
+  - debug fused engine with `hidden/logits` outputs forced to `fp32`
+
+Observed:
+- the debug engine changes `full_codec` by itself:
+  - `000003`: first diff vs original at index `2`
+  - `000004`: first diff vs original at index `3`
+  - `000008`: first diff vs original at index `0`
+- so the debug engine tail is not equal to the original production engine tail, even on identical inputs
+
+Interpretation:
+- forcing `hidden/logits` output formats to `fp32` changes TRT builder/runtime numerics enough to alter token decisions
+- therefore, comparisons that use the debug engine's exported `hidden` are only useful as **diagnostic probes**
+- they must **not** be treated as ground truth for the original fused engine behavior
+
 ## Historical Pre-Fix Narrowing
 
 ### Under the corrected official baseline, the first remaining divergence was CP stage2 at talker step1

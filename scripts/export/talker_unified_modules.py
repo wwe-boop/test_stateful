@@ -194,7 +194,7 @@ def _run_talker_attention_export(
 
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn_module.scaling
     attn_weights = attn_weights + attention_mask
-    attn_weights = torch.softmax(attn_weights, dim=-1)
+    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
 
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, attn_module.o_proj.in_features)

@@ -31,6 +31,13 @@ Example (build BF16 engine via Docker, then compare):
     --maxShapes=past_hidden:8x1x2048,codec_token_0:8 \\
     --memPoolSize=workspace:8192
 
+Example (replay real fused dump states through standalone CP):
+  python tests/integration/verify_code_predictor_trt.py \\
+    --variant-dir workspace/exported/custom-1.7b \\
+    --engine workspace/exported/custom-1.7b/code_predictor_unrolled_bf16.engine \\
+    --dump workspace/engine_dumps/4a_greedy_dump_fix_20260416_202542/000003_decode_*.pt \\
+    --dump-row 0
+
 Notes:
   - trtexec enables TF32 by default; for strict FP32 parity with some references,
     rebuild with --noTF32 (trtexec build flag).
@@ -41,6 +48,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import os
 import re
@@ -143,11 +151,80 @@ def _run_ort(onnx_path: Path, past_hidden: np.ndarray, codec_token_0: np.ndarray
     import onnxruntime as ort
 
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    return _run_ort_session(sess, past_hidden, codec_token_0)
+
+
+def _run_ort_session(
+    sess,
+    past_hidden: np.ndarray,
+    codec_token_0: np.ndarray,
+) -> np.ndarray:
     feeds = {
         "past_hidden": past_hidden.astype(np.float32),
         "codec_token_0": codec_token_0.astype(np.int64),
     }
     return sess.run(None, feeds)[0].reshape(-1).astype(np.int64)
+
+
+def _first_diff(a: np.ndarray, b: np.ndarray) -> int:
+    n = min(len(a), len(b))
+    for i in range(n):
+        if int(a[i]) != int(b[i]):
+            return i
+    return -1 if len(a) == len(b) else n
+
+
+def _resolve_dump_paths(patterns: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for raw in patterns:
+        matches = sorted(Path(m).resolve() for m in glob.glob(raw))
+        if matches:
+            paths.extend(matches)
+            continue
+        path = Path(raw).resolve()
+        if path.is_file():
+            paths.append(path)
+            continue
+        raise FileNotFoundError(f"No dump files matched: {raw}")
+    return paths
+
+
+def _extract_cp_inputs_from_fused_dump(
+    dump_path: Path,
+    fused_sess,
+    row: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    import torch
+
+    dump = torch.load(dump_path, map_location="cpu")
+    dump_inputs = dump["inputs"]
+    fused_input_names = {inp.name for inp in fused_sess.get_inputs()}
+    fused_output_names = [out.name for out in fused_sess.get_outputs()]
+
+    feeds = {}
+    for name in fused_input_names:
+        if name not in dump_inputs:
+            continue
+        value = dump_inputs[name]
+        if value.dtype == torch.bfloat16:
+            value = value.float()
+        feeds[name] = value.numpy()
+
+    fused_out = fused_sess.run(None, feeds)
+    fused_map = {name: value for name, value in zip(fused_output_names, fused_out)}
+
+    if "hidden" not in fused_map or "full_codec" not in fused_map:
+        raise KeyError("Fused ONNX outputs must include hidden and full_codec for dump replay")
+    if row < 0 or row >= fused_map["hidden"].shape[0]:
+        raise IndexError(f"dump row out of range: row={row}, batch={fused_map['hidden'].shape[0]}")
+
+    past_hidden = fused_map["hidden"][row : row + 1, -1:, :].astype(np.float32)
+    codec_token_0 = fused_map["full_codec"][row : row + 1, 0].astype(np.int64)
+
+    dump_tail = None
+    if "full_codec" in dump["outputs"]:
+        dump_tail = dump["outputs"]["full_codec"][row, 1:].cpu().numpy().astype(np.int64)
+    return past_hidden, codec_token_0, dump_tail
 
 
 def _optional_pytorch_ref(
@@ -216,6 +293,24 @@ def main() -> int:
     parser.add_argument("--codec-token0", type=int, default=1500)
     parser.add_argument("--trials", type=int, default=1, help="Random trials (seed, seed+1, ...)")
     parser.add_argument(
+        "--dump",
+        action="append",
+        default=[],
+        help="Replay one or more fused engine dump files/globs by extracting hidden_last+codec_token_0 from fused ONNX",
+    )
+    parser.add_argument(
+        "--dump-row",
+        type=int,
+        default=0,
+        help="Batch row to inspect when --dump is used",
+    )
+    parser.add_argument(
+        "--fused-onnx",
+        type=Path,
+        default=None,
+        help="Fused talker_code2wav_fused.onnx used to reconstruct hidden/codec_0 from dump inputs",
+    )
+    parser.add_argument(
         "--pytorch-ref",
         action="store_true",
         help="Load full TTS weights and compare ORT to PyTorch (slow; optional sanity check)",
@@ -255,6 +350,64 @@ def main() -> int:
     docker_image = getattr(args, "trtexec_docker_image", None)
     if isinstance(docker_image, str) and docker_image.strip() == "":
         docker_image = None
+
+    if args.dump:
+        import onnxruntime as ort
+
+        dump_paths = _resolve_dump_paths(args.dump)
+        fused_onnx_path = args.fused_onnx or (variant_dir / "talker_code2wav_fused.onnx")
+        if not fused_onnx_path.is_file():
+            logger.error("Missing fused ONNX for dump replay: %s", fused_onnx_path)
+            return 1
+
+        cp_sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        fused_sess = ort.InferenceSession(str(fused_onnx_path), providers=["CPUExecutionProvider"])
+
+        mismatches = 0
+        for dump_path in dump_paths:
+            past_hidden, codec_token_0, dump_tail = _extract_cp_inputs_from_fused_dump(
+                dump_path,
+                fused_sess,
+                args.dump_row,
+            )
+            ort_tokens = _run_ort_session(cp_sess, past_hidden, codec_token_0)
+            trt_tokens = _run_trtexec_infer(engine, past_hidden, codec_token_0, docker_image)
+            match = np.array_equal(ort_tokens, trt_tokens)
+            if not match:
+                mismatches += 1
+                logger.error(
+                    "ORT vs TRT mismatch dump=%s row=%s codec_token_0=%s first_diff=%s\n"
+                    "  ORT: %s\n"
+                    "  TRT: %s",
+                    dump_path.name,
+                    args.dump_row,
+                    codec_token_0.tolist(),
+                    _first_diff(ort_tokens, trt_tokens),
+                    ort_tokens,
+                    trt_tokens,
+                )
+            else:
+                logger.info(
+                    "OK dump=%s row=%s stages=%d engine=%s",
+                    dump_path.name,
+                    args.dump_row,
+                    len(ort_tokens),
+                    engine.name,
+                )
+
+            if dump_tail is not None:
+                logger.info(
+                    "  dump_tail_match=%s dump_vs_trt_first_diff=%s dump_vs_ort_first_diff=%s",
+                    np.array_equal(dump_tail, trt_tokens),
+                    _first_diff(dump_tail, trt_tokens),
+                    _first_diff(dump_tail, ort_tokens),
+                )
+
+        if mismatches:
+            logger.error("Total mismatches: %s / %s", mismatches, len(dump_paths))
+            return 1
+        logger.info("All %s dump case(s) matched ORT vs TRT.", len(dump_paths))
+        return 0
 
     mismatches = 0
     for t in range(args.trials):

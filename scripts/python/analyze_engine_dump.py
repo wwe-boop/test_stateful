@@ -296,29 +296,25 @@ def main() -> None:
         device=device,
         dtype=dtype,
     )
-    talker_rows = [
-        _compare_tensor(
-            "codec_sum",
-            talker_ref["codec_sum"],
-            outputs_cpu["codec_sum"],
-            cos_threshold=args.cos_threshold,
-        ),
-        _compare_tensor("full_codec", talker_ref["full_codec"], outputs_cpu["full_codec"], cos_threshold=args.cos_threshold),
-        _compare_tensor("hidden", talker_ref["hidden"], outputs_cpu["hidden"], cos_threshold=args.cos_threshold),
-        _compare_tensor("logits", talker_ref["logits"], outputs_cpu["logits"], cos_threshold=args.cos_threshold),
-        _compare_tensor(
-            "updated_token_counts",
-            talker_ref["updated_token_counts"],
-            outputs_cpu["updated_token_counts"],
-            cos_threshold=args.cos_threshold,
-        ),
-        _compare_tensor(
-            "talker_new_kv",
-            talker_ref["talker_new_kv"],
-            outputs_cpu["talker_new_kv"],
-            cos_threshold=args.cos_threshold,
-        ),
-    ]
+    talker_rows = []
+    for name in (
+        "codec_sum",
+        "full_codec",
+        "hidden",
+        "logits",
+        "updated_token_counts",
+        "talker_new_kv",
+    ):
+        if name not in outputs_cpu:
+            continue
+        talker_rows.append(
+            _compare_tensor(
+                name,
+                talker_ref[name],
+                outputs_cpu[name],
+                cos_threshold=args.cos_threshold,
+            )
+        )
     _print_section("Talker Replay", talker_rows)
 
     report: Dict[str, Any] = {
