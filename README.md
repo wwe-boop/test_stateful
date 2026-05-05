@@ -24,7 +24,7 @@ Qwen3-TTS Triton 是一个 **工程预览版** 项目：把官方 Qwen3-TTS PyTo
 
 - `13ms TTFT`：最低观测值，依赖指定硬件、warm engine、prefix/cache 命中、单路请求、特定 engine profile 和本地链路。
 - `180ms 128-stream avg TTFT`：并发压测口径，需要明确硬件、cache、输入文本、profile、采样参数和客户端测量方式。
-- WebUI 默认会在 live Triton/engine 不可用时展示 fixture trace/metrics，但不会补 synthetic beep 音频。只有结果 source 标记为 `live_triton`、`live_engine_websocket` 或 `live_official_pytorch` 且带 `audio` 字段时，才代表可回放的实时合成音频。
+- WebUI 默认会在 live Triton/engine 不可用时展示提示 warning，但不会补 synthetic beep 音频。只有结果 source 标记为 `live_triton` 或 `live_engine_websocket` 且带 `audio` 字段时，才代表可回放的实时合成音频。
 
 详细 benchmark 口径见 [docs/zh/benchmark_methodology.md](docs/zh/benchmark_methodology.md)。
 
@@ -164,8 +164,24 @@ bash scripts/bash/deploy.sh run --gateway triton --variant custom-1.7b --engine-
 WebUI 分为三个工程展示板块：
 
 - `Text Player`：把文本按 engine decode step 播放出来。一个音频 chunk 对应一个 step；前半段是 text token，进入 flush 后会直接显示 `PAD` step，不隐藏模型真实工作过程。合成完成后 slider 会 seek 实际 WAV 音频。
-- `Performance PK`：用同一段文本跑官方离线 API、官方 online-text API、裸 engine 和 Triton server，对齐请求开始时间后同步回放。官方两行只展示两个时间：`TTFT approx` 和 `Full wav ready`。`TTFT approx` 定义为官方 API 内第一个生成 code0 的时间减去请求开始时间；PK 图里官方捕获到的完整 WAV 从这个近似 TTFT 点开始回放。
+- `LLM PK`：模拟一个上游 LLM 按用户选择的速率（5–100ms / token）逐 token 吐字，把同一段文本同时喂给两套 TTS 接入。流式版本通过 Triton orchestrator 的 `init` + `append_text` × N + `text_complete` 把 token 增量推给引擎，引擎在第一个 token 到达后立刻开始合成；非流式版本在客户端把所有 token 攒齐后再用 `synthesize` 一次性发出。两栏共享同一时间轴和同一段 token tick，能直观看到流式版本的音频在上游 LLM 还没吐完就已经开播，而非流式版本要等"LLM 完成"竖线之后才出声。
 - `Concurrency`：用短文本跑多路合成，统计 TTFT 分布和吞吐；默认请求 live Triton 并保存每路真实音频，点击 lane 可以回放该路合成结果。模拟并发只作为显式 fallback，不附带假音频。
+
+### 演示预览
+
+完整录屏：[演示视频.mp4](docs/videos/演示视频.mp4)
+
+**Text Player**
+
+![Text Player 演示](docs/images/文本播放器.gif)
+
+**LLM PK**
+
+![流式非流式对比演示](docs/images/流式非流式对比.gif)
+
+**Concurrency**
+
+![多路合成演示](docs/images/多路合成.gif)
 
 首次体验建议用一键 demo 入口，WebUI dev server、Demo API 和 Triton 都由这个 launcher 启动/复用：
 
@@ -173,19 +189,13 @@ WebUI 分为三个工程展示板块：
 bash scripts/demo/start_webui_demo.sh --variant custom-1.7b
 ```
 
-如果希望 `Performance PK` 四路都有真实 trace/audio，但机器显存不足以同时常驻官方 PyTorch、裸 engine 和 Triton，使用顺序实测采集模式：
+如果需要同时拉起裸 engine 容器用于对比，可以加 `--with-engine`：
 
 ```bash
-bash scripts/demo/start_webui_demo.sh --variant custom-1.7b --collect-live-race
+bash scripts/demo/start_webui_demo.sh --variant custom-1.7b --with-engine
 ```
 
-这个模式会在 WebUI 启动前依次测官方 PyTorch、裸 engine、Triton：每个 backend 单独占用 GPU，采集完成后写入 `workspace/demo_traces/race_default.json` 和 `workspace/demo_audio/*.wav`，最后默认留下 Triton 供 WebUI 使用。页面里的 PK 进度条是采集结果的同步回放，不要求四个 backend 同时在线。
-
-WebUI 的 `Collect isolated PK` 按钮也会触发同一条顺序采集链路：Demo API 在本机启动采集脚本，通过 WebSocket 把日志推到页面，完成后自动加载新的 trace/audio。`Probe live endpoints` 只用于检查已经在线的服务；如果 official/bare engine 没有启动，它会诚实地显示 warning。
-
-注意：官方 `generate_custom_voice(non_streaming_mode=False)` 在上游 docstring 中说明的是模拟 streaming text input，并不会暴露真正的 audio chunk streaming。WebUI 因此把官方 public API 的真实完成时间保留为 `Full wav ready`，并额外用 hook 获取 `TTFT approx`：第一个生成 code0 出现时间减去请求开始时间。流式 text 模式下，这个点应接近“第一个文本 token 进入 backbone 后输出第一个 code0”；离线模式下，这个点应是完整文本输入后开始音频 code 生成时输出第一个 code0。PK 回放从 `TTFT approx` 开始播放捕获到的完整 WAV。
-
-官方 PyTorch baseline 的模型加载不计入测量时间；采集脚本会先加载模型，再对 offline/streaming 两种模式各跑 1 次不计入指标的 warmup，最后才记录正式请求。需要调整 warmup 可用 `QWEN_DEMO_OFFICIAL_WARMUP_ROUNDS` / `QWEN_DEMO_OFFICIAL_WARMUP_TEXT`，或在 `collect_live_race_sequential.sh` 上使用 `--official-warmup-rounds` / `--official-warmup-text`。
+`LLM PK` 通过 Triton gRPC 调用 `tts_orchestrator`，和 `Speak TRT` / `Concurrency` 共用同一后端，不需要单独启动裸 engine。两次 PK 跑完后，trace/audio 都通过 `/api/v1/llm-pk` 一次性返回；不再写 fixture 文件，不需要单独的采集脚本。
 
 WebUI demo 的 Triton active decode slots 默认按 128 路展示设置为 `TRITON_MAX_BATCH_SLOTS=128`。如果复用的是已经在跑的 Triton 容器，launcher 会读取该容器实际的 `MAX_BATCH_SLOTS`；比如容器仍是 64 slots，那么 128 路并发面板会明确显示 64 active / 64 queued，后 64 路 TTFT 会包含排队等待，不应解读为模型单路首包慢。
 
@@ -200,35 +210,9 @@ bash scripts/demo/start_webui_demo.sh --variant custom-1.7b --triton-slots 128
 npm --prefix webui run demo -- --variant custom-1.7b
 ```
 
-浏览器页面本身不能直接启动本机 Docker/Python 进程，因此自动启动逻辑放在本地 launcher 里。裸 engine 不默认和 Triton 同时启动，因为两者可能争抢 GPU/KV cache；需要把裸 engine 也纳入 `Performance PK` live 测量时显式加 `--with-engine`。
+浏览器页面本身不能直接启动本机 Docker/Python 进程，因此自动启动逻辑放在本地 launcher 里。所有 WebUI 面板（LLM PK / Speak TRT / Concurrency）都走 Triton，所以默认只起 Triton 就够了。`--with-engine` 仍然保留作为可选项，用于把裸 engine 容器拉起来做对比，但 WebUI 不依赖它。
 
-```bash
-bash scripts/demo/start_webui_demo.sh --variant custom-1.7b --with-engine
-```
-
-官方 PyTorch baseline 默认关闭，避免首次打开 WebUI 就加载另一份大模型。需要现场跑官方离线/官方 streaming baseline 时加：
-
-```bash
-bash scripts/demo/start_webui_demo.sh --variant custom-1.7b --official-live
-```
-
-如果某个 live backend 不可用，WebUI 会展示 fixture timing/trace 并明确 warning；音频按钮只会在该 backend 捕获到真实 waveform bytes 时启用，不再用嘟声占位。
-
-要一次性尝试官方 PyTorch baseline、裸 engine 和 Triton 的 4-way live PK，可以用：
-
-```bash
-bash scripts/demo/start_webui_demo.sh --variant custom-1.7b --full-live-pk
-```
-
-这个模式会同时占用更多 GPU 显存；如果出现 OOM 或 KV cache 竞争，WebUI 会保留可复现 warning，而不是用假数据补齐。
-
-也可以只刷新发布 trace，不启动 WebUI：
-
-```bash
-bash scripts/demo/collect_live_race_sequential.sh --variant custom-1.7b
-```
-
-`collect_live_race_sequential.sh` 会明确停止/启动 compose 管理的 engine/Triton 来释放显存；某个 backend 测不到时默认保留 fixture timing 并记录 warning，不会补假音频。需要 CI 或发布前强校验时加 `--strict`。
+如果某个 live backend 不可用，WebUI 会展示对应 warning；音频按钮只会在该 backend 捕获到真实 waveform bytes 时启用，不再用嘟声占位。
 
 多路合成默认走 live Triton。需要只看前端布局或离线演示指标时，可以显式关闭 live lane audio：
 
@@ -253,15 +237,6 @@ Docker Compose demo profile：
 ```bash
 bash scripts/bash/compose.sh up --gateway triton --variant custom-1.7b
 docker compose --profile demo up --build demo-api webui
-```
-
-刷新发布 trace：
-
-```bash
-python scripts/demo/collect_demo_traces.py \
-  --live-triton \
-  --triton-grpc localhost:8001 \
-  --output workspace/demo_traces/race_default.json
 ```
 
 如果直接手动启动 Demo API，live concurrency 默认开启；需要模拟模式时显式设为 0：

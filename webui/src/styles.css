@@ -325,18 +325,6 @@ select {
   letter-spacing: 0;
 }
 
-.backend-triton_trt_streaming .primary-metric strong {
-  color: #0f766e;
-}
-
-.backend-official_pytorch_streaming .primary-metric strong {
-  color: #2368a2;
-}
-
-.backend-official_pytorch_offline .primary-metric strong {
-  color: #9a5c00;
-}
-
 .metric-grid,
 .summary-row,
 .condition-grid {
@@ -634,20 +622,117 @@ select {
   background: #0f766e;
 }
 
-.race-official_pytorch_offline .race-audio-fill {
-  background: #9a5c00;
-}
-
-.race-official_pytorch_streaming .race-audio-fill {
-  background: #2368a2;
-}
-
-.race-bare_engine_streaming .race-audio-fill {
+.race-triton_streaming .race-audio-fill {
   background: #0f766e;
 }
 
-.race-triton_trt_streaming .race-audio-fill {
-  background: #208179;
+.race-triton_offline .race-audio-fill {
+  background: #b45309;
+}
+
+.race-token-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(15, 118, 110, 0.55);
+  pointer-events: none;
+}
+
+.race-triton_offline .race-token-tick {
+  background: rgba(180, 83, 9, 0.55);
+}
+
+.race-llm-complete-marker {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 0;
+  border-left: 2px dashed #475569;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.llm-pk-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.llm-pk-text {
+  width: 100%;
+  min-height: 56px;
+  padding: 8px 10px;
+  border: 1px solid #dce2e7;
+  border-radius: 6px;
+  font: inherit;
+  resize: vertical;
+}
+
+.llm-pk-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.llm-pk-row input[type="text"],
+.llm-pk-row input:not([type="range"]) {
+  padding: 6px 10px;
+  border: 1px solid #dce2e7;
+  border-radius: 6px;
+  font: inherit;
+  min-width: 0;
+}
+
+.llm-pk-slider {
+  flex: 1 1 220px;
+  min-width: 220px;
+}
+
+.llm-pk-slider label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #475569;
+}
+
+.llm-pk-slider input[type="range"] {
+  flex: 1;
+}
+
+.llm-pk-slider strong {
+  min-width: 48px;
+  text-align: right;
+  color: #0f172a;
+  font-variant-numeric: tabular-nums;
+}
+
+.llm-pk-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+  color: #64748b;
+}
+
+.llm-pk-presets .button.tiny.active {
+  background: #0f766e;
+  color: white;
+  border-color: #0f766e;
+}
+
+.llm-pk-summary {
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+  font-size: 13px;
 }
 
 .condition-grid > div {

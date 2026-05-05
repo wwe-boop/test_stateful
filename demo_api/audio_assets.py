@@ -21,14 +21,6 @@ def attach_audio_to_result(result: RunResult, audio_store: AudioStore) -> None:
 
 
 def scheduled_start_ms(metrics: dict, backend: str) -> float:
-    if backend.startswith("official_pytorch"):
-        return float(
-            metrics.get("official_approx_ttft_ms")
-            or metrics.get("first_playable_ms")
-            or metrics.get("full_audio_ready_ms")
-            or metrics.get("total_ms")
-            or 0.0
-        )
     return float(
         metrics.get("first_playable_ms")
         or metrics.get("client_ttfb_ms")

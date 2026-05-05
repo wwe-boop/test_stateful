@@ -30,6 +30,8 @@ class TtsRequest:
     task_type: str = "custom_voice"
     audio_encoding: str = "pcm_f32"
     sample_rate: int = 24000
+    input_mode: str | None = None
+    group_policy: str | None = None
 
 
 def _decode_obj(value: Any) -> str:
@@ -47,7 +49,7 @@ def _load_triton_client():
 
 
 def build_payload(request: TtsRequest) -> dict[str, Any]:
-    return {
+    payload = {
         "text": request.text,
         "task_type": request.task_type,
         "speaker": request.speaker,
@@ -59,6 +61,52 @@ def build_payload(request: TtsRequest) -> dict[str, Any]:
             "channels": 1,
         },
     }
+    if request.input_mode:
+        payload["input_mode"] = request.input_mode
+    if request.group_policy:
+        payload["group_policy"] = request.group_policy
+    return payload
+
+
+def build_action_payload(
+    action: str,
+    session_id: str,
+    *,
+    text: str = "",
+    request: TtsRequest | None = None,
+) -> dict[str, Any]:
+    """Build a payload for one tts_orchestrator action.
+
+    `init` / `synthesize` carry the full session config (speaker, language,
+    audio format). `append_text` carries `session_id` + `text`.
+    `text_complete` and `cancel` only carry `session_id`.
+    """
+    payload: dict[str, Any] = {"action": action, "session_id": session_id}
+    if action in ("init", "start", "synthesize"):
+        if request is None:
+            raise ValueError(f"action {action!r} requires a TtsRequest")
+        payload.update(
+            {
+                "task_type": request.task_type,
+                "speaker": request.speaker,
+                "language": request.language,
+                "cache_mode": request.cache_mode,
+                "audio": {
+                    "encoding": request.audio_encoding,
+                    "sample_rate": request.sample_rate,
+                    "channels": 1,
+                },
+            }
+        )
+        if request.input_mode:
+            payload["input_mode"] = request.input_mode
+        if request.group_policy:
+            payload["group_policy"] = request.group_policy
+        if action == "synthesize":
+            payload["text"] = text or request.text
+    elif action in ("append_text", "append"):
+        payload["text"] = text
+    return payload
 
 
 def probe_ready(endpoint: str = DEFAULT_TRITON_GRPC, model_name: str = DEFAULT_TRITON_MODEL) -> bool:

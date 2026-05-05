@@ -1,31 +1,43 @@
 import { Activity, AlertTriangle, Download, RadioTower, RotateCcw, Zap } from "lucide-react";
 import type { MutableRefObject } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { getCapabilities, mediaUrl, runRace, startRaceCapture, wsUrl } from "./api";
+import { getCapabilities, mediaUrl, runLlmPk, wsUrl } from "./api";
 import { PcmStreamPlayer } from "./audio/pcm-player";
 import { wavBlobFromPcmF32 } from "./audio/wav";
 import { ConcurrencyPanel } from "./components/ConcurrencyPanel";
 import { PerformanceRace } from "./components/PerformanceRace";
 import { TextPlayer } from "./components/TextPlayer";
 import { formatMs } from "./components/Timeline";
-import type { AudioFormat, Capabilities, DemoRequest, RaceCaptureEvent, RaceResult, TraceEvent } from "./types";
+import type {
+  AudioFormat,
+  Capabilities,
+  DemoRequest,
+  LlmPkRequest,
+  LlmPkResult,
+  TraceEvent,
+} from "./types";
 import "./styles.css";
 
 const DEFAULT_AUDIO: AudioFormat = { encoding: "pcm_f32", sample_rate: 24000, channels: 1 };
 
+const FALLBACK_LLM_PK: LlmPkRequest = {
+  text: "你好，今天天气不错，我们来聊聊最近你看过的书，有没有什么推荐的？",
+  speaker: "Serena",
+  language: "auto",
+  ms_per_token: 30,
+};
+
 export default function App() {
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
-  const [request, setRequest] = useState<DemoRequest>({
-    text: "你好，这是千问3 TTS token级流式语音演示。",
-    speaker: "Serena",
-    language: "auto",
-    cache_mode: "hit"
+  const [llmPkDefaults, setLlmPkDefaults] = useState<LlmPkRequest>(FALLBACK_LLM_PK);
+  const [trtRequest, setTrtRequest] = useState<DemoRequest>({
+    text: FALLBACK_LLM_PK.text,
+    speaker: FALLBACK_LLM_PK.speaker,
+    language: FALLBACK_LLM_PK.language,
   });
-  const [race, setRace] = useState<RaceResult | null>(null);
+  const [llmPk, setLlmPk] = useState<LlmPkResult | null>(null);
+  const [llmPkBusy, setLlmPkBusy] = useState(false);
   const [liveEvents, setLiveEvents] = useState<TraceEvent[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [captureRunning, setCaptureRunning] = useState(false);
-  const [captureLogs, setCaptureLogs] = useState<string[]>([]);
   const [liveBusy, setLiveBusy] = useState(false);
   const [liveClockRunning, setLiveClockRunning] = useState(false);
   const [warnings, setWarnings] = useState<string[]>([]);
@@ -34,7 +46,6 @@ export default function App() {
   const playerRef = useRef<PcmStreamPlayer | null>(null);
   const raceAudioRef = useRef<AudioContext | null>(null);
   const liveSocketRef = useRef<WebSocket | null>(null);
-  const raceCaptureSocketRef = useRef<WebSocket | null>(null);
   const liveRunSeqRef = useRef(0);
   const liveAudioPartsRef = useRef<ArrayBuffer[]>([]);
   const liveAudioFormatRef = useRef<AudioFormat>(DEFAULT_AUDIO);
@@ -47,24 +58,15 @@ export default function App() {
     getCapabilities()
       .then((caps) => {
         setCapabilities(caps);
-        setRequest(caps.default_request);
-        return runRace(caps.default_request, { useLiveTriton: false });
+        setLlmPkDefaults(caps.default_request);
+        setTrtRequest({
+          text: caps.default_request.text,
+          speaker: caps.default_request.speaker,
+          language: caps.default_request.language,
+        });
       })
-      .then(applyRaceResult)
       .catch((error) => setWarnings([String(error)]));
   }, []);
-
-  function applyRaceResult(result: RaceResult) {
-    liveRunSeqRef.current += 1;
-    liveSocketRef.current?.close();
-    liveSocketRef.current = null;
-    resetLiveProgress();
-    void playerRef.current?.stop();
-    setLiveBusy(false);
-    setRace(result);
-    setLiveEvents([]);
-    clearLiveAudioUrl();
-  }
 
   useEffect(() => {
     if (!liveClockRunning || liveStartedAtRef.current === null) {
@@ -108,82 +110,17 @@ export default function App() {
     liveAudioFormatRef.current = DEFAULT_AUDIO;
   }
 
-  async function onRace() {
-    setBusy(true);
+  async function onRunLlmPk(request: LlmPkRequest) {
+    setLlmPkBusy(true);
     setWarnings([]);
     try {
-      const result = await runRace(request, { useLiveTriton: true, useLiveEngine: true });
-      applyRaceResult(result);
+      const result = await runLlmPk(request);
+      setLlmPk(result);
       setWarnings(result.warnings ?? []);
     } catch (error) {
       setWarnings([String(error)]);
     } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onRaceOfficial() {
-    setBusy(true);
-    setWarnings([]);
-    try {
-      const result = await runRace(request, { useLiveTriton: true, useLiveEngine: true, liveBaselines: true });
-      applyRaceResult(result);
-      setWarnings(result.warnings ?? []);
-    } catch (error) {
-      setWarnings([String(error)]);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onCollectRace() {
-    raceCaptureSocketRef.current?.close();
-    setCaptureRunning(true);
-    setCaptureLogs([]);
-    setWarnings([]);
-    try {
-      const jobId = await startRaceCapture({
-        ...request,
-        triton_slots: capabilities?.concurrency?.triton_active_slot_limit ?? 128,
-      });
-      const socket = new WebSocket(wsUrl(`/api/v1/race-capture/${jobId}`));
-      raceCaptureSocketRef.current = socket;
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data) as RaceCaptureEvent;
-        if (message.type === "race_capture_started") {
-          setCaptureLogs((current) => [...current, `$ ${message.command}`]);
-        }
-        if (message.type === "race_capture_log") {
-          setCaptureLogs((current) => [...current, message.message]);
-        }
-        if (message.type === "race_capture_done") {
-          applyRaceResult(message.race);
-          setWarnings(message.race.warnings ?? []);
-          setCaptureLogs((current) => [...current, "race capture complete"]);
-          setCaptureRunning(false);
-          socket.close();
-        }
-        if (message.type === "race_capture_error") {
-          setWarnings((current) => [...current, message.message]);
-          setCaptureLogs((current) => [...current, message.message]);
-          setCaptureRunning(false);
-          socket.close();
-        }
-      };
-      socket.onerror = () => {
-        setWarnings((current) => [...current, "race capture websocket failed"]);
-        setCaptureLogs((current) => [...current, "race capture websocket failed"]);
-        setCaptureRunning(false);
-      };
-      socket.onclose = () => {
-        if (raceCaptureSocketRef.current === socket) {
-          raceCaptureSocketRef.current = null;
-        }
-      };
-    } catch (error) {
-      setWarnings([String(error)]);
-      setCaptureLogs((current) => [...current, String(error)]);
-      setCaptureRunning(false);
+      setLlmPkBusy(false);
     }
   }
 
@@ -214,7 +151,7 @@ export default function App() {
       }
       liveStartedAtRef.current = performance.now();
       setLiveClockRunning(true);
-      socket.send(JSON.stringify({ type: "speak", ...request }));
+      socket.send(JSON.stringify({ type: "speak", ...trtRequest }));
     };
     socket.onmessage = (event) => {
       if (runSeq !== liveRunSeqRef.current) {
@@ -292,24 +229,21 @@ export default function App() {
 
   const liveFirstAudio = liveEvents.find((event) => event.type === "first_audio_chunk")?.t_ms;
   const tritonReady = capabilities?.backends.find((backend) => backend.id === "triton_trt_streaming")?.live_available;
-  const officialReady = capabilities?.backends.some((backend) => backend.id.startsWith("official") && backend.live_available);
-  const release = race?.release ?? capabilities?.release;
-  const limitations = race?.limitations ?? capabilities?.limitations ?? [];
+  const llmPkReady = capabilities?.backends.some((backend) => (backend.id === "triton_streaming" || backend.id === "triton_offline") && backend.live_available);
+  const release = llmPk?.release ?? capabilities?.release;
+  const limitations = llmPk?.limitations ?? capabilities?.limitations ?? [];
   const showingLiveTrace = liveBusy || liveEvents.length > 0;
   const tokenEvents = useMemo(
-    () => (showingLiveTrace ? liveEvents : preferredTokenEvents(race, [])),
-    [race, liveEvents, showingLiveTrace]
+    () => (showingLiveTrace ? liveEvents : preferredTokenEvents(llmPk)),
+    [llmPk, liveEvents, showingLiveTrace],
   );
-  const tritonRaceResult = race?.results.find((result) => result.backend === "triton_trt_streaming");
-  const raceHasLiveCapture = race?.results.some((result) => result.source !== "fixture") ?? false;
-  const textPlayerAudioUrl = liveAudioUrl ?? (tritonRaceResult?.audio?.url ? mediaUrl(tritonRaceResult.audio.url) : undefined);
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div>
           <h1>Qwen3-TTS Triton</h1>
-          <p>PyTorch offline/online-text vs TensorRT token streaming</p>
+          <p>token streaming demo · LLM upstream simulation</p>
         </div>
         <div className="headline-metrics">
           <div>
@@ -326,8 +260,8 @@ export default function App() {
       <section className="release-notice">
         <div>
           <AlertTriangle size={17} />
-          <strong>{release?.stage === "engineering_preview" ? "工程预览版" : "Preview"}</strong>
-          <span>{release?.positioning ?? "当前演示用于展示 TensorRT token streaming 链路，不代表生产稳定性。"}</span>
+          <strong>{release?.stage === "engineering_preview" ? "Engineering Preview" : "Preview"}</strong>
+          <span>{release?.positioning ?? "This demo shows the TensorRT token-streaming path and does not represent production stability."}</span>
         </div>
         {limitations.length > 0 && (
           <ul>
@@ -337,22 +271,17 @@ export default function App() {
       </section>
 
       <section className="control-surface">
-        <textarea value={request.text} onChange={(event) => setRequest({ ...request, text: event.target.value })} />
+        <textarea value={trtRequest.text} onChange={(event) => setTrtRequest({ ...trtRequest, text: event.target.value })} />
         <div className="controls-row">
-          <input value={request.speaker} onChange={(event) => setRequest({ ...request, speaker: event.target.value })} aria-label="speaker" />
-          <input value={request.language} onChange={(event) => setRequest({ ...request, language: event.target.value })} aria-label="language" />
-          <select value={request.cache_mode} onChange={(event) => setRequest({ ...request, cache_mode: event.target.value as DemoRequest["cache_mode"] })}>
-            <option value="hit">Cache hit</option>
-            <option value="miss">Cache miss</option>
-            <option value="auto">Auto</option>
-          </select>
+          <input value={trtRequest.speaker} onChange={(event) => setTrtRequest({ ...trtRequest, speaker: event.target.value })} aria-label="speaker" />
+          <input value={trtRequest.language} onChange={(event) => setTrtRequest({ ...trtRequest, language: event.target.value })} aria-label="language" />
           <button className="button primary" onClick={speakTrt} disabled={liveBusy}>
             <Zap size={16} />
             {liveBusy ? "Speaking" : "Speak TRT"}
           </button>
-          <button className="button ghost" onClick={() => runRace(request, { useLiveTriton: false }).then(applyRaceResult)}>
+          <button className="button ghost" onClick={() => clearLiveAudioUrl()}>
             <RotateCcw size={16} />
-            Trace
+            Clear
           </button>
         </div>
       </section>
@@ -362,18 +291,15 @@ export default function App() {
           <RadioTower size={15} />
           Triton {tritonReady ? "live" : "fixture fallback"}
         </div>
-        <div className={`status-pill ${officialReady ? "ready" : "muted"}`}>
+        <div className={`status-pill ${llmPkReady ? "ready" : "muted"}`}>
           <RadioTower size={15} />
-          Official API {officialReady ? "enabled" : "fixture"}
+          LLM PK {llmPkReady ? "live" : "offline"}
         </div>
         <div className="status-pill">
           <Activity size={15} />
           Live first audio {formatMs(liveFirstAudio)}
         </div>
-        <div className="status-pill muted">
-          {raceHasLiveCapture ? "Captured trace loaded" : race?.source_path ? "Fixture trace loaded" : "Live result pending"}
-        </div>
-        <button className="button tiny" onClick={() => downloadJson(race)}>
+        <button className="button tiny" onClick={() => downloadJson(llmPk)}>
           <Download size={14} />
           JSON
         </button>
@@ -387,65 +313,47 @@ export default function App() {
 
       <TextPlayer
         events={tokenEvents}
-        text={request.text}
-        audioUrl={textPlayerAudioUrl}
+        text={trtRequest.text}
+        audioUrl={liveAudioUrl}
         liveMs={showingLiveTrace ? liveClockMs : 0}
         live={liveBusy}
-        source={showingLiveTrace ? "live TRT stream" : tritonRaceResult?.source ?? "trace"}
+        source={showingLiveTrace ? "live TRT stream" : "trace"}
       />
 
       <PerformanceRace
-        race={race}
-        busy={busy}
-        captureRunning={captureRunning}
-        captureLogs={captureLogs}
-        onCollectRace={onCollectRace}
-        onRace={onRace}
-        onRaceOfficial={onRaceOfficial}
+        result={llmPk}
+        busy={llmPkBusy}
+        defaults={llmPkDefaults}
+        onRun={onRunLlmPk}
         onPlayAligned={(items) => playAudioRace(items, true, raceAudioRef)}
         onPlayOne={(item) => playAudioRace([item], false, raceAudioRef)}
       />
 
-      {race && (
-        <section className="panel conditions-panel">
-          <div className="panel-head">
-            <div>
-              <h2>Benchmark Conditions</h2>
-              <p>hardware, cache, precision, replay mode</p>
-            </div>
-          </div>
-          <div className="condition-grid">
-            {Object.entries(race.benchmark_conditions).map(([key, value]) => (
-              <div key={key}>
-                <span>{key.replace(/_/g, " ")}</span>
-                <strong>{String(value)}</strong>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      <ConcurrencyPanel request={request} />
+      <ConcurrencyPanel
+        request={{
+          text: trtRequest.text,
+          speaker: trtRequest.speaker,
+          language: trtRequest.language,
+        }}
+      />
     </main>
   );
 }
 
-function preferredTokenEvents(race: RaceResult | null, liveEvents: TraceEvent[]): TraceEvent[] {
-  if (liveEvents.length > 0) {
-    return liveEvents;
+function preferredTokenEvents(result: LlmPkResult | null): TraceEvent[] {
+  if (!result) return [];
+  const streaming = result.results.find((row) => row.backend === "triton_streaming");
+  if (streaming?.events.length) {
+    return streaming.events;
   }
-  const triton = race?.results.find((result) => result.backend === "triton_trt_streaming");
-  if (triton?.events.length) {
-    return triton.events;
-  }
-  const engine = race?.results.find((result) => result.backend === "bare_engine_streaming");
-  return engine?.events ?? [];
+  const offline = result.results.find((row) => row.backend === "triton_offline");
+  return offline?.events ?? [];
 }
 
 async function playAudioRace(
   results: Array<{ audio?: { url: string; scheduled_start_ms?: number }; label: string }>,
   measuredWait: boolean,
-  contextRef: MutableRefObject<AudioContext | null>
+  contextRef: MutableRefObject<AudioContext | null>,
 ): Promise<void> {
   if (contextRef.current) {
     await contextRef.current.close();
@@ -468,7 +376,7 @@ async function playAudioRace(
         result,
         audio: await context.decodeAudioData(buffer.slice(0)),
       };
-    })
+    }),
   );
   const baseTime = context.currentTime + 0.08;
   decoded.forEach(({ result, audio }) => {
@@ -483,13 +391,13 @@ async function playAudioRace(
   });
 }
 
-function downloadJson(race: RaceResult | null): void {
-  if (!race) return;
-  const blob = new Blob([JSON.stringify(race, null, 2)], { type: "application/json" });
+function downloadJson(result: LlmPkResult | null): void {
+  if (!result) return;
+  const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = "qwen3-tts-race-result.json";
+  link.download = "qwen3-tts-llm-pk-result.json";
   link.click();
   URL.revokeObjectURL(url);
 }

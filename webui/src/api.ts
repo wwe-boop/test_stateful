@@ -1,4 +1,4 @@
-import type { Capabilities, DemoRequest, RaceResult } from "./types";
+import type { Capabilities, DemoRequest, LlmPkRequest, LlmPkResult } from "./types";
 
 const API_BASE = (import.meta.env.VITE_DEMO_API_URL ?? "").replace(/\/$/, "");
 
@@ -42,27 +42,11 @@ export function getCapabilities(): Promise<Capabilities> {
   return jsonFetch<Capabilities>("/api/v1/capabilities");
 }
 
-export function runRace(
-  request: DemoRequest,
-  options: { useLiveTriton: boolean; useLiveEngine?: boolean; liveBaselines?: boolean }
-): Promise<RaceResult> {
-  return jsonFetch<RaceResult>("/api/v1/race", {
+export function runLlmPk(request: LlmPkRequest): Promise<LlmPkResult> {
+  return jsonFetch<LlmPkResult>("/api/v1/llm-pk", {
     method: "POST",
-    body: JSON.stringify({
-      ...request,
-      use_live_triton: options.useLiveTriton,
-      use_live_engine: options.useLiveEngine ?? false,
-      live_baselines: options.liveBaselines ?? false
-    })
+    body: JSON.stringify(request)
   });
-}
-
-export async function startRaceCapture(payload: DemoRequest & { triton_slots?: number; strict?: boolean }): Promise<string> {
-  const response = await jsonFetch<{ job_id: string }>("/api/v1/race-capture", {
-    method: "POST",
-    body: JSON.stringify(payload)
-  });
-  return response.job_id;
 }
 
 export async function startConcurrency(payload: DemoRequest & { concurrency: number; live: boolean }): Promise<string> {

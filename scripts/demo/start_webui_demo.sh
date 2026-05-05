@@ -15,8 +15,6 @@ ENGINE_WS_PORT="${ENGINE_WEBSOCKET_PORT:-50052}"
 START_TRITON=true
 START_ENGINE=false
 LIVE_CONCURRENCY=true
-OFFICIAL_LIVE=false
-COLLECT_LIVE_RACE=false
 
 usage() {
   cat <<EOF
@@ -34,15 +32,13 @@ Options:
   --with-engine             Also start standalone engine container on WebSocket port ${ENGINE_WS_PORT}
   --live-concurrency        Enable real Triton concurrency jobs in demo_api (default)
   --simulated-concurrency   Use simulated concurrency metrics with no lane audio
-  --official-live           Enable live official PyTorch baselines when configured
-  --full-live-pk            Enable official live baselines and standalone engine for 4-way PK
-  --collect-live-race       Sequentially capture official/engine/Triton race trace+audio before WebUI starts
   -h, --help                Show this help
 
 Notes:
-  Bare engine is opt-in because it can compete with Triton for GPU memory.
-  Use --with-engine/--full-live-pk only when the target GPU has enough headroom.
-  Use --collect-live-race on smaller GPUs: each backend is measured alone, then replayed in WebUI.
+  All demo panels (LLM PK, Speak TRT, Concurrency) talk to the same Triton.
+  --with-engine is optional and only needed when you also want to compare
+  against a side-by-side standalone engine container; the WebUI doesn't
+  need it.
 EOF
 }
 
@@ -70,19 +66,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --simulated-concurrency)
       LIVE_CONCURRENCY=false
-      shift
-      ;;
-    --official-live)
-      OFFICIAL_LIVE=true
-      shift
-      ;;
-    --full-live-pk)
-      START_ENGINE=true
-      OFFICIAL_LIVE=true
-      shift
-      ;;
-    --collect-live-race)
-      COLLECT_LIVE_RACE=true
       shift
       ;;
     -h|--help)
@@ -158,12 +141,6 @@ cd "${REPO_ROOT}"
 PYTHON_BIN="$(choose_python)"
 require_demo_python_dependencies
 
-if ${COLLECT_LIVE_RACE}; then
-  QWEN_DEMO_PYTHON="${PYTHON_BIN}" bash scripts/demo/collect_live_race_sequential.sh \
-    --variant "${VARIANT}" \
-    --triton-slots "${TRITON_MAX_BATCH_SLOTS}"
-fi
-
 export TRITON_MAX_BATCH_SLOTS
 export TRITON_MAX_SESSIONS
 DETECTED_TRITON_SLOTS=""
@@ -204,7 +181,6 @@ export QWEN_DEMO_TRITON_MAX_SESSIONS="${TRITON_MAX_SESSIONS}"
 export QWEN_DEMO_ENGINE_WS="${QWEN_DEMO_ENGINE_WS:-ws://localhost:${ENGINE_WS_PORT}/v1/ws}"
 export QWEN_DEMO_ENGINE_CAPABILITIES="${QWEN_DEMO_ENGINE_CAPABILITIES:-http://localhost:${ENGINE_WS_PORT}/v1/capabilities}"
 export QWEN_DEMO_ENABLE_LIVE_CONCURRENCY=$(${LIVE_CONCURRENCY} && echo 1 || echo 0)
-export QWEN_DEMO_ENABLE_OFFICIAL_LIVE=$(${OFFICIAL_LIVE} && echo 1 || echo 0)
 ENGINE_STATUS="not started by launcher"
 if ${START_ENGINE}; then
   ENGINE_STATUS="started or reused by launcher"

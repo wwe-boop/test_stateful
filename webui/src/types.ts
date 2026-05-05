@@ -1,7 +1,6 @@
 export type BackendId =
-  | "official_pytorch_offline"
-  | "official_pytorch_streaming"
-  | "bare_engine_streaming"
+  | "triton_streaming"
+  | "triton_offline"
   | "triton_trt_streaming";
 
 export interface TraceEvent {
@@ -18,7 +17,6 @@ export interface TraceEvent {
 export interface RunMetrics {
   first_playable_ms?: number;
   total_ms?: number;
-  official_approx_ttft_ms?: number;
   server_ttft_ms?: number;
   triton_adapter_ttft_ms?: number;
   engine_internal_ttft_ms?: number;
@@ -26,6 +24,7 @@ export interface RunMetrics {
   first_audible_ms?: number;
   full_audio_ready_ms?: number;
   audio_duration_ms?: number;
+  simulated_llm_complete_ms?: number;
   chunks?: number;
   cache_hit?: boolean;
 }
@@ -62,11 +61,14 @@ export interface DemoRequest {
   text: string;
   speaker: string;
   language: string;
-  cache_mode: "hit" | "miss" | "auto";
+}
+
+export interface LlmPkRequest extends DemoRequest {
+  ms_per_token: number;
 }
 
 export interface Capabilities {
-  default_request: DemoRequest;
+  default_request: LlmPkRequest;
   backends: Array<{
     id: BackendId;
     label: string;
@@ -85,7 +87,6 @@ export interface Capabilities {
     triton_active_slot_limit: number;
     triton_max_sessions: number;
   };
-  benchmark_conditions: Record<string, unknown>;
   release?: ReleaseMetadata;
   limitations?: string[];
   headline: {
@@ -103,43 +104,14 @@ export interface ReleaseMetadata {
   planned_paths: string[];
 }
 
-export interface RaceResult {
-  type: "race_result";
-  request: DemoRequest;
-  benchmark_conditions: Record<string, unknown>;
-  release?: ReleaseMetadata;
-  limitations?: string[];
+export interface LlmPkResult {
+  type: "llm_pk_result";
+  request: LlmPkRequest;
   results: RunResult[];
   warnings: string[];
-  source_path: string;
+  release?: ReleaseMetadata;
+  limitations?: string[];
 }
-
-export type RaceCaptureEvent =
-  | {
-      type: "race_capture_started";
-      job_id: string;
-      command: string;
-    }
-  | {
-      type: "race_capture_log";
-      job_id: string;
-      message: string;
-    }
-  | {
-      type: "race_capture_done";
-      job_id: string;
-      returncode: number;
-      race: RaceResult;
-    }
-  | {
-      type: "race_capture_error";
-      job_id: string;
-      message: string;
-      returncode?: number;
-    }
-  | {
-      type: "heartbeat";
-    };
 
 export interface LaneUpdate {
   type: "lane_update";

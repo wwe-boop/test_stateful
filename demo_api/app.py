@@ -12,29 +12,25 @@ from aiohttp import WSMsgType, web
 
 from .audio_assets import attach_audio_to_result
 from .audio_store import AudioStore
-from . import engine_client
+from . import llm_pk
 from .jobs import ConcurrencyJobManager
-from .official_pytorch import (
-    OfficialPyTorchRunner,
-    is_official_streaming_info_warning,
-)
-from .race_capture import RaceCaptureJobManager
 from .schemas import TraceEvent
-from .trace_store import TraceStore, replace_backend_result
-from .triton_client import TtsRequest, measure_once, probe_ready, stream_once
+from .trace_store import TraceStore
+from .triton_client import TtsRequest, probe_ready, stream_once
 
 
-DEFAULT_TEXT = "你好，这是千问3 TTS token级流式语音演示。"
+DEFAULT_TEXT = "你好，今天天气不错，我们来聊聊最近你看过的书，有没有什么推荐的？"
 DEFAULT_SPEAKER = os.environ.get("QWEN_DEMO_DEFAULT_SPEAKER", "Serena")
 DEFAULT_LANGUAGE = os.environ.get("QWEN_DEMO_DEFAULT_LANGUAGE", "auto")
+DEFAULT_MS_PER_TOKEN = float(os.environ.get("QWEN_DEMO_DEFAULT_MS_PER_TOKEN", "30"))
 TRITON_GRPC = os.environ.get("QWEN_DEMO_TRITON_GRPC", "localhost:8001")
 TRITON_MODEL = os.environ.get("QWEN_DEMO_TRITON_MODEL", "tts_orchestrator")
-TRITON_MAX_BATCH_SLOTS = int(os.environ.get("QWEN_DEMO_TRITON_MAX_BATCH_SLOTS", os.environ.get("TRITON_MAX_BATCH_SLOTS", "64")))
+TRITON_MAX_BATCH_SLOTS = int(os.environ.get("QWEN_DEMO_TRITON_MAX_BATCH_SLOTS", os.environ.get("TRITON_MAX_BATCH_SLOTS", "128")))
 TRITON_MAX_SESSIONS = int(os.environ.get("QWEN_DEMO_TRITON_MAX_SESSIONS", os.environ.get("TRITON_MAX_SESSIONS", "128")))
 
 RELEASE_METADATA = {
     "stage": "engineering_preview",
-    "positioning": "工程预览版：展示 Qwen3-TTS TensorRT/token streaming 优化链路，不承诺生产稳定性。",
+    "positioning": "Engineering preview: demonstrates the Qwen3-TTS TensorRT/token-streaming optimization path and does not promise production stability.",
     "recommended_variant": "custom-1.7b",
     "stable_paths": ["custom_voice"],
     "experimental_paths": ["voice_design"],
@@ -42,12 +38,10 @@ RELEASE_METADATA = {
 }
 
 STREAMING_LIMITATIONS = [
-    "当前稳定开源范围优先限定为 custom-1.7b/custom_voice 路径。",
-    "流式模式仍可能出现幻觉、重复、漏读、插入未提供内容，长文本更容易触发。",
-    "13ms TTFT 只代表特定硬件、warm engine、cache 命中、单路请求下的最低观测值。",
-    "WebUI 在 live 后端不可用时只展示 fixture trace/metrics，不再补 synthetic beep 音频。",
-    "只有 source 标记为 live_triton、live_engine_websocket 或 live_official_pytorch 且带 audio 的结果才可回放真实合成音频。",
-    "Performance PK 中官方 PyTorch TTFT 近似值按 decode 阶段第一个 code0 出现时间减去请求开始时间统计；public API 实际仍是完整 waveform 返回。",
+    "The current stable open-source scope is focused on the custom-1.7b/custom_voice path.",
+    "Streaming mode may still hallucinate, repeat, skip, or insert text that was not provided, especially on longer inputs.",
+    "The 13ms TTFT figure is only the lowest observed value under specific hardware, a warm engine, a cache hit, and a single request.",
+    "The upstream token rate in LLM PK is client-side simulation, intended only to demonstrate the perceived difference between streaming and offline TTS.",
 ]
 
 
@@ -72,19 +66,14 @@ def create_app() -> web.Application:
         audio_store=audio_store,
         live_slot_limit=TRITON_MAX_BATCH_SLOTS,
     )
-    official_runner = OfficialPyTorchRunner()
     app = web.Application(middlewares=[cors_middleware])
     app["trace_store"] = store
     app["jobs"] = jobs
     app["audio_store"] = audio_store
-    app["official_runner"] = official_runner
-    app["race_capture_jobs"] = RaceCaptureJobManager(trace_store=store)
     app.router.add_get("/healthz", handle_healthz)
     app.router.add_get("/api/v1/capabilities", handle_capabilities)
     app.router.add_get("/api/v1/audio/{audio_id}", handle_audio)
-    app.router.add_post("/api/v1/race", handle_race)
-    app.router.add_post("/api/v1/race-capture", handle_race_capture_start)
-    app.router.add_get("/api/v1/race-capture/{job_id}", handle_race_capture_ws)
+    app.router.add_post("/api/v1/llm-pk", handle_llm_pk)
     app.router.add_get("/api/v1/trt-live", handle_trt_live)
     app.router.add_post("/api/v1/concurrency", handle_concurrency_start)
     app.router.add_get("/api/v1/concurrency/{job_id}", handle_concurrency_ws)
@@ -97,44 +86,39 @@ async def handle_healthz(request: web.Request) -> web.Response:
 
 async def handle_capabilities(request: web.Request) -> web.Response:
     triton_ready = False
-    engine_ready = False
     triton_error = ""
     try:
         triton_ready = await asyncio.to_thread(probe_ready, TRITON_GRPC, TRITON_MODEL)
     except Exception as exc:
         triton_error = str(exc)
-    engine_ready = await engine_client.probe_ready()
 
     store: TraceStore = request.app["trace_store"]
     jobs: ConcurrencyJobManager = request.app["jobs"]
-    race = store.load_default_race()
+    default_request = store.load_default_request()
     return web.json_response(
         {
             "default_request": {
-                "text": race.get("default_request", {}).get("text") or DEFAULT_TEXT,
-                "speaker": race.get("default_request", {}).get("speaker") or DEFAULT_SPEAKER,
-                "language": race.get("default_request", {}).get("language") or DEFAULT_LANGUAGE,
-                "cache_mode": race.get("default_request", {}).get("cache_mode") or "hit",
+                "text": default_request.get("text") or DEFAULT_TEXT,
+                "speaker": default_request.get("speaker") or DEFAULT_SPEAKER,
+                "language": default_request.get("language") or DEFAULT_LANGUAGE,
+                "ms_per_token": float(default_request.get("ms_per_token") or DEFAULT_MS_PER_TOKEN),
             },
             "backends": [
                 {
-                    "id": "official_pytorch_offline",
-                    "label": "Official PyTorch Offline",
+                    "id": "triton_streaming",
+                    "label": "Triton Streaming TTS (token-by-token)",
+                    "streaming": True,
+                    "live_available": triton_ready,
+                    "endpoint": TRITON_GRPC,
+                    "model": TRITON_MODEL,
+                },
+                {
+                    "id": "triton_offline",
+                    "label": "Triton Offline TTS (wait for full text)",
                     "streaming": False,
-                    "live_available": request.app["official_runner"].enabled(),
-                },
-                {
-                    "id": "official_pytorch_streaming",
-                    "label": "Official PyTorch Online Text",
-                    "streaming": True,
-                    "live_available": request.app["official_runner"].enabled(),
-                },
-                {
-                    "id": "bare_engine_streaming",
-                    "label": "Bare Engine Streaming",
-                    "streaming": True,
-                    "live_available": engine_ready,
-                    "endpoint": engine_client.DEFAULT_ENGINE_WS,
+                    "live_available": triton_ready,
+                    "endpoint": TRITON_GRPC,
+                    "model": TRITON_MODEL,
                 },
                 {
                     "id": "triton_trt_streaming",
@@ -155,7 +139,6 @@ async def handle_capabilities(request: web.Request) -> web.Response:
                 "triton_active_slot_limit": TRITON_MAX_BATCH_SLOTS,
                 "triton_max_sessions": TRITON_MAX_SESSIONS,
             },
-            "benchmark_conditions": race.get("benchmark_conditions", {}),
             "release": RELEASE_METADATA,
             "limitations": STREAMING_LIMITATIONS,
             "headline": {
@@ -166,140 +149,56 @@ async def handle_capabilities(request: web.Request) -> web.Response:
     )
 
 
-async def handle_race(request: web.Request) -> web.Response:
+async def handle_llm_pk(request: web.Request) -> web.Response:
     body = await _read_json(request)
-    store: TraceStore = request.app["trace_store"]
     audio_store: AudioStore = request.app["audio_store"]
-    official_runner: OfficialPyTorchRunner = request.app["official_runner"]
-    race = store.load_default_race()
-    warnings: list[str] = list(race.get("warnings", []) or [])
-    use_live_triton = body.get("use_live_triton", True)
 
-    if body.get("live_baselines"):
-        for backend, streaming_mode in (
-            ("official_pytorch_offline", False),
-            ("official_pytorch_streaming", True),
-        ):
-            try:
-                official_result = await asyncio.to_thread(
-                    official_runner.synthesize,
-                    text=str(body.get("text") or DEFAULT_TEXT),
-                    speaker=str(body.get("speaker") or DEFAULT_SPEAKER),
-                    language=str(body.get("language") or DEFAULT_LANGUAGE),
-                    streaming_mode=streaming_mode,
-                )
-                attach_audio_to_result(official_result, audio_store)
-                race = replace_backend_result(race, backend, official_result.to_dict())
-                warnings.extend(
-                    warning
-                    for warning in official_result.warnings
-                    if not is_official_streaming_info_warning(warning)
-                )
-            except Exception as exc:
-                warnings.append(f"{backend} live official API unavailable, using fixture trace/metrics without synthetic audio: {exc}")
+    text = str(body.get("text") or DEFAULT_TEXT)
+    speaker = str(body.get("speaker") or DEFAULT_SPEAKER)
+    language = str(body.get("language") or DEFAULT_LANGUAGE)
+    ms_per_token = float(body.get("ms_per_token") or DEFAULT_MS_PER_TOKEN)
+    timeout_sec = float(body.get("timeout_sec") or 120.0)
 
-    if body.get("use_live_engine", True):
+    request_payload = {
+        "text": text,
+        "speaker": speaker,
+        "language": language,
+        "ms_per_token": ms_per_token,
+    }
+
+    results: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for mode_label, runner in (
+        ("streaming", llm_pk.run_streaming),
+        ("offline", llm_pk.run_offline),
+    ):
         try:
-            engine_result = await engine_client.measure_once(
-                _tts_request_from_body(body),
-                timeout_sec=float(body.get("timeout_sec") or 60.0),
-            )
-            attach_audio_to_result(engine_result, audio_store)
-            race = replace_backend_result(race, "bare_engine_streaming", engine_result.to_dict())
-        except Exception as exc:
-            warnings.append(f"Bare engine live measurement unavailable, using fixture trace/metrics without synthetic audio: {exc}")
-
-    if use_live_triton:
-        try:
-            result = await measure_once(
-                _tts_request_from_body(body),
+            run_result = await runner(
+                text=text,
+                ms_per_token=ms_per_token,
+                speaker=speaker,
+                language=language,
                 endpoint=TRITON_GRPC,
                 model_name=TRITON_MODEL,
-                timeout_sec=float(body.get("timeout_sec") or 60.0),
+                timeout_sec=timeout_sec,
             )
-            attach_audio_to_result(result, audio_store)
-            race = replace_backend_result(race, "triton_trt_streaming", result.to_dict())
-        except Exception as exc:
-            warnings.append(f"Triton live measurement unavailable, using fixture trace/metrics without synthetic audio: {exc}")
+            attach_audio_to_result(run_result, audio_store)
+            results.append(run_result.to_dict())
+            warnings.extend(run_result.warnings)
+        except llm_pk.LlmPkError as exc:
+            warnings.append(f"{mode_label} run unavailable: {exc}")
 
-    response = {
-        "type": "race_result",
-        "request": {
-            "text": body.get("text") or race.get("default_request", {}).get("text") or DEFAULT_TEXT,
-            "speaker": body.get("speaker") or race.get("default_request", {}).get("speaker") or DEFAULT_SPEAKER,
-            "language": body.get("language") or race.get("default_request", {}).get("language") or DEFAULT_LANGUAGE,
-            "cache_mode": body.get("cache_mode") or race.get("default_request", {}).get("cache_mode") or "hit",
-        },
-        "benchmark_conditions": race.get("benchmark_conditions", {}),
-        "release": RELEASE_METADATA,
-        "limitations": STREAMING_LIMITATIONS,
-        "results": race.get("results", []),
-        "warnings": warnings,
-        "source_path": race.get("source_path", ""),
-    }
-    return web.json_response(response)
-
-
-async def handle_race_capture_start(request: web.Request) -> web.Response:
-    body = await _read_json(request)
-    manager: RaceCaptureJobManager = request.app["race_capture_jobs"]
-    job = await manager.create_job(
+    return web.json_response(
         {
-            "variant": body.get("variant") or os.environ.get("MODEL_VARIANT") or "custom-1.7b",
-            "text": body.get("text") or DEFAULT_TEXT,
-            "speaker": body.get("speaker") or DEFAULT_SPEAKER,
-            "language": body.get("language") or DEFAULT_LANGUAGE,
-            "cache_mode": body.get("cache_mode") or "hit",
-            "timeout_sec": float(body.get("timeout_sec") or 120.0),
-            "engine_retries": int(body.get("engine_retries") or os.environ.get("QWEN_DEMO_ENGINE_CAPTURE_RETRIES") or 4),
-            "official_warmup_rounds": int(body.get("official_warmup_rounds") or os.environ.get("QWEN_DEMO_OFFICIAL_WARMUP_ROUNDS") or 1),
-            "official_warmup_text": body.get("official_warmup_text") or os.environ.get("QWEN_DEMO_OFFICIAL_WARMUP_TEXT") or "你好。",
-            "triton_slots": int(body.get("triton_slots") or TRITON_MAX_BATCH_SLOTS),
-            "strict": bool(body.get("strict")),
-            "skip_official": bool(body.get("skip_official")),
-            "skip_engine": bool(body.get("skip_engine")),
-            "skip_triton": bool(body.get("skip_triton")),
+            "type": "llm_pk_result",
+            "request": request_payload,
+            "results": results,
+            "warnings": warnings,
+            "release": RELEASE_METADATA,
+            "limitations": STREAMING_LIMITATIONS,
         }
     )
-    return web.json_response({"job_id": job.job_id})
-
-
-async def handle_race_capture_ws(request: web.Request) -> web.StreamResponse:
-    manager: RaceCaptureJobManager = request.app["race_capture_jobs"]
-    job = manager.get(request.match_info["job_id"])
-    if job is None:
-        return web.json_response({"error": "unknown job_id"}, status=404)
-    ws = web.WebSocketResponse(heartbeat=30.0)
-    await ws.prepare(request)
-    queue = await manager.subscribe(job)
-    try:
-        while True:
-            try:
-                message = await asyncio.wait_for(queue.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                await ws.send_json({"type": "heartbeat"})
-                continue
-            if message.get("type") == "race_capture_done":
-                race = message.get("race", {})
-                message = {
-                    **message,
-                    "race": _race_payload_from_trace(
-                        race,
-                        {
-                            "text": job.request.get("text") or DEFAULT_TEXT,
-                            "speaker": job.request.get("speaker") or DEFAULT_SPEAKER,
-                            "language": job.request.get("language") or DEFAULT_LANGUAGE,
-                            "cache_mode": job.request.get("cache_mode") or "hit",
-                        },
-                    ),
-                }
-            await ws.send_json(message)
-            if message.get("type") in {"race_capture_done", "race_capture_error"}:
-                break
-    finally:
-        manager.unsubscribe(job, queue)
-        await ws.close()
-    return ws
 
 
 async def handle_audio(request: web.Request) -> web.StreamResponse:
@@ -436,24 +335,6 @@ def _tts_request_from_body(body: dict[str, Any]) -> TtsRequest:
         language=str(body.get("language") or DEFAULT_LANGUAGE),
         cache_mode=str(body.get("cache_mode") or "hit"),
     )
-
-
-def _race_payload_from_trace(race: dict[str, Any], request_data: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "type": "race_result",
-        "request": {
-            "text": request_data.get("text") or race.get("default_request", {}).get("text") or DEFAULT_TEXT,
-            "speaker": request_data.get("speaker") or race.get("default_request", {}).get("speaker") or DEFAULT_SPEAKER,
-            "language": request_data.get("language") or race.get("default_request", {}).get("language") or DEFAULT_LANGUAGE,
-            "cache_mode": request_data.get("cache_mode") or race.get("default_request", {}).get("cache_mode") or "hit",
-        },
-        "benchmark_conditions": race.get("benchmark_conditions", {}),
-        "release": RELEASE_METADATA,
-        "limitations": STREAMING_LIMITATIONS,
-        "results": race.get("results", []),
-        "warnings": list(race.get("warnings", []) or []),
-        "source_path": race.get("source_path", ""),
-    }
 
 
 def main() -> None:

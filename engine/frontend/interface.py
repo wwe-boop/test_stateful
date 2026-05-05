@@ -169,10 +169,12 @@ class FrontendInterface:
         if session is None or session.state == SessionState.DONE:
             return
         text = _normalize_tts_text(text)
-        if not text.strip():
-            return
 
         mode = session.config.input_mode
+        if not text:
+            return
+        if mode != InputMode.TOKEN and not text.strip():
+            return
         if mode == InputMode.FULL_TEXT:
             session.append_text(text)
             return
