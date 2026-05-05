@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from engine.backend.ref_audio_processor import ReferenceAudioSupport
-from engine.config import ModelArchConfig
+from engine.config import EngineConfig, EngineProfileConfig, ModelArchConfig
 from engine.core.types import SessionConfig
 from engine.server import TTSEngine
 
@@ -194,3 +194,23 @@ def test_describe_capabilities_reports_loaded_model_contract():
     assert cap["supported_input_modes"] == ["token", "clause", "long_segment", "full_text"]
     assert cap["supported_group_policies"] == ["none", "auto"]
     assert cap["ref_audio_available"] is False
+
+
+def test_runtime_profile_rejects_oversized_batch():
+    arch = ModelArchConfig(
+        variant="custom-1.7b",
+        engine_profile=EngineProfileConfig(max_batch_size=16, max_seq_len=512),
+    )
+
+    with pytest.raises(ValueError, match="runtime max_batch_size=32 exceeds engine profile"):
+        TTSEngine(config=EngineConfig(), model_arch=arch, max_batch_size=32, max_seq_len=512)
+
+
+def test_runtime_profile_rejects_oversized_seq_len():
+    arch = ModelArchConfig(
+        variant="custom-1.7b",
+        engine_profile=EngineProfileConfig(max_batch_size=64, max_seq_len=512),
+    )
+
+    with pytest.raises(ValueError, match="runtime max_seq_len=1024 exceeds engine profile"):
+        TTSEngine(config=EngineConfig(), model_arch=arch, max_batch_size=32, max_seq_len=1024)

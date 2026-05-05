@@ -34,12 +34,17 @@
 #      --skip-export         Skip model export
 #
 #    Phase B (forwarded to build_engines.sh):
-#      --max-batch-size <N>  TRT max batch (default: 8)
+#      --max-batch-size <N>  TRT max batch (default: 128)
+#      --max-input-len <N>   TRT max prefill/input token length
+#      --max-seq-len <N>     TRT max KV sequence length
 #      --image <uri>         Override NGC container image
 #      --dtype <type>        Engine precision: bf16|fp16|fp32 (default: bf16)
 #
 #    Phase C (forwarded to deploy.sh):
 #      --gateway <mode>      Gateway: standalone | triton | engine-docker
+#      --engine-mode <mode>  Triton assemble mode: trt | onnx
+#      --runtime-max-batch-size <N> Runtime scheduler max batch
+#      --runtime-max-seq-len <N> Runtime scheduler max sequence length
 #      --engine-image <tag>  engine-docker image tag (optional)
 #      --port <port>         Standalone gRPC port (default: 50051)
 #      --grpc-port <port>    Triton gRPC port (default: 8001)
@@ -78,16 +83,22 @@ SKIP_EXPORT=false
 # Phase B forwarding
 BUILD_ARGS=()
 MAX_BATCH_SIZE=""
+MAX_INPUT_LEN=""
+MAX_SEQ_LEN=""
 BUILD_IMAGE=""
 ENGINE_DTYPE=""
+TRITON_IO_FLOAT_DTYPE=""
 
 # Phase C forwarding
 DEPLOY_ARGS=()
 GATEWAY_MODE=""
+ENGINE_MODE=""
 ENGINE_PORT=""
 ENGINE_DOCKER_IMAGE=""
 GRPC_PORT=""
 HTTP_PORT=""
+RUNTIME_MAX_BATCH_SIZE=""
+RUNTIME_MAX_SEQ_LEN=""
 
 # ── Help ──
 
@@ -127,13 +138,22 @@ Phase A options (forwarded to setup_env.sh):
   --skip-export           Skip model export
 
 Phase B options (forwarded to build_engines.sh):
-  --max-batch-size <N>    Max batch size (default: 8)
+  --max-batch-size <N>    Max batch size (default: 128)
+  --max-input-len <N>     TRT max input/prefill length
+  --max-seq-len <N>       TRT max sequence/KV length
   --image <uri>           Override NGC container image
-  --dtype <type>          Engine precision: bf16|fp16|fp32 (default: bf16)
+  --dtype <type>          Engine precision: bf16|fp16|fp32|fp8 (default: bf16)
+  --triton-io-float-dtype <type>
+                          Float I/O dtype for generated TRT/Triton configs
                           Use fp32 if Triton reports dtype mismatch (e.g. TYPE_FP32 vs TYPE_BF16).
 
 Phase C options (forwarded to deploy.sh):
   --gateway <mode>        Gateway: standalone | triton | engine-docker (default: standalone)
+  --engine-mode <mode>    Triton assemble mode: trt | onnx (default: trt)
+  --runtime-max-batch-size <N>
+                          Runtime scheduler max batch size
+  --runtime-max-seq-len <N>
+                          Runtime scheduler max sequence length
   --engine-image <tag>    Image for engine-docker (default: qwen3-engine:26.02)
   --port <port>           Standalone / engine-docker gRPC port (default: 50051)
   --grpc-port <port>      Triton gRPC port (default: 8001)
@@ -147,10 +167,12 @@ Examples:
   autorun.sh custom-1.7b --dtype fp32 # Full pipeline, FP32 engines (fixes dtype mismatch)
   autorun.sh build -m custom-1.7b --dtype fp32    # Phase B with fp32
   autorun.sh build -m custom-1.7b --dtype fp16    # Phase B with fp16
+  autorun.sh build -m custom-1.7b --max-batch-size 64 --max-input-len 128 --max-seq-len 512
   autorun.sh build --target-driver 575.57   # build for production driver
   autorun.sh deploy                   # Phase C (standalone engine)
   autorun.sh deploy --gateway triton         # Phase C (Triton)
   autorun.sh deploy --gateway engine-docker  # Phase C (engine container image)
+  autorun.sh deploy --runtime-max-batch-size 32 --runtime-max-seq-len 512
   autorun.sh status                   # show pipeline status
   autorun.sh update-matrix            # fetch latest NGC compat data
 EOF
@@ -182,11 +204,17 @@ parse_args() {
 
             # Phase B
             --max-batch-size)   MAX_BATCH_SIZE="$2"; shift 2 ;;
+            --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
+            --max-seq-len)      MAX_SEQ_LEN="$2"; shift 2 ;;
             --image)            BUILD_IMAGE="$2"; shift 2 ;;
             --dtype)            ENGINE_DTYPE="$2"; shift 2 ;;
+            --triton-io-float-dtype) TRITON_IO_FLOAT_DTYPE="$2"; shift 2 ;;
 
             # Phase C
             --gateway)          GATEWAY_MODE="$2"; shift 2 ;;
+            --engine-mode)      ENGINE_MODE="$2"; shift 2 ;;
+            --runtime-max-batch-size|--runtime-max-batch) RUNTIME_MAX_BATCH_SIZE="$2"; shift 2 ;;
+            --runtime-max-seq-len|--runtime-max-seq) RUNTIME_MAX_SEQ_LEN="$2"; shift 2 ;;
             --engine-image)      ENGINE_DOCKER_IMAGE="$2"; shift 2 ;;
             --port)             ENGINE_PORT="$2"; shift 2 ;;
             --grpc-port)        GRPC_PORT="$2"; shift 2 ;;
@@ -254,8 +282,11 @@ build_forward_args() {
     fi
     if [ -n "$TARGET_DRIVER" ]; then BUILD_ARGS+=(--target-driver "$TARGET_DRIVER"); fi
     if [ -n "$MAX_BATCH_SIZE" ]; then BUILD_ARGS+=(--max-batch-size "$MAX_BATCH_SIZE"); fi
+    if [ -n "$MAX_INPUT_LEN" ]; then BUILD_ARGS+=(--max-input-len "$MAX_INPUT_LEN"); fi
+    if [ -n "$MAX_SEQ_LEN" ]; then BUILD_ARGS+=(--max-seq-len "$MAX_SEQ_LEN"); fi
     if [ -n "$BUILD_IMAGE" ]; then BUILD_ARGS+=(--image "$BUILD_IMAGE"); fi
     if [ -n "$ENGINE_DTYPE" ]; then BUILD_ARGS+=(--dtype "$ENGINE_DTYPE"); fi
+    if [ -n "$TRITON_IO_FLOAT_DTYPE" ]; then BUILD_ARGS+=(--triton-io-float-dtype "$TRITON_IO_FLOAT_DTYPE"); fi
     if $DRY_RUN; then BUILD_ARGS+=(--dry-run); fi
 
     # Phase C args (forwarded to deploy.sh)
@@ -264,6 +295,9 @@ build_forward_args() {
         DEPLOY_ARGS+=(--variant "$VARIANT")
     fi
     if [ -n "$GATEWAY_MODE" ]; then DEPLOY_ARGS+=(--gateway "$GATEWAY_MODE"); fi
+    if [ -n "$ENGINE_MODE" ]; then DEPLOY_ARGS+=(--engine-mode "$ENGINE_MODE"); fi
+    if [ -n "$RUNTIME_MAX_BATCH_SIZE" ]; then DEPLOY_ARGS+=(--max-batch "$RUNTIME_MAX_BATCH_SIZE"); fi
+    if [ -n "$RUNTIME_MAX_SEQ_LEN" ]; then DEPLOY_ARGS+=(--max-seq-len "$RUNTIME_MAX_SEQ_LEN"); fi
     if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
     if [ -n "$ENGINE_PORT" ]; then DEPLOY_ARGS+=(--port "$ENGINE_PORT"); fi
     if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
@@ -388,6 +422,11 @@ show_run_banner() {
     [ -n "$VARIANT" ] && echo "  变体:      $VARIANT"
     [ -n "${GATEWAY_MODE:-}" ] && echo "  阶段 C:    $GATEWAY_MODE"
     [ -n "$ENGINE_DTYPE" ] && echo "  精度:      $ENGINE_DTYPE"
+    [ -n "$MAX_BATCH_SIZE" ] && echo "  构建 batch: $MAX_BATCH_SIZE"
+    [ -n "$MAX_INPUT_LEN" ] && echo "  构建 input: $MAX_INPUT_LEN"
+    [ -n "$MAX_SEQ_LEN" ] && echo "  构建 seq:   $MAX_SEQ_LEN"
+    [ -n "$RUNTIME_MAX_BATCH_SIZE" ] && echo "  运行 batch: $RUNTIME_MAX_BATCH_SIZE"
+    [ -n "$RUNTIME_MAX_SEQ_LEN" ] && echo "  运行 seq:   $RUNTIME_MAX_SEQ_LEN"
     [ -n "$TARGET_DRIVER" ] && echo "  目标驱动:  $TARGET_DRIVER"
     $DRY_RUN && echo "  预演:      是"
     echo ""

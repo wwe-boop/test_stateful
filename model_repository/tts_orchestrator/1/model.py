@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -524,6 +525,8 @@ class TritonPythonModel:
             self._safe_send_final(response_sender)
 
     def _handle_start(self, req: dict[str, Any], response_sender, *, streaming: bool) -> None:
+        request_received = time.perf_counter()
+        first_audio_sent = False
         session_id = str(req.get("session_id") or uuid.uuid4().hex)
         text = str(req.get("text") or "")
         if not streaming and not text.strip():
@@ -532,10 +535,19 @@ class TritonPythonModel:
         config = self._session_config_from_request(req, streaming=streaming)
 
         async def on_audio(_sid: str, data: bytes) -> None:
+            nonlocal first_audio_sent
+            meta = None
+            if not first_audio_sent:
+                first_audio_sent = True
+                meta = {
+                    "triton_adapter_ttft_ms": f"{(time.perf_counter() - request_received) * 1000.0:.3f}",
+                    "first_audio_chunk": "true",
+                }
             self._send_event(
                 response_sender,
                 event_type="audio",
                 session_id=_sid,
+                meta=meta,
                 audio_bytes=_convert_audio_chunk_bytes(data, config.audio),
                 is_final=False,
             )

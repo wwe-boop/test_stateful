@@ -58,6 +58,7 @@ ENGINE_WS_PORT="${ENGINE_WEBSOCKET_PORT:-50052}"
 GPU_DEVICE=0
 MAX_BATCH=128
 MAX_SESSIONS=128
+MAX_SEQ_LEN=""
 FOREGROUND=false
 
 # Triton forwarding
@@ -92,7 +93,8 @@ Options:
     --port <N>           gRPC port (default: 50051)
     --ws-port <N>        WebSocket port (default: 50052)
     --device <N>         GPU device (default: 0)
-    --max-batch <N>      Max batch size (default: 64)
+    --max-batch <N>      Max batch size (default: 128)
+    --max-seq-len <N>    Optional scheduler max sequence length
     --max-sessions <N>   Max concurrent sessions (default: 128)
     --foreground         Run in foreground (don't daemonize)
 
@@ -166,6 +168,7 @@ while [[ $# -gt 0 ]]; do
         --ws-port)        ENGINE_WS_PORT="$2"; shift 2 ;;
         --device)         GPU_DEVICE="$2"; shift 2 ;;
         --max-batch)      MAX_BATCH="$2"; shift 2 ;;
+        --max-seq-len)    MAX_SEQ_LEN="$2"; shift 2 ;;
         --max-sessions)   MAX_SESSIONS="$2"; shift 2 ;;
         --foreground)     FOREGROUND=true; shift ;;
 
@@ -221,6 +224,7 @@ cmd_run_standalone() {
         log_info "  WS Port:    $ENGINE_WS_PORT"
         log_info "  Device:     $GPU_DEVICE"
         log_info "  Max Batch:  $MAX_BATCH"
+        log_info "  Max Seq:    ${MAX_SEQ_LEN:-auto}"
         log_info "  Max Sess:   $MAX_SESSIONS"
         log_info "  Foreground: $FOREGROUND"
         return 0
@@ -233,6 +237,9 @@ cmd_run_standalone() {
         --max-batch "$MAX_BATCH"
         --max-sessions "$MAX_SESSIONS"
     )
+    if [ -n "$MAX_SEQ_LEN" ]; then
+        start_args+=(--max-seq-len "$MAX_SEQ_LEN")
+    fi
     if $FOREGROUND; then
         start_args+=(--foreground)
     fi
@@ -285,6 +292,7 @@ cmd_run_engine_docker() {
         log_info "  WS Port:     $ENGINE_WS_PORT"
         log_info "  Device:      $GPU_DEVICE"
         log_info "  Max batch:   $MAX_BATCH"
+        log_info "  Max seq len: ${MAX_SEQ_LEN:-auto}"
         log_info "  Max sess:    $MAX_SESSIONS"
         return 0
     fi
@@ -312,6 +320,9 @@ cmd_run_engine_docker() {
         --max-batch "$MAX_BATCH"
         --max-sessions "$MAX_SESSIONS"
     )
+    if [ -n "$MAX_SEQ_LEN" ]; then
+        compose_args+=(--max-seq-len "$MAX_SEQ_LEN")
+    fi
     $DRY_RUN && compose_args+=(--dry-run)
 
     bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}" || exit 1

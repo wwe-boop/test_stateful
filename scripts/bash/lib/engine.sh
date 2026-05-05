@@ -158,6 +158,7 @@ engine_log_file() {
 #    --ws-port <N>         WebSocket port (default: $ENGINE_WEBSOCKET_PORT)
 #    --device <N>          GPU device (default: 0)
 #    --max-batch <N>       Max batch size (default: 48)
+#    --max-seq-len <N>     Max scheduler sequence length (optional)
 #    --max-sessions <N>    Max concurrent sessions (default: 128)
 #    --foreground          Run in foreground (don't daemonize)
 # ---------------------------------------------------------------------------
@@ -171,6 +172,7 @@ engine_start() {
     local device=0
     local max_batch=48
     local max_sessions=128
+    local max_seq_len=""
     local foreground=false
 
     while [[ $# -gt 0 ]]; do
@@ -179,6 +181,7 @@ engine_start() {
             --ws-port)       ws_port="$2"; shift 2 ;;
             --device)        device="$2"; shift 2 ;;
             --max-batch)     max_batch="$2"; shift 2 ;;
+            --max-seq-len)   max_seq_len="$2"; shift 2 ;;
             --max-sessions)  max_sessions="$2"; shift 2 ;;
             --foreground)    foreground=true; shift ;;
             *)               shift ;;
@@ -224,6 +227,7 @@ engine_start() {
     log_info "  TRT Engines:  ${_ENGINE_DIR:-stub mode}"
     log_info "  GPU Device:   $device"
     log_info "  Max Batch:    $max_batch"
+    log_info "  Max Seq Len:  ${max_seq_len:-auto}"
     log_info "  Max Sessions: $max_sessions"
     log_info "  gRPC Port:    $port"
     log_info "  WS Port:      $ws_port"
@@ -238,6 +242,10 @@ engine_start() {
         --port "$port"
         --ws-port "$ws_port"
     )
+    if [ -n "$max_seq_len" ]; then
+        cmd+=(--max-seq-len "$max_seq_len")
+        export ENGINE_SCHEDULER_MAX_SEQ_LEN="$max_seq_len"
+    fi
 
     if [ -n "$_ENGINE_DIR" ]; then
         cmd+=(--engine-dir "$_ENGINE_DIR")

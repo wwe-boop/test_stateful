@@ -25,7 +25,7 @@
 #
 #  Environment variables:
 #    NGC_IMAGE        Docker image override (default: auto-detect from driver)
-#    MAX_BATCH_SIZE   Max batch (default: 64)
+#    MAX_BATCH_SIZE   Max batch (default: 128)
 #    MAX_INPUT_LEN    Prefill len (default: 128)
 #    MAX_SEQ_LEN      Total seq len (default: 512)
 #    ENGINE_DTYPE     bfloat16|float16|float32|fp8 (default: bfloat16)
@@ -43,11 +43,12 @@ source "${SCRIPT_DIR}/tools.sh"
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 DOCKER_GPU_ARGS=(--gpus all)
 
-# ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=1024, batch=16) ──
+# ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=512, batch=128) ──
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-128}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-128}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}" # 512/128 for 30.72s, 1024/256 for 61.44s 
 ENGINE_DTYPE="${ENGINE_DTYPE:-bfloat16}"
+TRITON_IO_FLOAT_DTYPE="${TRITON_IO_FLOAT_DTYPE:-}"
 
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 TOKENIZER_DIR="${EXPORTED_DIR}/tokenizer"
@@ -57,15 +58,33 @@ PULL_ONLY=false
 USER_IMAGE="${NGC_IMAGE:-}"
 TARGET_DRIVER="${TARGET_DRIVER:-}"
 
-# Normalize ENGINE_DTYPE: bf16|fp16|fp32|fp8
-ENGINE_DTYPE="${ENGINE_DTYPE,,}"
-case "$ENGINE_DTYPE" in
-    bf16|bfloat16) ENGINE_DTYPE="bf16" ;;
-    fp16|float16)  ENGINE_DTYPE="fp16" ;;
-    fp32|float32)  ENGINE_DTYPE="fp32" ;;
-    fp8|float8)    ENGINE_DTYPE="fp8" ;;
-    *) log_error "Unknown ENGINE_DTYPE: $ENGINE_DTYPE (use bf16|fp16|fp32|fp8)"; exit 1 ;;
-esac
+_normalize_dtype_value() {
+    local value="${1,,}"
+    case "$value" in
+        bf16|bfloat16) echo "bf16" ;;
+        fp16|float16)  echo "fp16" ;;
+        fp32|float32)  echo "fp32" ;;
+        fp8|float8)    echo "fp8" ;;
+        *) return 1 ;;
+    esac
+}
+
+normalize_build_dtypes() {
+    ENGINE_DTYPE="$(_normalize_dtype_value "$ENGINE_DTYPE")" || {
+        log_error "Unknown ENGINE_DTYPE: $ENGINE_DTYPE (use bf16|fp16|fp32|fp8)"
+        exit 1
+    }
+    if [ -n "$TRITON_IO_FLOAT_DTYPE" ]; then
+        TRITON_IO_FLOAT_DTYPE="$(_normalize_dtype_value "$TRITON_IO_FLOAT_DTYPE")" || {
+            log_error "Unknown TRITON_IO_FLOAT_DTYPE: $TRITON_IO_FLOAT_DTYPE (use bf16|fp16|fp32|fp8)"
+            exit 1
+        }
+    else
+        TRITON_IO_FLOAT_DTYPE="$ENGINE_DTYPE"
+    fi
+}
+
+normalize_build_dtypes
 
 # _trtexec_precision_flags: echo trtexec precision flags for current ENGINE_DTYPE
 _trtexec_precision_flags() {
@@ -448,6 +467,39 @@ discover_trt_variants() {
     echo "${found[@]}"
 }
 
+update_variant_manifest_profile() {
+    local variant="$1"
+    local mark_built="${2:-false}"
+    local manifest="$EXPORTED_DIR/$variant/triton_manifest.json"
+    local update_py="${REPO_ROOT}/scripts/python/update_triton_manifest_profile.py"
+
+    if [ ! -f "$manifest" ]; then
+        log_warn "No triton_manifest.json for $variant; cannot record engine profile"
+        return 0
+    fi
+    if [ ! -f "$update_py" ]; then
+        log_warn "Missing update helper: $update_py"
+        return 0
+    fi
+
+    local args=(
+        --manifest "$manifest"
+        --engine-mode trt
+        --engine-dtype "$ENGINE_DTYPE"
+        --triton-io-float-dtype "$TRITON_IO_FLOAT_DTYPE"
+        --max-batch-size "$MAX_BATCH_SIZE"
+        --max-input-len "$MAX_INPUT_LEN"
+        --max-seq-len "$MAX_SEQ_LEN"
+        --builder-image "$NGC_IMAGE"
+        --target-driver "$TARGET_DRIVER"
+    )
+    if [ "$mark_built" != "true" ]; then
+        args+=(--skip-built-at)
+    fi
+
+    python3 "$update_py" "${args[@]}"
+}
+
 # Speaker engines for every variant directory that has speaker_encoder.onnx
 build_speaker_encoders_all() {
     local image="$1"
@@ -489,6 +541,7 @@ while [[ $# -gt 0 ]]; do
         --max-input-len)  MAX_INPUT_LEN="$2"; shift 2 ;;
         --max-seq-len)    MAX_SEQ_LEN="$2"; shift 2 ;;
         --dtype)          ENGINE_DTYPE="$2"; shift 2 ;;
+        --triton-io-float-dtype) TRITON_IO_FLOAT_DTYPE="$2"; shift 2 ;;
         --target-driver)  TARGET_DRIVER="$2"; export TARGET_DRIVER; shift 2 ;;
         --dry-run)        DRY_RUN=true; shift ;;
         --pull-only)      PULL_ONLY=true; shift ;;
@@ -499,10 +552,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --variant <name>       Build for a specific model variant"
             echo "  --image <uri>          Override NGC container image (default: auto-detect)"
             echo "  --target-driver <ver>  Target NVIDIA driver for NGC container selection"
-            echo "  --max-batch-size N     Max batch size (default: 8)"
-            echo "  --max-input-len N      Max input length for prefill (default: 512)"
-            echo "  --max-seq-len N        Max sequence length incl. KV cache (default: 4096)"
-            echo "  --dtype bf16|fp16      Engine precision (default: bfloat16)"
+            echo "  --max-batch-size N     Max batch size (default: 128)"
+            echo "  --max-input-len N      Max input length for prefill (default: 128)"
+            echo "  --max-seq-len N        Max sequence length incl. KV cache (default: 512)"
+            echo "  --dtype bf16|fp16|fp32|fp8  Engine precision (default: bfloat16)"
+            echo "  --triton-io-float-dtype T   Float I/O dtype (default: same as --dtype)"
             echo "  --dry-run              Show docker commands without executing"
             echo "  --pull-only            Pull the container image and exit"
             echo "  -h, --help             Show this help"
@@ -511,6 +565,8 @@ while [[ $# -gt 0 ]]; do
         *) log_error "Unknown argument: $1"; exit 1 ;;
     esac
 done
+
+normalize_build_dtypes
 
 # ===========================================================================
 #  Phase B: TRT engine build (trtexec from ONNX)
@@ -565,6 +621,12 @@ fi
 FAILED=0
 SUCCEEDED=0
 
+if ! $DRY_RUN; then
+    for variant in "${VARIANTS[@]}"; do
+        update_variant_manifest_profile "$variant" false
+    done
+fi
+
 if ! build_speaker_encoders_all "$NGC_IMAGE"; then
     FAILED=$((FAILED + 1))
 fi
@@ -577,6 +639,9 @@ done
 
 for variant in "${VARIANTS[@]}"; do
     if build_talker_code2wav_fused_trt "$variant"; then
+        if ! $DRY_RUN; then
+            update_variant_manifest_profile "$variant" true
+        fi
         SUCCEEDED=$((SUCCEEDED + 1))
     else
         FAILED=$((FAILED + 1))

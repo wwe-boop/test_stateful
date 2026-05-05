@@ -29,6 +29,33 @@
       "enum": ["fp32", "bf16", "fp16", "fp8", "float32", "bfloat16", "float16", "float8"],
       "description": "Float I/O for talker_code2wav_fused: trtexec --inputIOFormats/--outputIOFormats + Triton TYPE_* + BLS torch dtype; export_09 default bf16; ONNX file stays FP32"
     },
+    "engine_profile": {
+      "type": "object",
+      "description": "Actual TensorRT profile and build metadata used by Phase B",
+      "properties": {
+        "profile_schema_version": { "type": "integer" },
+        "builder": { "type": "string" },
+        "engine_mode": {
+          "type": "string",
+          "enum": ["onnx", "trt"]
+        },
+        "engine_dtype": {
+          "type": "string",
+          "enum": ["bf16", "fp16", "fp32", "fp8", "bfloat16", "float16", "float32", "float8"]
+        },
+        "triton_io_float_dtype": {
+          "type": "string",
+          "enum": ["fp32", "bf16", "fp16", "fp8", "float32", "bfloat16", "float16", "float8"]
+        },
+        "max_batch_size": { "type": "integer", "minimum": 1 },
+        "max_input_len": { "type": "integer", "minimum": 1 },
+        "max_seq_len": { "type": "integer", "minimum": 1 },
+        "builder_image": { "type": "string" },
+        "target_driver": { "type": "string" },
+        "built_at_utc": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
     "submodels": {
       "type": "object",
       "additionalProperties": { "type": "boolean" },

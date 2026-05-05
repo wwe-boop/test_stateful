@@ -65,8 +65,13 @@ class TestEnvOverrides:
 
 
 class TestLoadConfig:
-    def test_defaults(self):
-        cfg = load_config()
+    def test_defaults(self, tmp_path):
+        cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            cfg = load_config()
+        finally:
+            os.chdir(cwd)
         assert cfg.scheduler.max_batch_size == 48
         assert cfg.prefix_cache.enabled is True
 
@@ -186,6 +191,46 @@ class TestModelManifest:
         arch = load_model_manifest(str(tmp_path), None)
         assert arch.tts_model_type == "base"
         assert arch.supported_task_types == ("base", "instruct", "voice_clone")
+
+    def test_manifest_reads_engine_profile(self, tmp_path):
+        manifest = {
+            "variant": "custom-1.7b",
+            "engine_profile": {
+                "engine_mode": "trt",
+                "engine_dtype": "bf16",
+                "triton_io_float_dtype": "bf16",
+                "max_batch_size": 64,
+                "max_input_len": 128,
+                "max_seq_len": 512,
+                "builder_image": "nvcr.io/nvidia/tritonserver:26.02-py3",
+                "target_driver": "575.57",
+            },
+        }
+        (tmp_path / "triton_manifest.json").write_text(json.dumps(manifest))
+
+        arch = load_model_manifest(str(tmp_path), None)
+
+        assert arch.engine_profile.engine_mode == "trt"
+        assert arch.engine_profile.engine_dtype == "bf16"
+        assert arch.engine_profile.max_batch_size == 64
+        assert arch.engine_profile.max_input_len == 128
+        assert arch.engine_profile.max_seq_len == 512
+        assert arch.engine_profile.builder_image == "nvcr.io/nvidia/tritonserver:26.02-py3"
+
+    def test_manifest_searches_variant_parent_from_engine_subdir(self, tmp_path):
+        manifest = {
+            "variant": "custom-1.7b",
+            "engine_profile": {"max_batch_size": 32, "max_seq_len": 384},
+        }
+        (tmp_path / "triton_manifest.json").write_text(json.dumps(manifest))
+        engine_subdir = tmp_path / "engines" / "talker_code2wav_fused"
+        engine_subdir.mkdir(parents=True)
+
+        arch = load_model_manifest(str(engine_subdir), None)
+
+        assert arch.variant == "custom-1.7b"
+        assert arch.engine_profile.max_batch_size == 32
+        assert arch.engine_profile.max_seq_len == 384
 
 
 class TestToModelConfig:

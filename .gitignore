@@ -2,3 +2,11 @@ workspace/
 *__pycache__*
 *log*
 *.bak
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+webui/node_modules/
+webui/dist/
+webui/tsconfig.tsbuildinfo

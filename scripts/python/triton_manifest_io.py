@@ -137,6 +137,13 @@ def build_manifest_for_export(
         "engine_mode": engine_mode,
         "engine_dtype": engine_dtype,
         "triton_io_float_dtype": triton_io_float_dtype,
+        "engine_profile": {
+            "profile_schema_version": 1,
+            "engine_mode": engine_mode,
+            "engine_dtype": engine_dtype,
+            "triton_io_float_dtype": triton_io_float_dtype,
+            "builder": "trtexec",
+        },
         "architecture": architecture,
         "talker": talker,
         "code2wav_fused": {

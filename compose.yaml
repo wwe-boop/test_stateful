@@ -70,9 +70,10 @@ services:
         TENSORRT_PYTHON_VERSION: ${TRITON_TENSORRT_PYTHON_VERSION:-10.15.1.29}
     container_name: ${TRITON_CONTAINER_NAME:-qwen3-tts-triton}
     environment:
-      MAX_BATCH_SLOTS: ${TRITON_MAX_BATCH_SLOTS:-64}
+      MAX_BATCH_SLOTS: ${TRITON_MAX_BATCH_SLOTS:-128}
       MAX_SESSIONS: ${TRITON_MAX_SESSIONS:-128}
       PYTORCH_CUDA_ALLOC_CONF: ${TRITON_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      PYTHONDONTWRITEBYTECODE: "1"
     command:
       - tritonserver
       - --model-repository=/models
@@ -101,3 +102,39 @@ services:
           path: ./Dockerfile.triton
         - action: rebuild
           path: ./.dockerignore
+
+  demo-api:
+    profiles: ["demo"]
+    image: ${DEMO_API_IMAGE:-qwen3-tts-demo-api:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.demo-api
+    container_name: ${DEMO_API_CONTAINER_NAME:-qwen3-tts-demo-api}
+    working_dir: /app
+    environment:
+      QWEN_DEMO_TRITON_GRPC: ${QWEN_DEMO_TRITON_GRPC:-triton:8001}
+      QWEN_DEMO_TRITON_MODEL: ${QWEN_DEMO_TRITON_MODEL:-tts_orchestrator}
+      QWEN_DEMO_PORT: 7860
+      QWEN_DEMO_ENABLE_LIVE_CONCURRENCY: ${QWEN_DEMO_ENABLE_LIVE_CONCURRENCY:-0}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${DEMO_API_PORT:-7860}:7860"
+    volumes:
+      - ./workspace/demo_traces:/app/workspace/demo_traces
+    restart: unless-stopped
+
+  webui:
+    profiles: ["demo"]
+    image: node:20-bookworm-slim
+    container_name: ${WEBUI_CONTAINER_NAME:-qwen3-tts-webui}
+    working_dir: /app/webui
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_DEMO_API_URL: ${VITE_DEMO_API_URL:-http://localhost:${DEMO_API_PORT:-7860}}
+    ports:
+      - "${WEBUI_PORT:-5173}:5173"
+    volumes:
+      - .:/app
+    depends_on:
+      - demo-api
+    restart: unless-stopped

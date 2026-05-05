@@ -36,6 +36,21 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class EngineProfileConfig:
+    """TensorRT profile limits recorded in triton_manifest.json."""
+    engine_mode: str = ""
+    engine_dtype: str = ""
+    triton_io_float_dtype: str = ""
+    max_batch_size: int = 0
+    max_input_len: int = 0
+    max_seq_len: int = 0
+    builder: str = ""
+    builder_image: str = ""
+    target_driver: str = ""
+    built_at_utc: str = ""
+
+
+@dataclass
 class ModelArchConfig:
     """Model architecture — loaded from model_manifest / triton_manifest.json.
 
@@ -60,6 +75,7 @@ class ModelArchConfig:
     dtype: str = "bf16"
     tts_model_type: str = "unknown"
     supported_task_types: tuple[str, ...] = ()
+    engine_profile: EngineProfileConfig = field(default_factory=EngineProfileConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -317,15 +333,23 @@ def load_model_manifest(
     # --- Try loading manifest from engine_dir ---
     if engine_dir:
         engine_path = Path(engine_dir)
-        for fname in MANIFEST_FILENAMES:
-            manifest_file = engine_path / fname
-            if manifest_file.is_file():
-                try:
-                    with open(manifest_file, encoding="utf-8") as f:
-                        manifest_data = json.load(f)
-                    logger.info("Loaded model manifest from %s", manifest_file)
-                except (json.JSONDecodeError, OSError) as e:
-                    logger.warning("Failed to read %s: %s", manifest_file, e)
+        candidate_dirs = [engine_path, engine_path.parent, engine_path.parent.parent]
+        seen_dirs: set[Path] = set()
+        for manifest_dir in candidate_dirs:
+            if manifest_dir in seen_dirs:
+                continue
+            seen_dirs.add(manifest_dir)
+            for fname in MANIFEST_FILENAMES:
+                manifest_file = manifest_dir / fname
+                if manifest_file.is_file():
+                    try:
+                        with open(manifest_file, encoding="utf-8") as f:
+                            manifest_data = json.load(f)
+                        logger.info("Loaded model manifest from %s", manifest_file)
+                    except (json.JSONDecodeError, OSError) as e:
+                        logger.warning("Failed to read %s: %s", manifest_file, e)
+                    break
+            if manifest_data:
                 break
 
     # --- Extract architecture section ---
@@ -367,6 +391,31 @@ def load_model_manifest(
             arch.supported_task_types = tuple(
                 str(s).strip() for s in supported if str(s).strip()
             )
+
+    profile_section = manifest_data.get("engine_profile", {})
+    if isinstance(profile_section, dict):
+        for key in (
+            "engine_mode",
+            "engine_dtype",
+            "triton_io_float_dtype",
+            "builder",
+            "builder_image",
+            "target_driver",
+            "built_at_utc",
+        ):
+            value = profile_section.get(key)
+            if value is not None:
+                setattr(arch.engine_profile, key, str(value))
+        for key in ("max_batch_size", "max_input_len", "max_seq_len"):
+            value = profile_section.get(key)
+            if value is None:
+                continue
+            try:
+                setattr(arch.engine_profile, key, int(value))
+            except (ValueError, TypeError):
+                logger.warning("Cannot set engine_profile.%s = %r", key, value)
+    elif manifest_data:
+        logger.info("Manifest has no engine_profile section; runtime profile validation is disabled")
 
     applied = []
     for k, v in arch_section.items():

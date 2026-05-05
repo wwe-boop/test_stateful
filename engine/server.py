@@ -102,6 +102,10 @@ class TTSEngine:
         self._max_batch = max_batch_size if max_batch_size != 48 else self._cfg.scheduler.max_batch_size
         self._max_sessions = max_sessions if max_sessions != 128 else self._cfg.server.max_sessions
         self._max_seq_len = max_seq_len if max_seq_len != 512 else self._cfg.scheduler.max_seq_len
+        self._validate_runtime_profile_bounds()
+        self._cfg.scheduler.max_batch_size = self._max_batch
+        self._cfg.scheduler.max_seq_len = self._max_seq_len
+        self._cfg.server.max_sessions = self._max_sessions
 
         self._tokenizer: Optional[LightQwen3TTSTokenizer] = None
         self._frontend: Optional[FrontendInterface] = None
@@ -113,6 +117,27 @@ class TTSEngine:
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def _validate_runtime_profile_bounds(self) -> None:
+        """Fail early if requested runtime limits exceed the built TRT profile."""
+        profile = self._model_arch.engine_profile
+        variant = self._model_arch.variant or "unknown"
+        if profile.max_batch_size > 0 and self._max_batch > profile.max_batch_size:
+            raise ValueError(
+                f"runtime max_batch_size={self._max_batch} exceeds engine profile "
+                f"max_batch_size={profile.max_batch_size} for variant '{variant}'. "
+                "Lower --max-batch / ENGINE_SCHEDULER_MAX_BATCH_SIZE, or rebuild Phase B with "
+                f"`bash scripts/bash/build_engines.sh --variant {variant} "
+                f"--max-batch-size {self._max_batch}`."
+            )
+        if profile.max_seq_len > 0 and self._max_seq_len > profile.max_seq_len:
+            raise ValueError(
+                f"runtime max_seq_len={self._max_seq_len} exceeds engine profile "
+                f"max_seq_len={profile.max_seq_len} for variant '{variant}'. "
+                "Lower --max-seq-len / ENGINE_SCHEDULER_MAX_SEQ_LEN, or rebuild Phase B with "
+                f"`bash scripts/bash/build_engines.sh --variant {variant} "
+                f"--max-seq-len {self._max_seq_len}`."
+            )
 
     async def start(self) -> None:
         """Initialize all components, warm up, and start the engine thread."""
@@ -335,6 +360,15 @@ class TTSEngine:
         stats["loaded_model_type"] = self._loaded_model_type()
         if self._model_arch.supported_task_types:
             stats["declared_supported_task_types"] = list(self._model_arch.supported_task_types)
+        profile = self._model_arch.engine_profile
+        if profile.max_batch_size or profile.max_seq_len:
+            stats["engine_profile"] = {
+                "max_batch_size": profile.max_batch_size,
+                "max_input_len": profile.max_input_len,
+                "max_seq_len": profile.max_seq_len,
+                "engine_dtype": profile.engine_dtype,
+                "triton_io_float_dtype": profile.triton_io_float_dtype,
+            }
         if self._ref_audio_processor is not None:
             support = self._ref_audio_processor.support
             stats["ref_audio_available"] = support.available
@@ -365,6 +399,13 @@ class TTSEngine:
             ],
             "ref_audio_available": ref_audio_available,
             "ref_audio_reason": ref_audio_reason,
+            "engine_profile": {
+                "max_batch_size": self._model_arch.engine_profile.max_batch_size,
+                "max_input_len": self._model_arch.engine_profile.max_input_len,
+                "max_seq_len": self._model_arch.engine_profile.max_seq_len,
+                "engine_dtype": self._model_arch.engine_profile.engine_dtype,
+                "triton_io_float_dtype": self._model_arch.engine_profile.triton_io_float_dtype,
+            },
         }
 
     def _validate_session_config(self, config: SessionConfig) -> None:
@@ -505,6 +546,8 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-batch", type=int, default=0,
                         help="Override scheduler.max_batch_size")
+    parser.add_argument("--max-seq-len", type=int, default=0,
+                        help="Override scheduler.max_seq_len")
     parser.add_argument("--max-sessions", type=int, default=0,
                         help="Override server.max_sessions")
     parser.add_argument("--port", type=int, default=0,
@@ -524,6 +567,8 @@ def main():
         cli_overrides.setdefault("paths", {})["engine_dir"] = args.engine_dir
     if args.max_batch > 0:
         cli_overrides.setdefault("scheduler", {})["max_batch_size"] = args.max_batch
+    if args.max_seq_len > 0:
+        cli_overrides.setdefault("scheduler", {})["max_seq_len"] = args.max_seq_len
     if args.max_sessions > 0:
         cli_overrides.setdefault("server", {})["max_sessions"] = args.max_sessions
     if args.port > 0:

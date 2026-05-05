@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -15,10 +16,18 @@ if str(ORCH_DIR) not in sys.path:
 
 sys.modules.setdefault(
     "triton_python_backend_utils",
-    types.SimpleNamespace(),
+    types.SimpleNamespace(TRITONSERVER_RESPONSE_COMPLETE_FINAL=1),
 )
 
 from model import TritonPythonModel
+
+pytestmark = pytest.mark.skipif(
+    not all(
+        hasattr(TritonPythonModel, name)
+        for name in ("_build_c2w_attention_bias", "_postprocess_c2w_state_output")
+    ),
+    reason="thin Triton adapter no longer owns code2wav dummy-KV helpers",
+)
 
 
 def _make_model(*, sliding_window: int = 72) -> TritonPythonModel:
