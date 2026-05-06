@@ -7,8 +7,8 @@ Loads talker_unified.engine from a variant export dir, runs one prefill
 No PyTorch reference required.
 
 Usage:
-  python tests/integration/verify_trt_talker.py --variant design-1.7b [--steps 5]
-  python tests/integration/verify_trt_talker.py --engine-dir workspace/exported/design-1.7b [--steps 5]
+  python tests/tools/verify_trt_talker.py --variant design-1.7b [--steps 5]
+  python tests/tools/verify_trt_talker.py --engine-dir workspace/exported/design-1.7b [--steps 5]
 """
 
 import argparse

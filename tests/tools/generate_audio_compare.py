@@ -5,7 +5,7 @@ decode loop vs ORT (talker_unified.onnx) decode loop. All three produce codec to
 then decode to WAV via the same PyTorch speech_tokenizer.decode() for fair comparison.
 
 For **listenability only** (official vs deployed fused path), prefer:
-  `tests/e2e/compare_official_vs_triton_audio.py`
+  `tests/tools/compare_official_vs_triton_audio.py`
 which writes `proto.wav` + `triton.wav` only.
 
 This script adds manual/ORT paths and optional Triton (`trt_bf16.wav`); Triton uses the
@@ -16,8 +16,8 @@ into the prefill. The official _build_assistant_text format also includes a trai
 `\\n<|im_start|>assistant\\n` suffix. Both must be replicated exactly in manual/ORT paths.
 
 Usage (host, conda activate qwen3-tts):
-  python tests/e2e/generate_audio_compare.py --variant design-1.7b
-  python tests/e2e/generate_audio_compare.py --variant design-1.7b --text "你好，世界" --max-steps 300
+  python tests/tools/generate_audio_compare.py --variant design-1.7b
+  python tests/tools/generate_audio_compare.py --variant design-1.7b --text "你好，世界" --max-steps 300
 """
 
 import argparse

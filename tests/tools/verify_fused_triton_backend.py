@@ -6,7 +6,7 @@ This bypasses tts_orchestrator BLS and talks to `talker_code2wav_fused` directly
 so it isolates TensorRT engine / Triton backend issues from BLS scheduling logic.
 
 Example:
-  mamba run -n qwen3-tts python tests/e2e/verify_fused_triton_backend.py \
+  mamba run -n qwen3-tts python tests/tools/verify_fused_triton_backend.py \
       --variant custom-1.7b \
       --text "你好，这是一次当前Triton阶段环境的批处理接口验证。" \
       --speaker serena \

@@ -9,9 +9,9 @@ Verify code2wav streaming vs prototype consistency.
 
 Usage (from repo root, conda activate qwen3-tts):
   # Fixture test: same random codes -> one-shot decoder vs streaming (chunk_T=4); report max diff.
-  python tests/integration/verify_code2wav_streaming.py --models-dir workspace/models
+  python tests/tools/verify_code2wav_streaming.py --models-dir workspace/models
   # E2E: TTS -> codes -> decode with one-shot, streaming, and prototype tokenizer.decode; save WAVs for listening.
-  python tests/integration/verify_code2wav_streaming.py --models-dir workspace/models --e2e --text "你好世界" --max-steps 40
+  python tests/tools/verify_code2wav_streaming.py --models-dir workspace/models --e2e --text "你好世界" --max-steps 40
 """
 
 from __future__ import annotations

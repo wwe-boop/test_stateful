@@ -6,7 +6,7 @@ engine file as the standalone engine). Handles TRT's minimum shape
 constraints with dummy KV + masking (same approach as executor.py).
 
 Usage (conda activate qwen3-tts):
-  python tests/e2e/test_trt_direct.py
+  python tests/tools/trt_direct.py
 """
 
 import json

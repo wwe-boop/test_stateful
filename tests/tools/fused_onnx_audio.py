@@ -5,8 +5,8 @@ Builds prefill with PrefillBuilder (same weights as engine), runs fused ONNX
 through ORT, collects wav chunks, saves to workspace/audio_compare/fused_ort.wav.
 
 Usage (conda activate qwen3-tts):
-  python tests/e2e/test_fused_onnx_audio.py
-  python tests/e2e/test_fused_onnx_audio.py --text "你好" --max-steps 100
+  python tests/tools/fused_onnx_audio.py
+  python tests/tools/fused_onnx_audio.py --text "你好" --max-steps 100
 """
 
 import argparse

@@ -11,22 +11,16 @@ Tests the engine with:
   5. BadCase tests (empty text, whitespace, invalid task_type, etc.)
   6. Performance metrics: first-chunk latency, total latency, RTF, throughput
 
-Usage (CLI — generates WAV files):
+Pytest usage:
     python -m engine.server --config engine.yaml   # terminal 1
-    python tests/e2e/test_engine_standalone.py      # terminal 2
+    pytest tests/e2e/test_engine_standalone.py -v -s
 
-    python tests/e2e/test_engine_standalone.py --host localhost --port 50051
-    python tests/e2e/test_engine_standalone.py --concurrency 1,2,4,8
-    python tests/e2e/test_engine_standalone.py --skip-concurrent --skip-badcase
-    python tests/e2e/test_engine_standalone.py --skip-custom-instruct
-
-Usage (pytest — auto-skip if engine not reachable):
-    pytest tests/e2e/test_engine_standalone.py -v
+Manual benchmark usage:
+    python tests/tools/engine_standalone_benchmark.py --host localhost --port 50051
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import statistics
 import struct
@@ -40,16 +34,30 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from engine.gateway import tts_pb2, tts_pb2_grpc
+try:
+    from engine.gateway import tts_pb2, tts_pb2_grpc
+except Exception as exc:  # protobuf runtime mismatches also surface here.
+    tts_pb2 = None
+    tts_pb2_grpc = None
+    _GATEWAY_IMPORT_ERROR = exc
+else:
+    _GATEWAY_IMPORT_ERROR = None
 
 GRPC_HOST = "localhost"
 GRPC_PORT = 50051
 SAMPLE_RATE = 24000
 OUTPUT_DIR = REPO_ROOT / "workspace" / "audio_samples" / "engine"
+
+
+def _require_gateway():
+    if _GATEWAY_IMPORT_ERROR is not None:
+        raise RuntimeError(f"engine gateway protobuf import failed: {_GATEWAY_IMPORT_ERROR}")
+    return tts_pb2, tts_pb2_grpc
 
 # ---------------------------------------------------------------------------
 # Result dataclass (mirrors test_concurrent_tts.py)
@@ -171,8 +179,9 @@ def _pcm_bytes_to_f32(pcm_data: bytes) -> np.ndarray:
 
 
 def _audio_chunk_to_f32(audio_chunk) -> np.ndarray:
-    encoding = getattr(audio_chunk, "encoding", tts_pb2.AUDIO_ENCODING_PCM_F32)
-    if encoding == tts_pb2.AUDIO_ENCODING_PCM_S16LE:
+    pb2, _ = _require_gateway()
+    encoding = getattr(audio_chunk, "encoding", pb2.AUDIO_ENCODING_PCM_F32)
+    if encoding == pb2.AUDIO_ENCODING_PCM_S16LE:
         return np.frombuffer(audio_chunk.pcm_data, dtype=np.int16).astype(np.float32) / 32767.0
     return np.frombuffer(audio_chunk.pcm_data, dtype=np.float32)
 
@@ -208,19 +217,20 @@ def _make_session_config(
     sample_rate: int = SAMPLE_RATE,
     encoding=None,
 ):
+    pb2, _ = _require_gateway()
     if input_mode is None:
-        input_mode = tts_pb2.INPUT_MODE_LONG_SEGMENT
+        input_mode = pb2.INPUT_MODE_LONG_SEGMENT
     if group_policy is None:
-        group_policy = tts_pb2.GROUP_POLICY_AUTO
+        group_policy = pb2.GROUP_POLICY_AUTO
     if encoding is None:
-        encoding = tts_pb2.AUDIO_ENCODING_PCM_F32
-    return tts_pb2.SessionConfig(
+        encoding = pb2.AUDIO_ENCODING_PCM_F32
+    return pb2.SessionConfig(
         task_type=task_type,
         speaker=speaker,
         instruct=instruct or "",
         input_mode=input_mode,
         group_policy=group_policy,
-        audio=tts_pb2.AudioFormat(
+        audio=pb2.AudioFormat(
             encoding=encoding,
             sample_rate=sample_rate,
             channels=1,
@@ -255,11 +265,12 @@ def _check_server(host: str, port: int) -> bool:
 
 
 def _get_capabilities(host: str, port: int) -> dict:
+    pb2, pb2_grpc = _require_gateway()
     import grpc
     channel = grpc.insecure_channel(f"{host}:{port}")
-    stub = tts_pb2_grpc.TTSServiceStub(channel)
+    stub = pb2_grpc.TTSServiceStub(channel)
     try:
-        resp = stub.GetCapabilities(tts_pb2.GetCapabilitiesRequest(), timeout=10)
+        resp = stub.GetCapabilities(pb2.GetCapabilitiesRequest(), timeout=10)
         return {
             "variant": resp.variant,
             "loaded_model_type": resp.loaded_model_type,
@@ -299,12 +310,13 @@ def _synthesize_oneshot(
     timeout: float = 120.0,
 ) -> TTSResult:
     """Send a unary full-text request and collect streamed audio."""
+    pb2, pb2_grpc = _require_gateway()
     sid = session_id or uuid.uuid4().hex[:12]
     result = TTSResult(session_id=sid, text=text)
 
     import grpc
     channel = grpc.insecure_channel(f"{host}:{port}")
-    stub = tts_pb2_grpc.TTSServiceStub(channel)
+    stub = pb2_grpc.TTSServiceStub(channel)
 
     chunks = []
     first_ts = None
@@ -313,14 +325,14 @@ def _synthesize_oneshot(
     t0 = time.perf_counter()
     request_sent_ts = t0
     try:
-        request = tts_pb2.SynthesizeOnceRequest(
+        request = pb2.SynthesizeOnceRequest(
             session_id=sid,
             text=text,
             config=_make_session_config(
                 task_type=task_type,
                 speaker=speaker,
                 instruct=instruct,
-                input_mode=tts_pb2.INPUT_MODE_FULL_TEXT,
+                input_mode=pb2.INPUT_MODE_FULL_TEXT,
             ),
         )
         for resp in stub.SynthesizeOnce(request, timeout=timeout):
@@ -361,18 +373,21 @@ async def _synthesize_streaming(
     init_task_type: str,
     text_chunks: list[str],
     init_instruct: str = "",
-    input_mode=tts_pb2.INPUT_MODE_LONG_SEGMENT,
+    input_mode=None,
     chunk_delay_ms: float = 50.0,
     session_id: str = "",
     timeout: float = 120.0,
 ) -> TTSResult:
     """Send init → text_chunk* (with delays) → done, collect audio."""
+    pb2, pb2_grpc = _require_gateway()
+    if input_mode is None:
+        input_mode = pb2.INPUT_MODE_LONG_SEGMENT
     sid = session_id or uuid.uuid4().hex[:12]
     result = TTSResult(session_id=sid, text=" ".join(text_chunks))
 
     import grpc.aio as grpc_aio
     channel = grpc_aio.insecure_channel(f"{host}:{port}")
-    stub = tts_pb2_grpc.TTSServiceStub(channel)
+    stub = pb2_grpc.TTSServiceStub(channel)
 
     chunks: List[np.ndarray] = []
     first_ts = None
@@ -384,8 +399,8 @@ async def _synthesize_streaming(
 
     async def request_gen():
         send_marks["start_sent_ts"] = time.perf_counter()
-        yield tts_pb2.SynthesizeRequest(
-            start=tts_pb2.StartRequest(
+        yield pb2.SynthesizeRequest(
+            start=pb2.StartRequest(
                 session_id=sid,
                 config=_make_session_config(
                     task_type=init_task_type,
@@ -401,13 +416,13 @@ async def _synthesize_streaming(
             now = time.perf_counter()
             if send_marks["first_text_sent_ts"] is None:
                 send_marks["first_text_sent_ts"] = now
-            yield tts_pb2.SynthesizeRequest(
-                text=tts_pb2.TextChunk(text=chunk_text)
+            yield pb2.SynthesizeRequest(
+                text=pb2.TextChunk(text=chunk_text)
             )
         if chunk_delay_ms > 0:
             await asyncio.sleep(chunk_delay_ms / 1000)
-        yield tts_pb2.SynthesizeRequest(
-            end=tts_pb2.EndRequest()
+        yield pb2.SynthesizeRequest(
+            end=pb2.EndRequest()
         )
 
     t0 = time.perf_counter()
@@ -550,7 +565,7 @@ def _p95(values: list[float]) -> float:
 # Test 1: Single smoke
 # ---------------------------------------------------------------------------
 
-def test_single_smoke(host: str, port: int, output_dir: Path) -> TTSResult:
+def run_single_smoke(host: str, port: int, output_dir: Path) -> TTSResult:
     print("\n" + "=" * 60)
     print("  Test 1: Single Request Smoke Test")
     print("=" * 60)
@@ -573,7 +588,7 @@ def test_single_smoke(host: str, port: int, output_dir: Path) -> TTSResult:
 # Test 2: Streaming text input
 # ---------------------------------------------------------------------------
 
-def test_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
+def run_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
     print("\n" + "=" * 60)
     print("  Test 2: Streaming Text Input")
     print("=" * 60)
@@ -605,7 +620,7 @@ def test_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
 # Test 2b: CustomVoice + instruct (optional style control)
 # ---------------------------------------------------------------------------
 
-def test_custom_voice_instruct(host: str, port: int, output_dir: Path) -> list[TTSResult]:
+def run_custom_voice_instruct(host: str, port: int, output_dir: Path) -> list[TTSResult]:
     print("\n" + "=" * 60)
     print("  Test 2b: CustomVoice + Instruct")
     print("=" * 60)
@@ -667,7 +682,7 @@ def test_custom_voice_instruct(host: str, port: int, output_dir: Path) -> list[T
 # Test 3: Concurrent requests
 # ---------------------------------------------------------------------------
 
-def test_concurrent(host: str, port: int, concurrency: int, output_dir: Path) -> list[TTSResult]:
+def run_concurrent(host: str, port: int, concurrency: int, output_dir: Path) -> list[TTSResult]:
     print("\n" + "=" * 60)
     print(f"  Test 3: Concurrent Requests (concurrency={concurrency})")
     print("=" * 60)
@@ -809,7 +824,7 @@ def stress_concurrent(
 # Test 4: Long text rollover
 # ---------------------------------------------------------------------------
 
-def test_long_text(host: str, port: int, output_dir: Path) -> list[TTSResult]:
+def run_long_text(host: str, port: int, output_dir: Path) -> list[TTSResult]:
     print("\n" + "=" * 60)
     print("  Test 4: Long Text Rollover")
     print("=" * 60)
@@ -897,7 +912,7 @@ def test_long_text(host: str, port: int, output_dir: Path) -> list[TTSResult]:
 # Test 5: BadCase tests
 # ---------------------------------------------------------------------------
 
-def test_badcases(host: str, port: int, output_dir: Path) -> list:
+def run_badcases(host: str, port: int, output_dir: Path) -> list:
     print("\n" + "=" * 60)
     print("  Test 5: BadCase Tests")
     print("=" * 60)
@@ -1007,30 +1022,31 @@ def test_badcases(host: str, port: int, output_dir: Path) -> list:
 
 def _test_cancel(host: str, port: int) -> TTSResult:
     """Send init + text, then cancel before done."""
+    pb2, pb2_grpc = _require_gateway()
     sid = uuid.uuid4().hex[:12]
     result = TTSResult(session_id=sid, text="(cancel test)")
 
     import grpc
     channel = grpc.insecure_channel(f"{host}:{port}")
-    stub = tts_pb2_grpc.TTSServiceStub(channel)
+    stub = pb2_grpc.TTSServiceStub(channel)
 
     def request_gen():
-        yield tts_pb2.SynthesizeRequest(
-            start=tts_pb2.StartRequest(
+        yield pb2.SynthesizeRequest(
+            start=pb2.StartRequest(
                 session_id=sid,
                 config=_make_session_config(
                     task_type="custom_voice",
                     speaker="Serena",
-                    input_mode=tts_pb2.INPUT_MODE_LONG_SEGMENT,
+                    input_mode=pb2.INPUT_MODE_LONG_SEGMENT,
                 ),
             )
         )
-        yield tts_pb2.SynthesizeRequest(
-            text=tts_pb2.TextChunk(text="这段文字将被取消。")
+        yield pb2.SynthesizeRequest(
+            text=pb2.TextChunk(text="这段文字将被取消。")
         )
         time.sleep(0.1)
-        yield tts_pb2.SynthesizeRequest(
-            cancel=tts_pb2.CancelRequest()
+        yield pb2.SynthesizeRequest(
+            cancel=pb2.CancelRequest()
         )
 
     chunks = []
@@ -1062,11 +1078,11 @@ def _test_cancel(host: str, port: int) -> TTSResult:
 # pytest interface — auto-skip if engine not reachable
 # ---------------------------------------------------------------------------
 
-import pytest  # noqa: E402
-
 
 @pytest.fixture(scope="module")
 def engine_addr():
+    if _GATEWAY_IMPORT_ERROR is not None:
+        pytest.skip(f"engine gateway protobuf import failed: {_GATEWAY_IMPORT_ERROR}")
     if not _check_server(GRPC_HOST, GRPC_PORT):
         pytest.skip(
             f"Standalone engine not reachable at {GRPC_HOST}:{GRPC_PORT}. "
@@ -1198,138 +1214,3 @@ class TestEnginePerformance:
         assert r.first_chunk_ms is not None
         print(f"\n  first_chunk={r.first_chunk_ms:.0f}ms  RTF={r.rtf:.2f}")
         assert r.first_chunk_ms < 30_000, f"First chunk too slow: {r.first_chunk_ms:.0f}ms"
-
-
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="E2E test & benchmark for standalone TTS engine (gRPC)"
-    )
-    parser.add_argument("--host", default=GRPC_HOST)
-    parser.add_argument("--port", type=int, default=GRPC_PORT)
-    parser.add_argument("--concurrency", default="1,2,4",
-                        help="Concurrency levels, comma-separated (default: 1,2,4)")
-    parser.add_argument("--output-dir", default=str(OUTPUT_DIR),
-                        help="Output directory for WAV files")
-    parser.add_argument("--skip-streaming", action="store_true")
-    parser.add_argument(
-        "--skip-custom-instruct",
-        action="store_true",
-        help="Skip CustomVoice + instruct tests (2b)",
-    )
-    parser.add_argument("--skip-single", action="store_true")
-    parser.add_argument("--skip-concurrent", action="store_true")
-    parser.add_argument("--skip-long", action="store_true")
-    parser.add_argument("--skip-badcase", action="store_true")
-    parser.add_argument("--stress-concurrency", type=int, default=0,
-                        help="Run repeated concurrent stress rounds at this concurrency; 0 disables")
-    parser.add_argument("--stress-rounds", type=int, default=0,
-                        help="Measured stress rounds to run when --stress-concurrency > 0")
-    parser.add_argument("--stress-warmup-rounds", type=int, default=1,
-                        help="Warmup rounds before measured stress rounds")
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    concurrency_levels = [int(x.strip()) for x in args.concurrency.split(",")]
-
-    print("=" * 60)
-    print("  TTS Engine Standalone E2E Test & Benchmark")
-    print("=" * 60)
-    print(f"  Engine:      {args.host}:{args.port}")
-    print(f"  Concurrency: {concurrency_levels}")
-    if args.stress_concurrency > 0:
-        print(
-            f"  Stress:      concurrency={args.stress_concurrency}, "
-            f"warmup={args.stress_warmup_rounds}, rounds={args.stress_rounds}"
-        )
-    print(f"  Output:      {output_dir}")
-
-    if not _check_server(args.host, args.port):
-        print(f"\nERROR: Engine not reachable at {args.host}:{args.port}")
-        print("Start the engine first:")
-        print("  python -m engine.server --config engine.yaml")
-        sys.exit(1)
-    print("  Server:      READY")
-    cap = _get_capabilities(args.host, args.port)
-    print(f"  Variant:     {cap['variant'] or 'unknown'}")
-    print(f"  Model Type:  {cap['loaded_model_type'] or 'unknown'}")
-    print(f"  Ref Audio:   {cap['ref_audio_available']}")
-    if cap["ref_audio_reason"]:
-        print(f"  Ref Reason:  {cap['ref_audio_reason']}")
-
-    all_results: dict[str, list[TTSResult]] = {}
-
-    # Test 1: Single smoke
-    if not args.skip_single:
-        r = test_single_smoke(args.host, args.port, output_dir)
-        all_results["single"] = [r]
-
-    # Test 2: Streaming text
-    if not args.skip_streaming:
-        r = test_streaming_text(args.host, args.port, output_dir)
-        all_results["streaming"] = [r]
-
-    # Test 2b: CustomVoice + instruct
-    if not args.skip_custom_instruct:
-        instruct_results = test_custom_voice_instruct(args.host, args.port, output_dir)
-        if instruct_results:
-            all_results["custom_instruct"] = instruct_results
-
-    # Test 3: Concurrent
-    if not args.skip_concurrent:
-        for level in concurrency_levels:
-            results = test_concurrent(args.host, args.port, level, output_dir)
-            all_results[f"concurrent_x{level}"] = results
-
-    # Test 4: Long text
-    if not args.skip_long:
-        long_results = test_long_text(args.host, args.port, output_dir)
-        all_results["long_text"] = long_results
-
-    # Test 5: BadCases
-    if not args.skip_badcase:
-        test_badcases(args.host, args.port, output_dir)
-
-    # Test 6: Stress
-    if args.stress_concurrency > 0 and args.stress_rounds > 0:
-        stress_rounds = stress_concurrent(
-            args.host,
-            args.port,
-            concurrency=args.stress_concurrency,
-            rounds=args.stress_rounds,
-            warmup_rounds=args.stress_warmup_rounds,
-        )
-        measured = stress_rounds[args.stress_warmup_rounds:]
-        all_results[f"stress_x{args.stress_concurrency}"] = [
-            r for round_results in measured for r in round_results
-        ]
-
-    # Final summary
-    print("\n" + "=" * 60)
-    print("  FINAL SUMMARY")
-    print("=" * 60)
-    for name, results in all_results.items():
-        ok = sum(1 for r in results if r.error is None)
-        fail = sum(1 for r in results if r.error is not None)
-        first_chunks = [r.first_chunk_ms for r in results if r.first_chunk_ms is not None]
-        avg_first = statistics.mean(first_chunks) if first_chunks else 0
-        print(f"  {name:20s}  OK={ok}  FAIL={fail}  avg_first_chunk={avg_first:.0f}ms")
-
-    total_ok = sum(1 for results in all_results.values() for r in results if r.error is None)
-    total_fail = sum(1 for results in all_results.values() for r in results if r.error is not None)
-    print(f"\n  TOTAL: {total_ok} OK, {total_fail} FAILED")
-    print(f"  Output: {output_dir.resolve()}")
-    smoke_wav = output_dir / "test1_single_smoke.wav"
-    if smoke_wav.exists():
-        print(f"\n  Play audio: aplay {smoke_wav}")
-        print(f"         or:  ffplay -autoexit {smoke_wav}")
-
-    return 0 if total_fail == 0 else 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())

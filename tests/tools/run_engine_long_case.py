@@ -2,8 +2,8 @@
 """Run a single long-text standalone-engine case.
 
 Examples:
-  mamba run -n qwen3-tts python tests/e2e/run_engine_long_case.py --case 4a
-  mamba run -n qwen3-tts python tests/e2e/run_engine_long_case.py --case story
+  mamba run -n qwen3-tts python tests/tools/run_engine_long_case.py --case 4a
+  mamba run -n qwen3-tts python tests/tools/run_engine_long_case.py --case story
 """
 
 from __future__ import annotations

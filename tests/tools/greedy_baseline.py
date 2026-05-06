@@ -11,7 +11,7 @@ If only Triton produces silence → BLS logic bug.
 
 Usage:
     conda activate qwen3-tts
-    python tests/e2e/test_greedy_baseline.py \
+    python tests/tools/greedy_baseline.py \
         --model-path workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice \
         [--triton localhost:8001] \
         [--output-dir workspace/test_greedy_baseline]

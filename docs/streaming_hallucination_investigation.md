@@ -278,8 +278,8 @@ Interpretation:
 ### 13. Post-fix standalone engine reruns do not show a gross long-text length blowup on 4a or story
 
 Experiments:
-- `tests/e2e/run_engine_long_case.py --case 4a --speaker Serena`
-- `tests/e2e/run_engine_long_case.py --case story --speaker Serena`
+- `tests/tools/run_engine_long_case.py --case 4a --speaker Serena`
+- `tests/tools/run_engine_long_case.py --case story --speaker Serena`
 
 Observed on the fixed runtime:
 - 4a end-to-end result
@@ -329,8 +329,8 @@ Experiments:
   - `code_predictor_unrolled_bf16.engine`
   - `code_predictor_unrolled_fp32.engine`
 - random-trial parity:
-  - `python tests/integration/verify_code_predictor_trt.py --engine ...code_predictor_unrolled_bf16.engine --trials 10`
-  - `python tests/integration/verify_code_predictor_trt.py --engine ...code_predictor_unrolled_fp32.engine --trials 10`
+  - `python tests/tools/verify_code_predictor_trt.py --engine ...code_predictor_unrolled_bf16.engine --trials 10`
+  - `python tests/tools/verify_code_predictor_trt.py --engine ...code_predictor_unrolled_fp32.engine --trials 10`
 - bad-state parity:
   - same script in dump mode on `000003`, `000004`, `000008`
 

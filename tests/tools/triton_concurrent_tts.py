@@ -10,7 +10,7 @@ Tests the continuous batching orchestrator with:
 
 Usage:
     conda activate qwen3-tts
-    python tests/e2e/test_concurrent_tts.py [--triton localhost:8001] [--concurrency 1,2,4,8]
+    python tests/tools/triton_concurrent_tts.py [--triton localhost:8001] [--concurrency 1,2,4,8]
 """
 
 import argparse

@@ -9,4 +9,4 @@ ENV_NAME="${QWEN3_TTS_ENV_NAME:-qwen3-tts}"
 eval "$(mamba shell hook --shell bash)"
 mamba activate "${ENV_NAME}"
 
-exec python scripts/python/test_serving_endpoints.py "$@"
+exec python tests/tools/serving_endpoints.py "$@"

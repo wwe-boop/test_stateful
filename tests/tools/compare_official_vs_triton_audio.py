@@ -15,11 +15,11 @@ Prerequisites:
 
 Usage:
   conda activate qwen3-tts
-  python tests/e2e/compare_official_vs_triton_audio.py --variant custom-1.7b \\
+  python tests/tools/compare_official_vs_triton_audio.py --variant custom-1.7b \\
       --text "你好，这是一段测试。" --speaker serena --triton-url localhost:8001
 
   # VoiceDesign variant:
-  python tests/e2e/compare_official_vs_triton_audio.py --variant design-1.7b \\
+  python tests/tools/compare_official_vs_triton_audio.py --variant design-1.7b \\
       --text "Hello" --instruct "Speak calmly." --triton-url localhost:8001
 """
 

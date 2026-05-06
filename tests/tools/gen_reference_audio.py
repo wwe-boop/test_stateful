@@ -5,7 +5,7 @@ Produces proto_*.wav using model.generate() (the known-good path).
 Compare these with engine output in workspace/audio_samples/engine/.
 
 Usage (conda activate qwen3-tts):
-  python tests/e2e/gen_reference_audio.py
+  python tests/tools/gen_reference_audio.py
 """
 
 import sys

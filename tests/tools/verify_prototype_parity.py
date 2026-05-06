@@ -6,8 +6,8 @@ manual decode loop (PrefillBuilder prefill + Talker→CP→codec_sum→Talker) s
 Ensures three-layer consistency: prototype == manual PyTorch == ONNX/TRT.
 
 Usage (host, conda activate qwen3-tts):
-  python tests/integration/verify_prototype_parity.py --variant design-1.7b --text "你好，世界"
-  python tests/integration/verify_prototype_parity.py --variant design-1.7b --text "你好" --max-steps 100
+  python tests/tools/verify_prototype_parity.py --variant design-1.7b --text "你好，世界"
+  python tests/tools/verify_prototype_parity.py --variant design-1.7b --text "你好" --max-steps 100
 """
 
 import argparse

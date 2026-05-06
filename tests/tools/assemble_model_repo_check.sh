@@ -10,7 +10,7 @@
 #            top-level talker_code2wav_fused Triton model is exposed
 #
 #  Run from repo root:
-#    bash tests/integration/test_assemble.sh
+#    bash tests/tools/assemble_model_repo_check.sh
 #  Requires: workspace/exported/<variant>/ with ONNX (and optionally .engine for trt).
 # ===========================================================================
 

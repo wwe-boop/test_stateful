@@ -5,7 +5,7 @@ Calls the running engine via gRPC for the same texts as gen_reference_audio.py,
 saves WAV files side by side for A/B listening.
 
 Usage:
-  python tests/e2e/gen_engine_audio.py
+  python tests/tools/gen_engine_audio.py
 """
 
 import sys

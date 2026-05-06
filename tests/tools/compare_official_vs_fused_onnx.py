@@ -16,7 +16,7 @@ Prerequisites:
 
 Usage:
   conda activate qwen3-tts
-  python tests/integration/compare_official_vs_fused_onnx.py --variant custom-1.7b \\
+  python tests/tools/compare_official_vs_fused_onnx.py --variant custom-1.7b \\
       --text "你好，这是一段测试。" --speaker serena --max-steps 120
 """
 

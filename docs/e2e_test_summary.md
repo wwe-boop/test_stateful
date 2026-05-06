@@ -1,63 +1,118 @@
-# 端到端测试数据汇总
+# 端到端测试与验收入口
 
-## 1. 测试范围
+## 1. 入口分层
 
-E2E 测试位于 `tests/e2e/test_e2e.py`，通过 Triton gRPC 调用 `tts_orchestrator`，覆盖场景与错误处理（对应架构 T3.1、T3.3、T3.4）。
+E2E 相关入口现在按职责分开：
 
-| 用例 ID | 测试项 | 说明 |
-|--------|--------|------|
-| **T3.1a** | voice_design | 纯文本 + task_type=voice_design，校验流式音频与首包/总耗时 |
-| **T3.1b** | custom_voice | speaker + instruct，校验多 chunk 输出 |
-| **T3.1c** | voice_clone_xvec | 需 ref_audio + x_vector_only（当前默认 skip，缺 speaker_encoder） |
-| **T3.1d** | voice_clone_icl | 需 ref_audio + ref_text（当前默认 skip） |
-| **T3.3a** | error_empty_text | 空 text → 服务返回错误 |
-| **T3.3b** | error_invalid_task_type | 非法 task_type → 错误 |
-| **T3.3c** | error_voice_clone_no_ref | voice_clone 无 ref_audio → 错误 |
-| **T3.3d** | error_voice_clone_bad_base64 | ref_audio 非法 base64 → 错误 |
-| **T3.4** | first_chunk_latency | 首包延迟与总耗时（目标见下） |
+| 入口 | 类型 | 说明 |
+| --- | --- | --- |
+| `tests/e2e/test_e2e.py` | pytest | Triton gRPC `tts_orchestrator` 端到端断言，覆盖基础合成、错误处理、首包延迟 smoke。 |
+| `tests/e2e/test_engine_standalone.py` | pytest | 裸 standalone engine gRPC 端到端断言，服务不可达时自动 skip。 |
+| `tests/tools/serving_endpoints.py` | 手动验收/benchmark | 统一 serving 工具，覆盖 `engine-grpc`、`engine-websocket`、`triton-grpc`、`triton-http`。 |
+| `tests/tools/*.py` | 手动工具 | 音频生成、全链路试听、ONNX/TRT 对比、长文本调查、导出验证等。 |
 
-## 2. 指标定义
+完整测试地图见 [`tests/README.md`](../tests/README.md)。
 
-| 指标 | 含义 | 目标（架构/生产） |
-|------|------|-------------------|
-| **first_chunk_latency** | 请求发出到收到第一个 audio_chunk 的时间 | 生产 &lt; 200ms；架构参考 ~76ms（prefill+10 步 decode+code2wav） |
-| **total_sec** | 单次请求从发起到收到 is_final=True 的总时间 | 与文本长度和 decode 步数相关 |
-| **chunks** | 收到的音频 chunk 数量 | ≥ 1 |
-| **samples** | 总采样点数（float32, 24kHz） | 与生成时长一致 |
+## 2. Triton Pytest E2E
 
-## 3. 最近一次完整运行结果（参考）
-
-- **环境**: Triton 容器 `qwen3-tts-triton:latest`，model_repository 为 ONNX 模式、design-1.7b。
-- **结果**: **7 passed, 2 skipped**（voice_clone 两条因无 speaker_encoder 跳过）。
-- **总耗时**: ~12 分钟（含 3 条实际 TTS 推理，单条数十秒量级）。
-- **断言**: 首包延迟 &lt; 15s（CI 放宽）；生产目标仍为 &lt; 200ms。
-
-## 4. 如何获取具体数值
-
-运行测试并打开 `-s` 查看 print 输出，即可看到各次推理的首包/总耗时与采样数：
+启动 Triton 后运行：
 
 ```bash
-# 确保 Triton 已起：bash scripts/bash/build_triton.sh run
-cd /path/to/Qwen3-TTS-Triton
-python -m pytest tests/e2e/test_e2e.py -v -s
+bash scripts/bash/build_triton.sh run
+pytest tests/e2e/test_e2e.py -v -s
 ```
 
-输出中会出现类似：
+覆盖范围：
 
-- `[E2E T3.1a] voice_design first_chunk_s=... total_s=... samples=...`
-- `[E2E T3.4] first_chunk_latency_ms=... total_ms=... chunks=... samples=...`
+| 用例 | 说明 |
+| --- | --- |
+| `test_e2e_voice_design_or_custom` | `custom_voice`/`voice_design` 基础流式音频。 |
+| `test_e2e_custom_voice` | `speaker + instruct` custom voice 路径。 |
+| `test_e2e_error_*` | 空文本、非法 task type、voice clone 缺少或损坏 ref audio。 |
+| `test_e2e_first_chunk_latency` | Triton orchestrator 首个 audio chunk 延迟 smoke。 |
 
-将 `first_chunk_s` × 1000 或 `first_chunk_latency_ms` 与 200ms 对比即可评估首响是否达标。
+`voice_clone` 相关 pytest 默认 skip，因为需要真实 ref audio 和完整 ref audio 链路。
 
-## 5. 与架构目标对照
+## 3. Standalone Engine Pytest E2E
 
-| 项目 | 架构目标 | 说明 |
-|------|----------|------|
-| 首包延迟（TTS 部分） | ~76ms（prefill ~20ms + 10 步 decode ~41ms + code2wav ~15ms） | 当前为 ONNX 后端；TRT 可进一步逼近 |
-| 单步 decode | ~2.6ms (B=1) / ~2.8ms (B=8) | 需单独 benchmark talker_unified |
-| 首包 chunk | 10 帧 → ~19200 samples @ 24kHz | 由 `first_chunk_frames` 控制 |
+启动裸 engine 后运行：
 
-## 6. 已知限制
+```bash
+python -m engine.server --config engine.yaml
+pytest tests/e2e/test_engine_standalone.py -v -s
+```
 
-- **voice_clone**：需部署 `speaker_encoder` 且提供有效 ref_audio，当前 CI 不跑，可本地用真实音频手动测。
-- **并发/压测**：当前用例为单请求顺序执行，不测多路并发与 GPU 利用率；高利用率需多路并发或单独压测脚本。
+覆盖范围：
+
+| 用例组 | 说明 |
+| --- | --- |
+| `TestEngineSmokeAndStreaming` | capabilities、单次合成、英文文本、流式文本。 |
+| `TestEngineCustomVoiceInstruct` | custom voice instruct，非支持模型自动 skip。 |
+| `TestEngineLongText` | medium/very long 文本 rollover。 |
+| `TestEngineBadCases` | 空文本、空白文本、单字、cancel。 |
+| `TestEnginePerformance` | 首包延迟 smoke，阈值为 CI 友好的宽松断言。 |
+
+## 4. 完整 Serving 验收工具
+
+`tests/tools/serving_endpoints.py` 是推荐的人工验收入口：
+
+```bash
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --targets engine-grpc,engine-websocket
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --targets triton-grpc,triton-http
+```
+
+默认矩阵：
+
+- standalone engine gRPC：接近裸 engine pytest 的完整 suite。
+- standalone engine WebSocket：同一 suite 的 WebSocket transport。
+- Triton gRPC：health + 真实合成请求 + 可选长文本。
+- Triton HTTP：health + model metadata/config + 真实合成请求 + 可选长文本。
+
+常用快速验收：
+
+```bash
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
+  --targets engine-grpc \
+  --skip-long --skip-badcase
+```
+
+## 5. 裸 Engine TTFT 分布 Benchmark
+
+如果要测“裸引擎更准确一点的 TTFT”，使用统一 serving 工具的 TTFT 分布模式：
+
+```bash
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
+  --targets engine-grpc \
+  --skip-single --skip-streaming --skip-custom-instruct \
+  --skip-concurrent --skip-long --skip-badcase \
+  --ttft-warmup 3 \
+  --ttft-samples 30 \
+  --ttft-text "今天天气真好。"
+```
+
+输出包含：
+
+- `mean_ms`
+- `variance_ms2`（样本方差）
+- `population_variance_ms2`
+- `stdev_ms`
+- `coefficient_of_variation`
+- `min/p50/p90/p95/max/range`
+- 每次采样相对均值的 fluctuation bar
+- `--json` 下的结构化明细
+
+TTFT 这里定义为客户端发出 standalone engine `SynthesizeOnce` 请求到收到第一个 audio chunk 的 wall-clock 时间。它包含客户端 gRPC、本地调度、prefill/decode/code2wav 到首包产出的整条裸 engine 路径，不包含 Triton orchestrator。
+
+## 6. 指标口径
+
+| 指标 | 含义 |
+| --- | --- |
+| `first_chunk_ms` / `ttft_ms` | 请求开始到第一个可播放 audio chunk 到达客户端的 wall-clock 时间。 |
+| `total_ms` | 请求开始到终止事件/最终响应完成。 |
+| `chunks` | 收到的音频 chunk 数。 |
+| `samples` / `duration_sec` | 生成音频采样点数和换算时长。 |
+| `rtf` | wall-clock 总耗时 / 音频时长。 |
+| `decode_step_*` | 连续 audio chunk 到达间隔统计，用于观察流式稳定性。 |
+
+benchmark 数字必须带完整条件：硬件、driver、镜像/环境、engine profile、输入文本、warmup、样本数、目标 endpoint、采样参数、失败率。

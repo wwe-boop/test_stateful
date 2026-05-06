@@ -159,6 +159,47 @@ bash scripts/bash/compose.sh up --gateway triton --variant custom-1.7b
 bash scripts/bash/deploy.sh run --gateway triton --variant custom-1.7b --engine-mode trt
 ```
 
+## 测试与验收
+
+测试入口已经统一到 `tests/`，详细地图见 [tests/README.md](tests/README.md)。
+
+日常开发建议先跑 unit + integration：
+
+```bash
+pytest tests/unit tests/integration -q
+```
+
+服务级 E2E 分两类：
+
+```bash
+# Standalone engine，服务未启动时 pytest 会自动 skip
+python -m engine.server --config engine.yaml
+pytest tests/e2e/test_engine_standalone.py -v -s
+
+# Triton orchestrator，服务未启动时 pytest 会自动 skip
+bash scripts/bash/build_triton.sh run
+pytest tests/e2e/test_e2e.py -v -s
+```
+
+完整 serving 验收、音频生成和 benchmark 不再散落在 `scripts/python/` 或 `tests/e2e/test_*.py` 里，统一放在 `tests/tools/`：
+
+```bash
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --help
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --targets engine-grpc
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --targets triton-grpc,triton-http
+```
+
+裸 engine TTFT 分布 benchmark：
+
+```bash
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
+  --targets engine-grpc \
+  --skip-single --skip-streaming --skip-custom-instruct \
+  --skip-concurrent --skip-long --skip-badcase \
+  --ttft-warmup 3 \
+  --ttft-samples 30
+```
+
 ## WebUI Demo
 
 WebUI 分为三个工程展示板块：

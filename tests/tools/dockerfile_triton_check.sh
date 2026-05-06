@@ -8,8 +8,8 @@
 #    - tritonserver --help works
 #
 #  Run from repo root:
-#    bash tests/integration/test_dockerfile_triton.sh
-#  Optional: BUILD_TAG=qwen3-tts-triton:26.01 bash tests/integration/test_dockerfile_triton.sh
+#    bash tests/tools/dockerfile_triton_check.sh
+#  Optional: BUILD_TAG=qwen3-tts-triton:26.01 bash tests/tools/dockerfile_triton_check.sh
 # ===========================================================================
 
 set -euo pipefail

@@ -14,7 +14,7 @@ Requirements:
 
 Example (engine already built):
   conda activate qwen3-tts
-  python tests/integration/verify_code_predictor_trt.py \\
+  python tests/tools/verify_code_predictor_trt.py \\
     --variant-dir workspace/exported/custom-1.7b \\
     --engine workspace/exported/custom-1.7b/code_predictor_unrolled_bf16.engine \\
     --seed 42 --codec-token0 1500
@@ -32,7 +32,7 @@ Example (build BF16 engine via Docker, then compare):
     --memPoolSize=workspace:8192
 
 Example (replay real fused dump states through standalone CP):
-  python tests/integration/verify_code_predictor_trt.py \\
+  python tests/tools/verify_code_predictor_trt.py \\
     --variant-dir workspace/exported/custom-1.7b \\
     --engine workspace/exported/custom-1.7b/code_predictor_unrolled_bf16.engine \\
     --dump workspace/engine_dumps/4a_greedy_dump_fix_20260416_202542/000003_decode_*.pt \\
