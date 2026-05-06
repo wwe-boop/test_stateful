@@ -374,7 +374,9 @@ def _summarize_ttft_distribution(
 
 def _print_ttft_distribution(target: str, distribution: dict[str, Any]) -> None:
     summary = distribution["summary"]
-    print(f"\nTTFT Distribution ({target})")
+    measurement = str(summary.get("measurement", "") or "")
+    heading = target if not measurement else f"{target}, {measurement}"
+    print(f"\nTTFT Distribution ({heading})")
     print("-" * 72)
     if summary.get("count", 0) <= 0:
         print(f"  no successful samples; failures={summary.get('failures', 0)}")
@@ -540,9 +542,53 @@ def _read_story_text(args: argparse.Namespace) -> str:
 class EngineGrpcTransport:
     name = "engine-grpc"
 
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, *, ttft_connection_mode: str = "reuse"):
         self.endpoint = endpoint
         self.host, self.port = _parse_host_port(endpoint, 50051)
+        self.ttft_connection_mode = ttft_connection_mode
+        self._ttft_channel = None
+        self._ttft_stub = None
+        self._ttft_active = False
+
+    def _make_stub(self, *, timeout: float, wait_ready: bool):
+        pb2, pb2_grpc = _require_engine_gateway()
+        import grpc
+
+        channel = grpc.insecure_channel(f"{self.host}:{self.port}")
+        if wait_ready:
+            grpc.channel_ready_future(channel).result(timeout=timeout)
+        return channel, pb2_grpc.TTSServiceStub(channel)
+
+    def prepare_ttft(self, timeout: float) -> None:
+        """Prepare a gRPC connection according to the TTFT measurement mode.
+
+        Python gRPC channels are lazy: without an explicit ready wait, the
+        first RPC also pays HTTP/2 connection setup.  TTFT defaults to the
+        steady-state client posture: a ready, reused channel.
+        """
+        self.close_ttft()
+        self._ttft_active = True
+        if self.ttft_connection_mode != "reuse":
+            return
+        self._ttft_channel, self._ttft_stub = self._make_stub(
+            timeout=timeout,
+            wait_ready=True,
+        )
+
+    def close_ttft(self) -> None:
+        if self._ttft_channel is not None:
+            self._ttft_channel.close()
+        self._ttft_channel = None
+        self._ttft_stub = None
+        self._ttft_active = False
+
+    @property
+    def ttft_measurement_label(self) -> str:
+        if self.ttft_connection_mode == "reuse":
+            return "grpc_connection=reuse-ready"
+        if self.ttft_connection_mode == "ready":
+            return "grpc_connection=new-ready"
+        return "grpc_connection=new-cold"
 
     def get_capabilities(self, timeout: float) -> dict[str, Any]:
         pb2, pb2_grpc = _require_engine_gateway()
@@ -597,23 +643,33 @@ class EngineGrpcTransport:
         timeout: float,
         session_id: str | None = None,
     ) -> SynthesisResult:
-        pb2, pb2_grpc = _require_engine_gateway()
+        pb2, _ = _require_engine_gateway()
         import grpc
 
         sid = session_id or uuid.uuid4().hex[:12]
         result = SynthesisResult(self.name, sid, text, sample_rate=spec.sample_rate, encoding=spec.encoding)
-        channel = grpc.insecure_channel(f"{self.host}:{self.port}")
-        stub = pb2_grpc.TTSServiceStub(channel)
+        channel = None
+        mode = self.ttft_connection_mode if self._ttft_active else "ready"
+        stub = self._ttft_stub if self._ttft_active else None
+        close_channel = False
         chunks: list[np.ndarray] = []
         timestamps: list[float] = []
         first_ts: float | None = None
-        started = time.perf_counter()
         try:
+            if stub is None:
+                channel, stub = self._make_stub(
+                    timeout=timeout,
+                    wait_ready=(mode != "cold"),
+                )
+                close_channel = True
+                if self._ttft_active and mode == "ready":
+                    stub.GetCapabilities(pb2.GetCapabilitiesRequest(), timeout=timeout)
             request = pb2.SynthesizeOnceRequest(
                 session_id=sid,
                 text=text,
                 config=self._make_session_config(spec, input_mode=pb2.INPUT_MODE_FULL_TEXT),
             )
+            started = time.perf_counter()
             for resp in stub.SynthesizeOnce(request, timeout=timeout):
                 which = resp.WhichOneof("response")
                 if which == "audio":
@@ -638,13 +694,21 @@ class EngineGrpcTransport:
                         break
                     if resp.status.event == "done":
                         break
+        except grpc.FutureTimeoutError as exc:
+            result.error = f"gRPC channel ready timeout: {exc}"
         except grpc.RpcError as exc:
             result.error = f"gRPC {exc.code().name}: {exc.details()}"
         finally:
-            channel.close()
+            finished = time.perf_counter()
+            if close_channel and channel is not None:
+                channel.close()
 
-        result.total_ms = (time.perf_counter() - started) * 1000.0
-        result.first_chunk_ms = (first_ts - started) * 1000.0 if first_ts is not None else None
+        if "started" in locals():
+            result.total_ms = (finished - started) * 1000.0
+            result.first_chunk_ms = (first_ts - started) * 1000.0 if first_ts is not None else None
+        else:
+            result.total_ms = 0.0
+            result.first_chunk_ms = None
         result.start_to_first_audio_ms = result.first_chunk_ms
         result.ttft_ms = result.first_chunk_ms
         result.audio_chunk_intervals_ms = _compute_intervals_ms(timestamps)
@@ -1409,18 +1473,26 @@ def _run_ttft_distribution_case(
 ) -> CaseResult:
     measured: list[SynthesisResult] = []
     total_runs = args.ttft_warmup + args.ttft_samples
-    for idx in range(total_runs):
-        phase = "warmup" if idx < args.ttft_warmup else "measure"
-        measure_idx = idx - args.ttft_warmup
-        session_id = f"{transport.name}-ttft-{phase}-{measure_idx if phase == 'measure' else idx}"
-        result = transport.synthesize_oneshot(
-            spec,
-            args.ttft_text,
-            timeout=args.timeout,
-            session_id=session_id,
-        )
-        if phase == "measure":
-            measured.append(result)
+    prepare_ttft = getattr(transport, "prepare_ttft", None)
+    close_ttft = getattr(transport, "close_ttft", None)
+    if callable(prepare_ttft):
+        prepare_ttft(args.timeout)
+    try:
+        for idx in range(total_runs):
+            phase = "warmup" if idx < args.ttft_warmup else "measure"
+            measure_idx = idx - args.ttft_warmup
+            session_id = f"{transport.name}-ttft-{phase}-{measure_idx if phase == 'measure' else idx}"
+            result = transport.synthesize_oneshot(
+                spec,
+                args.ttft_text,
+                timeout=args.timeout,
+                session_id=session_id,
+            )
+            if phase == "measure":
+                measured.append(result)
+    finally:
+        if callable(close_ttft):
+            close_ttft()
 
     distribution = _summarize_ttft_distribution(
         measured,
@@ -1428,6 +1500,9 @@ def _run_ttft_distribution_case(
         warmup=args.ttft_warmup,
         bar_width=args.ttft_bar_width,
     )
+    measurement = getattr(transport, "ttft_measurement_label", "")
+    if measurement:
+        distribution["summary"]["measurement"] = measurement
     summary = distribution["summary"]
     ok = (
         summary.get("count", 0) == args.ttft_samples
@@ -2030,6 +2105,17 @@ def parse_args() -> argparse.Namespace:
         default=31,
         help="Character width for TTFT fluctuation bars",
     )
+    parser.add_argument(
+        "--ttft-grpc-connection",
+        choices=["reuse", "ready", "cold"],
+        default="reuse",
+        help=(
+            "gRPC connection mode for engine-grpc TTFT: "
+            "'reuse' reuses one ready channel, 'ready' creates and primes a "
+            "fresh ready channel per request outside the timer, and 'cold' preserves the "
+            "old lazy-channel behavior that includes connection setup"
+        ),
+    )
     parser.add_argument("--skip-single", action="store_true")
     parser.add_argument("--skip-streaming", action="store_true")
     parser.add_argument("--skip-custom-instruct", action="store_true")
@@ -2056,7 +2142,10 @@ def main() -> int:
         if target == "engine-grpc":
             all_cases.extend(
                 _run_engine_suite(
-                    EngineGrpcTransport(args.engine_grpc),
+                    EngineGrpcTransport(
+                        args.engine_grpc,
+                        ttft_connection_mode=args.ttft_grpc_connection,
+                    ),
                     args,
                     output_dir=output_root / target,
                 )

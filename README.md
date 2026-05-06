@@ -23,6 +23,7 @@ Qwen3-TTS Triton 是一个 **工程预览版** 项目：把官方 Qwen3-TTS PyTo
 项目里提到的低延迟数字是有条件结果，不是通用承诺：
 
 - `13ms TTFT`：最低观测值，依赖指定硬件、warm engine、prefix/cache 命中、单路请求、特定 engine profile 和本地链路。
+- standalone `engine-grpc` TTFT 默认按 ready/reused gRPC channel 统计，和 WebSocket 一样不把客户端建连成本计入模型/服务首包延迟；如果使用 cold/lazy gRPC channel，新建 HTTP/2 连接的成本会让单次 TTFT 额外增加约 10ms。
 - `180ms 128-stream avg TTFT`：并发压测口径，需要明确硬件、cache、输入文本、profile、采样参数和客户端测量方式。
 - WebUI 默认会在 live Triton/engine 不可用时展示提示 warning，但不会补 synthetic beep 音频。只有结果 source 标记为 `live_triton` 或 `live_engine_websocket` 且带 `audio` 字段时，才代表可回放的实时合成音频。
 
@@ -204,6 +205,26 @@ mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
   --skip-concurrent --skip-long --skip-badcase \
   --ttft-warmup 3 \
   --ttft-samples 30
+```
+
+`engine-grpc` TTFT 的 gRPC 连接口径由 `--ttft-grpc-connection` 控制：
+
+```text
+reuse  默认口径；复用一个 ready gRPC channel，推荐用于观察稳态 engine/server 首包延迟。
+ready  每次请求新建并预热一个 ready channel，建连/预热不计入 TTFT。
+cold   兼容旧口径；每次请求新建 lazy channel，TTFT 包含 gRPC/HTTP2 建连成本。
+```
+
+如果要复现旧的 `20ms+` gRPC cold-channel 数字，需要显式指定：
+
+```bash
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
+  --targets engine-grpc \
+  --skip-single --skip-streaming --skip-custom-instruct \
+  --skip-concurrent --skip-long --skip-badcase \
+  --ttft-warmup 3 \
+  --ttft-samples 30 \
+  --ttft-grpc-connection cold
 ```
 
 ## WebUI Demo
