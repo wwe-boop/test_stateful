@@ -182,6 +182,200 @@ export_compose_env() {
     export TRITON_METRICS_PORT="$TRITON_METRICS"
 }
 
+compose_service_container_name() {
+    local service="$1"
+    case "$service" in
+        engine) printf '%s\n' "${ENGINE_CONTAINER_NAME:-qwen3-engine}" ;;
+        triton) printf '%s\n' "${TRITON_CONTAINER_NAME:-qwen3-tts-triton}" ;;
+        *)
+            log_error "Unknown compose service: $service"
+            return 1
+            ;;
+    esac
+}
+
+compose_container_label() {
+    local container="$1"
+    local label="$2"
+    docker inspect -f "{{ index .Config.Labels \"$label\" }}" "$container" 2>/dev/null || true
+}
+
+compose_container_is_managed_service() {
+    local container="$1"
+    local service="$2"
+    local project="${COMPOSE_PROJECT_NAME:-qwen3-tts}"
+    local cproject
+    local cservice
+    cproject=$(compose_container_label "$container" "com.docker.compose.project")
+    cservice=$(compose_container_label "$container" "com.docker.compose.service")
+    [[ "$cproject" == "$project" && "$cservice" == "$service" ]]
+}
+
+compose_container_network_count() {
+    local container="$1"
+    docker inspect -f '{{len .NetworkSettings.Networks}}' "$container" 2>/dev/null || printf '0\n'
+}
+
+compose_container_published_count() {
+    local container="$1"
+    local target_port="$2"
+    docker inspect -f "{{with index .NetworkSettings.Ports \"${target_port}/tcp\"}}{{len .}}{{else}}0{{end}}" \
+        "$container" 2>/dev/null || printf '0\n'
+}
+
+compose_remove_stale_container_if_needed() {
+    local service="$1"
+    local container="$2"
+    shift 2
+
+    docker inspect "$container" &>/dev/null || return 0
+
+    if ! compose_container_is_managed_service "$container" "$service"; then
+        log_warn "Container '$container' already exists but is not managed by this compose project/service."
+        log_warn "If compose fails with a name conflict, stop or rename that container first."
+        return 0
+    fi
+
+    local network_count
+    network_count=$(compose_container_network_count "$container")
+    local stale_reason=""
+    if [[ "$network_count" == "0" ]]; then
+        stale_reason="no Docker network attachment"
+    else
+        local port
+        local published_count
+        for port in "$@"; do
+            published_count=$(compose_container_published_count "$container" "$port")
+            if [[ "$published_count" == "0" ]]; then
+                stale_reason="missing published port ${port}/tcp"
+                break
+            fi
+        done
+    fi
+
+    if [[ -n "$stale_reason" ]]; then
+        log_warn "Removing stale compose container '$container' ($stale_reason)."
+        log_warn "Docker Compose will recreate it with fresh network and port bindings."
+        docker rm -f "$container" >/dev/null
+    fi
+}
+
+compose_preflight_service() {
+    local service="$1"
+    local container
+    container=$(compose_service_container_name "$service")
+    case "$service" in
+        engine)
+            compose_remove_stale_container_if_needed \
+                "$service" "$container" "$ENGINE_PORT" "$ENGINE_WEBSOCKET" "$ENGINE_HEALTH"
+            ;;
+        triton)
+            compose_remove_stale_container_if_needed "$service" "$container" 8000 8001 8002
+            ;;
+    esac
+}
+
+compose_assert_service_network() {
+    local service="$1"
+    local container
+    container=$(compose_service_container_name "$service")
+    shift
+
+    if ! docker inspect "$container" &>/dev/null; then
+        log_error "Compose service '$service' did not create container '$container'"
+        return 1
+    fi
+
+    local status
+    status=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)
+    if [[ "$status" != "running" ]]; then
+        log_error "Container '$container' is not running (status=$status)"
+        compose_diagnose_service "$service"
+        return 1
+    fi
+
+    local network_count
+    network_count=$(compose_container_network_count "$container")
+    if [[ "$network_count" == "0" ]]; then
+        log_error "Container '$container' has no Docker network attachment"
+        compose_diagnose_service "$service"
+        return 1
+    fi
+
+    local port
+    local published_count
+    for port in "$@"; do
+        published_count=$(compose_container_published_count "$container" "$port")
+        if [[ "$published_count" == "0" ]]; then
+            log_error "Container '$container' is missing published port ${port}/tcp"
+            compose_diagnose_service "$service"
+            return 1
+        fi
+    done
+}
+
+compose_diagnose_service() {
+    local service="$1"
+    local container
+    container=$(compose_service_container_name "$service")
+
+    if ! docker inspect "$container" &>/dev/null; then
+        return 0
+    fi
+
+    log_info "Docker inspect summary for '$container':"
+    docker inspect "$container" \
+        --format '  status={{.State.Status}} restarting={{.State.Restarting}} exit={{.State.ExitCode}} network_mode={{.HostConfig.NetworkMode}} ports={{json .NetworkSettings.Ports}} networks={{json .NetworkSettings.Networks}}' \
+        2>/dev/null || true
+    log_info "Recent logs for '$container':"
+    docker logs --tail 80 "$container" 2>&1 || true
+}
+
+compose_wait_engine_http_health() {
+    local port="${1:-$ENGINE_HEALTH}"
+    local timeout="${2:-90}"
+    local elapsed=0
+    local interval=2
+    local url="http://localhost:${port}/health"
+
+    if ! command -v curl &>/dev/null; then
+        engine_health_check "$ENGINE_PORT" "$timeout"
+        return $?
+    fi
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        local body
+        body=$(curl -fsS "$url" 2>/dev/null || true)
+        if printf '%s\n' "$body" | grep -q '"running"[[:space:]]*:[[:space:]]*true'; then
+            log_info "Engine HTTP health ready at localhost:${port}"
+            return 0
+        fi
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    log_error "Engine HTTP health check timed out after ${timeout}s"
+    return 1
+}
+
+compose_wait_engine_ready() {
+    compose_assert_service_network engine "$ENGINE_PORT" "$ENGINE_WEBSOCKET" "$ENGINE_HEALTH" || return 1
+    if compose_wait_engine_http_health "$ENGINE_HEALTH" 90; then
+        return 0
+    fi
+    compose_diagnose_service engine
+    return 1
+}
+
+compose_wait_triton_ready() {
+    compose_assert_service_network triton 8000 8001 8002 || return 1
+    if triton_health_check "localhost" "$TRITON_HTTP" 120; then
+        return 0
+    fi
+    compose_diagnose_service triton
+    return 1
+}
+
 prepare_triton_repo() {
     resolve_variant_if_needed
     assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE"
@@ -258,39 +452,43 @@ cmd_up() {
         engine)
             resolve_variant_if_needed
             export_compose_env
+            compose_preflight_service engine
             if $BUILD_BEFORE_UP; then
                 compose_cmd up --build -d engine
             else
                 compose_cmd up -d engine
             fi
             if ! $NO_HEALTH_CHECK; then
-                engine_health_check "$ENGINE_PORT" 90
+                compose_wait_engine_ready
             fi
             ;;
         triton)
             ensure_triton_repo
             export_compose_env
+            compose_preflight_service triton
             if $BUILD_BEFORE_UP; then
                 compose_cmd up --build -d triton
             else
                 compose_cmd up -d triton
             fi
             if ! $NO_HEALTH_CHECK; then
-                triton_health_check "localhost" "$TRITON_HTTP" 120
+                compose_wait_triton_ready
             fi
             ;;
         all)
             ensure_triton_repo
             resolve_variant_if_needed
             export_compose_env
+            compose_preflight_service engine
+            compose_preflight_service triton
             if $BUILD_BEFORE_UP; then
                 compose_cmd up --build -d engine triton
             else
                 compose_cmd up -d engine triton
             fi
             if ! $NO_HEALTH_CHECK; then
-                engine_health_check "$ENGINE_PORT" 90
-                triton_health_check "localhost" "$TRITON_HTTP" 120
+                compose_wait_engine_ready
+                compose_wait_triton_ready
             fi
             ;;
     esac

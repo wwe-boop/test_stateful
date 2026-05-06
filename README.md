@@ -132,6 +132,12 @@ bash scripts/bash/deploy.sh run --gateway standalone --variant custom-1.7b
 bash scripts/bash/deploy.sh run --gateway engine-docker --variant custom-1.7b
 ```
 
+如果你从统一入口启动，等价命令是：
+
+```bash
+bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
+```
+
 如果你正在频繁改 engine 代码，不建议反复重建镜像。使用 compose 的开发覆盖层或 watch：
 
 ```bash

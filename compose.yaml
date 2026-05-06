@@ -35,7 +35,14 @@ services:
       - ${ENGINE_MODELS_DIR:-./workspace/models}:/models:ro
       - ${ENGINE_EXPORTED_DIR:-./workspace/exported}:/exported:ro
     gpus: all
+    init: true
     shm_size: "4g"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import os, urllib.request; urllib.request.urlopen(\"http://127.0.0.1:%s/health\" % os.environ.get(\"ENGINE_HEALTH_PORT\", \"8080\"), timeout=2).read()'"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 12
     restart: unless-stopped
     develop:
       watch:

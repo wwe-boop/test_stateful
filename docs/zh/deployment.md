@@ -99,6 +99,12 @@ bash scripts/bash/deploy.sh run \
   --variant custom-1.7b
 ```
 
+如果使用统一入口，等价命令是：
+
+```bash
+bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
+```
+
 这个模式使用 engine 镜像作为环境层，运行时挂载 `workspace/` 作为模型和 engine 数据层。普通镜像里仍会包含 `/app/engine` 代码，因此代码更新后需要重建镜像。
 
 开发期推荐改用：

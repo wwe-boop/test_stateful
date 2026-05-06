@@ -328,21 +328,15 @@ cmd_run_engine_docker() {
     bash "${SCRIPT_DIR}/compose.sh" "${compose_args[@]}" || exit 1
 
     echo ""
-    if engine_health_check "$ENGINE_PORT" 90; then
-        echo ""
-        log_step "Engine Docker Running"
-        log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
-        log_info "  WebSocket:      ws://localhost:${ENGINE_WS_PORT}/v1/ws"
-        log_info "  Variant:        $VARIANT"
-        log_info "  Image:          $img"
-        log_info "  Container:      ${ENGINE_CONTAINER_NAME:-qwen3-engine}"
-        echo ""
-        log_info "Logs: bash scripts/bash/compose.sh logs --gateway engine --follow"
-        log_info "Stop: bash scripts/bash/deploy.sh stop"
-    else
-        log_warn "Container started but port not yet reachable"
-        log_info "Check: bash scripts/bash/compose.sh logs --gateway engine"
-    fi
+    log_step "Engine Docker Running"
+    log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
+    log_info "  WebSocket:      ws://localhost:${ENGINE_WS_PORT}/v1/ws"
+    log_info "  Variant:        $VARIANT"
+    log_info "  Image:          $img"
+    log_info "  Container:      ${ENGINE_CONTAINER_NAME:-qwen3-engine}"
+    echo ""
+    log_info "Logs: bash scripts/bash/compose.sh logs --gateway engine --follow"
+    log_info "Stop: bash scripts/bash/deploy.sh stop"
 }
 
 cmd_stop() {
