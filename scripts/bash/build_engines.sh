@@ -13,7 +13,7 @@
 #
 #  Prerequisites:
 #    - NVIDIA GPU with driver >= 550.54
-#    - Docker with NVIDIA Container Toolkit (docker run --gpus all)
+#    - Docker with NVIDIA Container Toolkit
 #    - ONNX at workspace/exported/<variant>/ and workspace/exported/tokenizer/
 #
 #  Usage:
@@ -25,10 +25,11 @@
 #
 #  Environment variables:
 #    NGC_IMAGE        Docker image override (default: auto-detect from driver)
-#    MAX_BATCH_SIZE   Max batch (default: 128)
-#    MAX_INPUT_LEN    Prefill len (default: 128)
-#    MAX_SEQ_LEN      Total seq len (default: 512)
+#    MAX_BATCH_SIZE   Max batch (default: auto by selected build GPU memory)
+#    MAX_INPUT_LEN    Prefill len (default: auto by selected build GPU memory)
+#    MAX_SEQ_LEN      Total seq len (default: auto by selected build GPU memory)
 #    ENGINE_DTYPE     bfloat16|float16|float32|fp8 (default: bfloat16)
+#    BUILD_GPU_DEVICE GPU for TRT build (auto | all | N | cuda:N; default: auto)
 #
 #  Output: workspace/exported/<variant>/*.engine, workspace/exported/tokenizer/*.engine
 # ===========================================================================
@@ -43,12 +44,14 @@ source "${SCRIPT_DIR}/tools.sh"
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
 DOCKER_GPU_ARGS=(--gpus all)
 
-# ── Engine build defaults (TRT memory optimization: BF16 I/O, seq=512, batch=128) ──
-MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-128}"
-MAX_INPUT_LEN="${MAX_INPUT_LEN:-128}"
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}" # 512/128 for 30.72s, 1024/256 for 61.44s 
+# ── Engine build defaults are resolved after GPU selection. ──
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"
 ENGINE_DTYPE="${ENGINE_DTYPE:-bfloat16}"
 TRITON_IO_FLOAT_DTYPE="${TRITON_IO_FLOAT_DTYPE:-}"
+BUILD_GPU_DEVICE="${BUILD_GPU_DEVICE:-auto}"
+RESOLVED_BUILD_GPU_DEVICE=""
 
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 TOKENIZER_DIR="${EXPORTED_DIR}/tokenizer"
@@ -108,27 +111,94 @@ _trtexec_io_format() {
     esac
 }
 
+_validate_positive_int() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "$name must be a positive integer, got: $value"
+        exit 1
+    fi
+}
+
+_resolve_build_gpu_device() {
+    local norm
+    norm=$(normalize_gpu_device "$BUILD_GPU_DEVICE") || exit 1
+    if [ "$norm" = "auto" ]; then
+        RESOLVED_BUILD_GPU_DEVICE=$(select_best_gpu_index)
+        log_gpu_selection "Phase B build" "$RESOLVED_BUILD_GPU_DEVICE"
+    elif [ "$norm" = "all" ]; then
+        RESOLVED_BUILD_GPU_DEVICE="all"
+        log_info "Phase B build GPU: all visible GPUs (trtexec will choose its default device)"
+    else
+        RESOLVED_BUILD_GPU_DEVICE="$norm"
+        log_gpu_selection "Phase B build" "$RESOLVED_BUILD_GPU_DEVICE"
+    fi
+}
+
+_suggest_build_profile_for_memory() {
+    local mem_mb="${1:-0}"
+    if [ "$mem_mb" -ge 76000 ]; then
+        echo "128 128 512"
+    elif [ "$mem_mb" -ge 47000 ]; then
+        echo "64 128 512"
+    elif [ "$mem_mb" -ge 30000 ]; then
+        echo "32 128 512"
+    else
+        echo "16 96 384"
+    fi
+}
+
+_resolve_build_profile_defaults() {
+    local mem_mb=0
+    local mem_label="unknown"
+    if [ "$RESOLVED_BUILD_GPU_DEVICE" != "all" ]; then
+        mem_mb=$(gpu_total_memory_mb "$RESOLVED_BUILD_GPU_DEVICE")
+        [ -n "$mem_mb" ] || mem_mb=0
+        mem_label="${mem_mb} MiB on GPU ${RESOLVED_BUILD_GPU_DEVICE}"
+    fi
+
+    local suggested
+    suggested=($(_suggest_build_profile_for_memory "$mem_mb"))
+    [ -n "$MAX_BATCH_SIZE" ] || MAX_BATCH_SIZE="${suggested[0]}"
+    [ -n "$MAX_INPUT_LEN" ] || MAX_INPUT_LEN="${suggested[1]}"
+    [ -n "$MAX_SEQ_LEN" ] || MAX_SEQ_LEN="${suggested[2]}"
+
+    _validate_positive_int "MAX_BATCH_SIZE" "$MAX_BATCH_SIZE"
+    _validate_positive_int "MAX_INPUT_LEN" "$MAX_INPUT_LEN"
+    _validate_positive_int "MAX_SEQ_LEN" "$MAX_SEQ_LEN"
+
+    log_info "Build profile: max_batch=${MAX_BATCH_SIZE}, max_input=${MAX_INPUT_LEN}, max_seq=${MAX_SEQ_LEN}"
+    log_info "  Default profile source: selected build GPU memory (${mem_label}); override with --max-batch-size/--max-input-len/--max-seq-len"
+}
+
 _detect_docker_gpu_args() {
     local image="$1"
     local err=""
+    local docker_gpu_arg="all"
+    local visible_devices="all"
 
-    if docker run --rm --gpus all "$image" /bin/true >/dev/null 2>&1; then
-        DOCKER_GPU_ARGS=(--gpus all)
-        log_info "Docker GPU launch mode: --gpus all"
+    if [ -n "$RESOLVED_BUILD_GPU_DEVICE" ] && [ "$RESOLVED_BUILD_GPU_DEVICE" != "all" ]; then
+        docker_gpu_arg="device=${RESOLVED_BUILD_GPU_DEVICE}"
+        visible_devices="$RESOLVED_BUILD_GPU_DEVICE"
+    fi
+
+    if docker run --rm --gpus "$docker_gpu_arg" "$image" /bin/true >/dev/null 2>&1; then
+        DOCKER_GPU_ARGS=(--gpus "$docker_gpu_arg")
+        log_info "Docker GPU launch mode: --gpus ${docker_gpu_arg}"
         return 0
     fi
 
     err=$(docker run --rm \
         --runtime=nvidia \
-        -e NVIDIA_VISIBLE_DEVICES=all \
+        -e NVIDIA_VISIBLE_DEVICES="$visible_devices" \
         -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
         "$image" /bin/true 2>&1) && {
         DOCKER_GPU_ARGS=(
             --runtime=nvidia
-            -e NVIDIA_VISIBLE_DEVICES=all
+            -e NVIDIA_VISIBLE_DEVICES="$visible_devices"
             -e NVIDIA_DRIVER_CAPABILITIES=compute,utility
         )
-        log_warn "Docker GPU launch fallback enabled: --runtime=nvidia"
+        log_warn "Docker GPU launch fallback enabled: --runtime=nvidia (NVIDIA_VISIBLE_DEVICES=${visible_devices})"
         return 0
     }
 
@@ -234,7 +304,7 @@ build_talker_unified_trt() {
     prec_flag=$(_trtexec_precision_flags)
     log_info "Building talker_unified.engine (trtexec, ${ENGINE_DTYPE^^} I/O) ..."
     local unif_cmd=(
-        docker run --rm --gpus all
+        docker run --rm "${DOCKER_GPU_ARGS[@]}"
         -v "$variant_dir:/mnt/model"
         "$NGC_IMAGE"
         $TRTEXEC --onnx=/mnt/model/talker_unified.onnx
@@ -537,6 +607,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant)        VARIANT="$2"; shift 2 ;;
         --image)          USER_IMAGE="$2"; shift 2 ;;
+        --device|--build-device) BUILD_GPU_DEVICE="$2"; shift 2 ;;
         --max-batch-size) MAX_BATCH_SIZE="$2"; shift 2 ;;
         --max-input-len)  MAX_INPUT_LEN="$2"; shift 2 ;;
         --max-seq-len)    MAX_SEQ_LEN="$2"; shift 2 ;;
@@ -552,9 +623,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --variant <name>       Build for a specific model variant"
             echo "  --image <uri>          Override NGC container image (default: auto-detect)"
             echo "  --target-driver <ver>  Target NVIDIA driver for NGC container selection"
-            echo "  --max-batch-size N     Max batch size (default: 128)"
-            echo "  --max-input-len N      Max input length for prefill (default: 128)"
-            echo "  --max-seq-len N        Max sequence length incl. KV cache (default: 512)"
+            echo "  --device N|auto|all    Build GPU device (default: auto; aliases: --build-device)"
+            echo "  --max-batch-size N     Max batch size (default: auto by build GPU memory)"
+            echo "  --max-input-len N      Max input length for prefill (default: auto by build GPU memory)"
+            echo "  --max-seq-len N        Max sequence length incl. KV cache (default: auto by build GPU memory)"
             echo "  --dtype bf16|fp16|fp32|fp8  Engine precision (default: bfloat16)"
             echo "  --triton-io-float-dtype T   Float I/O dtype (default: same as --dtype)"
             echo "  --dry-run              Show docker commands without executing"
@@ -575,13 +647,16 @@ normalize_build_dtypes
 log_step "Phase B: TensorRT Engine Build (trtexec)"
 
 check_docker_gpu_ready || exit 1
+_resolve_build_gpu_device
 
 if [ -n "$USER_IMAGE" ]; then
     NGC_IMAGE="$USER_IMAGE"
     log_info "Using user-specified image: $NGC_IMAGE"
 else
     # Sync NGC compatibility matrix from NVIDIA website (best-effort; skip if offline)
-    if [[ -z "${NGC_SKIP_MATRIX_UPDATE:-}" ]]; then
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Skipping NGC matrix auto-update"
+    elif [[ -z "${NGC_SKIP_MATRIX_UPDATE:-}" ]]; then
         source "${SCRIPT_DIR}/lib/ngc_updater.sh" 2>/dev/null || true
         update_ngc_matrix "${SCRIPT_DIR}/ngc_matrix.conf" 2>/dev/null || true
     fi
@@ -596,6 +671,8 @@ if $PULL_ONLY; then
     log_info "Image ready. Re-run without --pull-only to build engines."
     exit 0
 fi
+
+_resolve_build_profile_defaults
 
 if [ ! -d "$EXPORTED_DIR" ]; then
     log_error "No exported models at: $EXPORTED_DIR"

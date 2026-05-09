@@ -22,6 +22,7 @@
 #    PYTHON_VERSION   Python version            (default: from NGC matrix)
 #    MODEL_VARIANT    Model variant to download (default: base-1.7b)
 #    MODEL_SOURCE     Download source           (auto | hf | modelscope)
+#    EXPORT_DEVICE    Export device             (auto | cpu | cuda:N | N)
 #    TARGET_DRIVER    Target NVIDIA driver for NGC container selection
 #                     (e.g. 575.57 for production machines)
 #    SKIP_MODELS      Set to 1 to skip model download
@@ -51,6 +52,7 @@ PLAN_FILE="${WORKDIR}/env_plan.json"
 
 MODEL_VARIANT="${MODEL_VARIANT:-${4:-}}"
 MODEL_SOURCE="${MODEL_SOURCE:-auto}"
+EXPORT_DEVICE="${EXPORT_DEVICE:-}"
 SKIP_MODELS="${SKIP_MODELS:-0}"
 SKIP_DEPS="${SKIP_DEPS:-0}"
 SKIP_EXPORT="${SKIP_EXPORT:-0}"
@@ -70,6 +72,7 @@ show_banner() {
     echo "  Python env:      $ENV_NAME (Python $PYTHON_VERSION)"
     echo "  Model variant:   $MODEL_VARIANT"
     echo "  Model source:    $MODEL_SOURCE"
+    echo "  Export device:   ${EXPORT_DEVICE:-auto}"
     echo ""
 }
 
@@ -233,6 +236,9 @@ export_models() {
 
     if [ "$MODEL_VARIANT" != "all" ] && [ "$MODEL_VARIANT" != "all-1.7b" ]; then
         export_args+=(--variant "$MODEL_VARIANT")
+    fi
+    if [ -n "$EXPORT_DEVICE" ]; then
+        export_args+=(--device "$EXPORT_DEVICE")
     fi
 
     cd "$export_dir"

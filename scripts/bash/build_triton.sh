@@ -30,6 +30,9 @@
 #    TRITON_METRICS_PORT   Metrics port (default: 8002)
 #    CONTAINER_NAME        Container name (default: qwen3-tts-triton)
 #    MODEL_REPO_DIR        Override model_repository path
+#    TRITON_GPU_DEVICE     Runtime GPU device (auto | N | cuda:N)
+#    TRITON_MAX_BATCH_SLOTS Runtime active decode slots
+#    TRITON_MAX_SEQ_LEN    Runtime max sequence length
 # ===========================================================================
 
 set -euo pipefail
@@ -49,6 +52,9 @@ ENGINE_MODE="${ENGINE_MODE:-trt}"
 USER_IMAGE="${TRITON_IMAGE:-}"
 BUILD_TAG=""
 HEALTH_TIMEOUT=120
+TRITON_GPU_DEVICE="${TRITON_GPU_DEVICE:-${RUNTIME_GPU_DEVICE:-auto}}"
+TRITON_MAX_BATCH_SLOTS="${TRITON_MAX_BATCH_SLOTS:-${RUNTIME_MAX_BATCH_SIZE:-}}"
+TRITON_MAX_SEQ_LEN="${TRITON_MAX_SEQ_LEN:-${RUNTIME_MAX_SEQ_LEN:-}}"
 
 # ── Subcommand functions ──
 
@@ -71,6 +77,9 @@ Options:
   --image <uri>          Override NGC container image
   --repo-dir <path>      Override model_repository output path
   --container <name>     Container name (default: qwen3-tts-triton)
+  --device <N|auto>      Runtime GPU device for Triton
+  --max-batch <N>        Runtime active decode slots
+  --max-seq-len <N>      Runtime max sequence length
   --tag <image:tag>      Docker image tag (for 'build' command)
   --no-health-check      Skip health check after 'run'
   --generate-dockerfile  Generate Dockerfile.triton and exit
@@ -151,6 +160,9 @@ while [[ $# -gt 0 ]]; do
         --image)          USER_IMAGE="$2"; shift 2 ;;
         --repo-dir)       MODEL_REPO_DIR="$2"; shift 2 ;;
         --container)      CONTAINER_NAME="$2"; shift 2 ;;
+        --device|--triton-device) TRITON_GPU_DEVICE="$2"; shift 2 ;;
+        --max-batch|--runtime-max-batch-size|--runtime-max-batch) TRITON_MAX_BATCH_SLOTS="$2"; shift 2 ;;
+        --max-seq-len|--runtime-max-seq-len|--runtime-max-seq) TRITON_MAX_SEQ_LEN="$2"; shift 2 ;;
         --tag)            BUILD_TAG="$2"; shift 2 ;;
         --no-health-check) NO_HEALTH_CHECK=true; shift ;;
         --dry-run)        DRY_RUN=true; shift ;;
@@ -358,6 +370,9 @@ cmd_run() {
         log_info "  Image:      $TRITON_IMAGE"
         log_info "  Repository: $MODEL_REPO_DIR"
         log_info "  Container:  $resolved_cname"
+        log_info "  Device:     $TRITON_GPU_DEVICE"
+        log_info "  Max batch:  ${TRITON_MAX_BATCH_SLOTS:-manifest/default}"
+        log_info "  Max seq:    ${TRITON_MAX_SEQ_LEN:-manifest/default}"
         log_info "  Ports:      gRPC=$TRITON_GRPC_PORT HTTP=$TRITON_HTTP_PORT metrics=$TRITON_METRICS_PORT"
         return 0
     fi
@@ -368,7 +383,14 @@ cmd_run() {
         --variant "$VARIANT"
         --repo-dir "$MODEL_REPO_DIR"
         --image "$TRITON_IMAGE"
+        --device "$TRITON_GPU_DEVICE"
     )
+    if [[ -n "$TRITON_MAX_BATCH_SLOTS" ]]; then
+        compose_args+=(--max-batch "$TRITON_MAX_BATCH_SLOTS")
+    fi
+    if [[ -n "$TRITON_MAX_SEQ_LEN" ]]; then
+        compose_args+=(--max-seq-len "$TRITON_MAX_SEQ_LEN")
+    fi
     if [[ -n "${CONTAINER_NAME:-}" ]]; then
         compose_args+=(--container "$CONTAINER_NAME")
     fi

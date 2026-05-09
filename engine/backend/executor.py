@@ -424,6 +424,7 @@ class Executor:
         self._device = torch.device("cuda", device_id)
         self._max_batch = max_batch_size
         self._max_seq_len = max_seq_len
+        self._max_input_len = 0
         self._config = model_config or ModelConfig()
         self._do_sample = do_sample
         self._temperature = temperature
@@ -514,6 +515,9 @@ class Executor:
         if self._fused_engine is None:
             return
         shape = self._fused_engine.get_input_profile_max_shape("talker_past_kv")
+        input_shape = self._fused_engine.get_input_profile_max_shape("input_embeds")
+        if input_shape is not None and len(input_shape) >= 2:
+            self._max_input_len = int(input_shape[1])
         if shape is None or len(shape) < 4:
             return
         profile_max_batch = int(shape[0])
@@ -540,6 +544,14 @@ class Executor:
             )
             self._max_seq_len = profile_max_seq
         self._config.max_seq_len = min(self._config.max_seq_len, self._max_seq_len)
+
+    def _validate_prefill_len(self, seq: int, stage: str) -> None:
+        if self._max_input_len > 0 and seq > self._max_input_len:
+            raise ValueError(
+                f"{stage} input length {seq} exceeds TRT profile max_input_len="
+                f"{self._max_input_len}. Rebuild Phase B with a larger "
+                "--max-input-len or split the request into shorter segments."
+            )
 
     def _discover_c2w_io_names(self) -> None:
         """Detect c2w conv/transconv I/O names from the loaded TRT engine.
@@ -651,6 +663,7 @@ class Executor:
             return None, False
 
         seq = int(prefill_embeds.shape[1])
+        self._validate_prefill_len(seq, "prefill")
 
         inputs = self._build_fused_inputs(
             input_embeds=prefill_embeds.to(self._config.dtype),
@@ -750,6 +763,7 @@ class Executor:
             return
 
         seq = int(prefill_embeds.shape[1])
+        self._validate_prefill_len(seq, "prefill_prefix_only")
 
         inputs = self._build_fused_inputs(
             input_embeds=prefill_embeds.to(self._config.dtype),

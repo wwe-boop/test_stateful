@@ -242,17 +242,15 @@ class TritonPythonModel:
         cfg.paths.weights_dir = str(self._weights_dir)
         cfg.paths.tokenizer_dir = str(self._tokenizer_dir)
         cfg.scheduler.max_batch_size = int(
-            _param_string(params, "max_batch_slots", os.environ.get("MAX_BATCH_SLOTS", "48"))
+            os.environ.get("MAX_BATCH_SLOTS")
+            or _param_string(params, "max_batch_slots", "48")
         )
         cfg.server.max_sessions = int(
             _param_string(params, "max_sessions", os.environ.get("MAX_SESSIONS", "128"))
         )
         cfg.scheduler.max_seq_len = int(
-            _param_string(
-                params,
-                "engine_max_decode_len",
-                os.environ.get("ENGINE_MAX_DECODE_LEN", "512"),
-            )
+            os.environ.get("ENGINE_MAX_DECODE_LEN")
+            or _param_string(params, "engine_max_decode_len", "512")
         )
         cfg.scheduler.session_timeout_sec = float(
             _param_string(params, "request_timeout_sec", os.environ.get("REQUEST_TIMEOUT_SEC", "300"))

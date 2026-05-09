@@ -34,17 +34,19 @@
 #      --skip-export         Skip model export
 #
 #    Phase B (forwarded to build_engines.sh):
-#      --max-batch-size <N>  TRT max batch (default: 128)
+#      --max-batch-size <N>  TRT max batch (default: suggested by build GPU memory)
 #      --max-input-len <N>   TRT max prefill/input token length
 #      --max-seq-len <N>     TRT max KV sequence length
 #      --image <uri>         Override NGC container image
 #      --dtype <type>        Engine precision: bf16|fp16|fp32 (default: bf16)
+#      --build-device <dev>  GPU for TensorRT build (auto|all|N|cuda:N)
 #
 #    Phase C (forwarded to deploy.sh):
 #      --gateway <mode>      Gateway: standalone | triton | engine-docker
 #      --engine-mode <mode>  Triton assemble mode: trt | onnx
 #      --runtime-max-batch-size <N> Runtime scheduler max batch
 #      --runtime-max-seq-len <N> Runtime scheduler max sequence length
+#      --runtime-device <N>  GPU for serving runtime (auto|N|cuda:N)
 #      --engine-image <tag>  engine-docker image tag (optional)
 #      --port <port>         Standalone gRPC port (default: 50051)
 #      --grpc-port <port>    Triton gRPC port (default: 8001)
@@ -63,42 +65,48 @@ _KNOWN_COMMANDS="all setup build deploy status stop update-matrix help"
 
 _is_variant() { [[ " $_KNOWN_VARIANTS " == *" $1 "* ]]; }
 _is_command() { [[ " $_KNOWN_COMMANDS " == *" $1 "* ]]; }
+_is_enabled() { [[ "${1:-}" == "true" || "${1:-}" == "1" ]]; }
+_env_or_empty() { printenv "$1" 2>/dev/null || true; }
 
 # ── Defaults ──
 COMMAND=""
-VARIANT=""
+VARIANT="${MODEL_VARIANT:-}"
 DRY_RUN=false
 YES_MODE=false
 TARGET_DRIVER="${TARGET_DRIVER:-}"
+GLOBAL_DEVICE="${QWEN3_TTS_GPU_DEVICE:-${GPU_DEVICE:-}}"
+EXPORT_DEVICE="${EXPORT_DEVICE:-}"
+BUILD_GPU_DEVICE="${BUILD_GPU_DEVICE:-}"
+RUNTIME_GPU_DEVICE="${RUNTIME_GPU_DEVICE:-}"
 
 # Phase A forwarding
 SETUP_ARGS=()
-PYTHON_VERSION=""
-ENV_NAME=""
-MODEL_SOURCE=""
+PYTHON_VERSION="${PYTHON_VERSION:-}"
+ENV_NAME="${ENV_NAME:-}"
+MODEL_SOURCE="${MODEL_SOURCE:-}"
 SKIP_MODELS=false
 SKIP_DEPS=false
 SKIP_EXPORT=false
 
 # Phase B forwarding
 BUILD_ARGS=()
-MAX_BATCH_SIZE=""
-MAX_INPUT_LEN=""
-MAX_SEQ_LEN=""
-BUILD_IMAGE=""
-ENGINE_DTYPE=""
-TRITON_IO_FLOAT_DTYPE=""
+MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-}"
+MAX_INPUT_LEN="${MAX_INPUT_LEN:-}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"
+BUILD_IMAGE="${NGC_IMAGE:-}"
+ENGINE_DTYPE="${ENGINE_DTYPE:-}"
+TRITON_IO_FLOAT_DTYPE="${TRITON_IO_FLOAT_DTYPE:-}"
 
 # Phase C forwarding
 DEPLOY_ARGS=()
-GATEWAY_MODE=""
-ENGINE_MODE=""
-ENGINE_PORT=""
-ENGINE_DOCKER_IMAGE=""
-GRPC_PORT=""
-HTTP_PORT=""
-RUNTIME_MAX_BATCH_SIZE=""
-RUNTIME_MAX_SEQ_LEN=""
+GATEWAY_MODE="${GATEWAY_MODE:-}"
+ENGINE_MODE="${ENGINE_MODE:-}"
+ENGINE_PORT="$(_env_or_empty ENGINE_GRPC_PORT)"
+ENGINE_DOCKER_IMAGE="$(_env_or_empty ENGINE_IMAGE)"
+GRPC_PORT="$(_env_or_empty TRITON_GRPC_PORT)"
+HTTP_PORT="$(_env_or_empty TRITON_HTTP_PORT)"
+RUNTIME_MAX_BATCH_SIZE="${RUNTIME_MAX_BATCH_SIZE:-}"
+RUNTIME_MAX_SEQ_LEN="${RUNTIME_MAX_SEQ_LEN:-}"
 
 # ── Help ──
 
@@ -125,6 +133,11 @@ Options:
   --target-driver <ver>   Target NVIDIA driver version for NGC container
                           selection (e.g. 575.57 for production machines).
                           Overrides local driver detection.
+  --device <dev>          Use this GPU for export, build, and runtime
+                          (auto | N | cuda:N; default: auto).
+  --export-device <dev>   Override Phase A export device only (auto | cpu | N | cuda:N).
+  --build-device <dev>    Override Phase B TensorRT build GPU only (auto | all | N | cuda:N).
+  --runtime-device <dev>  Override Phase C serving GPU only (auto | N | cuda:N).
   --yes, -y               Skip confirmations (non-interactive)
   --dry-run               Show what would be done without executing
   -h, --help              Show this help
@@ -138,9 +151,9 @@ Phase A options (forwarded to setup_env.sh):
   --skip-export           Skip model export
 
 Phase B options (forwarded to build_engines.sh):
-  --max-batch-size <N>    Max batch size (default: 128)
-  --max-input-len <N>     TRT max input/prefill length
-  --max-seq-len <N>       TRT max sequence/KV length
+  --max-batch-size <N>    TensorRT profile max batch (default: suggested by build GPU memory)
+  --max-input-len <N>     TensorRT profile max input/prefill length
+  --max-seq-len <N>       TensorRT profile max sequence/KV length
   --image <uri>           Override NGC container image
   --dtype <type>          Engine precision: bf16|fp16|fp32|fp8 (default: bf16)
   --triton-io-float-dtype <type>
@@ -163,11 +176,13 @@ Examples:
   autorun.sh                          # interactive guided setup
   autorun.sh base-1.7b                # full pipeline for base-1.7b
   autorun.sh all -m custom-1.7b       # full pipeline for custom-1.7b
+  autorun.sh all -m custom-1.7b --device auto
   autorun.sh setup --skip-export      # Phase A without export
   autorun.sh custom-1.7b --dtype fp32 # Full pipeline, FP32 engines (fixes dtype mismatch)
   autorun.sh build -m custom-1.7b --dtype fp32    # Phase B with fp32
   autorun.sh build -m custom-1.7b --dtype fp16    # Phase B with fp16
   autorun.sh build -m custom-1.7b --max-batch-size 64 --max-input-len 128 --max-seq-len 512
+  autorun.sh build -m custom-1.7b --build-device 1
   autorun.sh build --target-driver 575.57   # build for production driver
   autorun.sh deploy                   # Phase C (standalone engine)
   autorun.sh deploy --gateway triton         # Phase C (Triton)
@@ -192,6 +207,10 @@ parse_args() {
             --yes|-y)           YES_MODE=true; shift ;;
             --dry-run)          DRY_RUN=true; shift ;;
             --target-driver)    TARGET_DRIVER="$2"; shift 2 ;;
+            --device)           GLOBAL_DEVICE="$2"; shift 2 ;;
+            --export-device)    EXPORT_DEVICE="$2"; shift 2 ;;
+            --build-device)     BUILD_GPU_DEVICE="$2"; shift 2 ;;
+            --runtime-device)   RUNTIME_GPU_DEVICE="$2"; shift 2 ;;
             --help|-h)          usage; exit 0 ;;
 
             # Phase A
@@ -263,11 +282,17 @@ build_forward_args() {
         export MODEL_VARIANT="$VARIANT"
     fi
     if [ -n "$PYTHON_VERSION" ]; then
-        SETUP_ARGS+=('' '' '')  # placeholder positional args
-        SETUP_ARGS[2]="$PYTHON_VERSION"
+        export PYTHON_VERSION
     fi
     if [ -n "$MODEL_SOURCE" ]; then
         export MODEL_SOURCE="$MODEL_SOURCE"
+    fi
+    local effective_export_device="${EXPORT_DEVICE:-$GLOBAL_DEVICE}"
+    local effective_build_device="${BUILD_GPU_DEVICE:-$GLOBAL_DEVICE}"
+    local effective_runtime_device="${RUNTIME_GPU_DEVICE:-$GLOBAL_DEVICE}"
+
+    if [ -n "$effective_export_device" ]; then
+        export EXPORT_DEVICE="$effective_export_device"
     fi
     if $SKIP_MODELS; then export SKIP_MODELS=1; fi
     if $SKIP_DEPS; then export SKIP_DEPS=1; fi
@@ -281,6 +306,7 @@ build_forward_args() {
         BUILD_ARGS+=(--variant "$VARIANT")
     fi
     if [ -n "$TARGET_DRIVER" ]; then BUILD_ARGS+=(--target-driver "$TARGET_DRIVER"); fi
+    if [ -n "$effective_build_device" ]; then BUILD_ARGS+=(--device "$effective_build_device"); fi
     if [ -n "$MAX_BATCH_SIZE" ]; then BUILD_ARGS+=(--max-batch-size "$MAX_BATCH_SIZE"); fi
     if [ -n "$MAX_INPUT_LEN" ]; then BUILD_ARGS+=(--max-input-len "$MAX_INPUT_LEN"); fi
     if [ -n "$MAX_SEQ_LEN" ]; then BUILD_ARGS+=(--max-seq-len "$MAX_SEQ_LEN"); fi
@@ -296,6 +322,7 @@ build_forward_args() {
     fi
     if [ -n "$GATEWAY_MODE" ]; then DEPLOY_ARGS+=(--gateway "$GATEWAY_MODE"); fi
     if [ -n "$ENGINE_MODE" ]; then DEPLOY_ARGS+=(--engine-mode "$ENGINE_MODE"); fi
+    if [ -n "$effective_runtime_device" ]; then DEPLOY_ARGS+=(--device "$effective_runtime_device"); fi
     if [ -n "$RUNTIME_MAX_BATCH_SIZE" ]; then DEPLOY_ARGS+=(--max-batch "$RUNTIME_MAX_BATCH_SIZE"); fi
     if [ -n "$RUNTIME_MAX_SEQ_LEN" ]; then DEPLOY_ARGS+=(--max-seq-len "$RUNTIME_MAX_SEQ_LEN"); fi
     if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
@@ -319,10 +346,17 @@ run_phase_a() {
     if $DRY_RUN; then
         log_info "[DRY RUN] Would run: bash setup_env.sh"
         [ -n "$VARIANT" ] && log_info "  MODEL_VARIANT=$VARIANT"
+        [ -n "$PYTHON_VERSION" ] && log_info "  PYTHON_VERSION=$PYTHON_VERSION"
+        [ -n "$ENV_NAME" ] && log_info "  ENV_NAME=$ENV_NAME"
+        [ -n "$MODEL_SOURCE" ] && log_info "  MODEL_SOURCE=$MODEL_SOURCE"
+        [ -n "${EXPORT_DEVICE:-$GLOBAL_DEVICE}" ] && log_info "  EXPORT_DEVICE=${EXPORT_DEVICE:-$GLOBAL_DEVICE}"
+        _is_enabled "$SKIP_MODELS" && log_info "  SKIP_MODELS=1"
+        _is_enabled "$SKIP_DEPS" && log_info "  SKIP_DEPS=1"
+        _is_enabled "$SKIP_EXPORT" && log_info "  SKIP_EXPORT=1"
         return 0
     fi
 
-    bash "${SCRIPT_DIR}/setup_env.sh" || {
+    bash "${SCRIPT_DIR}/setup_env.sh" "${SETUP_ARGS[@]}" || {
         log_error "Phase A 失败。"
         log_info  "请修正问题后重新执行: bash scripts/bash/autorun.sh setup"
         return 1
@@ -422,6 +456,9 @@ show_run_banner() {
     [ -n "$VARIANT" ] && echo "  变体:      $VARIANT"
     [ -n "${GATEWAY_MODE:-}" ] && echo "  阶段 C:    $GATEWAY_MODE"
     [ -n "$ENGINE_DTYPE" ] && echo "  精度:      $ENGINE_DTYPE"
+    [ -n "${EXPORT_DEVICE:-$GLOBAL_DEVICE}" ] && echo "  导出 GPU:  ${EXPORT_DEVICE:-$GLOBAL_DEVICE}"
+    [ -n "${BUILD_GPU_DEVICE:-$GLOBAL_DEVICE}" ] && echo "  构建 GPU:  ${BUILD_GPU_DEVICE:-$GLOBAL_DEVICE}"
+    [ -n "${RUNTIME_GPU_DEVICE:-$GLOBAL_DEVICE}" ] && echo "  运行 GPU:  ${RUNTIME_GPU_DEVICE:-$GLOBAL_DEVICE}"
     [ -n "$MAX_BATCH_SIZE" ] && echo "  构建 batch: $MAX_BATCH_SIZE"
     [ -n "$MAX_INPUT_LEN" ] && echo "  构建 input: $MAX_INPUT_LEN"
     [ -n "$MAX_SEQ_LEN" ] && echo "  构建 seq:   $MAX_SEQ_LEN"
@@ -473,27 +510,63 @@ interactive_mode() {
         export MODEL_VARIANT="$VARIANT"
     fi
 
-    # Ask for engine dtype when Phase B will run (choices 1, 3, or 5→build)
+    local needs_setup=false
+    case "${choice:-1}" in
+        1|2) needs_setup=true ;;
+        5) [[ "$resume_point" == "setup" ]] && needs_setup=true ;;
+    esac
+
+    # Ask for engine dtype and profile when Phase B will run (choices 1, 3, or 5→build)
     local needs_build=false
     case "${choice:-1}" in
         1) needs_build=true ;;
         3) needs_build=true ;;
-        5) [[ "$resume_point" == "build" ]] && needs_build=true ;;
+        5) [[ "$resume_point" == "setup" || "$resume_point" == "build" ]] && needs_build=true ;;
     esac
-    if $needs_build && [ -z "$ENGINE_DTYPE" ] && [ -t 0 ]; then
-        echo ""
-        echo "  引擎精度 (阶段 B): bf16 | fp16 | fp32 (默认: bf16)"
-        read -rp "  精度 [bf16] (30s 后自动选择默认): " -t 30 _dtyp || true
-        if [ -n "$_dtyp" ]; then
-            ENGINE_DTYPE="$_dtyp"
-        fi
-    fi
 
     # Phase C gateway: standalone | Triton | engine Docker image
     local will_deploy=false
     case "${choice:-1}" in
         1|4|5) will_deploy=true ;;
     esac
+
+    if [ -t 0 ] && { $needs_setup || $needs_build || $will_deploy; } && \
+        [ -z "$GLOBAL_DEVICE" ] && [ -z "$EXPORT_DEVICE" ] && [ -z "$BUILD_GPU_DEVICE" ] && [ -z "$RUNTIME_GPU_DEVICE" ]; then
+        echo ""
+        echo "  GPU 选择 (默认: auto，自动选择当前空闲显存最多的 GPU)"
+        if command -v nvidia-smi &>/dev/null; then
+            nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null \
+                | sed 's/^/    /' || true
+        fi
+        local _gpu=""
+        read -rp "  GPU [auto] (可填 0 / 1 / cuda:1，30s 后自动): " -t 30 _gpu || true
+        if [ -n "$_gpu" ]; then
+            GLOBAL_DEVICE="$_gpu"
+        fi
+    fi
+
+    if $needs_build && [ -z "$ENGINE_DTYPE" ] && [ -t 0 ]; then
+        echo ""
+        echo "  引擎精度 (阶段 B): bf16 | fp16 | fp32 | fp8 (默认: bf16)"
+        read -rp "  精度 [bf16] (30s 后自动选择默认): " -t 30 _dtyp || true
+        if [ -n "$_dtyp" ]; then
+            ENGINE_DTYPE="$_dtyp"
+        fi
+    fi
+
+    if $needs_build && [ -t 0 ] && \
+        { [ -z "$MAX_BATCH_SIZE" ] || [ -z "$MAX_INPUT_LEN" ] || [ -z "$MAX_SEQ_LEN" ]; }; then
+        echo ""
+        echo "  TensorRT 构建 profile (留空则 Phase B 按构建 GPU 显存给建议默认值)"
+        local _mb="" _mi="" _ms=""
+        [ -z "$MAX_BATCH_SIZE" ] && read -rp "  max-batch-size [auto]: " -t 30 _mb || true
+        [ -z "$MAX_INPUT_LEN" ] && read -rp "  max-input-len [auto]: " -t 30 _mi || true
+        [ -z "$MAX_SEQ_LEN" ] && read -rp "  max-seq-len [auto]: " -t 30 _ms || true
+        [ -n "$_mb" ] && MAX_BATCH_SIZE="$_mb"
+        [ -n "$_mi" ] && MAX_INPUT_LEN="$_mi"
+        [ -n "$_ms" ] && MAX_SEQ_LEN="$_ms"
+    fi
+
     if $will_deploy && [ -z "$GATEWAY_MODE" ] && [ -t 0 ]; then
         echo ""
         echo "  阶段 C — 部署方式:"
@@ -513,6 +586,17 @@ interactive_mode() {
     fi
     if $will_deploy && [ -z "$GATEWAY_MODE" ]; then
         GATEWAY_MODE="standalone"
+    fi
+
+    if $will_deploy && [ -t 0 ] && \
+        { [ -z "$RUNTIME_MAX_BATCH_SIZE" ] || [ -z "$RUNTIME_MAX_SEQ_LEN" ]; }; then
+        echo ""
+        echo "  Runtime 上限 (留空则读取 manifest engine_profile；不能超过 Phase B profile)"
+        local _rb="" _rs=""
+        [ -z "$RUNTIME_MAX_BATCH_SIZE" ] && read -rp "  runtime-max-batch-size [manifest]: " -t 30 _rb || true
+        [ -z "$RUNTIME_MAX_SEQ_LEN" ] && read -rp "  runtime-max-seq-len [manifest]: " -t 30 _rs || true
+        [ -n "$_rb" ] && RUNTIME_MAX_BATCH_SIZE="$_rb"
+        [ -n "$_rs" ] && RUNTIME_MAX_SEQ_LEN="$_rs"
     fi
 
     build_forward_args

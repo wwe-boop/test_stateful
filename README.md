@@ -45,7 +45,10 @@ Qwen3-TTS Triton 是一个 **工程预览版** 项目：把官方 Qwen3-TTS PyTo
 git clone --recursive https://github.com/user/Qwen3-TTS-Triton.git
 cd Qwen3-TTS-Triton
 
-# 推荐先跑 custom-1.7b
+# 推荐先跑 custom-1.7b；不带参数时会进入交互模式
+bash scripts/bash/autorun.sh
+
+# 一次性跑完整流程
 bash scripts/bash/autorun.sh all -m custom-1.7b
 ```
 
@@ -62,9 +65,48 @@ Phase C: deploy.sh / compose.sh
   以 standalone engine、engine Docker 或 Triton gateway 启动服务
 ```
 
-## 构建参数
+## 统一入口与控制参数
 
-`autorun.sh` 现在会透传关键 engine profile 参数：
+`scripts/bash/autorun.sh` 是推荐的统一入口。它同时支持两种方式：
+
+- 交互式：`bash scripts/bash/autorun.sh`
+- 一次性调用：`bash scripts/bash/autorun.sh <command> [variant] [options]`
+
+底层的 `setup_env.sh`、`build_engines.sh`、`deploy.sh`、`compose.sh` 仍可单独使用，但 README 默认只展示 `autorun.sh`。所有关键控制项都可以从 `autorun.sh` 进入：导出 GPU、TensorRT 编译 GPU、engine profile、runtime 上限、部署方式和端口。
+
+配置优先级是：命令行参数 > 已导出的环境变量 > manifest/default。常用环境变量包括 `EXPORT_DEVICE`、`BUILD_GPU_DEVICE`、`RUNTIME_GPU_DEVICE`、`MAX_BATCH_SIZE`、`MAX_INPUT_LEN`、`MAX_SEQ_LEN`、`RUNTIME_MAX_BATCH_SIZE`、`RUNTIME_MAX_SEQ_LEN`；但推荐日常都从 `autorun.sh` 参数进入，便于复现。
+
+### GPU 选择
+
+默认 `--device auto`：脚本会选择当前空闲显存最多的 GPU。你也可以显式指定同一张卡用于所有阶段：
+
+```bash
+bash scripts/bash/autorun.sh all -m custom-1.7b --device 1
+```
+
+也可以按阶段拆开指定：
+
+```bash
+bash scripts/bash/autorun.sh all -m custom-1.7b \
+  --export-device auto \
+  --build-device 1 \
+  --runtime-device 1
+```
+
+参数含义：
+
+```text
+--device <dev>          同时作用于导出、编译、运行阶段；dev 可为 auto、0、1、cuda:1
+--export-device <dev>   仅 Phase A 导出模型使用；额外支持 cpu
+--build-device <dev>    仅 Phase B trtexec 编译 engine 使用；支持 auto、all、0、1、cuda:1
+--runtime-device <dev>  仅 Phase C 服务运行使用；支持 auto、0、1、cuda:1
+```
+
+Phase B 会在 Docker 层限制构建 GPU，例如 `--build-device 1` 会使用类似 `docker run --gpus device=1 ...` 的方式运行 `trtexec`。因此 `trtexec` 日志里可能显示容器内 `Selected Device ID: 0`，但 UUID 会对应物理 GPU 1。
+
+### Engine Profile
+
+TensorRT engine profile 由 Phase B 决定：
 
 ```bash
 bash scripts/bash/autorun.sh build -m custom-1.7b \
@@ -74,7 +116,28 @@ bash scripts/bash/autorun.sh build -m custom-1.7b \
   --dtype bf16
 ```
 
-这些值会写入 `workspace/exported/<variant>/triton_manifest.json` 的 `engine_profile` 字段。runtime 启动时如果请求的 batch/seq 超过 profile，会直接报错，避免 silent clamp 或运行时才暴露 TensorRT shape 问题。
+如果不显式传 `--max-batch-size`、`--max-input-len`、`--max-seq-len`，Phase B 会根据选中的构建 GPU 总显存给一个保守建议值：
+
+```text
+约 24 GB GPU:  max_batch=16   max_input_len=96   max_seq_len=384
+约 32 GB GPU:  max_batch=32   max_input_len=128  max_seq_len=512
+约 48 GB GPU:  max_batch=64   max_input_len=128  max_seq_len=512
+约 80 GB GPU:  max_batch=128  max_input_len=128  max_seq_len=512
+```
+
+这只是默认建议，不是限制。比如你可以在 24G 机器上为 48G 部署机尝试构建更大的 profile：
+
+```bash
+bash scripts/bash/autorun.sh build -m custom-1.7b \
+  --build-device 1 \
+  --max-batch-size 64 \
+  --max-input-len 128 \
+  --max-seq-len 512
+```
+
+但 TensorRT 编译本身也需要显存。如果构建机显存不足，`trtexec` 仍可能 OOM；这时需要换更大构建卡、释放显存，或降低 profile。
+
+这些值会写入 `workspace/exported/<variant>/triton_manifest.json` 的 `engine_profile` 字段。runtime 启动时如果请求的 batch/seq 超过 profile，会直接报错；prefill 长度超过 `max_input_len` 时也会报出明确错误，避免 silent clamp 或运行时才暴露 TensorRT shape 问题。
 
 常用参数：
 
@@ -86,12 +149,14 @@ Phase B:
   --dtype bf16|fp16|fp32|fp8    TensorRT build precision
   --triton-io-float-dtype <T>   TensorRT/Triton float I/O dtype，默认等于 --dtype
   --target-driver <ver>         按部署机 NVIDIA driver 选择 NGC 镜像
+  --build-device <dev>          trtexec 编译 GPU
 
 Phase C:
   --gateway standalone|triton|engine-docker
   --engine-mode trt|onnx
   --runtime-max-batch-size <N>  runtime scheduler batch 上限
   --runtime-max-seq-len <N>     runtime scheduler seq 上限
+  --runtime-device <dev>        runtime 服务 GPU
 ```
 
 示例：
@@ -106,6 +171,13 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b \
   --gateway standalone \
   --runtime-max-batch-size 16 \
   --runtime-max-seq-len 384
+
+# Triton gateway 也走同一套 runtime 上限和 GPU 入口
+bash scripts/bash/autorun.sh deploy -m custom-1.7b \
+  --gateway triton \
+  --runtime-device 1 \
+  --runtime-max-batch-size 16 \
+  --runtime-max-seq-len 384
 ```
 
 ## 部署方式
@@ -115,7 +187,7 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b \
 本机 Python 运行 `engine.server`，适合调试 engine、协议和 WebSocket/gRPC：
 
 ```bash
-bash scripts/bash/deploy.sh run --gateway standalone --variant custom-1.7b
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway standalone
 ```
 
 默认端口：
@@ -130,13 +202,7 @@ bash scripts/bash/deploy.sh run --gateway standalone --variant custom-1.7b
 独立 engine 容器挂载 `workspace/`，不把模型和 engine 烘进镜像：
 
 ```bash
-bash scripts/bash/deploy.sh run --gateway engine-docker --variant custom-1.7b
-```
-
-如果你从统一入口启动，等价命令是：
-
-```bash
-bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
 ```
 
 如果你正在频繁改 engine 代码，不建议反复重建镜像。使用 compose 的开发覆盖层或 watch：
@@ -156,14 +222,14 @@ bash scripts/bash/compose.sh watch --gateway engine --variant custom-1.7b
 组装 `workspace/model_repository` 并启动 Triton：
 
 ```bash
-bash scripts/bash/compose.sh prepare --gateway triton --variant custom-1.7b --engine-mode trt
-bash scripts/bash/compose.sh up --gateway triton --variant custom-1.7b
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway triton --engine-mode trt
 ```
 
-也可以通过高层入口：
+高级调试时可以直接使用 compose：
 
 ```bash
-bash scripts/bash/deploy.sh run --gateway triton --variant custom-1.7b --engine-mode trt
+bash scripts/bash/compose.sh prepare --gateway triton --variant custom-1.7b --engine-mode trt
+bash scripts/bash/compose.sh up --gateway triton --variant custom-1.7b
 ```
 
 ## 测试与验收

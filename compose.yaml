@@ -78,7 +78,9 @@ services:
     container_name: ${TRITON_CONTAINER_NAME:-qwen3-tts-triton}
     environment:
       MAX_BATCH_SLOTS: ${TRITON_MAX_BATCH_SLOTS:-128}
+      ENGINE_MAX_DECODE_LEN: ${TRITON_MAX_SEQ_LEN:-512}
       MAX_SESSIONS: ${TRITON_MAX_SESSIONS:-128}
+      CUDA_VISIBLE_DEVICES: ${TRITON_GPU_DEVICE:-0}
       PYTORCH_CUDA_ALLOC_CONF: ${TRITON_PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       PYTHONDONTWRITEBYTECODE: "1"
     command:

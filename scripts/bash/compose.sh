@@ -39,14 +39,17 @@ CONTAINER_OVERRIDE=""
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
 ENGINE_WEBSOCKET="${ENGINE_WEBSOCKET_PORT:-50052}"
 ENGINE_HEALTH="${ENGINE_HEALTH_PORT:-8080}"
-ENGINE_DEVICE="${ENGINE_DEVICE:-0}"
-ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH_SIZE:-128}"
+ENGINE_DEVICE="${ENGINE_DEVICE:-${RUNTIME_GPU_DEVICE:-auto}}"
+ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH_SIZE:-${RUNTIME_MAX_BATCH_SIZE:-}}"
 ENGINE_MAX_SESSIONS="${ENGINE_MAX_SESSIONS:-128}"
-ENGINE_MAX_SEQ_LEN="${ENGINE_MAX_SEQ_LEN:-}"
+ENGINE_MAX_SEQ_LEN="${ENGINE_MAX_SEQ_LEN:-${RUNTIME_MAX_SEQ_LEN:-}}"
 
 TRITON_HTTP="${TRITON_HTTP_PORT:-8000}"
 TRITON_GRPC="${TRITON_GRPC_PORT:-8001}"
 TRITON_METRICS="${TRITON_METRICS_PORT:-8002}"
+TRITON_GPU_DEVICE="${TRITON_GPU_DEVICE:-$ENGINE_DEVICE}"
+TRITON_MAX_BATCH="${TRITON_MAX_BATCH_SLOTS:-${RUNTIME_MAX_BATCH_SIZE:-}}"
+TRITON_MAX_SEQ_LEN="${TRITON_MAX_SEQ_LEN:-${RUNTIME_MAX_SEQ_LEN:-}}"
 
 usage() {
     cat <<'EOF'
@@ -75,8 +78,9 @@ Options:
   --grpc-port <N>        Triton gRPC port
   --http-port <N>        Triton HTTP port
   --metrics-port <N>     Triton metrics port
-  --device <N>           Engine CUDA device
-  --max-batch <N>        Engine max batch size
+  --device <N|auto>      Runtime CUDA device (engine and Triton)
+  --triton-device <N>    Triton CUDA device override
+  --max-batch <N>        Runtime max batch size
   --max-sessions <N>     Engine max sessions
   --max-seq-len <N>      Optional engine scheduler max seq len override
   --build                Build before `up`
@@ -132,6 +136,11 @@ require_docker_compose() {
     fi
 }
 
+require_docker_compose_if_needed() {
+    $DRY_RUN && return 0
+    require_docker_compose
+}
+
 compose_cmd() {
     local profile_args=()
     case "$GATEWAY" in
@@ -163,6 +172,8 @@ compose_cmd() {
 }
 
 export_compose_env() {
+    resolve_compose_runtime_controls
+
     export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-qwen3-tts}"
     export MODEL_VARIANT="$VARIANT"
     export ENGINE_MODELS_DIR="$ENGINE_MODELS_DIR"
@@ -180,6 +191,78 @@ export_compose_env() {
     export TRITON_HTTP_PORT="$TRITON_HTTP"
     export TRITON_GRPC_PORT="$TRITON_GRPC"
     export TRITON_METRICS_PORT="$TRITON_METRICS"
+    export TRITON_GPU_DEVICE="$TRITON_GPU_DEVICE"
+    export TRITON_MAX_BATCH_SLOTS="$TRITON_MAX_BATCH"
+    export TRITON_MAX_SEQ_LEN="$TRITON_MAX_SEQ_LEN"
+    export ENGINE_MAX_DECODE_LEN="$TRITON_MAX_SEQ_LEN"
+}
+
+log_compose_runtime_summary() {
+    log_info "[DRY RUN] Resolved compose runtime:"
+    log_info "  Gateway:          $GATEWAY"
+    [ -n "$VARIANT" ] && log_info "  Variant:          $VARIANT"
+    log_info "  Engine device:    $ENGINE_DEVICE"
+    log_info "  Engine max batch: $ENGINE_MAX_BATCH"
+    log_info "  Engine max seq:   $ENGINE_MAX_SEQ_LEN"
+    log_info "  Triton device:    $TRITON_GPU_DEVICE"
+    log_info "  Triton max batch: $TRITON_MAX_BATCH"
+    log_info "  Triton max seq:   $TRITON_MAX_SEQ_LEN"
+}
+
+compose_manifest_profile_value() {
+    local key="$1"
+    local manifest="$EXPORTED_DIR/$VARIANT/triton_manifest.json"
+    if [[ -z "$VARIANT" || ! -f "$manifest" ]]; then
+        return 0
+    fi
+    python3 - "$manifest" "$key" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+value = data.get("engine_profile", {}).get(key, "")
+if value not in ("", None):
+    print(value)
+PY
+}
+
+resolve_compose_runtime_controls() {
+    if [[ "${ENGINE_DEVICE:-auto}" = "auto" || -z "${ENGINE_DEVICE:-}" ]]; then
+        ENGINE_DEVICE=$(resolve_gpu_device_index "${ENGINE_DEVICE:-auto}") || exit 1
+    else
+        ENGINE_DEVICE=$(resolve_gpu_device_index "$ENGINE_DEVICE") || exit 1
+    fi
+    if [[ "${TRITON_GPU_DEVICE:-auto}" = "auto" || -z "${TRITON_GPU_DEVICE:-}" ]]; then
+        TRITON_GPU_DEVICE="$ENGINE_DEVICE"
+    else
+        TRITON_GPU_DEVICE=$(resolve_gpu_device_index "$TRITON_GPU_DEVICE") || exit 1
+    fi
+
+    if [[ -z "${ENGINE_MAX_BATCH:-}" ]]; then
+        ENGINE_MAX_BATCH=$(compose_manifest_profile_value max_batch_size)
+        ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH:-128}"
+    fi
+    if [[ -z "${ENGINE_MAX_SEQ_LEN:-}" ]]; then
+        ENGINE_MAX_SEQ_LEN=$(compose_manifest_profile_value max_seq_len)
+        ENGINE_MAX_SEQ_LEN="${ENGINE_MAX_SEQ_LEN:-512}"
+    fi
+    if [[ -z "${TRITON_MAX_BATCH:-}" ]]; then
+        TRITON_MAX_BATCH="$ENGINE_MAX_BATCH"
+    fi
+    if [[ -z "${TRITON_MAX_SEQ_LEN:-}" ]]; then
+        TRITON_MAX_SEQ_LEN="$ENGINE_MAX_SEQ_LEN"
+    fi
+
+    local name value
+    for name in ENGINE_MAX_BATCH ENGINE_MAX_SEQ_LEN TRITON_MAX_BATCH TRITON_MAX_SEQ_LEN; do
+        value="${!name}"
+        if ! [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "$name must be a positive integer, got: $value"
+            exit 1
+        fi
+    done
 }
 
 compose_service_container_name() {
@@ -394,7 +477,7 @@ ensure_triton_repo() {
 }
 
 cmd_build() {
-    require_docker_compose
+    require_docker_compose_if_needed
     export_compose_env
     case "$GATEWAY" in
         engine) compose_cmd build engine ;;
@@ -412,13 +495,14 @@ cmd_prepare() {
 }
 
 cmd_up() {
-    require_docker_compose
+    require_docker_compose_if_needed
 
     if $DRY_RUN; then
         case "$GATEWAY" in
             engine)
                 resolve_variant_if_needed
                 export_compose_env
+                log_compose_runtime_summary
                 if $BUILD_BEFORE_UP; then
                     compose_cmd up --build -d engine
                 else
@@ -426,7 +510,9 @@ cmd_up() {
                 fi
                 ;;
             triton)
+                resolve_variant_if_needed
                 export_compose_env
+                log_compose_runtime_summary
                 if $BUILD_BEFORE_UP; then
                     compose_cmd up --build -d triton
                 else
@@ -436,6 +522,7 @@ cmd_up() {
             all)
                 resolve_variant_if_needed
                 export_compose_env
+                log_compose_runtime_summary
                 if $BUILD_BEFORE_UP; then
                     compose_cmd up --build -d engine triton
                 else
@@ -495,7 +582,7 @@ cmd_up() {
 }
 
 cmd_watch() {
-    require_docker_compose
+    require_docker_compose_if_needed
 
     if $USE_DEV_OVERLAY; then
         log_error "`watch` cannot be combined with --dev; use either bind mounts or compose watch"
@@ -532,7 +619,7 @@ cmd_watch() {
 }
 
 cmd_down() {
-    require_docker_compose
+    require_docker_compose_if_needed
     export_compose_env
     case "$GATEWAY" in
         engine)
@@ -550,7 +637,7 @@ cmd_down() {
 }
 
 cmd_logs() {
-    require_docker_compose
+    require_docker_compose_if_needed
     export_compose_env
     local args=(logs)
     $FOLLOW && args+=(-f)
@@ -563,13 +650,13 @@ cmd_logs() {
 }
 
 cmd_ps() {
-    require_docker_compose
+    require_docker_compose_if_needed
     export_compose_env
     compose_cmd ps
 }
 
 cmd_config() {
-    require_docker_compose
+    require_docker_compose_if_needed
     export_compose_env
     compose_cmd config
 }
@@ -596,10 +683,13 @@ while [[ $# -gt 0 ]]; do
         --grpc-port) TRITON_GRPC="$2"; shift 2 ;;
         --http-port) TRITON_HTTP="$2"; shift 2 ;;
         --metrics-port) TRITON_METRICS="$2"; shift 2 ;;
-        --device) ENGINE_DEVICE="$2"; shift 2 ;;
-        --max-batch) ENGINE_MAX_BATCH="$2"; shift 2 ;;
+        --device) ENGINE_DEVICE="$2"; TRITON_GPU_DEVICE="$2"; shift 2 ;;
+        --triton-device) TRITON_GPU_DEVICE="$2"; shift 2 ;;
+        --max-batch|--runtime-max-batch-size|--runtime-max-batch)
+            ENGINE_MAX_BATCH="$2"; TRITON_MAX_BATCH="$2"; shift 2 ;;
         --max-sessions) ENGINE_MAX_SESSIONS="$2"; shift 2 ;;
-        --max-seq-len) ENGINE_MAX_SEQ_LEN="$2"; shift 2 ;;
+        --max-seq-len|--runtime-max-seq-len|--runtime-max-seq)
+            ENGINE_MAX_SEQ_LEN="$2"; TRITON_MAX_SEQ_LEN="$2"; shift 2 ;;
         --build) BUILD_BEFORE_UP=true; shift ;;
         --dev) USE_DEV_OVERLAY=true; shift ;;
         --prepare) FORCE_PREPARE=true; shift ;;

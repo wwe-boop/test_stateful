@@ -592,6 +592,8 @@ triton_run() {
     log_info "  Ports:      gRPC=$TRITON_GRPC_PORT HTTP=$TRITON_HTTP_PORT metrics=$TRITON_METRICS_PORT"
 
     local gpu_device="${TRITON_GPU_DEVICE:-0}"
+    local max_batch_slots="${TRITON_MAX_BATCH_SLOTS:-${RUNTIME_MAX_BATCH_SIZE:-128}}"
+    local max_seq_len="${TRITON_MAX_SEQ_LEN:-${RUNTIME_MAX_SEQ_LEN:-512}}"
     local variant_label=""
     local type_label=""
     
@@ -616,6 +618,8 @@ triton_run() {
         --ulimit memlock=-1 \
         $variant_label $type_label \
         $code2wav_bf16_env \
+        -e "MAX_BATCH_SLOTS=${max_batch_slots}" \
+        -e "ENGINE_MAX_DECODE_LEN=${max_seq_len}" \
         -p "${TRITON_HTTP_PORT}:8000" \
         -p "${TRITON_GRPC_PORT}:8001" \
         -p "${TRITON_METRICS_PORT}:8002" \

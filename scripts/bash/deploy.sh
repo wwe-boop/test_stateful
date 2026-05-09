@@ -35,6 +35,9 @@
 #    GATEWAY_MODE            Override gateway: standalone | triton | engine-docker
 #    ENGINE_GRPC_PORT        Standalone gRPC port (default: 50051)
 #    ENGINE_WEBSOCKET_PORT   Standalone WebSocket port (default: 50052)
+#    RUNTIME_GPU_DEVICE      Runtime GPU device (auto | N | cuda:N; default: auto)
+#    RUNTIME_MAX_BATCH_SIZE  Runtime scheduler batch limit (default: manifest profile)
+#    RUNTIME_MAX_SEQ_LEN     Runtime scheduler seq limit (default: manifest profile)
 #    ENGINE_PYTHON           Python binary for standalone engine (default: conda env qwen3-tts, else PATH)
 #    QWEN3_TTS_ENV_NAME      Conda env name for auto-resolve (default: qwen3-tts)
 #    TRITON_GRPC_PORT        Triton gRPC port (default: 8001)
@@ -55,10 +58,10 @@ DRY_RUN=false
 # Standalone options
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
 ENGINE_WS_PORT="${ENGINE_WEBSOCKET_PORT:-50052}"
-GPU_DEVICE=0
-MAX_BATCH=128
+GPU_DEVICE="${RUNTIME_GPU_DEVICE:-auto}"
+MAX_BATCH="${RUNTIME_MAX_BATCH_SIZE:-}"
 MAX_SESSIONS=128
-MAX_SEQ_LEN=""
+MAX_SEQ_LEN="${RUNTIME_MAX_SEQ_LEN:-}"
 FOREGROUND=false
 
 # Triton forwarding
@@ -92,9 +95,9 @@ Options:
   Standalone options:
     --port <N>           gRPC port (default: 50051)
     --ws-port <N>        WebSocket port (default: 50052)
-    --device <N>         GPU device (default: 0)
-    --max-batch <N>      Max batch size (default: 128)
-    --max-seq-len <N>    Optional scheduler max sequence length
+    --device <N|auto>    Runtime GPU device (default: auto)
+    --max-batch <N>      Runtime max batch size (default: manifest profile, else 128)
+    --max-seq-len <N>    Runtime max sequence length (default: manifest profile, else 512)
     --max-sessions <N>   Max concurrent sessions (default: 128)
     --foreground         Run in foreground (don't daemonize)
 
@@ -166,9 +169,9 @@ while [[ $# -gt 0 ]]; do
         # Standalone options
         --port)           ENGINE_PORT="$2"; shift 2 ;;
         --ws-port)        ENGINE_WS_PORT="$2"; shift 2 ;;
-        --device)         GPU_DEVICE="$2"; shift 2 ;;
-        --max-batch)      MAX_BATCH="$2"; shift 2 ;;
-        --max-seq-len)    MAX_SEQ_LEN="$2"; shift 2 ;;
+        --device|--runtime-device) GPU_DEVICE="$2"; shift 2 ;;
+        --max-batch|--runtime-max-batch-size|--runtime-max-batch) MAX_BATCH="$2"; shift 2 ;;
+        --max-seq-len|--runtime-max-seq-len|--runtime-max-seq) MAX_SEQ_LEN="$2"; shift 2 ;;
         --max-sessions)   MAX_SESSIONS="$2"; shift 2 ;;
         --foreground)     FOREGROUND=true; shift ;;
 
@@ -198,10 +201,61 @@ case "$GATEWAY_MODE" in
         ;;
 esac
 
+# ── Runtime defaults ──
+
+_manifest_profile_value() {
+    local key="$1"
+    local manifest="$EXPORTED_DIR/$VARIANT/triton_manifest.json"
+    if [ ! -f "$manifest" ]; then
+        return 0
+    fi
+    python3 - "$manifest" "$key" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    data = json.load(f)
+value = data.get("engine_profile", {}).get(key, "")
+if value not in ("", None):
+    print(value)
+PY
+}
+
+resolve_runtime_controls() {
+    local raw_device="$GPU_DEVICE"
+    GPU_DEVICE=$(resolve_gpu_device_index "$GPU_DEVICE") || exit 1
+    if [ "$raw_device" = "auto" ] || [ -z "$raw_device" ]; then
+        log_gpu_selection "Runtime" "$GPU_DEVICE"
+    fi
+
+    if [ -z "$MAX_BATCH" ]; then
+        MAX_BATCH=$(_manifest_profile_value max_batch_size)
+        MAX_BATCH="${MAX_BATCH:-128}"
+    fi
+    if [ -z "$MAX_SEQ_LEN" ]; then
+        MAX_SEQ_LEN=$(_manifest_profile_value max_seq_len)
+        MAX_SEQ_LEN="${MAX_SEQ_LEN:-512}"
+    fi
+    if ! [[ "$MAX_BATCH" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "Runtime max batch must be a positive integer, got: $MAX_BATCH"
+        exit 1
+    fi
+    if ! [[ "$MAX_SEQ_LEN" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "Runtime max seq len must be a positive integer, got: $MAX_SEQ_LEN"
+        exit 1
+    fi
+
+    export RUNTIME_GPU_DEVICE="$GPU_DEVICE"
+    export RUNTIME_MAX_BATCH_SIZE="$MAX_BATCH"
+    export RUNTIME_MAX_SEQ_LEN="$MAX_SEQ_LEN"
+}
+
 # ── Commands ──
 
 cmd_run() {
     resolve_variant
+    resolve_runtime_controls
 
     case "$GATEWAY_MODE" in
         standalone)
@@ -268,6 +322,9 @@ cmd_run_triton() {
     local compose_args=(
         up
         --gateway triton
+        --device "$GPU_DEVICE"
+        --max-batch "$MAX_BATCH"
+        --max-seq-len "$MAX_SEQ_LEN"
     )
     [ -n "$VARIANT" ] && compose_args+=(--variant "$VARIANT")
     $DRY_RUN && compose_args+=(--dry-run)

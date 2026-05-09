@@ -537,7 +537,19 @@ instance_group [
     return "\n".join(parts)
 
 
-def render_orchestrator(variant: str, orch: Dict[str, str]) -> str:
+def _profile_int(profile: Dict[str, Any], key: str, default: int) -> int:
+    try:
+        value = int(profile.get(key, 0))
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else default
+
+
+def render_orchestrator(
+    variant: str,
+    orch: Dict[str, str],
+    profile: Optional[Dict[str, Any]] = None,
+) -> str:
     tts = orch.get("tts_model_type", "unknown")
     tasks = orch.get("supported_task_types", "unknown")
     max_decode = orch.get("max_decode_steps", "4096")
@@ -546,6 +558,9 @@ def render_orchestrator(variant: str, orch: Dict[str, str]) -> str:
     edir = orch.get("engine_dir", "/models/tts_orchestrator/1/runtime")
     wdir = orch.get("weights_dir", "/models/tts_orchestrator/1/weights")
     tdir = orch.get("tokenizer_dir", "/models/tts_orchestrator/1/tokenizer")
+    profile = profile or {}
+    max_batch_slots = _profile_int(profile, "max_batch_size", 128)
+    engine_max_decode_len = _profile_int(profile, "max_seq_len", 512)
     return f'''name: "tts_orchestrator"
 backend: "python"
 max_batch_size: 0
@@ -616,6 +631,14 @@ parameters: {{
 parameters: {{
   key: "tokenizer_dir"
   value: {{ string_value: "{tdir}" }}
+}}
+parameters: {{
+  key: "max_batch_slots"
+  value: {{ string_value: "{max_batch_slots}" }}
+}}
+parameters: {{
+  key: "engine_max_decode_len"
+  value: {{ string_value: "{engine_max_decode_len}" }}
 }}
 parameters: {{
   key: "max_decode_steps"
@@ -719,6 +742,7 @@ def generate_configs(
     variant = str(manifest.get("variant", "unknown"))
     talker = manifest.get("talker") or {}
     orch = manifest.get("orchestrator") or {}
+    profile = manifest.get("engine_profile") or {}
 
     models = [
         "speaker_encoder",
@@ -773,7 +797,7 @@ def generate_configs(
 
     orch_dir = output_repo / "tts_orchestrator"
     if orch_dir.is_dir():
-        otxt = render_orchestrator(variant, orch)
+        otxt = render_orchestrator(variant, orch, profile)
         (orch_dir / "config.pbtxt").write_text(otxt, encoding="utf-8")
         logger.info("Wrote %s", orch_dir / "config.pbtxt")
 

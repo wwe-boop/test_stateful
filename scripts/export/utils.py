@@ -103,13 +103,16 @@ def auto_detect_device() -> str:
 def resolve_device(user_device: Optional[str]) -> str:
     """Resolve a user-supplied --device arg to a concrete device string.
 
-    - None or ""  → auto_detect_device() (scan all GPUs, pick best)
-    - "cuda"      → auto_detect_device() (bare 'cuda' would default to GPU 0)
-    - "cuda:N"    → use as-is (user picked a specific GPU)
-    - "cpu"       → use as-is
+    - None, "", "auto" → auto_detect_device() (scan all GPUs, pick best)
+    - "cuda"          → auto_detect_device() (bare 'cuda' would default to GPU 0)
+    - "cuda:N"        → use as-is (user picked a specific GPU)
+    - "N"             → use cuda:N
+    - "cpu"           → use as-is
     """
-    if not user_device or user_device == "cuda":
+    if not user_device or user_device in ("auto", "cuda"):
         return auto_detect_device()
+    if user_device.isdigit():
+        return f"cuda:{user_device}"
     return user_device
 
 
