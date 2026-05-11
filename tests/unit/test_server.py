@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 import pytest
@@ -66,8 +67,7 @@ def test_validate_session_config_reports_unavailable_ref_audio_processor():
         engine._validate_session_config(SessionConfig(task_type="base", ref_audio=b"x"))
 
 
-@pytest.mark.asyncio
-async def test_start_session_validates_before_delegating():
+def test_start_session_validates_before_delegating():
     engine = TTSEngine(model_arch=ModelArchConfig(
         variant="custom-1.7b",
         tts_model_type="custom_voice",
@@ -77,7 +77,7 @@ async def test_start_session_validates_before_delegating():
     engine._frontend = frontend
 
     config = SessionConfig(task_type="custom_voice", speaker="Serena")
-    result = await engine.start_session("sid-1", config=config)
+    result = asyncio.run(engine.start_session("sid-1", config=config))
 
     assert result["session_id"] == "sid-1"
     assert len(frontend.calls) == 1

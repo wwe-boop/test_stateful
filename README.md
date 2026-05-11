@@ -184,7 +184,11 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b \
 
 ### Standalone
 
-本机 Python 运行 `engine.server`，适合调试 engine、协议和 WebSocket/gRPC：
+本机 Python 运行 `engine.server`，适合调试 engine、协议和 WebSocket/gRPC。
+启动前会组装同一个 `workspace/model_repository/tts_orchestrator/1`
+模型包，然后通过 `--model-package-dir` 读取 `runtime/`、`weights/`、
+`tokenizer/` 和 manifest；不会再直接把 `workspace/models` 与
+`workspace/exported/<variant>` 当作运行时输入。
 
 ```bash
 bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway standalone
@@ -199,9 +203,38 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway standalone
 
 ### Engine Docker
 
-独立 engine 容器挂载 `workspace/`，不把模型和 engine 烘进镜像：
+独立 engine 容器也使用和 Triton 相同的模型包：
+`workspace/model_repository/tts_orchestrator/1`。这个包由 Phase C assemble
+生成，包含 `runtime/`、`weights/`、`tokenizer/` 和 manifest；engine 镜像只提供
+运行时和 `/app/engine` 代码，不再直接挂载原始 `workspace/models` 或
+`workspace/exported`。
 
 ```bash
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
+```
+
+注意：`autorun.sh build` 是 Phase B 的 TensorRT engine 编译，不是重建
+`Dockerfile.engine` 对应的 Docker 镜像。`autorun.sh deploy --gateway engine-docker`
+只会在镜像不存在，或镜像明显不是 engine 镜像时自动构建；如果你更新了
+`engine/`、`engine.yaml` 或 `scripts/compose/engine-entrypoint.sh` 这类会被
+`Dockerfile.engine` `COPY` 进镜像的文件，需要显式重新构建并重建容器：
+
+```bash
+bash scripts/bash/compose.sh down --gateway engine
+
+DOCKER_BUILDKIT=1 bash scripts/bash/compose.sh up \
+  --gateway engine \
+  --variant custom-1.7b \
+  --build
+
+bash scripts/bash/compose.sh logs --gateway engine --follow
+```
+
+如果想继续走 `autorun.sh deploy`，可以先删除旧镜像，让 deploy 阶段重新构建：
+
+```bash
+bash scripts/bash/autorun.sh stop
+docker image rm qwen3-engine:26.02
 bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
 ```
 
@@ -216,10 +249,12 @@ bash scripts/bash/compose.sh watch --gateway engine --variant custom-1.7b
 ```
 
 长期部署时可以使用普通镜像；开发期用 `--dev`/`watch`，把“环境层”和“代码层”分开。
+engine-docker 当前要求模型包为 `--engine-mode trt`，因为 `engine.server`
+消费的是 `runtime/model.plan`；Triton 仍可用同一包结构跑 `trt` 或 `onnx`。
 
 ### Triton
 
-组装 `workspace/model_repository` 并启动 Triton：
+组装同一个 `workspace/model_repository` 并启动 Triton：
 
 ```bash
 bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway triton --engine-mode trt

@@ -182,6 +182,15 @@ assemble_model_repo() {
         log_warn "  runtime/speech_tokenizer_codec_fused.onnx: SKIPPED (not required for non-base / non-ICL)"
     fi
 
+    if [ -f "$tokenizer_dir/speech_tokenizer_encoder.onnx" ]; then
+        _link_or_copy "$tokenizer_dir/speech_tokenizer_encoder.onnx" "$runtime_dir/speech_tokenizer_encoder.onnx"
+        [ -f "$tokenizer_dir/speech_tokenizer_encoder.onnx.data" ] \
+            && _link_or_copy "$tokenizer_dir/speech_tokenizer_encoder.onnx.data" "$runtime_dir/speech_tokenizer_encoder.onnx.data"
+        log_info "  runtime/speech_tokenizer_encoder.onnx: OK"
+    else
+        log_warn "  runtime/speech_tokenizer_encoder.onnx: SKIPPED (only needed for base / voice clone)"
+    fi
+
     # ── 2. Talker + Code2Wav fused (required — production single runtime engine) ──
     local fused_src
     if fused_src="$(_resolve_model_src "$variant_dir/talker_code2wav_fused")"; then
@@ -282,9 +291,36 @@ assemble_model_repo() {
 
     _write_tts_orchestrator_stub_if_missing "$repo_dir"
 
-    _link_or_copy "$variant_dir/triton_manifest.json" "$repo_dir/triton_manifest.json"
-    _link_or_copy "$variant_dir/triton_manifest.json" "$runtime_dir/triton_manifest.json"
-    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/1/runtime)"
+    if ! PYTHONPATH="$repo_root/scripts/python" python3 - \
+        "$variant_dir/triton_manifest.json" \
+        "$engine_mode" \
+        "$repo_dir" \
+        "$repo_dir/triton_manifest.json" \
+        "$repo_dir/tts_orchestrator/1/triton_manifest.json" \
+        "$runtime_dir/triton_manifest.json" <<'PY'; then
+import json
+import sys
+from pathlib import Path
+
+from triton_manifest_io import load_manifest
+
+src = Path(sys.argv[1])
+engine_mode = sys.argv[2]
+output_repo = Path(sys.argv[3])
+targets = [Path(p) for p in sys.argv[4:]]
+
+manifest = load_manifest(src, output_repo=output_repo)
+manifest["engine_mode"] = engine_mode
+manifest.setdefault("package", {})["model_package_dir"] = "/models/tts_orchestrator/1"
+
+for target in targets:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+        log_error "  failed to write package triton_manifest.json"
+        return 1
+    fi
+    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/1 + runtime)"
 
     # Keep the Triton Python backend payload minimal.  Only the new adapter,
     # engine package, tokenizer / weights, and manifest should enter the container.
@@ -294,6 +330,7 @@ assemble_model_repo() {
         ! -name "tokenizer" \
         ! -name "weights" \
         ! -name "runtime" \
+        ! -name "triton_manifest.json" \
         -exec rm -rf {} +
     find "$repo_dir/tts_orchestrator/1" -type d -name "__pycache__" -prune -exec rm -rf {} +
     log_info "  tts_orchestrator/python: pruned legacy payload"
@@ -380,7 +417,23 @@ validate_model_repo() {
     done
 
     local orch_dir="$repo_dir/tts_orchestrator/1"
-    local runtime_dir="$orch_dir/runtime"
+    local repo_root
+    repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
+    local package_info
+    package_info=$(PYTHONPATH="$repo_root" python3 - "$orch_dir" <<'PY' 2>/dev/null || true
+import sys
+from engine.config import resolve_model_package_paths
+
+p = resolve_model_package_paths(sys.argv[1])
+print("\t".join([p.engine_dir, p.manifest_path, p.runtime_artifact_path]))
+PY
+)
+    local runtime_dir manifest_path runtime_engine
+    IFS=$'\t' read -r runtime_dir manifest_path runtime_engine <<< "$package_info"
+    runtime_dir="${runtime_dir:-$orch_dir/runtime}"
+    manifest_path="${manifest_path:-$runtime_dir/triton_manifest.json}"
+    runtime_engine="${runtime_engine:-$runtime_dir/model.plan}"
+
     if [ ! -f "$orch_dir/model.py" ]; then
         log_error "  tts_orchestrator/1/model.py: missing"
         missing=$((missing + 1))
@@ -393,23 +446,21 @@ validate_model_repo() {
     else
         log_info "  tts_orchestrator/1/engine/: OK"
     fi
-    if [ ! -f "$runtime_dir/triton_manifest.json" ]; then
-        log_error "  tts_orchestrator/1/runtime/triton_manifest.json: missing"
+    if [ ! -f "$manifest_path" ]; then
+        log_error "  model package manifest: missing ($manifest_path)"
         missing=$((missing + 1))
     else
-        log_info "  tts_orchestrator/1/runtime/triton_manifest.json: OK"
+        log_info "  model package manifest: OK ($manifest_path)"
+    fi
+    if [ ! -f "$orch_dir/triton_manifest.json" ]; then
+        log_error "  tts_orchestrator/1/triton_manifest.json: missing"
+        missing=$((missing + 1))
+    else
+        log_info "  tts_orchestrator/1/triton_manifest.json: OK"
     fi
 
-    local runtime_engine=""
-    if [ -f "$runtime_dir/model.plan" ]; then
-        runtime_engine="$runtime_dir/model.plan"
-    elif [ -f "$runtime_dir/model.onnx" ]; then
-        runtime_engine="$runtime_dir/model.onnx"
-    elif [ -f "$runtime_dir/talker_code2wav_fused.engine" ]; then
-        runtime_engine="$runtime_dir/talker_code2wav_fused.engine"
-    fi
-    if [ -z "$runtime_engine" ]; then
-        log_error "  tts_orchestrator/1/runtime/{model.plan|model.onnx|talker_code2wav_fused.engine}: missing"
+    if [ ! -f "$runtime_engine" ]; then
+        log_error "  runtime artifact: missing ($runtime_engine)"
         missing=$((missing + 1))
     else
         log_info "  runtime engine: OK ($(basename "$runtime_engine"))"

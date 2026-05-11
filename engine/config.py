@@ -1,14 +1,15 @@
 """Engine configuration — split into engine params (YAML) and model params (manifest).
 
 Loading priority for model architecture:
-    model_manifest.json (from engine_dir) > engine.yaml model overrides > defaults
+    package manifest (resolved runtime_dir) > engine.yaml model overrides > defaults
 
 Loading priority for engine params:
     CLI args > ENGINE_* env vars > engine.yaml > defaults
 
 Usage:
     cfg = load_config("engine.yaml", cli_overrides={...})
-    model_arch = load_model_manifest(engine_dir, cfg)
+    paths = resolve_model_package_paths(cfg.paths.model_package_dir)
+    model_arch = load_model_manifest(paths.engine_dir, cfg)
     model_config = to_model_config(model_arch, cfg)
 """
 
@@ -20,8 +21,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +54,9 @@ class ModelArchConfig:
     """Model architecture — loaded from model_manifest / triton_manifest.json.
 
     These values are determined at export time and travel with the model
-    artifacts.  The standalone engine reads them from the manifest file
-    in engine_dir instead of requiring manual configuration.
+    artifacts.  The engine reads them from the manifest file inside the
+    resolved model package runtime directory instead of requiring manual
+    architecture configuration.
     """
     variant: str = ""
     num_layers: int = 28
@@ -85,9 +85,22 @@ class ModelArchConfig:
 @dataclass
 class PathsConfig:
     """File paths — resolved relative to repo root or absolute."""
+    model_package_dir: str = ""
     tokenizer_dir: str = ""
     weights_dir: str = ""
     engine_dir: str = ""
+
+
+@dataclass(frozen=True)
+class ModelPackagePaths:
+    """Resolved paths inside a Triton-compatible model package."""
+    package_dir: str
+    engine_dir: str
+    weights_dir: str
+    tokenizer_dir: str
+    manifest_path: str
+    runtime_artifact_path: str
+    engine_mode: str = "unknown"
 
 
 @dataclass
@@ -304,6 +317,102 @@ def load_config(
     return _dict_to_config(raw)
 
 
+def resolve_model_package_paths(
+    model_package_dir: str = "",
+    *,
+    model_repository: str = "/models",
+    model_name: str = "tts_orchestrator",
+    model_version: str = "1",
+) -> ModelPackagePaths:
+    """Resolve the shared deployment package layout used by Triton and engine.
+
+    The model package is the Triton model version directory:
+    ``<model_repository>/<model_name>/<model_version>``.  Both runtimes load
+    assets from the same subdirectories:
+      - ``runtime``: TensorRT plan / runtime manifest / optional ONNX helpers
+      - ``weights``: exported embedding and projection weights
+      - ``tokenizer``: text tokenizer files
+    """
+    if model_package_dir:
+        package = Path(model_package_dir)
+    else:
+        package = Path(model_repository) / model_name / str(model_version)
+
+    runtime_dir = package / "runtime"
+    weights_dir = package / "weights"
+    tokenizer_dir = package / "tokenizer"
+    manifest_path = package / "triton_manifest.json"
+    if not manifest_path.is_file():
+        manifest_path = runtime_dir / "triton_manifest.json"
+    engine_mode = "unknown"
+    runtime_artifact = runtime_dir / "model.plan"
+
+    def _package_path(value: str, default: Path) -> Path:
+        if not value:
+            return default
+        candidate = Path(value)
+        return candidate if candidate.is_absolute() else package / candidate
+
+    if manifest_path.is_file():
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                data = json.load(f)
+            engine_mode = str(data.get("engine_mode") or "unknown").lower()
+            package_section = data.get("package", {})
+            if isinstance(package_section, dict):
+                runtime_dir = _package_path(
+                    str(package_section.get("runtime_dir") or ""),
+                    runtime_dir,
+                )
+                weights_dir = _package_path(
+                    str(package_section.get("weights_dir") or ""),
+                    weights_dir,
+                )
+                tokenizer_dir = _package_path(
+                    str(package_section.get("tokenizer_dir") or ""),
+                    tokenizer_dir,
+                )
+                artifacts = package_section.get("runtime_artifacts", {})
+                if isinstance(artifacts, dict):
+                    runtime_artifact = _package_path(
+                        str(artifacts.get(engine_mode) or ""),
+                        runtime_artifact,
+                    )
+                manifest_path = _package_path(
+                    str(package_section.get("manifest") or ""),
+                    manifest_path,
+                )
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to read package manifest %s: %s", manifest_path, exc)
+
+    if engine_mode == "onnx" and runtime_artifact == runtime_dir / "model.plan":
+        runtime_artifact = runtime_dir / "model.onnx"
+    elif not runtime_artifact.is_file() and (runtime_dir / "model.onnx").is_file():
+        runtime_artifact = runtime_dir / "model.onnx"
+
+    return ModelPackagePaths(
+        package_dir=str(package),
+        engine_dir=str(runtime_dir),
+        weights_dir=str(weights_dir),
+        tokenizer_dir=str(tokenizer_dir),
+        manifest_path=str(manifest_path),
+        runtime_artifact_path=str(runtime_artifact),
+        engine_mode=engine_mode,
+    )
+
+
+def apply_model_package_paths(
+    cfg: EngineConfig,
+    paths: ModelPackagePaths,
+) -> EngineConfig:
+    """Apply resolved package paths to an EngineConfig in-place."""
+    cfg.paths.model_package_dir = paths.package_dir
+    cfg.paths.engine_dir = paths.engine_dir
+    cfg.paths.weights_dir = paths.weights_dir
+    cfg.paths.tokenizer_dir = paths.tokenizer_dir
+    return cfg
+
+
 # ---------------------------------------------------------------------------
 # Public: load model manifest (architecture)
 # ---------------------------------------------------------------------------
@@ -316,11 +425,12 @@ def load_model_manifest(
     engine_config: Optional[EngineConfig] = None,
     tokenizer_dir: str = "",
 ) -> ModelArchConfig:
-    """Load model architecture from manifest file in engine_dir.
+    """Load model architecture from the resolved runtime manifest directory.
 
     Search order for manifest:
-      1. engine_dir/triton_manifest.json  (generated by export_09)
-      2. engine_dir/model_manifest.json
+      1. runtime_dir/triton_manifest.json
+      2. package_dir/triton_manifest.json
+      3. model_repository/triton_manifest.json
 
     If no manifest is found, falls back to auto-detection from
     tokenizer config.json, then to hardcoded defaults.
@@ -470,6 +580,8 @@ def _detect_from_tokenizer(tokenizer_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def torch_dtype(dtype_str: str) -> torch.dtype:
+    import torch
+
     mapping = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     return mapping.get(dtype_str, torch.bfloat16)
 

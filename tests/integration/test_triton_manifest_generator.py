@@ -59,14 +59,13 @@ def test_render_orchestrator_custom_variant():
         "max_decode_steps": "4096",
         "audio_chunk_frames": "25",
         "first_chunk_frames": "4",
-        "engine_dir": "/models/tts_orchestrator/1/runtime",
-        "weights_dir": "/models/tts_orchestrator/1/weights",
-        "tokenizer_dir": "/models/tts_orchestrator/1/tokenizer",
+        "model_package_dir": "/models/tts_orchestrator/1",
     }
     text = render_orchestrator("custom-1.7b", orch)
     assert 'string_value: "custom-1.7b"' in text
     assert 'string_value: "custom_voice"' in text
-    assert 'string_value: "/models/tts_orchestrator/1/runtime"' in text
+    assert 'key: "model_package_dir"' in text
+    assert 'string_value: "/models/tts_orchestrator/1"' in text
 
 
 def test_render_orchestrator_http_custom_variant():
@@ -105,7 +104,7 @@ def test_load_manifest_merges_orchestrator_defaults(tmp_path):
     )
     m = load_manifest(mpath, output_repo=None)
     assert m["orchestrator"]["tts_model_type"] == "custom_voice"
-    assert m["orchestrator"]["engine_dir"] == "/models/tts_orchestrator/1/runtime"
+    assert m["orchestrator"]["model_package_dir"] == "/models/tts_orchestrator/1"
 
 
 def test_build_manifest_for_export_roundtrip():
@@ -123,6 +122,8 @@ def test_build_manifest_for_export_roundtrip():
     m = build_manifest_for_export("custom-1.7b", wc, lay)
     assert m["schema_version"] == 2
     assert m.get("triton_io_float_dtype") == "bf16"
+    assert m["package"]["layout"] == "triton_model_version"
+    assert m["package"]["runtime_artifacts"]["trt"] == "runtime/model.plan"
     assert m["code2wav_fused"]["packed_kv"] is True
     assert m["code2wav_fused"]["c2w_kv_heads"] == 16
     assert m["code2wav_fused"]["c2w_head_dim"] == 64
@@ -147,7 +148,8 @@ def test_generate_configs_minimal_repo(tmp_path):
     orch_http_cfg = (tmp_path / "tts_orchestrator_http" / "config.pbtxt").read_text()
     assert "tts_orchestrator" in orch_cfg
     assert "custom-1.7b" in orch_cfg
-    assert '/models/tts_orchestrator/1/runtime' in orch_cfg
+    assert 'key: "model_package_dir"' in orch_cfg
+    assert '/models/tts_orchestrator/1' in orch_cfg
     assert 'name: "tts_orchestrator_http"' in orch_http_cfg
     assert 'string_value: "tts_orchestrator"' in orch_http_cfg
     assert not (tmp_path / "talker_code2wav_fused" / "config.pbtxt").exists()

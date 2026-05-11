@@ -1,6 +1,5 @@
- # Standalone TTS engine: TRT base + Python deps + bundled application code.
-# Large artifacts (tokenizer, exported weights, TRT engines) are NOT baked in;
-# mount host workspace/ at runtime (see scripts/bash/lib/engine.sh engine_start_docker).
+# Standalone TTS engine: TRT base + Python deps + bundled application code.
+# Large artifacts are NOT baked in; mount the shared model_repository at runtime.
 #
 # Layer order: pip deps (cached by Docker if unchanged) then COPY app.
 # Rebuilds after only editing engine/ reuse the deps layer — no re-download.

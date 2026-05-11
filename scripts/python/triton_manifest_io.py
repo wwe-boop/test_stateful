@@ -52,9 +52,28 @@ def variant_orchestrator_defaults(variant: str) -> Dict[str, str]:
         "max_decode_steps": "4096",
         "audio_chunk_frames": "25",
         "first_chunk_frames": "4",
-        "engine_dir": "/models/tts_orchestrator/1/runtime",
-        "weights_dir": "/models/tts_orchestrator/1/weights",
-        "tokenizer_dir": "/models/tts_orchestrator/1/tokenizer",
+        "model_package_dir": "/models/tts_orchestrator/1",
+    }
+
+
+def package_defaults() -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "layout": "triton_model_version",
+        "model_package_dir": "/models/tts_orchestrator/1",
+        "runtime_dir": "runtime",
+        "weights_dir": "weights",
+        "tokenizer_dir": "tokenizer",
+        "manifest": "runtime/triton_manifest.json",
+        "runtime_artifacts": {
+            "trt": "runtime/model.plan",
+            "onnx": "runtime/model.onnx",
+        },
+        "optional_assets": {
+            "speaker_encoder": "runtime/speaker_encoder.onnx",
+            "speech_tokenizer_encoder": "runtime/speech_tokenizer_encoder.onnx",
+            "speech_tokenizer_codec_fused": "runtime/speech_tokenizer_codec_fused.onnx",
+        },
     }
 
 
@@ -84,6 +103,20 @@ def load_manifest(
         merged = dict(defaults)
         merged.update(orch)
         manifest["orchestrator"] = merged
+
+    package = manifest.get("package")
+    if not isinstance(package, dict):
+        manifest["package"] = package_defaults()
+    else:
+        merged_package = package_defaults()
+        for key, value in package.items():
+            if isinstance(value, dict) and isinstance(merged_package.get(key), dict):
+                nested = dict(merged_package[key])
+                nested.update(value)
+                merged_package[key] = nested
+            else:
+                merged_package[key] = value
+        manifest["package"] = merged_package
 
     return manifest
 
@@ -137,6 +170,24 @@ def build_manifest_for_export(
         "engine_mode": engine_mode,
         "engine_dtype": engine_dtype,
         "triton_io_float_dtype": triton_io_float_dtype,
+        "package": {
+            "schema_version": 1,
+            "layout": "triton_model_version",
+            "model_package_dir": "/models/tts_orchestrator/1",
+            "runtime_dir": "runtime",
+            "weights_dir": "weights",
+            "tokenizer_dir": "tokenizer",
+            "manifest": "runtime/triton_manifest.json",
+            "runtime_artifacts": {
+                "trt": "runtime/model.plan",
+                "onnx": "runtime/model.onnx",
+            },
+            "optional_assets": {
+                "speaker_encoder": "runtime/speaker_encoder.onnx",
+                "speech_tokenizer_encoder": "runtime/speech_tokenizer_encoder.onnx",
+                "speech_tokenizer_codec_fused": "runtime/speech_tokenizer_codec_fused.onnx",
+            },
+        },
         "engine_profile": {
             "profile_schema_version": 1,
             "engine_mode": engine_mode,

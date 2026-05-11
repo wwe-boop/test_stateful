@@ -2,54 +2,66 @@
 
 set -euo pipefail
 
-variant="${MODEL_VARIANT:-}"
-if [[ -z "$variant" ]]; then
-    echo "MODEL_VARIANT is required" >&2
-    exit 1
-fi
-
-case "$variant" in
-    design-1.7b) tokenizer_subdir="Qwen3-TTS-12Hz-1.7B-VoiceDesign" ;;
-    custom-1.7b) tokenizer_subdir="Qwen3-TTS-12Hz-1.7B-CustomVoice" ;;
-    base-1.7b) tokenizer_subdir="Qwen3-TTS-12Hz-1.7B-Base" ;;
-    custom-0.6b) tokenizer_subdir="Qwen3-TTS-12Hz-0.6B-CustomVoice" ;;
-    base-0.6b) tokenizer_subdir="Qwen3-TTS-12Hz-0.6B-Base" ;;
-    *)
-        echo "Unsupported MODEL_VARIANT: $variant" >&2
-        exit 1
-        ;;
-esac
-
-model_root="${MODEL_ROOT:-/models}"
-exported_root="${EXPORTED_ROOT:-/exported}"
 config_path="${ENGINE_CONFIG:-/app/engine.yaml}"
 
-tokenizer_dir="${TOKENIZER_DIR:-}"
-weights_dir="${WEIGHTS_DIR:-}"
-engine_dir="${ENGINE_RUNTIME_DIR:-}"
+model_repo="${ENGINE_MODEL_REPOSITORY:-/models}"
+model_name="${ENGINE_MODEL_NAME:-tts_orchestrator}"
+model_version="${ENGINE_MODEL_VERSION:-1}"
+model_package_dir="${ENGINE_MODEL_PACKAGE_DIR:-${model_repo}/${model_name}/${model_version}}"
 
-if [[ -z "$tokenizer_dir" ]]; then
-    tokenizer_dir="${model_root}/${tokenizer_subdir}"
-fi
-if [[ -z "$weights_dir" ]]; then
-    weights_dir="${exported_root}/${variant}/weights"
-fi
+resolved_paths="$(
+    python3 - "$model_package_dir" <<'PY'
+import sys
+from engine.config import resolve_model_package_paths
 
-if [[ -z "$engine_dir" ]]; then
-    if [[ -f "${exported_root}/${variant}/engines/talker_code2wav_fused/model.plan" ]] || \
-       [[ -f "${exported_root}/${variant}/engines/talker_code2wav_fused/talker_code2wav_fused.engine" ]]; then
-        engine_dir="${exported_root}/${variant}/engines/talker_code2wav_fused"
-    elif [[ -f "${exported_root}/${variant}/talker_code2wav_fused.engine" ]]; then
-        engine_dir="${exported_root}/${variant}"
-    fi
-fi
+p = resolve_model_package_paths(sys.argv[1])
+print("\t".join([
+    p.package_dir,
+    p.engine_dir,
+    p.weights_dir,
+    p.tokenizer_dir,
+    p.manifest_path,
+    p.runtime_artifact_path,
+    p.engine_mode,
+]))
+PY
+)"
+IFS=$'\t' read -r model_package_dir engine_dir weights_dir tokenizer_dir manifest_path runtime_artifact engine_mode <<< "$resolved_paths"
 
+if [[ ! -d "$model_package_dir" ]]; then
+    echo "Model package directory not found: $model_package_dir" >&2
+    echo "Expected Triton-compatible model package: /models/tts_orchestrator/1/{runtime,weights,tokenizer}" >&2
+    exit 1
+fi
 if [[ ! -d "$tokenizer_dir" ]]; then
     echo "Tokenizer directory not found: $tokenizer_dir" >&2
     exit 1
 fi
 if [[ ! -d "$weights_dir" ]]; then
     echo "Weights directory not found: $weights_dir" >&2
+    exit 1
+fi
+if [[ ! -d "$engine_dir" ]]; then
+    echo "Runtime directory not found: $engine_dir" >&2
+    exit 1
+fi
+if [[ ! -f "$manifest_path" ]]; then
+    echo "Model package manifest not found: $manifest_path" >&2
+    exit 1
+fi
+if [[ "$engine_mode" != "trt" ]]; then
+    echo "Engine Docker requires a TensorRT model package, got engine_mode=${engine_mode:-unknown}: $manifest_path" >&2
+    echo "Re-assemble with: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt" >&2
+    exit 1
+fi
+if [[ ! -f "$runtime_artifact" ]]; then
+    if [[ -f "${engine_dir}/model.onnx" ]]; then
+        echo "Engine Docker requires a TensorRT model package, but found ONNX runtime only: ${engine_dir}/model.onnx" >&2
+        echo "Re-assemble with: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt" >&2
+    else
+        echo "TensorRT runtime artifact not found: ${runtime_artifact}" >&2
+        echo "Run Phase B and assemble the shared model_repository in trt mode." >&2
+    fi
     exit 1
 fi
 if [[ ! -f "$config_path" ]]; then
@@ -67,27 +79,22 @@ fi
 cmd=(
     python3 -m engine.server
     --config "$config_path"
-    --tokenizer-dir "$tokenizer_dir"
-    --weights-dir "$weights_dir"
+    --model-package-dir "$model_package_dir"
     --device "${ENGINE_DEVICE:-0}"
     --max-batch "${ENGINE_MAX_BATCH_SIZE:-48}"
     --max-sessions "${ENGINE_MAX_SESSIONS:-128}"
     --port "${ENGINE_GRPC_PORT:-50051}"
 )
-if [[ -n "$engine_dir" ]]; then
-    cmd+=(--engine-dir "$engine_dir")
-fi
 
-echo "Starting engine for variant=${variant}" >&2
+echo "Starting engine from shared model package" >&2
 echo "  config=${config_path}" >&2
+echo "  model_repo=${model_repo}" >&2
+echo "  model_package=${model_package_dir}" >&2
 echo "  tokenizer=${tokenizer_dir}" >&2
 echo "  weights=${weights_dir}" >&2
-echo "  model_root=${model_root}" >&2
-echo "  exported_root=${exported_root}" >&2
-if [[ -n "$engine_dir" ]]; then
-    echo "  engine_dir=${engine_dir}" >&2
-else
-    echo "  engine_dir=stub-mode" >&2
-fi
+echo "  engine_dir=${engine_dir}" >&2
+echo "  manifest=${manifest_path}" >&2
+echo "  runtime_artifact=${runtime_artifact}" >&2
+echo "  engine_mode=${engine_mode}" >&2
 
 exec "${cmd[@]}"

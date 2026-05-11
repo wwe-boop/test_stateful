@@ -50,7 +50,12 @@ if (_BAKED_REPO / "engine").is_dir():
     if _br not in sys.path:
         sys.path.append(_br)
 
-from engine.config import EngineConfig, load_model_manifest
+from engine.config import (
+    EngineConfig,
+    apply_model_package_paths,
+    load_model_manifest,
+    resolve_model_package_paths,
+)
 from engine.core.types import AudioConfig, AudioEncoding, GroupPolicy, InputMode, SessionConfig
 from engine.server import TTSEngine
 
@@ -223,24 +228,16 @@ class TritonPythonModel:
         self.variant = _param_string(params, "model_variant", "unknown")
         self.device_id = int(_param_string(params, "device_id", os.environ.get("CUDA_DEVICE", "0")))
 
-        self._engine_dir = Path(
-            _param_string(
-                params,
-                "engine_dir",
-                str(_MODEL_VERSION_DIR / "runtime"),
-            )
+        self._model_package_dir = Path(
+            _param_string(params, "model_package_dir", str(_MODEL_VERSION_DIR))
         )
-        self._weights_dir = Path(
-            _param_string(params, "weights_dir", str(_MODEL_VERSION_DIR / "weights"))
-        )
-        self._tokenizer_dir = Path(
-            _param_string(params, "tokenizer_dir", str(_MODEL_VERSION_DIR / "tokenizer"))
-        )
+        package_paths = resolve_model_package_paths(str(self._model_package_dir))
+        self._engine_dir = Path(package_paths.engine_dir)
+        self._weights_dir = Path(package_paths.weights_dir)
+        self._tokenizer_dir = Path(package_paths.tokenizer_dir)
 
         cfg = EngineConfig()
-        cfg.paths.engine_dir = str(self._engine_dir)
-        cfg.paths.weights_dir = str(self._weights_dir)
-        cfg.paths.tokenizer_dir = str(self._tokenizer_dir)
+        apply_model_package_paths(cfg, package_paths)
         cfg.scheduler.max_batch_size = int(
             os.environ.get("MAX_BATCH_SLOTS")
             or _param_string(params, "max_batch_slots", "48")
@@ -366,9 +363,10 @@ class TritonPythonModel:
             raise
 
         logger.info(
-            "Initialized TTSEngine-backed orchestrator: variant=%s engine_dir=%s tokenizer_dir=%s "
+            "Initialized TTSEngine-backed orchestrator: variant=%s model_package=%s engine_dir=%s tokenizer_dir=%s "
             "weights_dir=%s loaded_model_type=%s max_batch=%d max_sessions=%d max_seq_len=%d",
             self.variant,
+            self._model_package_dir,
             self._engine_dir,
             self._tokenizer_dir,
             self._weights_dir,

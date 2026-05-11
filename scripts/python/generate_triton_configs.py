@@ -555,9 +555,7 @@ def render_orchestrator(
     max_decode = orch.get("max_decode_steps", "4096")
     achunk = orch.get("audio_chunk_frames", "25")
     fchunk = orch.get("first_chunk_frames", "4")
-    edir = orch.get("engine_dir", "/models/tts_orchestrator/1/runtime")
-    wdir = orch.get("weights_dir", "/models/tts_orchestrator/1/weights")
-    tdir = orch.get("tokenizer_dir", "/models/tts_orchestrator/1/tokenizer")
+    pdir = orch.get("model_package_dir", "/models/tts_orchestrator/1")
     profile = profile or {}
     max_batch_slots = _profile_int(profile, "max_batch_size", 128)
     engine_max_decode_len = _profile_int(profile, "max_seq_len", 512)
@@ -621,16 +619,8 @@ parameters: {{
   value: {{ string_value: "{tasks}" }}
 }}
 parameters: {{
-  key: "engine_dir"
-  value: {{ string_value: "{edir}" }}
-}}
-parameters: {{
-  key: "weights_dir"
-  value: {{ string_value: "{wdir}" }}
-}}
-parameters: {{
-  key: "tokenizer_dir"
-  value: {{ string_value: "{tdir}" }}
+  key: "model_package_dir"
+  value: {{ string_value: "{pdir}" }}
 }}
 parameters: {{
   key: "max_batch_slots"

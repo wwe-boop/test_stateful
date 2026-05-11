@@ -25,7 +25,7 @@ Architecture:
 
 Usage:
     python -m engine.server --config engine.yaml
-    python -m engine.server --tokenizer-dir /path/to/tokenizer [--weights-dir ...]
+    python -m engine.server --model-package-dir /models/tts_orchestrator/1
 """
 
 from __future__ import annotations
@@ -40,7 +40,13 @@ from typing import AsyncIterator, Optional
 import torch
 
 from .config import (
-    EngineConfig, ModelArchConfig, load_config, load_model_manifest, to_model_config,
+    EngineConfig,
+    ModelArchConfig,
+    apply_model_package_paths,
+    load_config,
+    load_model_manifest,
+    resolve_model_package_paths,
+    to_model_config,
 )
 from .core.mlfq import MLFQConfig
 from .core.types import SessionConfig
@@ -148,6 +154,19 @@ class TTSEngine:
 
         model_config = to_model_config(self._model_arch, self._cfg)
         sampling = self._cfg.sampling
+        package_paths = (
+            resolve_model_package_paths(self._cfg.paths.model_package_dir)
+            if self._cfg.paths.model_package_dir
+            else None
+        )
+        runtime_artifact = package_paths.runtime_artifact_path if package_paths else ""
+        if runtime_artifact:
+            logger.info(
+                "Resolved model package: package=%s mode=%s runtime_artifact=%s",
+                package_paths.package_dir,
+                package_paths.engine_mode,
+                runtime_artifact,
+            )
         self._executor = Executor(
             engine_dir=self._engine_dir,
             weights_dir=self._weights_dir,
@@ -537,12 +556,8 @@ def main():
     parser = argparse.ArgumentParser(description="TTS Engine Server")
     parser.add_argument("--config", default="engine.yaml",
                         help="Path to engine.yaml config file (default: engine.yaml)")
-    parser.add_argument("--tokenizer-dir", default="",
-                        help="Path to tokenizer directory (tokenizer.json / vocab.json)")
-    parser.add_argument("--weights-dir", default="",
-                        help="Path to embedding weights (.pt files)")
-    parser.add_argument("--engine-dir", default="",
-                        help="Path to TRT engine directory (model.plan)")
+    parser.add_argument("--model-package-dir", default="",
+                        help="Path to shared model package (tts_orchestrator/1)")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-batch", type=int, default=0,
                         help="Override scheduler.max_batch_size")
@@ -559,12 +574,8 @@ def main():
     args = parser.parse_args()
 
     cli_overrides: dict = {}
-    if args.tokenizer_dir:
-        cli_overrides.setdefault("paths", {})["tokenizer_dir"] = args.tokenizer_dir
-    if args.weights_dir:
-        cli_overrides.setdefault("paths", {})["weights_dir"] = args.weights_dir
-    if args.engine_dir:
-        cli_overrides.setdefault("paths", {})["engine_dir"] = args.engine_dir
+    if args.model_package_dir:
+        cli_overrides.setdefault("paths", {})["model_package_dir"] = args.model_package_dir
     if args.max_batch > 0:
         cli_overrides.setdefault("scheduler", {})["max_batch_size"] = args.max_batch
     if args.max_seq_len > 0:
@@ -579,9 +590,14 @@ def main():
         cli_overrides.setdefault("server", {})["websocket_path"] = args.ws_path
 
     cfg = load_config(args.config, cli_overrides=cli_overrides)
+    if cfg.paths.model_package_dir:
+        apply_model_package_paths(
+            cfg,
+            resolve_model_package_paths(cfg.paths.model_package_dir),
+        )
 
-    engine_dir = args.engine_dir or cfg.paths.engine_dir
-    tokenizer_dir = args.tokenizer_dir or cfg.paths.tokenizer_dir
+    engine_dir = cfg.paths.engine_dir
+    tokenizer_dir = cfg.paths.tokenizer_dir
     model_arch = load_model_manifest(engine_dir, cfg, tokenizer_dir=tokenizer_dir)
 
     async def run():

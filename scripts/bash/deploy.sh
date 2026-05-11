@@ -14,7 +14,7 @@
 #
 #  C) Engine Docker (--gateway engine-docker)
 #     Builds (if missing) Dockerfile.engine and runs engine.server via docker compose;
-#     mounts workspace/ read-only. No host PyTorch required.
+#     mounts the shared model_repository read-only. No host PyTorch required.
 #     Best for: portable deploy, matching TRT base with Phase B.
 #
 #  Usage:
@@ -33,6 +33,7 @@
 #
 #  Environment variables:
 #    GATEWAY_MODE            Override gateway: standalone | triton | engine-docker
+#    MODEL_REPO_DIR          Shared model_repository path (default: workspace/model_repository)
 #    ENGINE_GRPC_PORT        Standalone gRPC port (default: 50051)
 #    ENGINE_WEBSOCKET_PORT   Standalone WebSocket port (default: 50052)
 #    RUNTIME_GPU_DEVICE      Runtime GPU device (auto | N | cuda:N; default: auto)
@@ -51,6 +52,7 @@ source "${SCRIPT_DIR}/tools.sh"
 
 # ── Defaults ──
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
+MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
 GATEWAY_MODE="${GATEWAY_MODE:-standalone}"
 VARIANT=""
 DRY_RUN=false
@@ -274,6 +276,8 @@ cmd_run_standalone() {
     if $DRY_RUN; then
         log_info "[DRY RUN] Would start standalone engine:"
         log_info "  Variant:    $VARIANT"
+        log_info "  Model repo: $MODEL_REPO_DIR"
+        log_info "  Package:    $MODEL_REPO_DIR/tts_orchestrator/1"
         log_info "  Port:       $ENGINE_PORT"
         log_info "  WS Port:    $ENGINE_WS_PORT"
         log_info "  Device:     $GPU_DEVICE"
@@ -283,6 +287,13 @@ cmd_run_standalone() {
         log_info "  Foreground: $FOREGROUND"
         return 0
     fi
+
+    MODEL_REPO_DIR="$MODEL_REPO_DIR" bash "${SCRIPT_DIR}/compose.sh" \
+        prepare \
+        --gateway engine \
+        --variant "$VARIANT" \
+        --engine-mode trt \
+        --repo-dir "$MODEL_REPO_DIR"
 
     local start_args=(
         --port "$ENGINE_PORT"
@@ -308,6 +319,7 @@ cmd_run_standalone() {
             log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
             log_info "  WebSocket:      ws://localhost:${ENGINE_WS_PORT}/v1/ws"
             log_info "  Variant:        $VARIANT"
+            log_info "  Model package:  $MODEL_REPO_DIR/tts_orchestrator/1"
             log_info "  Log file:       $(engine_log_file "$REPO_ROOT")"
             echo ""
             log_info "Stop: bash scripts/bash/deploy.sh stop"

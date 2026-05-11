@@ -107,14 +107,21 @@ bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
 
 这个模式使用 engine 镜像作为固定应用层：镜像内包含 TensorRT/Python
 运行时、`/app/engine` 引擎代码、默认 `/app/engine.yaml` 和启动脚本；
-运行时只读挂载模型产物。普通镜像里已经包含 `/app/engine` 代码，因此
-代码更新后需要重新构建并发布镜像。
+运行时只读挂载和 Triton 相同的模型包
+`workspace/model_repository/tts_orchestrator/1`。普通镜像里已经包含
+`/app/engine` 代码，因此代码更新后需要重新构建并发布镜像。
+
+本机 standalone gateway 也使用同一个模型包，只是由本机 Python 承载
+`engine.server`。也就是说，standalone、engine-docker 和 Triton 的模型产物
+都是 `model_repository/tts_orchestrator/1`，差异只在运行时进程和容器层。
 
 生产环境推荐把“应用镜像、模型产物、部署配置”拆成三层：
 
 - 应用镜像：`qwen3-engine:<tag>`，包含依赖和引擎代码，不挂载源码目录。
-- 模型产物：tokenizer、weights、TensorRT engine 和 manifest，通过
-  `/models`、`/exported` 只读挂载。
+- 模型产物：统一的 Triton-compatible `model_repository`。engine 和 Triton
+  都从 `/models/tts_orchestrator/1` 读取 `runtime/`、`weights/`、
+  `tokenizer/` 和 manifest。engine-docker 当前要求 `runtime/model.plan`
+  这种 `trt` 包。
 - 部署配置：端口、batch、seq_len、session、speaker 默认值等，通过
   `ENGINE_CONFIG` 指向只读挂载的 YAML，或通过 `ENGINE_*` 环境变量覆盖。
 
@@ -123,8 +130,7 @@ bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
 ```bash
 ENGINE_CONFIG=/etc/qwen3-tts/engine.yaml \
 ENGINE_CONFIG_FILE=/srv/qwen3/config/engine.yaml \
-ENGINE_MODELS_DIR=/srv/qwen3/models \
-ENGINE_EXPORTED_DIR=/srv/qwen3/exported \
+MODEL_REPO_DIR=/srv/qwen3/model_repository \
 bash scripts/bash/compose.sh up --gateway engine --variant custom-1.7b
 ```
 
@@ -132,8 +138,7 @@ bash scripts/bash/compose.sh up --gateway engine --variant custom-1.7b
 
 ```yaml
 volumes:
-  - /srv/qwen3/models:/models:ro
-  - /srv/qwen3/exported:/exported:ro
+  - /srv/qwen3/model_repository:/models:ro
   - /srv/qwen3/config/engine.yaml:/etc/qwen3-tts/engine.yaml:ro
 environment:
   ENGINE_CONFIG: /etc/qwen3-tts/engine.yaml

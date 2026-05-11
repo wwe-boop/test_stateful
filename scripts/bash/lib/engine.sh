@@ -2,7 +2,7 @@
 # ===========================================================================
 #  engine.sh — Standalone TTS Engine lifecycle helpers
 #
-#  Functions: resolve_variant_model_dir, engine_start, engine_stop,
+#  Functions: resolve_engine_package_paths, engine_start, engine_stop,
 #             engine_status, engine_health_check
 #  Depends:   lib/logging.sh, lib/utils.sh
 #
@@ -66,68 +66,81 @@ resolve_engine_python_bin() {
 }
 
 # ---------------------------------------------------------------------------
-#  resolve_variant_model_dir <variant>
-#  Maps a variant name to the HuggingFace model directory name.
-#  Echoes the directory name (not full path) on success, returns 1 on failure.
+#  resolve_engine_package_paths <repo_root>
+#  Resolves the shared Triton-compatible package consumed by host standalone,
+#  engine Docker, and Triton. Sets _ENGINE_MODEL_PACKAGE_DIR,
+#  _ENGINE_TOKENIZER_DIR, _ENGINE_WEIGHTS_DIR, _ENGINE_DIR, and
+#  _ENGINE_RUNTIME_ARTIFACT.
 # ---------------------------------------------------------------------------
-resolve_variant_model_dir() {
-    local variant="$1"
-    case "$variant" in
-        design-1.7b) echo "Qwen3-TTS-12Hz-1.7B-VoiceDesign" ;;
-        custom-1.7b) echo "Qwen3-TTS-12Hz-1.7B-CustomVoice" ;;
-        base-1.7b)   echo "Qwen3-TTS-12Hz-1.7B-Base" ;;
-        custom-0.6b) echo "Qwen3-TTS-12Hz-0.6B-CustomVoice" ;;
-        base-0.6b)   echo "Qwen3-TTS-12Hz-0.6B-Base" ;;
-        *)
-            log_error "Unknown variant: $variant"
-            return 1
-            ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
-#  resolve_engine_paths <repo_root> <variant>
-#  Auto-discovers tokenizer, weights, and engine directories.
-#  Sets global variables: _ENGINE_TOKENIZER_DIR, _ENGINE_WEIGHTS_DIR,
-#  _ENGINE_DIR (TRT plan directory).
-#  Returns 1 if critical paths are missing.
-# ---------------------------------------------------------------------------
-resolve_engine_paths() {
+resolve_engine_package_paths() {
     local repo_root="$1"
-    local variant="$2"
-    local exported_dir="$repo_root/workspace/exported"
-    local models_dir="$repo_root/workspace/models"
+    local model_repo="${MODEL_REPO_DIR:-$repo_root/workspace/model_repository}"
+    local model_package="${ENGINE_MODEL_PACKAGE_DIR:-$model_repo/tts_orchestrator/1}"
 
-    # Tokenizer dir: workspace/models/<model_dir>
-    local model_dir_name
-    model_dir_name=$(resolve_variant_model_dir "$variant") || return 1
-    _ENGINE_TOKENIZER_DIR="$models_dir/$model_dir_name"
-    if [ ! -d "$_ENGINE_TOKENIZER_DIR" ]; then
-        log_error "Tokenizer directory not found: $_ENGINE_TOKENIZER_DIR"
-        log_error "Run Phase A first: autorun.sh setup"
+    local resolved_paths
+    resolved_paths=$(PYTHONPATH="$repo_root" python3 - "$model_package" <<'PY' 2>/dev/null || true
+import sys
+from engine.config import resolve_model_package_paths
+
+p = resolve_model_package_paths(sys.argv[1])
+print("\t".join([
+    p.package_dir,
+    p.engine_dir,
+    p.weights_dir,
+    p.tokenizer_dir,
+    p.manifest_path,
+    p.runtime_artifact_path,
+    p.engine_mode,
+]))
+PY
+)
+    if [ -z "$resolved_paths" ]; then
+        log_error "Failed to resolve shared model package: $model_package"
+        log_error "Run: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt"
         return 1
     fi
 
-    # Weights dir: workspace/exported/<variant>/weights
-    _ENGINE_WEIGHTS_DIR="$exported_dir/$variant/weights"
+    local manifest_path engine_mode
+    IFS=$'\t' read -r \
+        _ENGINE_MODEL_PACKAGE_DIR \
+        _ENGINE_DIR \
+        _ENGINE_WEIGHTS_DIR \
+        _ENGINE_TOKENIZER_DIR \
+        manifest_path \
+        _ENGINE_RUNTIME_ARTIFACT \
+        engine_mode <<< "$resolved_paths"
+
+    if [ ! -d "$_ENGINE_MODEL_PACKAGE_DIR" ]; then
+        log_error "Shared model package not found: $_ENGINE_MODEL_PACKAGE_DIR"
+        log_error "Expected: model_repository/tts_orchestrator/1/{runtime,weights,tokenizer}"
+        log_error "Run: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt"
+        return 1
+    fi
+    if [ ! -d "$_ENGINE_DIR" ]; then
+        log_error "Runtime directory not found: $_ENGINE_DIR"
+        return 1
+    fi
     if [ ! -d "$_ENGINE_WEIGHTS_DIR" ]; then
         log_error "Weights directory not found: $_ENGINE_WEIGHTS_DIR"
-        log_error "Run Phase A first: autorun.sh setup"
         return 1
     fi
-
-    # TRT fused engine:
-    #   - Phase B (build_engines.sh): workspace/exported/<variant>/talker_code2wav_fused.engine
-    #   - Triton assemble copy:       .../engines/talker_code2wav_fused/model.plan
-    local fused_subdir="$exported_dir/$variant/engines/talker_code2wav_fused"
-    local fused_flat="$exported_dir/$variant/talker_code2wav_fused.engine"
-    if [ -d "$fused_subdir" ] && { [ -f "$fused_subdir/model.plan" ] || [ -f "$fused_subdir/talker_code2wav_fused.engine" ]; }; then
-        _ENGINE_DIR="$fused_subdir"
-    elif [ -f "$fused_flat" ]; then
-        _ENGINE_DIR="$exported_dir/$variant"
-    else
-        _ENGINE_DIR=""
-        log_warn "TRT engine directory not found, engine will run in stub/ONNX mode"
+    if [ ! -d "$_ENGINE_TOKENIZER_DIR" ]; then
+        log_error "Tokenizer directory not found: $_ENGINE_TOKENIZER_DIR"
+        return 1
+    fi
+    if [ ! -f "$manifest_path" ]; then
+        log_error "Model package manifest not found: $manifest_path"
+        return 1
+    fi
+    if [ "$engine_mode" != "trt" ]; then
+        log_error "Standalone engine requires a TensorRT model package, got engine_mode=${engine_mode:-unknown}: $manifest_path"
+        log_error "Use --engine-mode trt for engine/standalone, or choose Triton for ONNX packages."
+        return 1
+    fi
+    if [ ! -f "$_ENGINE_RUNTIME_ARTIFACT" ]; then
+        log_error "TensorRT runtime artifact not found: $_ENGINE_RUNTIME_ARTIFACT"
+        log_error "Run Phase B and assemble the shared model_repository in trt mode."
+        return 1
     fi
 
     return 0
@@ -205,7 +218,7 @@ engine_start() {
         rm -f "$pid_file"
     fi
 
-    resolve_engine_paths "$repo_root" "$variant" || return 1
+    resolve_engine_package_paths "$repo_root" || return 1
 
     local pybin
     pybin=$(resolve_engine_python_bin "$repo_root") || {
@@ -222,9 +235,11 @@ engine_start() {
     log_step "Starting Standalone TTS Engine"
     log_info "  Python:       $pybin"
     log_info "  Variant:      $variant"
+    log_info "  Model package:$_ENGINE_MODEL_PACKAGE_DIR"
     log_info "  Tokenizer:    $_ENGINE_TOKENIZER_DIR"
     log_info "  Weights:      $_ENGINE_WEIGHTS_DIR"
-    log_info "  TRT Engines:  ${_ENGINE_DIR:-stub mode}"
+    log_info "  Runtime:      $_ENGINE_DIR"
+    log_info "  TRT Engine:   $_ENGINE_RUNTIME_ARTIFACT"
     log_info "  GPU Device:   $device"
     log_info "  Max Batch:    $max_batch"
     log_info "  Max Seq Len:  ${max_seq_len:-auto}"
@@ -234,8 +249,7 @@ engine_start() {
 
     local cmd=(
         "$pybin" -m engine.server
-        --tokenizer-dir "$_ENGINE_TOKENIZER_DIR"
-        --weights-dir "$_ENGINE_WEIGHTS_DIR"
+        --model-package-dir "$_ENGINE_MODEL_PACKAGE_DIR"
         --device "$device"
         --max-batch "$max_batch"
         --max-sessions "$max_sessions"
@@ -245,10 +259,6 @@ engine_start() {
     if [ -n "$max_seq_len" ]; then
         cmd+=(--max-seq-len "$max_seq_len")
         export ENGINE_SCHEDULER_MAX_SEQ_LEN="$max_seq_len"
-    fi
-
-    if [ -n "$_ENGINE_DIR" ]; then
-        cmd+=(--engine-dir "$_ENGINE_DIR")
     fi
 
     if $foreground; then
@@ -451,14 +461,15 @@ engine_start_docker() {
         docker rm "$container_name" >/dev/null 2>&1
     fi
 
-    resolve_engine_paths "$repo_root" "$variant" || return 1
+    resolve_engine_package_paths "$repo_root" || return 1
+    local model_repo_host="${MODEL_REPO_DIR:-$repo_root/workspace/model_repository}"
 
     log_step "Starting Engine (Docker: $image)"
     log_info "  Container:    $container_name"
     log_info "  Variant:      $variant"
-    log_info "  Tokenizer:    $_ENGINE_TOKENIZER_DIR"
-    log_info "  Weights:      $_ENGINE_WEIGHTS_DIR"
-    log_info "  TRT Engines:  ${_ENGINE_DIR:-stub mode}"
+    log_info "  Model repo:   $model_repo_host"
+    log_info "  Model package:/models/tts_orchestrator/1"
+    log_info "  TRT Engine:   $_ENGINE_RUNTIME_ARTIFACT"
     log_info "  GPU Device:   $device"
     log_info "  Max Batch:    $max_batch"
     log_info "  Max Sessions: $max_sessions"
@@ -466,24 +477,11 @@ engine_start_docker() {
     log_info "  gRPC Port:    $port"
     log_info "  WS Port:      $ws_port"
 
-    # Image bundles engine/ + engine.yaml under /app; mount only workspace/ for data.
-    local workspace_host="$repo_root/workspace"
-    local tk_mount="/data/models/$(basename "$_ENGINE_TOKENIZER_DIR")"
-    local wt_mount="/data/exported/$variant/weights"
-    local eng_mount=""
-    if [[ -n "${_ENGINE_DIR:-}" ]]; then
-        eng_mount="/data${_ENGINE_DIR#"$workspace_host"}"
-    fi
-
     local -a run_cmd=(
         python3 -m engine.server
         --config /app/engine.yaml
-        --tokenizer-dir "$tk_mount"
-        --weights-dir "$wt_mount"
+        --model-package-dir /models/tts_orchestrator/1
     )
-    if [[ -n "$eng_mount" ]]; then
-        run_cmd+=( --engine-dir "$eng_mount" )
-    fi
     run_cmd+=(
         --device "$device"
         --max-batch "$max_batch"
@@ -505,7 +503,7 @@ engine_start_docker() {
         --name "$container_name" \
         -w /app \
         -e "PYTHONPATH=/app" \
-        -v "$workspace_host:/data:ro" \
+        -v "$model_repo_host:/models:ro" \
         -p "${port}:${port}" \
         -p "${ws_port}:${ws_port}" \
         -p "${health_port}:${health_port}" \

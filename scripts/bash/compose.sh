@@ -3,8 +3,8 @@
 #  compose.sh — Unified Docker Compose workflow for engine / Triton deploy
 #
 #  Wraps compose.yaml with project-specific defaults:
-#    - engine: standalone engine.server in Docker
-#    - triton: Triton Inference Server with mounted model_repository
+#    - engine: standalone engine.server in Docker with mounted model_repository
+#    - triton: Triton Inference Server with the same mounted model_repository
 # ===========================================================================
 
 set -euo pipefail
@@ -16,8 +16,6 @@ source "${SCRIPT_DIR}/tools.sh"
 COMPOSE_FILE="${REPO_ROOT}/compose.yaml"
 COMPOSE_DEV_FILE="${REPO_ROOT}/compose.dev.yaml"
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
-ENGINE_MODELS_DIR="${ENGINE_MODELS_DIR:-${REPO_ROOT}/workspace/models}"
-ENGINE_EXPORTED_DIR="${ENGINE_EXPORTED_DIR:-${REPO_ROOT}/workspace/exported}"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
 
 COMMAND=""
@@ -57,7 +55,7 @@ Usage: compose.sh <command> [options]
 
 Commands:
   build                  Build compose image(s)
-  prepare                Assemble Triton model_repository
+  prepare                Assemble shared model_repository
   up                     Start compose service(s)
   watch                  Watch files and auto refresh/rebuild service(s)
   down                   Stop/remove compose service(s)
@@ -68,8 +66,8 @@ Commands:
 Options:
   --gateway <mode>       engine | triton | all (default: all)
   --variant <name>       Model variant (auto-discover when possible)
-  --engine-mode <mode>   trt | onnx for Triton repo assembly (default: trt)
-  --repo-dir <path>      Triton model repository path
+  --engine-mode <mode>   trt | onnx for model_repository assembly (default: trt)
+  --repo-dir <path>      Shared model_repository path
   --image <tag>          Override service image tag for selected gateway
   --container <name>     Override container name for selected gateway
   --port <N>             Engine gRPC port
@@ -176,9 +174,7 @@ export_compose_env() {
 
     export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-qwen3-tts}"
     export MODEL_VARIANT="$VARIANT"
-    export ENGINE_MODELS_DIR="$ENGINE_MODELS_DIR"
-    export ENGINE_EXPORTED_DIR="$ENGINE_EXPORTED_DIR"
-    export TRITON_MODEL_REPO_DIR="$MODEL_REPO_DIR"
+    export MODEL_REPO_DIR="$MODEL_REPO_DIR"
 
     export ENGINE_GRPC_PORT="$ENGINE_PORT"
     export ENGINE_WEBSOCKET_PORT="$ENGINE_WEBSOCKET"
@@ -201,6 +197,7 @@ log_compose_runtime_summary() {
     log_info "[DRY RUN] Resolved compose runtime:"
     log_info "  Gateway:          $GATEWAY"
     [ -n "$VARIANT" ] && log_info "  Variant:          $VARIANT"
+    log_info "  Model repo:       $MODEL_REPO_DIR"
     log_info "  Engine device:    $ENGINE_DEVICE"
     log_info "  Engine max batch: $ENGINE_MAX_BATCH"
     log_info "  Engine max seq:   $ENGINE_MAX_SEQ_LEN"
@@ -459,20 +456,65 @@ compose_wait_triton_ready() {
     return 1
 }
 
-prepare_triton_repo() {
+gateway_uses_engine_container() {
+    [[ "$GATEWAY" == "engine" || "$GATEWAY" == "all" ]]
+}
+
+prepare_model_repo() {
     resolve_variant_if_needed
+    if gateway_uses_engine_container && [[ "$ENGINE_MODE" != "trt" ]]; then
+        log_error "Engine Docker consumes the shared model_repository, but requires engine-mode=trt."
+        log_error "Use --engine-mode trt for --gateway engine/all, or choose --gateway triton for ONNX."
+        exit 1
+    fi
     assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE"
     validate_model_repo "$MODEL_REPO_DIR"
 }
 
-ensure_triton_repo() {
+ensure_model_repo() {
+    resolve_variant_if_needed
     if $FORCE_PREPARE; then
-        prepare_triton_repo
+        prepare_model_repo
         return 0
     fi
     if [[ ! -d "$MODEL_REPO_DIR" ]] || [[ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]]; then
-        log_info "Model repository missing, assembling it first"
-        prepare_triton_repo
+        log_info "Shared model_repository missing, assembling it first"
+        prepare_model_repo
+        return 0
+    fi
+
+    local repo_info
+    repo_info=$(PYTHONPATH="$REPO_ROOT" python3 - "$MODEL_REPO_DIR/tts_orchestrator/1" <<'PY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+from engine.config import resolve_model_package_paths
+
+p = resolve_model_package_paths(sys.argv[1])
+variant = ""
+if Path(p.manifest_path).is_file():
+    with open(p.manifest_path, encoding="utf-8") as f:
+        variant = str(json.load(f).get("variant") or "")
+print("\t".join([
+    p.manifest_path,
+    p.runtime_artifact_path,
+    p.weights_dir,
+    p.tokenizer_dir,
+    variant,
+    p.engine_mode,
+]))
+PY
+)
+    IFS=$'\t' read -r manifest artifact weights_dir tokenizer_dir repo_variant repo_mode <<< "$repo_info"
+    if [[ ! -f "$manifest" || ! -f "$artifact" || ! -d "$weights_dir" || ! -d "$tokenizer_dir" ]]; then
+        log_warn "Shared model_repository is incomplete for engine_mode=$ENGINE_MODE, re-assembling"
+        prepare_model_repo
+        return 0
+    fi
+
+    if [[ "$repo_variant" != "$VARIANT" || "$repo_mode" != "$ENGINE_MODE" ]]; then
+        log_warn "Shared model_repository is for variant=${repo_variant:-unknown}, engine_mode=${repo_mode:-unknown}; requested variant=$VARIANT, engine_mode=$ENGINE_MODE"
+        prepare_model_repo
     fi
 }
 
@@ -487,11 +529,7 @@ cmd_build() {
 }
 
 cmd_prepare() {
-    if [[ "$GATEWAY" != "triton" && "$GATEWAY" != "all" ]]; then
-        log_error "`prepare` is only valid for Triton"
-        exit 1
-    fi
-    prepare_triton_repo
+    prepare_model_repo
 }
 
 cmd_up() {
@@ -537,7 +575,7 @@ cmd_up() {
 
     case "$GATEWAY" in
         engine)
-            resolve_variant_if_needed
+            ensure_model_repo
             export_compose_env
             compose_preflight_service engine
             if $BUILD_BEFORE_UP; then
@@ -550,7 +588,7 @@ cmd_up() {
             fi
             ;;
         triton)
-            ensure_triton_repo
+            ensure_model_repo
             export_compose_env
             compose_preflight_service triton
             if $BUILD_BEFORE_UP; then
@@ -563,8 +601,7 @@ cmd_up() {
             fi
             ;;
         all)
-            ensure_triton_repo
-            resolve_variant_if_needed
+            ensure_model_repo
             export_compose_env
             compose_preflight_service engine
             compose_preflight_service triton
@@ -591,14 +628,13 @@ cmd_watch() {
 
     case "$GATEWAY" in
         engine)
-            resolve_variant_if_needed
+            ensure_model_repo
             ;;
         triton)
-            ensure_triton_repo
+            ensure_model_repo
             ;;
         all)
-            resolve_variant_if_needed
-            ensure_triton_repo
+            ensure_model_repo
             ;;
     esac
 

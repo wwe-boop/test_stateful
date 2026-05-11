@@ -13,13 +13,11 @@ services:
     working_dir: /app
     command: ["/bin/bash", "/app/scripts/compose/engine-entrypoint.sh"]
     environment:
-      MODEL_VARIANT: ${MODEL_VARIANT:-custom-1.7b}
-      MODEL_ROOT: /models
-      EXPORTED_ROOT: /exported
       ENGINE_CONFIG: ${ENGINE_CONFIG:-/etc/qwen3-tts/engine.yaml}
-      TOKENIZER_DIR: ${ENGINE_TOKENIZER_DIR:-}
-      WEIGHTS_DIR: ${ENGINE_WEIGHTS_DIR:-}
-      ENGINE_RUNTIME_DIR: ${ENGINE_RUNTIME_DIR:-}
+      ENGINE_MODEL_REPOSITORY: /models
+      ENGINE_MODEL_NAME: ${ENGINE_MODEL_NAME:-tts_orchestrator}
+      ENGINE_MODEL_VERSION: ${ENGINE_MODEL_VERSION:-1}
+      ENGINE_MODEL_PACKAGE_DIR: ${ENGINE_MODEL_PACKAGE_DIR:-/models/tts_orchestrator/1}
       ENGINE_DEVICE: ${ENGINE_DEVICE:-0}
       ENGINE_GRPC_PORT: ${ENGINE_GRPC_PORT:-50051}
       ENGINE_WEBSOCKET_PORT: ${ENGINE_WEBSOCKET_PORT:-50052}
@@ -33,8 +31,7 @@ services:
       - "${ENGINE_WEBSOCKET_PORT:-50052}:${ENGINE_WEBSOCKET_PORT:-50052}"
       - "${ENGINE_HEALTH_PORT:-8080}:${ENGINE_HEALTH_PORT:-8080}"
     volumes:
-      - ${ENGINE_MODELS_DIR:-./workspace/models}:/models:ro
-      - ${ENGINE_EXPORTED_DIR:-./workspace/exported}:/exported:ro
+      - ${MODEL_REPO_DIR:-./workspace/model_repository}:/models:ro
       - ${ENGINE_CONFIG_FILE:-./engine.yaml}:/etc/qwen3-tts/engine.yaml:ro
     gpus: all
     init: true
@@ -95,7 +92,7 @@ services:
       - "${TRITON_GRPC_PORT:-8001}:8001"
       - "${TRITON_METRICS_PORT:-8002}:8002"
     volumes:
-      - ${TRITON_MODEL_REPO_DIR:-./workspace/model_repository}:/models:ro
+      - ${MODEL_REPO_DIR:-./workspace/model_repository}:/models:ro
     gpus: all
     shm_size: "4g"
     restart: unless-stopped

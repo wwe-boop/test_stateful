@@ -48,7 +48,7 @@ class ReferenceAudioProcessor:
         engine_dir = self._engine_dir
         speaker_encoder = engine_dir / "speaker_encoder.onnx"
         speech_tokenizer_codec_fused = engine_dir / "speech_tokenizer_codec_fused.onnx"
-        speech_tokenizer_encoder = Path("workspace/exported/tokenizer/speech_tokenizer_encoder.onnx")
+        speech_tokenizer_encoder = engine_dir / "speech_tokenizer_encoder.onnx"
 
         if not speaker_encoder.is_file():
             return ReferenceAudioSupport(

@@ -6,7 +6,7 @@
 #    - ONNX mode: fused runtime ONNX is copied under tts_orchestrator/1/runtime/,
 #                 tokenizer assets and TTSEngine payload are present
 #    - TRT mode:  fused runtime TRT plan is copied under tts_orchestrator/1/runtime/
-#    - Both: orchestrator config carries engine_dir/first_chunk_frames and no
+#    - Both: orchestrator config carries model_package_dir/first_chunk_frames and no
 #            top-level talker_code2wav_fused Triton model is exposed
 #
 #  Run from repo root:
@@ -54,6 +54,7 @@ RUNTIME_ONNX="${ORCH_1}/runtime"
 [ -f "${ORCH_1}/engine/frontend/interface.py" ] || { log_error "Missing TTSEngine payload: engine/frontend/interface.py"; exit 1; }
 [ -f "${ORCH_1}/engine/backend/engine_loop.py" ] || { log_error "Missing TTSEngine payload: engine/backend/engine_loop.py"; exit 1; }
 [ -f "${ORCH_1}/weights/config.json" ] || { log_error "Missing orchestrator weights/config.json"; exit 1; }
+[ -f "${ORCH_1}/triton_manifest.json" ] || { log_error "Missing package-root manifest"; exit 1; }
 [ -f "${RUNTIME_ONNX}/triton_manifest.json" ] || { log_error "Missing runtime manifest"; exit 1; }
 [ -f "${RUNTIME_ONNX}/model.onnx" ] || { log_error "Missing runtime/model.onnx"; exit 1; }
 [ ! -e "${TEST_REPO_ONNX}/talker_code2wav_fused" ] || { log_error "Unexpected top-level talker_code2wav_fused model in ONNX repo"; exit 1; }
@@ -63,8 +64,8 @@ for legacy in __pycache__ greedy_tokenizer.py batch_decode_scheduler.py text_seg
   [ ! -e "${ORCH_1}/${legacy}" ] || { log_error "Unexpected legacy BLS payload remained: ${ORCH_1}/${legacy}"; exit 1; }
 done
 grep -q "first_chunk_frames" "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config missing first_chunk_frames"; exit 1; }
-grep -q 'key: "engine_dir"' "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config missing engine_dir"; exit 1; }
-grep -q '/models/tts_orchestrator/1/runtime' "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config has wrong engine_dir"; exit 1; }
+grep -q 'key: "model_package_dir"' "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config missing model_package_dir"; exit 1; }
+grep -q '/models/tts_orchestrator/1' "${TEST_REPO_ONNX}/tts_orchestrator/config.pbtxt" || { log_error "Orchestrator config has wrong model_package_dir"; exit 1; }
 grep -q 'name: "tts_orchestrator_http"' "${TEST_REPO_ONNX}/tts_orchestrator_http/config.pbtxt" || { log_error "HTTP orchestrator config missing model name"; exit 1; }
 grep -q 'key: "target_model"' "${TEST_REPO_ONNX}/tts_orchestrator_http/config.pbtxt" || { log_error "HTTP orchestrator config missing target_model"; exit 1; }
 if [ -d "${ORCH_1}/tokenizer" ]; then
@@ -81,11 +82,12 @@ if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${E
   assemble_model_repo "${EXPORTED_DIR}" "${VARIANT}" "${TEST_REPO_TRT}" "trt" || { log_error "assemble (trt) failed"; exit 1; }
   validate_model_repo "${TEST_REPO_TRT}" || { log_error "validate (trt) failed"; exit 1; }
   RUNTIME_TRT="${TEST_REPO_TRT}/tts_orchestrator/1/runtime"
+  [ -f "${TEST_REPO_TRT}/tts_orchestrator/1/triton_manifest.json" ] || { log_error "Missing TRT package-root manifest"; exit 1; }
   [ -f "${RUNTIME_TRT}/triton_manifest.json" ] || { log_error "Missing TRT runtime manifest"; exit 1; }
   [ -f "${RUNTIME_TRT}/model.plan" ] || { log_error "Missing TRT runtime/model.plan"; exit 1; }
   [ ! -e "${TEST_REPO_TRT}/talker_code2wav_fused" ] || { log_error "Unexpected top-level talker_code2wav_fused model in TRT repo"; exit 1; }
-  grep -q 'key: "engine_dir"' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config missing engine_dir"; exit 1; }
-  grep -q '/models/tts_orchestrator/1/runtime' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config has wrong engine_dir"; exit 1; }
+  grep -q 'key: "model_package_dir"' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config missing model_package_dir"; exit 1; }
+  grep -q '/models/tts_orchestrator/1' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config has wrong model_package_dir"; exit 1; }
   [ -f "${TEST_REPO_TRT}/tts_orchestrator_http/1/model.py" ] || { log_error "Missing TRT HTTP orchestrator model.py"; exit 1; }
   log_info "TRT assemble checks passed"
 else

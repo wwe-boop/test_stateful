@@ -1,12 +1,12 @@
 # =============================================================================
 # Qwen3-TTS Engine Configuration
 # =============================================================================
-# Model architecture is auto-loaded from triton_manifest.json in engine_dir.
-# This file contains engine deployment paths + runtime parameters.
+# Model architecture is auto-loaded from the manifest inside the model package.
+# This file contains deployment package path + runtime parameters.
 #
 # Priority:
 #   Engine params:  CLI args (debug) > ENGINE_* env > engine.yaml > defaults
-#   Model arch:     manifest (engine_dir) > auto-detect (tokenizer) > defaults
+#   Model arch:     package manifest > auto-detect (tokenizer) > defaults
 #
 # In production, just set the paths below and run:
 #   python -m engine.server --config engine.yaml
@@ -14,9 +14,7 @@
 
 # --- Deployment paths (fill once per deployment) ---
 paths:
-  tokenizer_dir: workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice
-  weights_dir:   workspace/exported/custom-1.7b/weights
-  engine_dir:    workspace/exported/custom-1.7b
+  model_package_dir: workspace/model_repository/tts_orchestrator/1
 
 server:
   port: 50051

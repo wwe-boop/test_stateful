@@ -572,7 +572,7 @@ interactive_mode() {
         echo "  阶段 C — 部署方式:"
         echo "    [1] standalone    — 本机 Python 运行 engine（需 Phase A conda / torch）"
         echo "    [2] triton        — Docker 内 Triton Server + 组装 model_repository"
-        echo "    [3] engine-docker — 独立引擎镜像 (Dockerfile.engine)，挂载 workspace，不依赖本机 PyTorch"
+        echo "    [3] engine-docker — 独立引擎镜像，挂载同一份 model_repository，不依赖本机 PyTorch"
         echo ""
         local gwch=""
         read -rp "  请选择 [1-3] (默认: 1 standalone, 30s 后选默认): " -t 30 gwch || true

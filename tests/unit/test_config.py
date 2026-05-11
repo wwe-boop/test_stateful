@@ -11,6 +11,7 @@ from engine.config import (
     ModelArchConfig,
     load_config,
     load_model_manifest,
+    resolve_model_package_paths,
     _coerce_value,
     _apply_env_overrides,
     _dict_to_config,
@@ -231,6 +232,43 @@ class TestModelManifest:
         assert arch.variant == "custom-1.7b"
         assert arch.engine_profile.max_batch_size == 32
         assert arch.engine_profile.max_seq_len == 384
+
+
+class TestModelPackagePaths:
+    def test_defaults_to_triton_model_version_layout(self):
+        paths = resolve_model_package_paths("/models/tts_orchestrator/1")
+        assert paths.package_dir == "/models/tts_orchestrator/1"
+        assert paths.engine_dir == "/models/tts_orchestrator/1/runtime"
+        assert paths.weights_dir == "/models/tts_orchestrator/1/weights"
+        assert paths.tokenizer_dir == "/models/tts_orchestrator/1/tokenizer"
+        assert paths.manifest_path == "/models/tts_orchestrator/1/runtime/triton_manifest.json"
+        assert paths.runtime_artifact_path == "/models/tts_orchestrator/1/runtime/model.plan"
+
+    def test_manifest_can_describe_extensible_package_layout(self, tmp_path):
+        package = tmp_path / "tts_orchestrator" / "1"
+        package.mkdir(parents=True)
+        (package / "triton_manifest.json").write_text(
+            json.dumps(
+                {
+                    "engine_mode": "trt",
+                    "package": {
+                        "runtime_dir": "rt",
+                        "weights_dir": "w",
+                        "tokenizer_dir": "tok",
+                        "runtime_artifacts": {"trt": "rt/fused.plan"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        paths = resolve_model_package_paths(str(package))
+
+        assert paths.engine_mode == "trt"
+        assert paths.engine_dir == str(package / "rt")
+        assert paths.weights_dir == str(package / "w")
+        assert paths.tokenizer_dir == str(package / "tok")
+        assert paths.runtime_artifact_path == str(package / "rt" / "fused.plan")
 
 
 class TestToModelConfig:
