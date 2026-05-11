@@ -55,6 +55,7 @@ EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
 GATEWAY_MODE="${GATEWAY_MODE:-standalone}"
 VARIANT=""
+MODEL_VERSION="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
 DRY_RUN=false
 
 # Standalone options
@@ -92,6 +93,7 @@ Options:
   --gateway <mode>       Gateway: standalone | triton | engine-docker (default: standalone)
   --engine-image <tag>   Image tag for engine-docker (default: qwen3-engine:26.02)
   --variant <name>       Model variant (default: auto-discover)
+  --model-version <N>    Triton model version directory (default: 1)
   --dry-run              Show what would be done
 
   Standalone options:
@@ -115,6 +117,7 @@ Examples:
   deploy.sh run --gateway triton                 # Triton mode
   deploy.sh run --gateway engine-docker          # Engine Dockerfile + container
   deploy.sh run --foreground                     # standalone, foreground
+  deploy.sh run --model-version 2                # use tts_orchestrator/2 package
   deploy.sh stop                                 # stop whatever is running
   deploy.sh status                               # show status for both modes
   deploy.sh assemble --engine-mode trt           # Triton: assemble model repo
@@ -164,6 +167,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --gateway)        GATEWAY_MODE="$2"; shift 2 ;;
         --variant)        VARIANT="$2"; shift 2 ;;
+        --model-version)  MODEL_VERSION="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=true; shift ;;
         --engine-image)   ENGINE_IMAGE="$2"; shift 2 ;;
         --help|-h)        usage; exit 0 ;;
@@ -193,6 +197,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
+export MODEL_VERSION
+export ENGINE_MODEL_VERSION="$MODEL_VERSION"
 
 # Validate gateway mode
 case "$GATEWAY_MODE" in
@@ -277,7 +285,7 @@ cmd_run_standalone() {
         log_info "[DRY RUN] Would start standalone engine:"
         log_info "  Variant:    $VARIANT"
         log_info "  Model repo: $MODEL_REPO_DIR"
-        log_info "  Package:    $MODEL_REPO_DIR/tts_orchestrator/1"
+        log_info "  Package:    $MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
         log_info "  Port:       $ENGINE_PORT"
         log_info "  WS Port:    $ENGINE_WS_PORT"
         log_info "  Device:     $GPU_DEVICE"
@@ -293,7 +301,10 @@ cmd_run_standalone() {
         --gateway engine \
         --variant "$VARIANT" \
         --engine-mode trt \
-        --repo-dir "$MODEL_REPO_DIR"
+        --repo-dir "$MODEL_REPO_DIR" \
+        --model-version "$MODEL_VERSION"
+
+    ENGINE_MODEL_PACKAGE_DIR="$MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
 
     local start_args=(
         --port "$ENGINE_PORT"
@@ -319,7 +330,7 @@ cmd_run_standalone() {
             log_info "  gRPC endpoint:  localhost:${ENGINE_PORT}"
             log_info "  WebSocket:      ws://localhost:${ENGINE_WS_PORT}/v1/ws"
             log_info "  Variant:        $VARIANT"
-            log_info "  Model package:  $MODEL_REPO_DIR/tts_orchestrator/1"
+            log_info "  Model package:  $MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
             log_info "  Log file:       $(engine_log_file "$REPO_ROOT")"
             echo ""
             log_info "Stop: bash scripts/bash/deploy.sh stop"
@@ -337,6 +348,7 @@ cmd_run_triton() {
         --device "$GPU_DEVICE"
         --max-batch "$MAX_BATCH"
         --max-seq-len "$MAX_SEQ_LEN"
+        --model-version "$MODEL_VERSION"
     )
     [ -n "$VARIANT" ] && compose_args+=(--variant "$VARIANT")
     $DRY_RUN && compose_args+=(--dry-run)
@@ -388,6 +400,7 @@ cmd_run_engine_docker() {
         --device "$GPU_DEVICE"
         --max-batch "$MAX_BATCH"
         --max-sessions "$MAX_SESSIONS"
+        --model-version "$MODEL_VERSION"
     )
     if [ -n "$MAX_SEQ_LEN" ]; then
         compose_args+=(--max-seq-len "$MAX_SEQ_LEN")
@@ -453,6 +466,7 @@ cmd_forward_triton() {
     local subcmd="$1"
     local forward_args=()
     [ -n "$VARIANT" ] && forward_args+=(--variant "$VARIANT")
+    forward_args+=(--model-version "$MODEL_VERSION")
     $DRY_RUN && forward_args+=(--dry-run)
     forward_args+=("${TRITON_ARGS[@]}")
 

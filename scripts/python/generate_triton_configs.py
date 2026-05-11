@@ -713,10 +713,26 @@ parameters: {{
 '''
 
 
-def model_has_engine(model_dir: Path) -> Tuple[bool, bool]:
+def _manifest_model_version(manifest: Dict[str, Any]) -> str:
+    package = manifest.get("package")
+    package_dir = ""
+    if isinstance(package, dict):
+        package_dir = str(package.get("model_package_dir") or "")
+    if not package_dir:
+        orch = manifest.get("orchestrator") or {}
+        if isinstance(orch, dict):
+            package_dir = str(orch.get("model_package_dir") or "")
+    if not package_dir:
+        package_dir = "/models/tts_orchestrator/1"
+
+    version = Path(package_dir).name.strip()
+    return version if version else "1"
+
+
+def model_has_engine(model_dir: Path, model_version: str) -> Tuple[bool, bool]:
     """Returns (has_plan, has_onnx)."""
-    v1 = model_dir / "1"
-    return (v1 / "model.plan").is_file(), (v1 / "model.onnx").is_file()
+    version_dir = model_dir / model_version
+    return (version_dir / "model.plan").is_file(), (version_dir / "model.onnx").is_file()
 
 
 def generate_configs(
@@ -733,6 +749,7 @@ def generate_configs(
     talker = manifest.get("talker") or {}
     orch = manifest.get("orchestrator") or {}
     profile = manifest.get("engine_profile") or {}
+    model_version = _manifest_model_version(manifest)
 
     models = [
         "speaker_encoder",
@@ -747,7 +764,7 @@ def generate_configs(
         mdir = output_repo / name
         if not mdir.is_dir():
             continue
-        has_plan, has_onnx = model_has_engine(mdir)
+        has_plan, has_onnx = model_has_engine(mdir, model_version)
         if not has_plan and not has_onnx:
             continue
 

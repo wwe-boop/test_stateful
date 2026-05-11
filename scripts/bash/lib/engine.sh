@@ -75,7 +75,12 @@ resolve_engine_python_bin() {
 resolve_engine_package_paths() {
     local repo_root="$1"
     local model_repo="${MODEL_REPO_DIR:-$repo_root/workspace/model_repository}"
-    local model_package="${ENGINE_MODEL_PACKAGE_DIR:-$model_repo/tts_orchestrator/1}"
+    local model_version
+    model_version=$(resolve_model_version) || return 1
+    local model_package="${ENGINE_MODEL_PACKAGE_DIR:-}"
+    if [ -z "$model_package" ] || { [[ "$model_package" == /models/* ]] && [ ! -d "$model_package" ]; }; then
+        model_package="$model_repo/tts_orchestrator/$model_version"
+    fi
 
     local resolved_paths
     resolved_paths=$(PYTHONPATH="$repo_root" python3 - "$model_package" <<'PY' 2>/dev/null || true
@@ -96,7 +101,7 @@ PY
 )
     if [ -z "$resolved_paths" ]; then
         log_error "Failed to resolve shared model package: $model_package"
-        log_error "Run: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt"
+        log_error "Run: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt --model-version $model_version"
         return 1
     fi
 
@@ -112,8 +117,8 @@ PY
 
     if [ ! -d "$_ENGINE_MODEL_PACKAGE_DIR" ]; then
         log_error "Shared model package not found: $_ENGINE_MODEL_PACKAGE_DIR"
-        log_error "Expected: model_repository/tts_orchestrator/1/{runtime,weights,tokenizer}"
-        log_error "Run: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt"
+        log_error "Expected: model_repository/tts_orchestrator/$model_version/{runtime,weights,tokenizer}"
+        log_error "Run: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt --model-version $model_version"
         return 1
     fi
     if [ ! -d "$_ENGINE_DIR" ]; then
@@ -463,12 +468,15 @@ engine_start_docker() {
 
     resolve_engine_package_paths "$repo_root" || return 1
     local model_repo_host="${MODEL_REPO_DIR:-$repo_root/workspace/model_repository}"
+    local model_version
+    model_version=$(resolve_model_version) || return 1
+    local model_package_container="/models/tts_orchestrator/$model_version"
 
     log_step "Starting Engine (Docker: $image)"
     log_info "  Container:    $container_name"
     log_info "  Variant:      $variant"
     log_info "  Model repo:   $model_repo_host"
-    log_info "  Model package:/models/tts_orchestrator/1"
+    log_info "  Model package:$model_package_container"
     log_info "  TRT Engine:   $_ENGINE_RUNTIME_ARTIFACT"
     log_info "  GPU Device:   $device"
     log_info "  Max Batch:    $max_batch"
@@ -480,7 +488,7 @@ engine_start_docker() {
     local -a run_cmd=(
         python3 -m engine.server
         --config /app/engine.yaml
-        --model-package-dir /models/tts_orchestrator/1
+        --model-package-dir "$model_package_container"
     )
     run_cmd+=(
         --device "$device"

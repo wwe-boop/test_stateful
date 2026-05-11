@@ -74,7 +74,19 @@ Phase C: deploy.sh / compose.sh
 
 底层的 `setup_env.sh`、`build_engines.sh`、`deploy.sh`、`compose.sh` 仍可单独使用，但 README 默认只展示 `autorun.sh`。所有关键控制项都可以从 `autorun.sh` 进入：导出 GPU、TensorRT 编译 GPU、engine profile、runtime 上限、部署方式和端口。
 
-配置优先级是：命令行参数 > 已导出的环境变量 > manifest/default。常用环境变量包括 `EXPORT_DEVICE`、`BUILD_GPU_DEVICE`、`RUNTIME_GPU_DEVICE`、`MAX_BATCH_SIZE`、`MAX_INPUT_LEN`、`MAX_SEQ_LEN`、`RUNTIME_MAX_BATCH_SIZE`、`RUNTIME_MAX_SEQ_LEN`；但推荐日常都从 `autorun.sh` 参数进入，便于复现。
+配置优先级是：命令行参数 > 已导出的环境变量 > manifest/default。常用环境变量包括 `MODEL_VERSION`、`EXPORT_DEVICE`、`BUILD_GPU_DEVICE`、`RUNTIME_GPU_DEVICE`、`MAX_BATCH_SIZE`、`MAX_INPUT_LEN`、`MAX_SEQ_LEN`、`RUNTIME_MAX_BATCH_SIZE`、`RUNTIME_MAX_SEQ_LEN`；但推荐日常都从 `autorun.sh` 参数进入，便于复现。
+
+### 模型版本号
+
+默认会组装 Triton model version 目录 `1`。如果需要生成其他版本目录，可以通过 `--model-version <N>` 指定；这会把共享模型包放到 `workspace/model_repository/tts_orchestrator/<N>`，并让 standalone、engine Docker 和 Triton 都从 `/models/tts_orchestrator/<N>` 读取。
+
+```bash
+bash scripts/bash/autorun.sh deploy -m custom-1.7b \
+  --gateway triton \
+  --model-version 2
+```
+
+这个版本号是 Triton model repository 的版本目录，不是 Hugging Face / ModelScope 权重 revision。HTTP 客户端如果显式带版本，需要请求 `/v2/models/tts_orchestrator/versions/<N>/infer`；不显式带版本时则由 Triton 按仓库状态选择可用版本。
 
 ### GPU 选择
 
@@ -185,7 +197,7 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b \
 ### Standalone
 
 本机 Python 运行 `engine.server`，适合调试 engine、协议和 WebSocket/gRPC。
-启动前会组装同一个 `workspace/model_repository/tts_orchestrator/1`
+启动前会组装同一个 `workspace/model_repository/tts_orchestrator/<model-version>`
 模型包，然后通过 `--model-package-dir` 读取 `runtime/`、`weights/`、
 `tokenizer/` 和 manifest；不会再直接把 `workspace/models` 与
 `workspace/exported/<variant>` 当作运行时输入。
@@ -204,7 +216,7 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway standalone
 ### Engine Docker
 
 独立 engine 容器也使用和 Triton 相同的模型包：
-`workspace/model_repository/tts_orchestrator/1`。这个包由 Phase C assemble
+`workspace/model_repository/tts_orchestrator/<model-version>`。这个包由 Phase C assemble
 生成，包含 `runtime/`、`weights/`、`tokenizer/` 和 manifest；engine 镜像只提供
 运行时和 `/app/engine` 代码，不再直接挂载原始 `workspace/models` 或
 `workspace/exported`。

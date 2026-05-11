@@ -10,12 +10,15 @@ Usage:
 
 import argparse
 import json
+import os
 import struct
 import sys
 import time
 import wave
 
 import numpy as np
+
+TRITON_MODEL_VERSION = os.environ.get("TRITON_MODEL_VERSION", "1")
 
 
 def _build_request(text: str, task_type: str, language: str) -> str:
@@ -56,7 +59,7 @@ def test_http_non_streaming(url: str, text: str, output_path: str, task_type: st
     t0 = time.time()
 
     resp = requests.post(
-        f"{url}/v2/models/tts_orchestrator/versions/1/infer",
+        f"{url}/v2/models/tts_orchestrator/versions/{TRITON_MODEL_VERSION}/infer",
         json=payload,
         timeout=120,
     )

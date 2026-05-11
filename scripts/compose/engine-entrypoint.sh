@@ -6,7 +6,7 @@ config_path="${ENGINE_CONFIG:-/app/engine.yaml}"
 
 model_repo="${ENGINE_MODEL_REPOSITORY:-/models}"
 model_name="${ENGINE_MODEL_NAME:-tts_orchestrator}"
-model_version="${ENGINE_MODEL_VERSION:-1}"
+model_version="${ENGINE_MODEL_VERSION:-${MODEL_VERSION:-1}}"
 model_package_dir="${ENGINE_MODEL_PACKAGE_DIR:-${model_repo}/${model_name}/${model_version}}"
 
 resolved_paths="$(
@@ -30,7 +30,7 @@ IFS=$'\t' read -r model_package_dir engine_dir weights_dir tokenizer_dir manifes
 
 if [[ ! -d "$model_package_dir" ]]; then
     echo "Model package directory not found: $model_package_dir" >&2
-    echo "Expected Triton-compatible model package: /models/tts_orchestrator/1/{runtime,weights,tokenizer}" >&2
+    echo "Expected Triton-compatible model package: /models/tts_orchestrator/${model_version}/{runtime,weights,tokenizer}" >&2
     exit 1
 fi
 if [[ ! -d "$tokenizer_dir" ]]; then
@@ -51,13 +51,13 @@ if [[ ! -f "$manifest_path" ]]; then
 fi
 if [[ "$engine_mode" != "trt" ]]; then
     echo "Engine Docker requires a TensorRT model package, got engine_mode=${engine_mode:-unknown}: $manifest_path" >&2
-    echo "Re-assemble with: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt" >&2
+    echo "Re-assemble with: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt --model-version ${model_version}" >&2
     exit 1
 fi
 if [[ ! -f "$runtime_artifact" ]]; then
     if [[ -f "${engine_dir}/model.onnx" ]]; then
         echo "Engine Docker requires a TensorRT model package, but found ONNX runtime only: ${engine_dir}/model.onnx" >&2
-        echo "Re-assemble with: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt" >&2
+        echo "Re-assemble with: bash scripts/bash/compose.sh prepare --gateway engine --engine-mode trt --model-version ${model_version}" >&2
     else
         echo "TensorRT runtime artifact not found: ${runtime_artifact}" >&2
         echo "Run Phase B and assemble the shared model_repository in trt mode." >&2

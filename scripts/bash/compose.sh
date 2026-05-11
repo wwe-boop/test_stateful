@@ -17,6 +17,7 @@ COMPOSE_FILE="${REPO_ROOT}/compose.yaml"
 COMPOSE_DEV_FILE="${REPO_ROOT}/compose.dev.yaml"
 EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
+MODEL_VERSION="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
 
 COMMAND=""
 GATEWAY="all"
@@ -68,6 +69,7 @@ Options:
   --variant <name>       Model variant (auto-discover when possible)
   --engine-mode <mode>   trt | onnx for model_repository assembly (default: trt)
   --repo-dir <path>      Shared model_repository path
+  --model-version <N>    Triton model version directory (default: 1)
   --image <tag>          Override service image tag for selected gateway
   --container <name>     Override container name for selected gateway
   --port <N>             Engine gRPC port
@@ -175,6 +177,10 @@ export_compose_env() {
     export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-qwen3-tts}"
     export MODEL_VARIANT="$VARIANT"
     export MODEL_REPO_DIR="$MODEL_REPO_DIR"
+    MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
+    export MODEL_VERSION
+    export ENGINE_MODEL_VERSION="$MODEL_VERSION"
+    export ENGINE_MODEL_PACKAGE_DIR="/models/tts_orchestrator/$MODEL_VERSION"
 
     export ENGINE_GRPC_PORT="$ENGINE_PORT"
     export ENGINE_WEBSOCKET_PORT="$ENGINE_WEBSOCKET"
@@ -197,6 +203,7 @@ log_compose_runtime_summary() {
     log_info "[DRY RUN] Resolved compose runtime:"
     log_info "  Gateway:          $GATEWAY"
     [ -n "$VARIANT" ] && log_info "  Variant:          $VARIANT"
+    log_info "  Model version:    $MODEL_VERSION"
     log_info "  Model repo:       $MODEL_REPO_DIR"
     log_info "  Engine device:    $ENGINE_DEVICE"
     log_info "  Engine max batch: $ENGINE_MAX_BATCH"
@@ -467,8 +474,8 @@ prepare_model_repo() {
         log_error "Use --engine-mode trt for --gateway engine/all, or choose --gateway triton for ONNX."
         exit 1
     fi
-    assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE"
-    validate_model_repo "$MODEL_REPO_DIR"
+    assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION"
+    validate_model_repo "$MODEL_REPO_DIR" "$MODEL_VERSION"
 }
 
 ensure_model_repo() {
@@ -484,7 +491,7 @@ ensure_model_repo() {
     fi
 
     local repo_info
-    repo_info=$(PYTHONPATH="$REPO_ROOT" python3 - "$MODEL_REPO_DIR/tts_orchestrator/1" <<'PY' 2>/dev/null || true
+    repo_info=$(PYTHONPATH="$REPO_ROOT" python3 - "$MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION" <<'PY' 2>/dev/null || true
 import json
 import sys
 from pathlib import Path
@@ -711,6 +718,7 @@ while [[ $# -gt 0 ]]; do
         --variant) VARIANT="$2"; shift 2 ;;
         --engine-mode) ENGINE_MODE="$2"; shift 2 ;;
         --repo-dir) MODEL_REPO_DIR="$2"; shift 2 ;;
+        --model-version) MODEL_VERSION="$2"; shift 2 ;;
         --image) IMAGE_OVERRIDE="$2"; shift 2 ;;
         --container) CONTAINER_OVERRIDE="$2"; shift 2 ;;
         --port) ENGINE_PORT="$2"; shift 2 ;;

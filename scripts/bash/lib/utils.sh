@@ -51,6 +51,25 @@ require_cmd() {
 }
 
 # ---------------------------------------------------------------------------
+#  resolve_model_version [raw]
+#  Normalizes the shared Triton model version number.
+#  Precedence: explicit arg > MODEL_VERSION > ENGINE_MODEL_VERSION > 1.
+# ---------------------------------------------------------------------------
+resolve_model_version() {
+    local raw="${1:-${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}}"
+    raw="${raw//[[:space:]]/}"
+
+    if [[ "$raw" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$raw"
+        return 0
+    fi
+
+    log_error "Invalid model version: ${raw:-<empty>}"
+    log_error "Use a positive integer like 1 or 2."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 #  ensure_workdir <path>
 #  Creates the directory if needed, then cd into it.
 # ---------------------------------------------------------------------------

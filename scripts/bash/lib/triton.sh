@@ -21,7 +21,7 @@ source "${_LIB_DIR}/docker.sh"
 
 # Default production layout: only the Python orchestrator is exposed to Triton.
 # Runtime assets (fused engine, optional voice-clone ONNX exports, manifest) live
-# under tts_orchestrator/1/runtime. ASSEMBLE_VERIFICATION_MODELS=1 can still add
+# under tts_orchestrator/<version>/runtime. ASSEMBLE_VERIFICATION_MODELS=1 can still add
 # standalone verification models such as talker_unified/code2wav.
 _TRITON_REQUIRED_MODELS=(
     "tts_orchestrator"
@@ -71,7 +71,7 @@ _link_or_copy() {
 }
 
 # ---------------------------------------------------------------------------
-#  assemble_model_repo <exported_dir> <variant> <model_repo_dir> [engine_mode]
+#  assemble_model_repo <exported_dir> <variant> <model_repo_dir> [engine_mode] [model_version]
 #
 #  engine_mode: trt (default) | onnx
 #  TRT mode:  copies .engine → model.plan, backend tensorrt
@@ -79,7 +79,7 @@ _link_or_copy() {
 #
 #  Default layout: only tts_orchestrator is exposed to Triton. The fused runtime
 #  engine and optional voice-clone ONNX exports are copied into
-#  tts_orchestrator/1/runtime/. ASSEMBLE_VERIFICATION_MODELS=1 adds standalone
+#  tts_orchestrator/<version>/runtime/. ASSEMBLE_VERIFICATION_MODELS=1 adds standalone
 #  speech_tokenizer_encoder, talker_unified, code2wav models for debugging.
 # ---------------------------------------------------------------------------
 assemble_model_repo() {
@@ -87,9 +87,14 @@ assemble_model_repo() {
     local variant="$2"
     local repo_dir="$3"
     local engine_mode="${4:-trt}"
+    local model_version
+    model_version=$(resolve_model_version "${5:-}") || return 1
 
     local variant_dir="$exported_dir/$variant"
     local tokenizer_dir="$exported_dir/tokenizer"
+    local orch_model_dir="$repo_dir/tts_orchestrator/$model_version"
+    local orch_http_model_dir="$repo_dir/tts_orchestrator_http/$model_version"
+    local runtime_dir="$orch_model_dir/runtime"
     # Read engine dtype from build_engines.sh output; default bf16
     local engine_dtype="bf16"
     if [ -f "$exported_dir/.engine_dtype" ]; then
@@ -97,7 +102,7 @@ assemble_model_repo() {
     fi
     engine_dtype="${engine_dtype:-bf16}"
 
-    log_step "Assembling Triton model repository (engine_mode=$engine_mode, dtype=$engine_dtype)"
+    log_step "Assembling Triton model repository (engine_mode=$engine_mode, dtype=$engine_dtype, version=$model_version)"
     log_info "  Variant:    $variant"
     log_info "  Source:     $variant_dir"
     log_info "  Repository: $repo_dir"
@@ -121,13 +126,14 @@ assemble_model_repo() {
         "$repo_dir/talker_unified" \
         "$repo_dir/code2wav" \
         "$repo_dir/tts_orchestrator" \
+        "$repo_dir/tts_orchestrator_http" \
         "$repo_dir/triton_manifest.json"
 
     # Helper: copy engine/onnx only; config.pbtxt comes from generate_triton_configs.py
     _place_model() {
         local name="$1"
         local src="$2"
-        local model_dir="$repo_dir/$name/1"
+        local model_dir="$repo_dir/$name/$model_version"
         mkdir -p "$model_dir"
         if [ "$engine_mode" = "trt" ]; then
             _link_or_copy "$src" "$model_dir/model.plan"
@@ -154,7 +160,6 @@ assemble_model_repo() {
         return 1
     }
 
-    local runtime_dir="$repo_dir/tts_orchestrator/1/runtime"
     mkdir -p "$runtime_dir"
 
     # ── 1. Optional voice-clone runtime ONNX assets ──
@@ -231,10 +236,10 @@ assemble_model_repo() {
 
     # ── 5. TTS Orchestrator (Python BLS backend) ──
     local weights_dir="$variant_dir/weights"
-    mkdir -p "$repo_dir/tts_orchestrator/1/weights"
+    mkdir -p "$orch_model_dir/weights"
     if [ -d "$weights_dir" ]; then
         for f in "$weights_dir"/*; do
-            _link_or_copy "$f" "$repo_dir/tts_orchestrator/1/weights/$(basename "$f")"
+            _link_or_copy "$f" "$orch_model_dir/weights/$(basename "$f")"
         done
         log_info "  tts_orchestrator/weights: OK"
     else
@@ -246,10 +251,10 @@ assemble_model_repo() {
     repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
     local orch_py_dir="$repo_root/model_repository/tts_orchestrator/1"
     if [ -d "$orch_py_dir" ]; then
-        cp "$orch_py_dir/model.py" "$repo_dir/tts_orchestrator/1/model.py"
+        cp "$orch_py_dir/model.py" "$orch_model_dir/model.py"
 
-        rm -rf "$repo_dir/tts_orchestrator/1/engine"
-        cp -R "$repo_root/engine" "$repo_dir/tts_orchestrator/1/engine"
+        rm -rf "$orch_model_dir/engine"
+        cp -R "$repo_root/engine" "$orch_model_dir/engine"
 
         log_info "  tts_orchestrator/python: OK (copied model.py + engine/ package)"
     else
@@ -257,9 +262,9 @@ assemble_model_repo() {
     fi
 
     local orch_http_py_dir="$repo_root/model_repository/tts_orchestrator_http/1"
-    mkdir -p "$repo_dir/tts_orchestrator_http/1"
+    mkdir -p "$orch_http_model_dir"
     if [ -d "$orch_http_py_dir" ] && [ -f "$orch_http_py_dir/model.py" ]; then
-        cp "$orch_http_py_dir/model.py" "$repo_dir/tts_orchestrator_http/1/model.py"
+        cp "$orch_http_py_dir/model.py" "$orch_http_model_dir/model.py"
         log_info "  tts_orchestrator_http/python: OK (copied offline HTTP aggregator)"
     else
         log_error "  tts_orchestrator_http/model.py missing in source tree"
@@ -278,25 +283,26 @@ assemble_model_repo() {
         base-0.6b)   tok_dir="$model_base_dir/Qwen3-TTS-12Hz-0.6B-Base" ;;
     esac
     if [ -n "$tok_dir" ] && [ -d "$tok_dir" ]; then
-        mkdir -p "$repo_dir/tts_orchestrator/1/tokenizer"
+        mkdir -p "$orch_model_dir/tokenizer"
         for tf in tokenizer.json tokenizer_config.json vocab.json merges.txt \
                   config.json generation_config.json; do
             [ -f "$tok_dir/$tf" ] && \
-                _link_or_copy "$tok_dir/$tf" "$repo_dir/tts_orchestrator/1/tokenizer/$tf"
+                _link_or_copy "$tok_dir/$tf" "$orch_model_dir/tokenizer/$tf"
         done
         log_info "  tts_orchestrator/tokenizer: OK"
     else
         log_warn "  tts_orchestrator/tokenizer: SKIPPED (model dir not found)"
     fi
 
-    _write_tts_orchestrator_stub_if_missing "$repo_dir"
+    _write_tts_orchestrator_stub_if_missing "$repo_dir" "$model_version"
 
     if ! PYTHONPATH="$repo_root/scripts/python" python3 - \
         "$variant_dir/triton_manifest.json" \
         "$engine_mode" \
+        "$model_version" \
         "$repo_dir" \
         "$repo_dir/triton_manifest.json" \
-        "$repo_dir/tts_orchestrator/1/triton_manifest.json" \
+        "$orch_model_dir/triton_manifest.json" \
         "$runtime_dir/triton_manifest.json" <<'PY'; then
 import json
 import sys
@@ -306,12 +312,15 @@ from triton_manifest_io import load_manifest
 
 src = Path(sys.argv[1])
 engine_mode = sys.argv[2]
-output_repo = Path(sys.argv[3])
-targets = [Path(p) for p in sys.argv[4:]]
+model_version = sys.argv[3]
+output_repo = Path(sys.argv[4])
+targets = [Path(p) for p in sys.argv[5:]]
+model_package_dir = f"/models/tts_orchestrator/{model_version}"
 
-manifest = load_manifest(src, output_repo=output_repo)
+manifest = load_manifest(src, output_repo=output_repo, model_package_dir=model_package_dir)
 manifest["engine_mode"] = engine_mode
-manifest.setdefault("package", {})["model_package_dir"] = "/models/tts_orchestrator/1"
+manifest.setdefault("package", {})["model_package_dir"] = model_package_dir
+manifest.setdefault("orchestrator", {})["model_package_dir"] = model_package_dir
 
 for target in targets:
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -320,11 +329,11 @@ PY
         log_error "  failed to write package triton_manifest.json"
         return 1
     fi
-    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/1 + runtime)"
+    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/$model_version + runtime)"
 
     # Keep the Triton Python backend payload minimal.  Only the new adapter,
     # engine package, tokenizer / weights, and manifest should enter the container.
-    find "$repo_dir/tts_orchestrator/1" -mindepth 1 -maxdepth 1 \
+    find "$orch_model_dir" -mindepth 1 -maxdepth 1 \
         ! -name "model.py" \
         ! -name "engine" \
         ! -name "tokenizer" \
@@ -332,7 +341,7 @@ PY
         ! -name "runtime" \
         ! -name "triton_manifest.json" \
         -exec rm -rf {} +
-    find "$repo_dir/tts_orchestrator/1" -type d -name "__pycache__" -prune -exec rm -rf {} +
+    find "$orch_model_dir" -type d -name "__pycache__" -prune -exec rm -rf {} +
     log_info "  tts_orchestrator/python: pruned legacy payload"
 
     if ! python3 "$repo_root/scripts/python/generate_triton_configs.py" \
@@ -394,8 +403,33 @@ sync_trt_configs() {
 # ---------------------------------------------------------------------------
 validate_model_repo() {
     local repo_dir="$1"
+    local model_version="${2:-}"
     local missing=0
     local warned=0
+
+    if [ -z "$model_version" ] && [ -f "$repo_dir/triton_manifest.json" ]; then
+        model_version=$(python3 - "$repo_dir/triton_manifest.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8") as f:
+    manifest = json.load(f)
+package = manifest.get("package") or {}
+package_dir = ""
+if isinstance(package, dict):
+    package_dir = str(package.get("model_package_dir") or "")
+if not package_dir:
+    orch = manifest.get("orchestrator") or {}
+    if isinstance(orch, dict):
+        package_dir = str(orch.get("model_package_dir") or "")
+if package_dir:
+    print(Path(package_dir).name)
+PY
+        )
+    fi
+    model_version=$(resolve_model_version "${model_version:-}") || return 1
 
     log_step "Validating model repository: $repo_dir"
 
@@ -407,8 +441,8 @@ validate_model_repo() {
             continue
         fi
 
-        if [ ! -d "$model_dir/1" ]; then
-            log_error "  $model: no version directory (1/)"
+        if [ ! -d "$model_dir/$model_version" ]; then
+            log_error "  $model: no version directory ($model_version/)"
             missing=$((missing + 1))
             continue
         fi
@@ -416,7 +450,7 @@ validate_model_repo() {
         log_info "  $model: OK"
     done
 
-    local orch_dir="$repo_dir/tts_orchestrator/1"
+    local orch_dir="$repo_dir/tts_orchestrator/$model_version"
     local repo_root
     repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
     local package_info
@@ -435,16 +469,16 @@ PY
     runtime_engine="${runtime_engine:-$runtime_dir/model.plan}"
 
     if [ ! -f "$orch_dir/model.py" ]; then
-        log_error "  tts_orchestrator/1/model.py: missing"
+        log_error "  tts_orchestrator/$model_version/model.py: missing"
         missing=$((missing + 1))
     else
-        log_info "  tts_orchestrator/1/model.py: OK"
+        log_info "  tts_orchestrator/$model_version/model.py: OK"
     fi
     if [ ! -d "$orch_dir/engine" ]; then
-        log_error "  tts_orchestrator/1/engine/: missing"
+        log_error "  tts_orchestrator/$model_version/engine/: missing"
         missing=$((missing + 1))
     else
-        log_info "  tts_orchestrator/1/engine/: OK"
+        log_info "  tts_orchestrator/$model_version/engine/: OK"
     fi
     if [ ! -f "$manifest_path" ]; then
         log_error "  model package manifest: missing ($manifest_path)"
@@ -453,10 +487,10 @@ PY
         log_info "  model package manifest: OK ($manifest_path)"
     fi
     if [ ! -f "$orch_dir/triton_manifest.json" ]; then
-        log_error "  tts_orchestrator/1/triton_manifest.json: missing"
+        log_error "  tts_orchestrator/$model_version/triton_manifest.json: missing"
         missing=$((missing + 1))
     else
-        log_info "  tts_orchestrator/1/triton_manifest.json: OK"
+        log_info "  tts_orchestrator/$model_version/triton_manifest.json: OK"
     fi
 
     if [ ! -f "$runtime_engine" ]; then
@@ -468,16 +502,16 @@ PY
 
     if [ -d "$repo_dir/talker_code2wav_fused" ]; then
         log_error "  legacy top-level model detected: $repo_dir/talker_code2wav_fused"
-        log_error "  re-run assemble so the fused engine lives under tts_orchestrator/1/runtime/"
+        log_error "  re-run assemble so the fused engine lives under tts_orchestrator/$model_version/runtime/"
         missing=$((missing + 1))
     fi
 
-    local orch_http_dir="$repo_dir/tts_orchestrator_http/1"
+    local orch_http_dir="$repo_dir/tts_orchestrator_http/$model_version"
     if [ ! -f "$orch_http_dir/model.py" ]; then
-        log_error "  tts_orchestrator_http/1/model.py: missing"
+        log_error "  tts_orchestrator_http/$model_version/model.py: missing"
         missing=$((missing + 1))
     else
-        log_info "  tts_orchestrator_http/1/model.py: OK"
+        log_info "  tts_orchestrator_http/$model_version/model.py: OK"
     fi
 
     if [ "$missing" -gt 0 ]; then
@@ -512,7 +546,32 @@ build_triton_image() {
     fi
 
     local model_repo="$repo_root/workspace/model_repository"
-    local runtime_dir="$model_repo/tts_orchestrator/1/runtime"
+    local model_version="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
+    if [ -f "$model_repo/triton_manifest.json" ]; then
+        model_version=$(python3 - "$model_repo/triton_manifest.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8") as f:
+    manifest = json.load(f)
+package = manifest.get("package") or {}
+package_dir = ""
+if isinstance(package, dict):
+    package_dir = str(package.get("model_package_dir") or "")
+if not package_dir:
+    orch = manifest.get("orchestrator") or {}
+    if isinstance(orch, dict):
+        package_dir = str(orch.get("model_package_dir") or "")
+if package_dir:
+    print(Path(package_dir).name)
+PY
+        )
+    fi
+    model_version=$(resolve_model_version "${model_version:-}") || return 1
+    local model_dir="$model_repo/tts_orchestrator/$model_version"
+    local runtime_dir="$model_dir/runtime"
     local fused_artifact=""
     if [ -f "$runtime_dir/model.plan" ]; then
         fused_artifact="$runtime_dir/model.plan"
@@ -522,13 +581,13 @@ build_triton_image() {
         fused_artifact="$runtime_dir/talker_code2wav_fused.engine"
     fi
 
-    if [ ! -f "$model_repo/tts_orchestrator/1/model.py" ] \
-        || [ ! -d "$model_repo/tts_orchestrator/1/engine" ] \
+    if [ ! -f "$model_dir/model.py" ] \
+        || [ ! -d "$model_dir/engine" ] \
         || [ -z "$fused_artifact" ]; then
         log_error "Assembled model repository is incomplete for image build"
         log_error "Expected:"
-        log_error "  $model_repo/tts_orchestrator/1/model.py"
-        log_error "  $model_repo/tts_orchestrator/1/engine/"
+        log_error "  $model_dir/model.py"
+        log_error "  $model_dir/engine/"
         log_error "  $runtime_dir/model.plan or model.onnx"
         return 1
     fi
@@ -563,7 +622,7 @@ DOCKERFILE
 
     log_step "Building Triton deployment image: $image_tag"
     log_info "  Base image:  $base_image"
-    log_info "  Runtime:     /models/tts_orchestrator/1/model.py + engine/ + $(basename "$fused_artifact")"
+    log_info "  Runtime:     /models/tts_orchestrator/$model_version/model.py + engine/ + $(basename "$fused_artifact")"
 
     docker build \
         --build-arg "BASE_IMAGE=$base_image" \
@@ -735,11 +794,14 @@ triton_stop() {
 
 
 # ---------------------------------------------------------------------------
-#  _write_tts_orchestrator_stub_if_missing <repo_dir>
+#  _write_tts_orchestrator_stub_if_missing <repo_dir> [model_version]
 #  Minimal Python stub when model_repository sources were not copied.
 # ---------------------------------------------------------------------------
 _write_tts_orchestrator_stub_if_missing() {
-    local orch_dir="$1/tts_orchestrator/1"
+    local repo_dir="$1"
+    local model_version
+    model_version=$(resolve_model_version "${2:-}") || return 1
+    local orch_dir="$repo_dir/tts_orchestrator/$model_version"
     mkdir -p "$orch_dir"
     if [ -f "$orch_dir/model.py" ]; then
         return 0

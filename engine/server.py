@@ -25,7 +25,7 @@ Architecture:
 
 Usage:
     python -m engine.server --config engine.yaml
-    python -m engine.server --model-package-dir /models/tts_orchestrator/1
+    python -m engine.server --model-package-dir /models/tts_orchestrator/<version>
 """
 
 from __future__ import annotations
@@ -557,7 +557,7 @@ def main():
     parser.add_argument("--config", default="engine.yaml",
                         help="Path to engine.yaml config file (default: engine.yaml)")
     parser.add_argument("--model-package-dir", default="",
-                        help="Path to shared model package (tts_orchestrator/1)")
+                        help="Path to shared model package (tts_orchestrator/<version>)")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-batch", type=int, default=0,
                         help="Override scheduler.max_batch_size")

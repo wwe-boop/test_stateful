@@ -153,3 +153,24 @@ def test_generate_configs_minimal_repo(tmp_path):
     assert 'name: "tts_orchestrator_http"' in orch_http_cfg
     assert 'string_value: "tts_orchestrator"' in orch_http_cfg
     assert not (tmp_path / "talker_code2wav_fused" / "config.pbtxt").exists()
+
+
+def test_generate_configs_uses_package_version(tmp_path):
+    if not FIXTURE_MANIFEST.is_file():
+        pytest.fail("missing fixture manifest")
+    manifest = json.loads(FIXTURE_MANIFEST.read_text(encoding="utf-8"))
+    manifest.setdefault("package", {})["model_package_dir"] = "/models/tts_orchestrator/2"
+    manifest.setdefault("orchestrator", {})["model_package_dir"] = "/models/tts_orchestrator/2"
+
+    # Minimal fake repo for version 2: only the versioned orchestrator package is present.
+    (tmp_path / "tts_orchestrator" / "2" / "runtime").mkdir(parents=True)
+    (tmp_path / "tts_orchestrator_http" / "2").mkdir(parents=True)
+    (tmp_path / "tts_orchestrator" / "2" / "runtime" / "model.plan").write_text("stub")
+
+    generate_configs(manifest, tmp_path, "trt", engine_dtype="bf16")
+
+    orch_cfg = (tmp_path / "tts_orchestrator" / "config.pbtxt").read_text()
+    orch_http_cfg = (tmp_path / "tts_orchestrator_http" / "config.pbtxt").read_text()
+    assert '/models/tts_orchestrator/2' in orch_cfg
+    assert 'name: "tts_orchestrator_http"' in orch_http_cfg
+    assert 'string_value: "tts_orchestrator"' in orch_http_cfg

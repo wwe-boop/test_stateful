@@ -20,6 +20,7 @@
 #
 #  Options:
 #    --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, ...)
+#    --model-version <N>     Triton model version directory (default: 1)
 #    --target-driver <ver>   Target NVIDIA driver for NGC container selection
 #    --yes, -y               Skip confirmations (non-interactive)
 #    --dry-run               Show what would be done
@@ -71,6 +72,7 @@ _env_or_empty() { printenv "$1" 2>/dev/null || true; }
 # ── Defaults ──
 COMMAND=""
 VARIANT="${MODEL_VARIANT:-}"
+MODEL_VERSION="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
 DRY_RUN=false
 YES_MODE=false
 TARGET_DRIVER="${TARGET_DRIVER:-}"
@@ -130,6 +132,7 @@ If a model variant name is given without a command, runs the full pipeline.
 Options:
   --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, design-1.7b,
                           base-0.6b, custom-0.6b, all-1.7b, all)
+  --model-version <N>     Triton model version directory (default: 1)
   --target-driver <ver>   Target NVIDIA driver version for NGC container
                           selection (e.g. 575.57 for production machines).
                           Overrides local driver detection.
@@ -204,6 +207,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --variant|-m)       VARIANT="$2"; shift 2 ;;
+            --model-version)    MODEL_VERSION="$2"; shift 2 ;;
             --yes|-y)           YES_MODE=true; shift ;;
             --dry-run)          DRY_RUN=true; shift ;;
             --target-driver)    TARGET_DRIVER="$2"; shift 2 ;;
@@ -274,6 +278,7 @@ build_forward_args() {
     if [ -n "$TARGET_DRIVER" ]; then
         export TARGET_DRIVER
     fi
+    MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
 
     # Phase A args
     SETUP_ARGS=()
@@ -281,6 +286,8 @@ build_forward_args() {
         # Pass variant via env var (setup_env.sh reads MODEL_VARIANT)
         export MODEL_VARIANT="$VARIANT"
     fi
+    export MODEL_VERSION
+    export ENGINE_MODEL_VERSION="$MODEL_VERSION"
     if [ -n "$PYTHON_VERSION" ]; then
         export PYTHON_VERSION
     fi
@@ -327,6 +334,7 @@ build_forward_args() {
     if [ -n "$RUNTIME_MAX_SEQ_LEN" ]; then DEPLOY_ARGS+=(--max-seq-len "$RUNTIME_MAX_SEQ_LEN"); fi
     if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
     if [ -n "$ENGINE_PORT" ]; then DEPLOY_ARGS+=(--port "$ENGINE_PORT"); fi
+    if [ -n "$MODEL_VERSION" ]; then DEPLOY_ARGS+=(--model-version "$MODEL_VERSION"); fi
     if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
     if [ -n "$GRPC_PORT" ]; then
         export TRITON_GRPC_PORT="$GRPC_PORT"
@@ -454,6 +462,7 @@ show_run_banner() {
     echo ""
     echo "  模式:      $description"
     [ -n "$VARIANT" ] && echo "  变体:      $VARIANT"
+    [ -n "$MODEL_VERSION" ] && echo "  版本:      $MODEL_VERSION"
     [ -n "${GATEWAY_MODE:-}" ] && echo "  阶段 C:    $GATEWAY_MODE"
     [ -n "$ENGINE_DTYPE" ] && echo "  精度:      $ENGINE_DTYPE"
     [ -n "${EXPORT_DEVICE:-$GLOBAL_DEVICE}" ] && echo "  导出 GPU:  ${EXPORT_DEVICE:-$GLOBAL_DEVICE}"
@@ -529,6 +538,16 @@ interactive_mode() {
     case "${choice:-1}" in
         1|4|5) will_deploy=true ;;
     esac
+
+    if [ -t 0 ] && { $needs_build || $will_deploy; }; then
+        echo ""
+        echo "  模型版本 (Triton model version)"
+        local _mv=""
+        read -rp "  版本号 [${MODEL_VERSION}] (30s 后自动): " -t 30 _mv || true
+        if [ -n "$_mv" ]; then
+            MODEL_VERSION="$_mv"
+        fi
+    fi
 
     if [ -t 0 ] && { $needs_setup || $needs_build || $will_deploy; } && \
         [ -z "$GLOBAL_DEVICE" ] && [ -z "$EXPORT_DEVICE" ] && [ -z "$BUILD_GPU_DEVICE" ] && [ -z "$RUNTIME_GPU_DEVICE" ]; then
@@ -631,6 +650,9 @@ interactive_mode() {
 
 main() {
     parse_args "$@"
+    MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
+    export MODEL_VERSION
+    export ENGINE_MODEL_VERSION="$MODEL_VERSION"
 
     # No command → interactive mode
     if [ -z "$COMMAND" ]; then

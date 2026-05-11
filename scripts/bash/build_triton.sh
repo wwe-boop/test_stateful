@@ -48,6 +48,7 @@ EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
 MODEL_REPO_DIR="${MODEL_REPO_DIR:-${REPO_ROOT}/workspace/model_repository}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen3-tts-triton}"
 VARIANT=""
+MODEL_VERSION="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
 ENGINE_MODE="${ENGINE_MODE:-trt}"
 USER_IMAGE="${TRITON_IMAGE:-}"
 BUILD_TAG=""
@@ -73,6 +74,7 @@ Commands:
 
 Options:
   --variant <name>       Target model variant (default: auto-discover first)
+  --model-version <N>    Triton model version directory (default: 1)
   --engine-mode onnx|trt Use ONNX or TensorRT engines (default: trt)
   --image <uri>          Override NGC container image
   --repo-dir <path>      Override model_repository output path
@@ -156,6 +158,7 @@ shift
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant)        VARIANT="$2"; shift 2 ;;
+        --model-version)  MODEL_VERSION="$2"; shift 2 ;;
         --engine-mode)    ENGINE_MODE="$2"; shift 2 ;;
         --image)          USER_IMAGE="$2"; shift 2 ;;
         --repo-dir)       MODEL_REPO_DIR="$2"; shift 2 ;;
@@ -171,6 +174,10 @@ while [[ $# -gt 0 ]]; do
         *) log_error "Unknown option: $1"; usage; exit 1 ;;
     esac
 done
+
+MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
+export MODEL_VERSION
+export ENGINE_MODEL_VERSION="$MODEL_VERSION"
 
 # ── Discover first available variant ──
 discover_first_variant() {
@@ -210,21 +217,22 @@ cmd_assemble() {
         log_info "  Source:  $EXPORTED_DIR/$VARIANT"
         log_info "  Target:  $MODEL_REPO_DIR"
         log_info "  Engine:  $ENGINE_MODE"
+        log_info "  Version: $MODEL_VERSION"
         return 0
     fi
 
-    assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
+    assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \
         || { log_error "Assembly failed"; exit 1; }
 
     echo ""
-    validate_model_repo "$MODEL_REPO_DIR"
+    validate_model_repo "$MODEL_REPO_DIR" "$MODEL_VERSION"
     local status=$?
 
     echo ""
     if [ $status -eq 0 ]; then
         log_info "Next steps:"
-        log_info "  1. Pull container:  bash scripts/bash/build_triton.sh pull"
-        log_info "  2. Start server:    bash scripts/bash/build_triton.sh run"
+        log_info "  1. Pull container:  bash scripts/bash/build_triton.sh pull --model-version $MODEL_VERSION"
+        log_info "  2. Start server:    bash scripts/bash/build_triton.sh run --model-version $MODEL_VERSION"
     fi
 
     return $status
@@ -263,6 +271,8 @@ cmd_run() {
 
     # Assemble if needed, or re-assemble if source engines are newer than assembled files
     local need_assemble=false
+    local package_dir="$MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
+    local runtime_dir="$package_dir/runtime"
     if [ ! -d "$MODEL_REPO_DIR" ] || [ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]; then
         need_assemble=true
         log_info "Model repository not found, will assemble (engine_mode=$ENGINE_MODE) ..."
@@ -270,14 +280,14 @@ cmd_run() {
         local stale=false
         local target_artifact
         if [ "$ENGINE_MODE" = "trt" ]; then
-            target_artifact="$MODEL_REPO_DIR/tts_orchestrator/1/runtime/model.plan"
+            target_artifact="$runtime_dir/model.plan"
             local src_engine="$EXPORTED_DIR/$VARIANT/talker_code2wav_fused.engine"
             if [ -f "$src_engine" ] && { [ ! -f "$target_artifact" ] || [ ! -s "$target_artifact" ] || [ "$src_engine" -nt "$target_artifact" ]; }; then
                 stale=true
                 log_warn "Runtime fused TRT engine is missing or stale"
             fi
         else
-            target_artifact="$MODEL_REPO_DIR/tts_orchestrator/1/runtime/model.onnx"
+            target_artifact="$runtime_dir/model.onnx"
             local src_engine="$EXPORTED_DIR/$VARIANT/talker_code2wav_fused.onnx"
             if [ -f "$src_engine" ] && { [ ! -f "$target_artifact" ] || [ ! -s "$target_artifact" ] || [ "$src_engine" -nt "$target_artifact" ]; }; then
                 stale=true
@@ -290,7 +300,7 @@ cmd_run() {
             "$EXPORTED_DIR/$VARIANT/speaker_encoder.onnx" \
             "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.onnx"; do
             [ -f "$src_runtime_onnx" ] || continue
-            dst_runtime_onnx="$MODEL_REPO_DIR/tts_orchestrator/1/runtime/$(basename "$src_runtime_onnx")"
+            dst_runtime_onnx="$runtime_dir/$(basename "$src_runtime_onnx")"
             if [ ! -f "$dst_runtime_onnx" ] || [ "$src_runtime_onnx" -nt "$dst_runtime_onnx" ]; then
                 stale=true
                 log_warn "Runtime ONNX asset is missing or stale: $(basename "$src_runtime_onnx")"
@@ -298,22 +308,22 @@ cmd_run() {
             fi
         done
         if [ -f "$EXPORTED_DIR/$VARIANT/triton_manifest.json" ] && \
-            { [ ! -f "$MODEL_REPO_DIR/tts_orchestrator/1/runtime/triton_manifest.json" ] || \
-              [ "$EXPORTED_DIR/$VARIANT/triton_manifest.json" -nt "$MODEL_REPO_DIR/tts_orchestrator/1/runtime/triton_manifest.json" ]; }; then
+            { [ ! -f "$runtime_dir/triton_manifest.json" ] || \
+              [ "$EXPORTED_DIR/$VARIANT/triton_manifest.json" -nt "$runtime_dir/triton_manifest.json" ]; }; then
             stale=true
             log_warn "Runtime manifest is missing or stale"
         fi
         # Also re-assemble when orchestrator Python source (e.g. model.py) is newer
         local orch_src="$REPO_ROOT/model_repository/tts_orchestrator/1/model.py"
-        local orch_dst="$MODEL_REPO_DIR/tts_orchestrator/1/model.py"
+        local orch_dst="$package_dir/model.py"
         if [ -f "$orch_src" ] && [ -f "$orch_dst" ] && [ "$orch_src" -nt "$orch_dst" ]; then
             stale=true
             log_warn "Orchestrator Python source (model.py) is newer than assembled copy"
         fi
         # Re-assemble if the new TTSEngine payload is missing from an older assemble.
-        if [ ! -f "$MODEL_REPO_DIR/tts_orchestrator/1/engine/server.py" ]; then
+        if [ ! -f "$package_dir/engine/server.py" ]; then
             stale=true
-            log_warn "TTSEngine package missing in model repo: tts_orchestrator/1/engine/server.py"
+            log_warn "TTSEngine package missing in model repo: tts_orchestrator/$MODEL_VERSION/engine/server.py"
         fi
         local legacy_payload
         for legacy_payload in \
@@ -328,9 +338,9 @@ cmd_run() {
             "decode_fsm.py" \
             "ratio_tracker.py" \
             "mlfq_scheduler.py"; do
-            if [ -e "$MODEL_REPO_DIR/tts_orchestrator/1/$legacy_payload" ]; then
+            if [ -e "$package_dir/$legacy_payload" ]; then
                 stale=true
-                log_warn "Legacy BLS payload still present in model repo: tts_orchestrator/1/$legacy_payload"
+                log_warn "Legacy BLS payload still present in model repo: tts_orchestrator/$MODEL_VERSION/$legacy_payload"
                 break
             fi
         done
@@ -342,7 +352,7 @@ cmd_run() {
         fi
     fi
     if $need_assemble; then
-        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
+        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \
             || { log_error "Assembly failed"; exit 1; }
     fi
 
@@ -350,7 +360,7 @@ cmd_run() {
     # when they exist from a prior run but current variant didn't place them.
     sync_trt_configs "$MODEL_REPO_DIR" "$ENGINE_MODE" "$EXPORTED_DIR"
 
-    validate_model_repo "$MODEL_REPO_DIR" || exit 1
+    validate_model_repo "$MODEL_REPO_DIR" "$MODEL_VERSION" || exit 1
 
     check_docker_gpu_ready || exit 1
 
@@ -382,6 +392,7 @@ cmd_run() {
         --gateway triton
         --variant "$VARIANT"
         --repo-dir "$MODEL_REPO_DIR"
+        --model-version "$MODEL_VERSION"
         --image "$TRITON_IMAGE"
         --device "$TRITON_GPU_DEVICE"
     )
@@ -434,10 +445,40 @@ cmd_build() {
 
     if [ ! -d "$MODEL_REPO_DIR" ] || [ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]; then
         resolve_variant
-        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" \
+        assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \
             || { log_error "Assembly failed"; exit 1; }
+    else
+        local repo_version=""
+        if [ -f "$MODEL_REPO_DIR/triton_manifest.json" ]; then
+            repo_version=$(python3 - "$MODEL_REPO_DIR/triton_manifest.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8") as f:
+    manifest = json.load(f)
+package = manifest.get("package") or {}
+package_dir = ""
+if isinstance(package, dict):
+    package_dir = str(package.get("model_package_dir") or "")
+if not package_dir:
+    orch = manifest.get("orchestrator") or {}
+    if isinstance(orch, dict):
+        package_dir = str(orch.get("model_package_dir") or "")
+if package_dir:
+    print(Path(package_dir).name)
+PY
+            )
+        fi
+        if [ -n "$repo_version" ] && [ "$repo_version" != "$MODEL_VERSION" ]; then
+            log_warn "Model repository version mismatch: repo=$repo_version requested=$MODEL_VERSION, re-assembling ..."
+            resolve_variant
+            assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \
+                || { log_error "Assembly failed"; exit 1; }
+        fi
     fi
-    validate_model_repo "$MODEL_REPO_DIR" || exit 1
+    validate_model_repo "$MODEL_REPO_DIR" "$MODEL_VERSION" || exit 1
 
     # Generate Dockerfile if missing
     if [ ! -f "$REPO_ROOT/Dockerfile.triton" ]; then

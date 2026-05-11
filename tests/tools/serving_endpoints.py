@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import socket
 import statistics
 import sys
@@ -65,6 +66,7 @@ DEFAULT_TRITON_HTTP = "http://localhost:8000"
 DEFAULT_TRITON_GRPC = "localhost:8001"
 DEFAULT_TRITON_MODEL = "tts_orchestrator"
 DEFAULT_TRITON_HTTP_MODEL = "tts_orchestrator_http"
+DEFAULT_TRITON_MODEL_VERSION = os.environ.get("TRITON_MODEL_VERSION", "1")
 DEFAULT_SAMPLE_RATE = 24000
 TRITON_EXPECTED_INPUTS = {"request"}
 TRITON_EXPECTED_OUTPUTS = {"audio_chunk", "event_type", "event_json", "is_final"}
@@ -1337,7 +1339,7 @@ class TritonHttpTransport:
         synth = SynthesisResult(self.name, uuid.uuid4().hex[:12], text)
         try:
             resp = requests.post(
-                f"{self.base_url}/v2/models/{self.model_name}/versions/1/infer",
+                f"{self.base_url}/v2/models/{self.model_name}/versions/{DEFAULT_TRITON_MODEL_VERSION}/infer",
                 json=payload,
                 timeout=timeout,
             )

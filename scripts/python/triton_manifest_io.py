@@ -33,7 +33,10 @@ def weights_to_talker_section(w: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
-def variant_orchestrator_defaults(variant: str) -> Dict[str, str]:
+def variant_orchestrator_defaults(
+    variant: str,
+    model_package_dir: str = "/models/tts_orchestrator/1",
+) -> Dict[str, str]:
     if variant.startswith("base-"):
         tts = "base"
         tasks = "voice_clone_icl,voice_clone_xvec"
@@ -52,7 +55,7 @@ def variant_orchestrator_defaults(variant: str) -> Dict[str, str]:
         "max_decode_steps": "4096",
         "audio_chunk_frames": "25",
         "first_chunk_frames": "4",
-        "model_package_dir": "/models/tts_orchestrator/1",
+        "model_package_dir": model_package_dir,
     }
 
 
@@ -80,29 +83,40 @@ def package_defaults() -> Dict[str, Any]:
 def load_manifest(
     manifest_path: Path,
     output_repo: Optional[Path] = None,
+    model_package_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Load JSON manifest.
-    Optionally fill talker section from tts_orchestrator/1/weights/config.json in output_repo.
+    Optionally fill talker section from tts_orchestrator/<version>/weights/config.json in output_repo.
     """
     with open(manifest_path, encoding="utf-8") as f:
         manifest: Dict[str, Any] = json.load(f)
 
     variant = manifest.get("variant", "unknown")
+    package_model_package_dir = model_package_dir or "/models/tts_orchestrator/1"
+    package = manifest.get("package")
+    if model_package_dir is None and isinstance(package, dict):
+        raw_package_dir = package.get("model_package_dir")
+        if raw_package_dir:
+            package_model_package_dir = str(raw_package_dir)
+    package_version = Path(package_model_package_dir).name or "1"
+
     if not manifest.get("talker") and output_repo is not None:
-        wc = output_repo / "tts_orchestrator" / "1" / "weights" / "config.json"
+        wc = output_repo / "tts_orchestrator" / package_version / "weights" / "config.json"
         if wc.is_file():
             manifest["talker"] = weights_to_talker_section(load_weights_config(wc))
             logger.info("Filled manifest.talker from orchestrator weights/config.json")
 
     orch = manifest.get("orchestrator")
-    defaults = variant_orchestrator_defaults(variant)
+    defaults = variant_orchestrator_defaults(variant, package_model_package_dir)
     if orch is None:
         manifest["orchestrator"] = dict(defaults)
     else:
         merged = dict(defaults)
         merged.update(orch)
         manifest["orchestrator"] = merged
+    if model_package_dir is not None:
+        manifest["orchestrator"]["model_package_dir"] = package_model_package_dir
 
     package = manifest.get("package")
     if not isinstance(package, dict):
@@ -117,6 +131,8 @@ def load_manifest(
             else:
                 merged_package[key] = value
         manifest["package"] = merged_package
+    if model_package_dir is not None:
+        manifest["package"]["model_package_dir"] = package_model_package_dir
 
     return manifest
 

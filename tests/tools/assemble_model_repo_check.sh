@@ -30,6 +30,7 @@ source "${LIB_DIR}/triton.sh"
 
 TEST_REPO_ONNX="${TEST_REPO_ONNX:-${REPO_ROOT}/workspace/test_repo_onnx}"
 TEST_REPO_TRT="${TEST_REPO_TRT:-${REPO_ROOT}/workspace/test_repo_trt}"
+TEST_REPO_V2="${TEST_REPO_V2:-${REPO_ROOT}/workspace/test_repo_v2}"
 
 log_step "T2.4 assemble_model_repo tests (variant=$VARIANT)"
 
@@ -74,6 +75,24 @@ if [ -d "${ORCH_1}/tokenizer" ]; then
   fi
 fi
 log_info "ONNX assemble checks passed"
+
+# ---- ONNX mode with alternate model version ----
+log_info "Assembling ONNX mode with version 2 -> ${TEST_REPO_V2}"
+rm -rf "${TEST_REPO_V2}"
+assemble_model_repo "${EXPORTED_DIR}" "${VARIANT}" "${TEST_REPO_V2}" "onnx" "2" || { log_error "assemble (onnx, v2) failed"; exit 1; }
+validate_model_repo "${TEST_REPO_V2}" || { log_error "validate (onnx, v2) failed"; exit 1; }
+
+ORCH_2="${TEST_REPO_V2}/tts_orchestrator/2"
+ORCH_HTTP_2="${TEST_REPO_V2}/tts_orchestrator_http/2"
+RUNTIME_ONNX_V2="${ORCH_2}/runtime"
+[ -f "${ORCH_2}/model.py" ] || { log_error "Missing ${ORCH_2}/model.py"; exit 1; }
+[ -f "${ORCH_HTTP_2}/model.py" ] || { log_error "Missing ${ORCH_HTTP_2}/model.py"; exit 1; }
+[ -f "${ORCH_2}/triton_manifest.json" ] || { log_error "Missing v2 package-root manifest"; exit 1; }
+[ -f "${RUNTIME_ONNX_V2}/triton_manifest.json" ] || { log_error "Missing v2 runtime manifest"; exit 1; }
+[ -f "${RUNTIME_ONNX_V2}/model.onnx" ] || { log_error "Missing v2 runtime/model.onnx"; exit 1; }
+grep -q '/models/tts_orchestrator/2' "${TEST_REPO_V2}/tts_orchestrator/config.pbtxt" || { log_error "V2 orchestrator config has wrong model_package_dir"; exit 1; }
+grep -q 'name: "tts_orchestrator_http"' "${TEST_REPO_V2}/tts_orchestrator_http/config.pbtxt" || { log_error "V2 HTTP orchestrator config missing model name"; exit 1; }
+log_info "ONNX assemble checks for version 2 passed"
 
 # ---- TRT mode (if .engine exists) ----
 if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.plan" ]; then
