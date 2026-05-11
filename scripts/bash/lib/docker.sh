@@ -5,7 +5,8 @@
 #  Functions: detect_driver_version, detect_gpu_compute_cap,
 #             resolve_ngc_image, ensure_ngc_image,
 #             check_docker_gpu_ready, print_container_recommendation,
-#             resolve_ngc_tag, resolve_ngc_python_version,
+#             resolve_ngc_tag, resolve_ngc_image_from_tag,
+#             resolve_ngc_python_version,
 #             resolve_ngc_entry, build_triton_deploy_image,
 #             _check_ngc_manifest
 #  Depends:   lib/logging.sh, lib/utils.sh
@@ -42,14 +43,14 @@ _QWEN3_MIN_DRIVER="550.54"
 
 # ---------------------------------------------------------------------------
 #  _load_ngc_matrix
-#  Populates _NGC_TRTLLM_MATRIX from ngc_matrix.conf.
+#  Populates _NGC_CONTAINER_MATRIX from ngc_matrix.conf.
 #  Falls back to a minimal built-in default if the file is missing.
-#  Each entry: "tag  min_driver  trtllm_version  cuda_version  python_version  size_gb"
+#  Each entry: "tag  min_driver  tensorrt_version  cuda_version  python_version  size_gb"
 # ---------------------------------------------------------------------------
-_NGC_TRTLLM_MATRIX=()
+_NGC_CONTAINER_MATRIX=()
 
 _load_ngc_matrix() {
-    [[ ${#_NGC_TRTLLM_MATRIX[@]} -gt 0 ]] && return 0
+    [[ ${#_NGC_CONTAINER_MATRIX[@]} -gt 0 ]] && return 0
 
     local conf_path="${_LIB_DIR}/../ngc_matrix.conf"
 
@@ -57,21 +58,40 @@ _load_ngc_matrix() {
         while IFS= read -r line; do
             local stripped="${line##"${line%%[![:space:]]*}"}"
             [[ -z "$stripped" || "$stripped" == \#* ]] && continue
-            _NGC_TRTLLM_MATRIX+=("$stripped")
+            _NGC_CONTAINER_MATRIX+=("$stripped")
         done < "$conf_path"
     fi
 
-    if [ ${#_NGC_TRTLLM_MATRIX[@]} -eq 0 ]; then
+    if [ ${#_NGC_CONTAINER_MATRIX[@]} -eq 0 ]; then
         log_warn "ngc_matrix.conf not found or empty — using built-in fallback"
-        _NGC_TRTLLM_MATRIX=(
-            "25.11  580.95  1.0.3  13.0  3.12  12.25"
-            "25.05  570.124 0.19.0 12.8  3.12  17.0"
-            "24.07  550.54  0.11.0 12.4  3.10  23.0"
+        _NGC_CONTAINER_MATRIX=(
+            "25.11  590.44  10.14.1.48  13.1  3.12  -"
+            "25.05  575.51  10.10.0.31  12.9  3.12  -"
+            "25.03  570.124 10.9.0.34   12.8  3.12  -"
+            "24.07  555.42  10.2.0.19   12.5  3.10  -"
         )
     fi
 }
 
 _load_ngc_matrix
+
+# ---------------------------------------------------------------------------
+#  _ngc_entry_by_tag <tag>
+#  Looks up one matrix row by NGC tag. Echoes:
+#    "tag min_driver tensorrt_version cuda_version python_version size_gb"
+# ---------------------------------------------------------------------------
+_ngc_entry_by_tag() {
+    local want="$1"
+    local tag min_drv trt_ver cuda_ver py_ver size_gb
+    for entry in "${_NGC_CONTAINER_MATRIX[@]}"; do
+        read -r tag min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
+        if [ "$tag" = "$want" ]; then
+            echo "$tag $min_drv $trt_ver $cuda_ver ${py_ver:-3.12} ${size_gb:--}"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 #  detect_driver_version
@@ -190,7 +210,7 @@ _check_ngc_manifest() {
 #  Docker registry via _check_ngc_manifest.  Entries whose manifest is
 #  unavailable (not yet released) are skipped with a warning.
 #
-#  On success, echoes: "tag min_driver trt_version cuda_version python_version size_gb"
+#  On success, echoes: "tag min_driver tensorrt_version cuda_version python_version size_gb"
 #  On failure, prints targeted error messages and returns 1.
 # ---------------------------------------------------------------------------
 _resolve_best_entry() {
@@ -205,7 +225,7 @@ _resolve_best_entry() {
 
     local tag min_drv trt_ver cuda_ver py_ver size_gb
 
-    for entry in "${_NGC_TRTLLM_MATRIX[@]}"; do
+    for entry in "${_NGC_CONTAINER_MATRIX[@]}"; do
         read -r tag min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
         if _driver_ge "$driver_ver" "$min_drv"; then
             if [ "${NGC_SKIP_MANIFEST_VERIFY:-0}" != "1" ] && [ "${_NGC_VERIFY_MANIFEST:-0}" = "1" ]; then
@@ -237,6 +257,10 @@ _resolve_best_entry() {
 #  Echoes: nvcr.io/nvidia/tritonserver:xx.yy-py3
 # ---------------------------------------------------------------------------
 resolve_ngc_image() {
+    if [ -n "${NGC_TAG:-}" ]; then
+        resolve_ngc_image_from_tag "$NGC_TAG"
+        return $?
+    fi
     local entry
     entry=$(_resolve_best_entry "$@") || return 1
 
@@ -246,11 +270,37 @@ resolve_ngc_image() {
 }
 
 # ---------------------------------------------------------------------------
+#  resolve_ngc_image_from_tag <tag>
+#  Converts an explicit matrix tag (e.g. 25.03) to a Triton py3 image URI.
+# ---------------------------------------------------------------------------
+resolve_ngc_image_from_tag() {
+    local tag="$1"
+    if ! _ngc_entry_by_tag "$tag" >/dev/null; then
+        log_error "Unknown NGC tag: $tag"
+        log_error "Run: bash scripts/bash/autorun.sh list-ngc"
+        return 1
+    fi
+    echo "${_NGC_TRITON_BASE}:${tag}${_NGC_PY3_SUFFIX}"
+}
+
+# ---------------------------------------------------------------------------
 #  resolve_ngc_image_info [driver_version]
 #  Like resolve_ngc_image but also logs tag/CUDA/Python info.
 #  Echoes the Triton deploy image URI to stdout.
 # ---------------------------------------------------------------------------
 resolve_ngc_image_info() {
+    if [ -n "${NGC_TAG:-}" ]; then
+        local entry tag min_drv trt_ver cuda_ver py_ver size_gb
+        entry=$(_ngc_entry_by_tag "$NGC_TAG") || {
+            log_error "Unknown NGC_TAG: $NGC_TAG"
+            return 1
+        }
+        read -r tag min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
+        log_info "NGC tag override: $tag (CUDA $cuda_ver, Python ${py_ver:-?}, TensorRT $trt_ver)"
+        echo "${_NGC_TRITON_BASE}:${tag}${_NGC_PY3_SUFFIX}"
+        return 0
+    fi
+
     local entry
     entry=$(_resolve_best_entry "$@") || return 1
 
@@ -331,9 +381,17 @@ check_docker_gpu_ready() {
 #  resolve_ngc_tag [driver_version]
 #  Like resolve_ngc_image but echoes only the NGC tag (e.g. "25.09"),
 #  not the full image URI.  Used to construct image names for both
-#  trtllm and py3 variants.
+#  Triton py3 images.
 # ---------------------------------------------------------------------------
 resolve_ngc_tag() {
+    if [ -n "${NGC_TAG:-}" ]; then
+        if _ngc_entry_by_tag "$NGC_TAG" >/dev/null; then
+            echo "$NGC_TAG"
+            return 0
+        fi
+        log_error "Unknown NGC_TAG: $NGC_TAG"
+        return 1
+    fi
     local entry
     entry=$(_resolve_best_entry "$@") || return 1
 
@@ -346,10 +404,162 @@ resolve_ngc_tag() {
 #  resolve_ngc_entry [driver_version]
 #  Returns the full matrix entry (all 6 fields) for the best compatible
 #  NGC container.  Useful for callers that need python_version or size.
-#  Output: "tag  min_driver  trtllm_version  cuda_version  python_version  size_gb"
+#  Output: "tag  min_driver  tensorrt_version  cuda_version  python_version  size_gb"
 # ---------------------------------------------------------------------------
 resolve_ngc_entry() {
+    if [ -n "${NGC_TAG:-}" ]; then
+        _ngc_entry_by_tag "$NGC_TAG" || {
+            log_error "Unknown NGC_TAG: $NGC_TAG"
+            return 1
+        }
+        return 0
+    fi
     _resolve_best_entry "$@"
+}
+
+# ---------------------------------------------------------------------------
+#  resolve_ngc_entry_by_tag <tag>
+#  Public wrapper around matrix lookup for UI code.
+# ---------------------------------------------------------------------------
+resolve_ngc_entry_by_tag() {
+    local tag="$1"
+    _ngc_entry_by_tag "$tag" || {
+        log_error "Unknown NGC tag: $tag"
+        return 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+#  resolve_ngc_tag_cuda_version <tag>
+#  Echoes the CUDA major.minor recorded in the matrix for a tag.
+# ---------------------------------------------------------------------------
+resolve_ngc_tag_cuda_version() {
+    local tag="$1"
+    local entry tag_out min_drv trt_ver cuda_ver py_ver size_gb
+    entry=$(_ngc_entry_by_tag "$tag") || return 1
+    read -r tag_out min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
+    echo "$cuda_ver"
+}
+
+# ---------------------------------------------------------------------------
+#  resolve_ngc_tag_tensorrt_version <tag>
+#  Echoes the TensorRT version recorded in the matrix for a tag.
+# ---------------------------------------------------------------------------
+resolve_ngc_tag_tensorrt_version() {
+    local tag="$1"
+    local entry tag_out min_drv tensorrt_ver cuda_ver py_ver size_gb
+    entry=$(_ngc_entry_by_tag "$tag") || return 1
+    read -r tag_out min_drv tensorrt_ver cuda_ver py_ver size_gb <<< "$entry"
+    echo "$tensorrt_ver"
+}
+
+# ---------------------------------------------------------------------------
+#  resolve_ngc_torch_index_tag [ngc_tag]
+#  Maps the selected NGC CUDA version to the PyTorch CUDA wheel tag.
+# ---------------------------------------------------------------------------
+resolve_ngc_torch_index_tag() {
+    local ngc_tag="${1:-}"
+    local cuda_ver=""
+    if [ -n "$ngc_tag" ]; then
+        cuda_ver=$(resolve_ngc_tag_cuda_version "$ngc_tag") || return 1
+    else
+        local entry tag min_drv trt_ver py_ver size_gb
+        entry=$(_resolve_best_entry) || return 1
+        read -r tag min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
+    fi
+
+    local major minor
+    major=$(echo "$cuda_ver" | cut -d. -f1)
+    minor=$(echo "$cuda_ver" | cut -d. -f2)
+    if [ "$major" -le 11 ]; then
+        echo "cu118"
+    elif [ "$major" -eq 12 ]; then
+        if   [ "$minor" -le 1 ]; then echo "cu121"
+        elif [ "$minor" -le 4 ]; then echo "cu124"
+        elif [ "$minor" -le 6 ]; then echo "cu126"
+        else                          echo "cu128"
+        fi
+    elif [ "$major" -eq 13 ]; then
+        echo "cu130"
+    else
+        echo "cu${major}${minor}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+#  list_ngc_matrix [driver_version]
+#  Prints all known NGC tags, marking driver-compatible rows and the default.
+# ---------------------------------------------------------------------------
+list_ngc_matrix() {
+    local driver_ver="${1:-${TARGET_DRIVER:-}}"
+    if [ -z "$driver_ver" ]; then
+        driver_ver=$(detect_driver_version 2>/dev/null || true)
+    fi
+
+    local default_tag=""
+    if [ -n "$driver_ver" ]; then
+        default_tag=$(resolve_ngc_tag "$driver_ver" 2>/dev/null || true)
+    fi
+
+    printf '%-7s %-10s %-8s %-7s %-14s %-8s %-12s %s\n' \
+        "TAG" "MIN_DRIVER" "CUDA" "PYTHON" "TENSORRT" "SIZE_GB" "STATUS" "IMAGE"
+    local entry tag min_drv trt_ver cuda_ver py_ver size_gb status image
+    for entry in "${_NGC_CONTAINER_MATRIX[@]}"; do
+        read -r tag min_drv trt_ver cuda_ver py_ver size_gb <<< "$entry"
+        status="unknown"
+        if [ -n "$driver_ver" ]; then
+            if _driver_ge "$driver_ver" "$min_drv"; then
+                status="ok"
+            else
+                status="needs-driver"
+            fi
+            if [ "$tag" = "$default_tag" ]; then
+                status="default"
+            fi
+        fi
+        image="${_NGC_TRITON_BASE}:${tag}${_NGC_PY3_SUFFIX}"
+        printf '%-7s %-10s %-8s %-7s %-14s %-8s %-12s %s\n' \
+            "$tag" "$min_drv" "$cuda_ver" "${py_ver:-3.12}" "$trt_ver" "${size_gb:--}" "$status" "$image"
+    done
+}
+
+# ---------------------------------------------------------------------------
+#  select_ngc_tag_interactive [driver_version]
+#  Lists all matrix rows and asks for a tag. Blank input uses the current
+#  best compatible tag for the detected/target driver.
+# ---------------------------------------------------------------------------
+select_ngc_tag_interactive() {
+    local driver_ver="${1:-${TARGET_DRIVER:-}}"
+    if [ -z "$driver_ver" ]; then
+        driver_ver=$(detect_driver_version 2>/dev/null || true)
+    fi
+
+    local default_tag=""
+    if [ -n "$driver_ver" ]; then
+        default_tag=$(resolve_ngc_tag "$driver_ver" 2>/dev/null || true)
+    fi
+
+    echo "" >&2
+    echo "  NGC 容器版本选择 (用于 Phase B trtexec / Phase C Triton 镜像)" >&2
+    if [ -n "$driver_ver" ]; then
+        echo "  当前/目标 NVIDIA driver: $driver_ver" >&2
+    fi
+    echo "  说明: 这里列的是 tritonserver:<tag>-py3；TENSORRT 列用于判断 plan/runtime 兼容。" >&2
+    echo "" >&2
+    list_ngc_matrix "$driver_ver" | sed 's/^/    /' >&2
+    echo "" >&2
+
+    local choice=""
+    read -rp "  NGC tag [${default_tag:-auto}] (例如 25.03，留空用默认): " -t 30 choice || true
+    choice="${choice:-$default_tag}"
+    if [ -z "$choice" ]; then
+        return 0
+    fi
+    if ! _ngc_entry_by_tag "$choice" >/dev/null; then
+        log_error "Unknown NGC tag: $choice"
+        return 1
+    fi
+    echo "$choice"
 }
 
 # ---------------------------------------------------------------------------
@@ -359,10 +569,17 @@ resolve_ngc_entry() {
 # ---------------------------------------------------------------------------
 resolve_ngc_python_version() {
     local entry
-    entry=$(_resolve_best_entry "$@") || return 1
+    if [ -n "${NGC_TAG:-}" ]; then
+        entry=$(_ngc_entry_by_tag "$NGC_TAG") || {
+            log_error "Unknown NGC_TAG: $NGC_TAG"
+            return 1
+        }
+    else
+        entry=$(_resolve_best_entry "$@") || return 1
+    fi
 
-    local tag min_drv trtllm_ver cuda_ver py_ver size_gb
-    read -r tag min_drv trtllm_ver cuda_ver py_ver size_gb <<< "$entry"
+    local tag min_drv tensorrt_ver cuda_ver py_ver size_gb
+    read -r tag min_drv tensorrt_ver cuda_ver py_ver size_gb <<< "$entry"
 
     echo "${py_ver:-3.12}"
 }
@@ -384,6 +601,10 @@ build_triton_deploy_image() {
 
     local base_image="${_NGC_TRITON_BASE}:${ngc_tag}${_NGC_PY3_SUFFIX}"
     local deploy_tag="${_DEPLOY_IMAGE_NAME}:${ngc_tag}"
+    local pytorch_cuda_tag="${TRITON_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}"
+    if [ -z "$pytorch_cuda_tag" ]; then
+        pytorch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag") || return 1
+    fi
 
     if docker image inspect "$deploy_tag" &>/dev/null; then
         log_info "Deploy image already exists: $deploy_tag"
@@ -410,6 +631,7 @@ build_triton_deploy_image() {
     if ! DOCKER_BUILDKIT=1 docker build \
         --build-arg "BASE_IMAGE=$base_image" \
         --build-arg "TENSORRT_PYTHON_VERSION=$trt_python_version" \
+        --build-arg "PYTORCH_CUDA_TAG=$pytorch_cuda_tag" \
         -t "$deploy_tag" \
         -f "$dockerfile" \
         "$repo_root"; then

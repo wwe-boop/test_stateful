@@ -6,7 +6,7 @@ Compares the ORIGINAL PyTorch model output against the decomposed pipeline
 (exported weights + ONNX models) step-by-step:
 
   Stage A: Prefill construction (exported weights vs PyTorch)
-  Stage B: Talker Backbone forward (PyTorch reference only — TRT-LLM tested separately)
+  Stage B: Talker Backbone forward (PyTorch reference only; TensorRT engines are built in Phase B)
   Stage C: Code Predictor (PyTorch vs ONNX)
   Stage D: Code2Wav decoder (PyTorch vs ONNX)
   Stage E: Full decode loop (N steps, compare codec tokens & audio)

@@ -416,8 +416,13 @@ engine_build_image() {
     fi
 
     log_step "Building engine Docker image: $image_tag"
+    local pytorch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-cu130}}"
     # BuildKit: enables RUN --mount cache for pip (faster rebuilds; see Dockerfile.engine).
-    DOCKER_BUILDKIT=1 docker build -t "$image_tag" -f "$dockerfile" "$repo_root" \
+    DOCKER_BUILDKIT=1 docker build \
+        --build-arg "PYTORCH_CUDA_TAG=$pytorch_cuda_tag" \
+        -t "$image_tag" \
+        -f "$dockerfile" \
+        "$repo_root" \
         || { log_error "Docker build failed"; return 1; }
     log_info "Image built: $image_tag"
 }

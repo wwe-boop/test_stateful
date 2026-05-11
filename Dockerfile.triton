@@ -5,14 +5,16 @@
 # BuildKit pip cache: DOCKER_BUILDKIT=1 (see build_triton_deploy_image in docker.sh).
 ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.02-py3
 ARG TENSORRT_PYTHON_VERSION=10.15.1.29
+ARG PYTORCH_CUDA_TAG=cu130
 FROM ${BASE_IMAGE} AS triton-deps
 ARG TENSORRT_PYTHON_VERSION
+ARG PYTORCH_CUDA_TAG
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
     --trusted-host mirrors.bfsu.edu.cn \
-    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    --extra-index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_TAG} \
     torch \
     tokenizers \
     pyyaml \

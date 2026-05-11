@@ -539,6 +539,7 @@ build_triton_image() {
     local image_tag="$2"
     local base_image="${3:-}"
     local trt_python_version="${TRITON_TENSORRT_PIP_VERSION:-10.15.1.29}"
+    local pytorch_cuda_tag="${TRITON_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-cu130}}"
 
     if [ -z "$base_image" ]; then
         base_image=$(resolve_triton_deploy_image) \
@@ -598,13 +599,15 @@ PY
     cat > "$dockerfile" <<DOCKERFILE
 ARG BASE_IMAGE=${base_image}
 ARG TENSORRT_PYTHON_VERSION=${trt_python_version}
+ARG PYTORCH_CUDA_TAG=${pytorch_cuda_tag}
 FROM \${BASE_IMAGE}
 ARG TENSORRT_PYTHON_VERSION
+ARG PYTORCH_CUDA_TAG
 
 RUN python3 -m pip install --no-cache-dir \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
     --trusted-host mirrors.bfsu.edu.cn \
-    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    --extra-index-url https://download.pytorch.org/whl/\${PYTORCH_CUDA_TAG} \
     torch \
     tokenizers \
     "tensorrt==\${TENSORRT_PYTHON_VERSION}"
@@ -627,6 +630,7 @@ DOCKERFILE
     docker build \
         --build-arg "BASE_IMAGE=$base_image" \
         --build-arg "TENSORRT_PYTHON_VERSION=$trt_python_version" \
+        --build-arg "PYTORCH_CUDA_TAG=$pytorch_cuda_tag" \
         -t "$image_tag" \
         -f "$dockerfile" \
         "$repo_root" \

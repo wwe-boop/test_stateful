@@ -16,11 +16,13 @@
 #    bash scripts/bash/autorun.sh deploy [options]    # Phase C only
 #    bash scripts/bash/autorun.sh status              # show pipeline status
 #    bash scripts/bash/autorun.sh stop                # stop TTS service
+#    bash scripts/bash/autorun.sh list-ngc            # list container versions
 #    bash scripts/bash/autorun.sh update-matrix       # update NGC compat matrix
 #
 #  Options:
 #    --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, ...)
 #    --model-version <N>     Triton model version directory (default: 1)
+#    --ngc-tag <tag>         Select NGC tritonserver tag (e.g. 25.03)
 #    --target-driver <ver>   Target NVIDIA driver for NGC container selection
 #    --yes, -y               Skip confirmations (non-interactive)
 #    --dry-run               Show what would be done
@@ -62,7 +64,7 @@ source "${SCRIPT_DIR}/tools.sh"
 
 # ── Known model variant names (for auto-detection of positional args) ──
 _KNOWN_VARIANTS="base-1.7b custom-1.7b design-1.7b base-0.6b custom-0.6b all-1.7b all"
-_KNOWN_COMMANDS="all setup build deploy status stop update-matrix help"
+_KNOWN_COMMANDS="all setup build deploy status stop list-ngc update-matrix help"
 
 _is_variant() { [[ " $_KNOWN_VARIANTS " == *" $1 "* ]]; }
 _is_command() { [[ " $_KNOWN_COMMANDS " == *" $1 "* ]]; }
@@ -76,6 +78,7 @@ MODEL_VERSION="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
 DRY_RUN=false
 YES_MODE=false
 TARGET_DRIVER="${TARGET_DRIVER:-}"
+NGC_TAG="${NGC_TAG:-}"
 GLOBAL_DEVICE="${QWEN3_TTS_GPU_DEVICE:-${GPU_DEVICE:-}}"
 EXPORT_DEVICE="${EXPORT_DEVICE:-}"
 BUILD_GPU_DEVICE="${BUILD_GPU_DEVICE:-}"
@@ -96,6 +99,7 @@ MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-}"
 MAX_INPUT_LEN="${MAX_INPUT_LEN:-}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-}"
 BUILD_IMAGE="${NGC_IMAGE:-}"
+BUILD_IMAGE_EXPLICIT=false
 ENGINE_DTYPE="${ENGINE_DTYPE:-}"
 TRITON_IO_FLOAT_DTYPE="${TRITON_IO_FLOAT_DTYPE:-}"
 
@@ -105,6 +109,7 @@ GATEWAY_MODE="${GATEWAY_MODE:-}"
 ENGINE_MODE="${ENGINE_MODE:-}"
 ENGINE_PORT="$(_env_or_empty ENGINE_GRPC_PORT)"
 ENGINE_DOCKER_IMAGE="$(_env_or_empty ENGINE_IMAGE)"
+ENGINE_DOCKER_IMAGE_EXPLICIT=false
 GRPC_PORT="$(_env_or_empty TRITON_GRPC_PORT)"
 HTTP_PORT="$(_env_or_empty TRITON_HTTP_PORT)"
 RUNTIME_MAX_BATCH_SIZE="${RUNTIME_MAX_BATCH_SIZE:-}"
@@ -124,6 +129,7 @@ Commands:
   status            Show pipeline status
   stop              Stop TTS service
   update-matrix     Update NGC compatibility matrix from NVIDIA website
+  list-ngc          List selectable NGC container versions
   help              Show this help
 
 If no command is given, launches interactive mode (Phase C: standalone | triton | engine-docker).
@@ -133,6 +139,8 @@ Options:
   --variant, -m <name>    Model variant (base-1.7b, custom-1.7b, design-1.7b,
                           base-0.6b, custom-0.6b, all-1.7b, all)
   --model-version <N>     Triton model version directory (default: 1)
+  --ngc-tag <tag>         Select NGC tritonserver:<tag>-py3 for Phase B/C
+                          (default: newest compatible tag for current driver).
   --target-driver <ver>   Target NVIDIA driver version for NGC container
                           selection (e.g. 575.57 for production machines).
                           Overrides local driver detection.
@@ -170,7 +178,7 @@ Phase C options (forwarded to deploy.sh):
                           Runtime scheduler max batch size
   --runtime-max-seq-len <N>
                           Runtime scheduler max sequence length
-  --engine-image <tag>    Image for engine-docker (default: qwen3-engine:26.02)
+  --engine-image <tag>    Image for engine-docker (default: qwen3-engine:<ngc-tag>, else qwen3-engine:26.02)
   --port <port>           Standalone / engine-docker gRPC port (default: 50051)
   --grpc-port <port>      Triton gRPC port (default: 8001)
   --http-port <port>      Triton HTTP port (default: 8000)
@@ -186,6 +194,8 @@ Examples:
   autorun.sh build -m custom-1.7b --dtype fp16    # Phase B with fp16
   autorun.sh build -m custom-1.7b --max-batch-size 64 --max-input-len 128 --max-seq-len 512
   autorun.sh build -m custom-1.7b --build-device 1
+  autorun.sh build -m custom-1.7b --ngc-tag 25.03
+  autorun.sh list-ngc                  # list available container tags
   autorun.sh build --target-driver 575.57   # build for production driver
   autorun.sh deploy                   # Phase C (standalone engine)
   autorun.sh deploy --gateway triton         # Phase C (Triton)
@@ -208,6 +218,7 @@ parse_args() {
         case "$1" in
             --variant|-m)       VARIANT="$2"; shift 2 ;;
             --model-version)    MODEL_VERSION="$2"; shift 2 ;;
+            --ngc-tag|--container-tag) NGC_TAG="$2"; shift 2 ;;
             --yes|-y)           YES_MODE=true; shift ;;
             --dry-run)          DRY_RUN=true; shift ;;
             --target-driver)    TARGET_DRIVER="$2"; shift 2 ;;
@@ -229,7 +240,7 @@ parse_args() {
             --max-batch-size)   MAX_BATCH_SIZE="$2"; shift 2 ;;
             --max-input-len)    MAX_INPUT_LEN="$2"; shift 2 ;;
             --max-seq-len)      MAX_SEQ_LEN="$2"; shift 2 ;;
-            --image)            BUILD_IMAGE="$2"; shift 2 ;;
+            --image)            BUILD_IMAGE="$2"; BUILD_IMAGE_EXPLICIT=true; shift 2 ;;
             --dtype)            ENGINE_DTYPE="$2"; shift 2 ;;
             --triton-io-float-dtype) TRITON_IO_FLOAT_DTYPE="$2"; shift 2 ;;
 
@@ -238,7 +249,7 @@ parse_args() {
             --engine-mode)      ENGINE_MODE="$2"; shift 2 ;;
             --runtime-max-batch-size|--runtime-max-batch) RUNTIME_MAX_BATCH_SIZE="$2"; shift 2 ;;
             --runtime-max-seq-len|--runtime-max-seq) RUNTIME_MAX_SEQ_LEN="$2"; shift 2 ;;
-            --engine-image)      ENGINE_DOCKER_IMAGE="$2"; shift 2 ;;
+            --engine-image)      ENGINE_DOCKER_IMAGE="$2"; ENGINE_DOCKER_IMAGE_EXPLICIT=true; shift 2 ;;
             --port)             ENGINE_PORT="$2"; shift 2 ;;
             --grpc-port)        GRPC_PORT="$2"; shift 2 ;;
             --http-port)        HTTP_PORT="$2"; shift 2 ;;
@@ -277,6 +288,44 @@ build_forward_args() {
     # Target driver override (propagated via env var to all phases)
     if [ -n "$TARGET_DRIVER" ]; then
         export TARGET_DRIVER
+    fi
+    if [ -z "$NGC_TAG" ] && ! $BUILD_IMAGE_EXPLICIT; then
+        case "${COMMAND:-all}" in
+            all|setup|build|deploy)
+                NGC_TAG=$(resolve_ngc_tag "${TARGET_DRIVER:-}" 2>/dev/null || true)
+                ;;
+        esac
+    fi
+    if [ -n "$NGC_TAG" ]; then
+        export NGC_TAG
+        if ! resolve_ngc_entry_by_tag "$NGC_TAG" >/dev/null; then
+            exit 1
+        fi
+        local _ngc_image
+        _ngc_image=$(resolve_ngc_image_from_tag "$NGC_TAG") || exit 1
+        local _torch_tag
+        _torch_tag=$(resolve_ngc_torch_index_tag "$NGC_TAG") || exit 1
+        local _trt_python_version
+        _trt_python_version=$(resolve_ngc_tag_tensorrt_version "$NGC_TAG") || exit 1
+        if ! $BUILD_IMAGE_EXPLICIT; then
+            BUILD_IMAGE="$_ngc_image"
+        fi
+        export TRITON_BASE_IMAGE="${TRITON_BASE_IMAGE:-$_ngc_image}"
+        export ENGINE_BASE_IMAGE="${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:${NGC_TAG}-py3}"
+        export TRITON_IMAGE="${TRITON_IMAGE:-qwen3-tts-triton:${NGC_TAG}}"
+        if ! $ENGINE_DOCKER_IMAGE_EXPLICIT; then
+            ENGINE_DOCKER_IMAGE="qwen3-engine:${NGC_TAG}"
+            export ENGINE_IMAGE="$ENGINE_DOCKER_IMAGE"
+        fi
+        export PYTORCH_CUDA_TAG="${PYTORCH_CUDA_TAG:-$_torch_tag}"
+        export ENGINE_PYTORCH_CUDA_TAG="${ENGINE_PYTORCH_CUDA_TAG:-$_torch_tag}"
+        export TRITON_PYTORCH_CUDA_TAG="${TRITON_PYTORCH_CUDA_TAG:-$_torch_tag}"
+        export TRITON_TENSORRT_PYTHON_VERSION="${TRITON_TENSORRT_PYTHON_VERSION:-$_trt_python_version}"
+        export TRITON_TENSORRT_PIP_VERSION="${TRITON_TENSORRT_PIP_VERSION:-$_trt_python_version}"
+        export STANDALONE_ENGINE_TENSORRT_PIP_VERSION="${STANDALONE_ENGINE_TENSORRT_PIP_VERSION:-$_trt_python_version}"
+    fi
+    if [ -z "$ENGINE_DOCKER_IMAGE" ]; then
+        ENGINE_DOCKER_IMAGE="$(_env_or_empty ENGINE_IMAGE)"
     fi
     MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
 
@@ -332,10 +381,14 @@ build_forward_args() {
     if [ -n "$effective_runtime_device" ]; then DEPLOY_ARGS+=(--device "$effective_runtime_device"); fi
     if [ -n "$RUNTIME_MAX_BATCH_SIZE" ]; then DEPLOY_ARGS+=(--max-batch "$RUNTIME_MAX_BATCH_SIZE"); fi
     if [ -n "$RUNTIME_MAX_SEQ_LEN" ]; then DEPLOY_ARGS+=(--max-seq-len "$RUNTIME_MAX_SEQ_LEN"); fi
-    if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
+    if $ENGINE_DOCKER_IMAGE_EXPLICIT || [ "${GATEWAY_MODE:-}" = "engine-docker" ]; then
+        if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
+    fi
     if [ -n "$ENGINE_PORT" ]; then DEPLOY_ARGS+=(--port "$ENGINE_PORT"); fi
     if [ -n "$MODEL_VERSION" ]; then DEPLOY_ARGS+=(--model-version "$MODEL_VERSION"); fi
-    if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
+    if $BUILD_IMAGE_EXPLICIT; then
+        if [ -n "$BUILD_IMAGE" ]; then DEPLOY_ARGS+=(--image "$BUILD_IMAGE"); fi
+    fi
     if [ -n "$GRPC_PORT" ]; then
         export TRITON_GRPC_PORT="$GRPC_PORT"
     fi
@@ -449,6 +502,10 @@ cmd_update_matrix() {
     update_ngc_matrix "${SCRIPT_DIR}/ngc_matrix.conf"
 }
 
+cmd_list_ngc() {
+    list_ngc_matrix "${TARGET_DRIVER:-}"
+}
+
 # ── Banner ──
 
 show_run_banner() {
@@ -474,6 +531,10 @@ show_run_banner() {
     [ -n "$RUNTIME_MAX_BATCH_SIZE" ] && echo "  运行 batch: $RUNTIME_MAX_BATCH_SIZE"
     [ -n "$RUNTIME_MAX_SEQ_LEN" ] && echo "  运行 seq:   $RUNTIME_MAX_SEQ_LEN"
     [ -n "$TARGET_DRIVER" ] && echo "  目标驱动:  $TARGET_DRIVER"
+    [ -n "$NGC_TAG" ] && echo "  NGC tag:   $NGC_TAG"
+    [ -n "$BUILD_IMAGE" ] && echo "  Phase B镜像: $BUILD_IMAGE"
+    [ -n "${TRITON_BASE_IMAGE:-}" ] && echo "  Triton base: ${TRITON_BASE_IMAGE}"
+    [ -n "${ENGINE_BASE_IMAGE:-}" ] && echo "  Engine base: ${ENGINE_BASE_IMAGE}"
     $DRY_RUN && echo "  预演:      是"
     echo ""
 }
@@ -570,6 +631,14 @@ interactive_mode() {
         read -rp "  精度 [bf16] (30s 后自动选择默认): " -t 30 _dtyp || true
         if [ -n "$_dtyp" ]; then
             ENGINE_DTYPE="$_dtyp"
+        fi
+    fi
+
+    if $needs_build && [ -z "$NGC_TAG" ] && ! $BUILD_IMAGE_EXPLICIT && [ -t 0 ]; then
+        local _selected_ngc_tag=""
+        _selected_ngc_tag=$(select_ngc_tag_interactive "${TARGET_DRIVER:-}") || exit 1
+        if [ -n "$_selected_ngc_tag" ]; then
+            NGC_TAG="$_selected_ngc_tag"
         fi
     fi
 
@@ -679,6 +748,7 @@ main() {
         deploy)         cmd_deploy ;;
         status)         cmd_status ;;
         stop)           cmd_stop ;;
+        list-ngc)       cmd_list_ngc ;;
         update-matrix)  cmd_update_matrix ;;
         help)           usage ;;
         *)              log_error "Unknown command: $COMMAND"; usage; exit 1 ;;

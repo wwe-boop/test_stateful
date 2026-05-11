@@ -2,8 +2,8 @@
 # ===========================================================================
 #  ngc_updater.sh — Fetch and update NGC compatibility matrix
 #
-#  Scrapes the official NVIDIA Triton compatibility page and merges new
-#  entries into the local ngc_matrix.conf.
+#  Scrapes the official NVIDIA Triton release notes and merges new entries
+#  into the local ngc_matrix.conf.
 #
 #  Functions: update_ngc_matrix
 #  Depends:   lib/logging.sh, curl, python3 (for HTML parsing)
@@ -18,51 +18,160 @@ _LIB_NGC_UPDATER_LOADED=1
 _LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${_LIB_DIR}/logging.sh"
 
-_COMPAT_URL="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/introduction/compatibility.html"
+_RELEASE_NOTES_INDEX_URL="https://docs.nvidia.com/deeplearning/triton-inference-server/release-notes/index.html"
+_RELEASE_NOTES_BASE_URL="https://docs.nvidia.com/deeplearning/triton-inference-server/release-notes"
 
 # ---------------------------------------------------------------------------
 #  _scrape_compat_matrix
-#  Downloads the compatibility page and extracts trtllm-python-py3 rows
-#  into the conf format.  Outputs lines to stdout.
+#  Downloads the latest Triton release-notes page and extracts the generic
+#  "NVIDIA Triton Inference Server Container Versions" table into this
+#  project's matrix format.
+#  Outputs lines to stdout.
 #  Returns 1 on any failure (network, parse, empty result).
 # ---------------------------------------------------------------------------
 _scrape_compat_matrix() {
-    local html
-    html=$(curl -fsSL --connect-timeout 15 --max-time 30 "$_COMPAT_URL" 2>/dev/null) \
-        || { log_warn "Failed to fetch compatibility page"; return 1; }
+    local tmp_index tmp_release release_href release_url
+    tmp_index=$(mktemp /tmp/ngc_release_index.XXXXXX) || return 1
+    tmp_release=$(mktemp /tmp/ngc_release_notes.XXXXXX) || {
+        rm -f "$tmp_index"
+        return 1
+    }
 
-    if [ -z "$html" ]; then
-        log_warn "Empty response from compatibility page"
+    if ! curl -fsSL --connect-timeout 15 --max-time 30 \
+        -o "$tmp_index" "$_RELEASE_NOTES_INDEX_URL" 2>/dev/null; then
+        log_warn "Failed to fetch release-notes index"
+        rm -f "$tmp_index" "$tmp_release"
         return 1
     fi
 
-    python3 - "$html" <<'PYEOF' || return 1
+    release_href=$(
+        python3 - "$tmp_index" <<'PYEOF' || true
+import re
+import sys
+from pathlib import Path
+
+html = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+links = re.findall(r'href="([^"]*rel[_-](\d{2})-(\d{2})\.html)[^"]*"', html)
+if not links:
+    sys.exit(1)
+
+def key(item):
+    _href, yy, mm = item
+    return int(yy), int(mm)
+
+print(sorted(links, key=key, reverse=True)[0][0])
+PYEOF
+    )
+    if [ -z "$release_href" ]; then
+        log_warn "Could not locate latest Triton release notes page"
+        rm -f "$tmp_index" "$tmp_release"
+        return 1
+    fi
+
+    if [[ "$release_href" =~ ^https?:// ]]; then
+        release_url="$release_href"
+    else
+        release_href="${release_href%%#*}"
+        release_url="${_RELEASE_NOTES_BASE_URL}/${release_href#./}"
+    fi
+
+    if ! curl -fsSL --connect-timeout 15 --max-time 30 \
+        -o "$tmp_release" "$release_url" 2>/dev/null; then
+        log_warn "Failed to fetch release notes: $release_url"
+        rm -f "$tmp_index" "$tmp_release"
+        return 1
+    fi
+
+    if [ ! -s "$tmp_release" ]; then
+        log_warn "Empty response from release notes"
+        rm -f "$tmp_index" "$tmp_release"
+        return 1
+    fi
+
+    python3 - "$tmp_release" <<'PYEOF'
 import sys, re
 from html.parser import HTMLParser
+from pathlib import Path
 
-html = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read()
+html = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
 
-class TritonTableParser(HTMLParser):
-    """Extract rows from the trtllm-python-py3 table."""
+CUDA_MIN_DRIVER = [
+    # CUDA major.minor, optional update predicate, Linux x86_64 minimum driver
+    ("13.2", "update1", "595.58"),
+    ("13.2", None, "595.45"),
+    ("13.1", "update1", "590.48"),
+    ("13.1", None, "590.44"),
+    ("13.0", "update2", "580.95"),
+    ("13.0", "update1", "580.82"),
+    ("13.0", None, "580.65"),
+    ("12.9", "update1", "575.57"),
+    ("12.9", None, "575.51"),
+    ("12.8", "update1", "570.124"),
+    ("12.8", None, "570.86"),
+    ("12.6", "update3", "560.35"),
+    ("12.6", "update2", "560.35"),
+    ("12.6", "update1", "560.35"),
+    ("12.6", None, "560.28"),
+    ("12.5", "update1", "555.42"),
+    ("12.5", None, "555.42"),
+    ("12.4", "update1", "550.54"),
+    ("12.4", None, "550.54"),
+    ("12.3", "update1", "545.23"),
+    ("12.3", None, "545.23"),
+]
+
+def normalize_cuda(value):
+    m = re.search(r'(\d+\.\d+)(?:\.(\d+))?', value)
+    if not m:
+        return "-", None
+    major_minor = m.group(1)
+    patch = int(m.group(2) or 0)
+    return major_minor, patch
+
+def min_driver_for_cuda(cuda, patch):
+    for major_minor, update, driver in CUDA_MIN_DRIVER:
+        if cuda != major_minor:
+            continue
+        if update == "update3" and patch >= 3:
+            return driver
+        if update == "update2" and patch >= 2:
+            return driver
+        if update == "update1" and patch >= 1:
+            return driver
+        if update is None:
+            return driver
+    return "-"
+
+def normalize_version(value):
+    m = re.search(r'(\d+(?:\.\d+)+(?:\.post\d+)?(?:\.dev\d+)?)', value)
+    return m.group(1) if m else "-"
+
+def infer_python_version(tag):
+    try:
+        yy, mm = [int(x) for x in tag.split(".", 1)]
+    except ValueError:
+        return "3.12"
+    if (yy, mm) >= (24, 11):
+        return "3.12"
+    return "3.10"
+
+class TritonReleaseNotesParser(HTMLParser):
+    """Extract rows from the generic Triton container versions table."""
 
     def __init__(self):
         super().__init__()
-        self.in_trtllm_section = False
         self.in_table = False
         self.in_row = False
         self.in_cell = False
         self.current_row = []
         self.cell_text = ""
+        self.tables = []
         self.rows = []
-        self.header_seen = False
-        self.tag_stack = []
 
     def handle_starttag(self, tag, attrs):
-        self.tag_stack.append(tag)
-        if tag == "h2":
-            self.in_trtllm_section = False
-        if tag == "table" and self.in_trtllm_section:
+        if tag == "table":
             self.in_table = True
+            self.rows = []
         if tag == "tr" and self.in_table:
             self.in_row = True
             self.current_row = []
@@ -71,76 +180,65 @@ class TritonTableParser(HTMLParser):
             self.cell_text = ""
 
     def handle_endtag(self, tag):
-        if self.tag_stack:
-            self.tag_stack.pop()
         if tag in ("td", "th") and self.in_cell:
             self.in_cell = False
             self.current_row.append(self.cell_text.strip())
         if tag == "tr" and self.in_row:
             self.in_row = False
             if self.current_row:
-                if not self.header_seen:
-                    self.header_seen = True
-                else:
-                    self.rows.append(self.current_row)
+                self.rows.append(self.current_row)
         if tag == "table" and self.in_table:
+            self.tables.append(self.rows)
             self.in_table = False
 
     def handle_data(self, data):
         if self.in_cell:
             self.cell_text += data
-        stripped = data.strip()
-        if "trtllm-python-py3" in stripped.lower():
-            if "h2" in self.tag_stack or "h3" in self.tag_stack:
-                self.in_trtllm_section = True
-                self.header_seen = False
 
-parser = TritonTableParser()
+parser = TritonReleaseNotesParser()
 parser.feed(html)
 
-if not parser.rows:
+table = None
+for rows in parser.tables:
+    if not rows:
+        continue
+    header = [cell.lower() for cell in rows[0]]
+    if (
+        any("container version" in cell for cell in header)
+        and any("cuda toolkit" in cell for cell in header)
+        and any("tensorrt" in cell for cell in header)
+    ):
+        table = rows
+        break
+
+if not table:
     sys.exit(1)
 
-for row in parser.rows:
-    if len(row) < 9:
+for row in table[1:]:
+    if len(row) < 2:
         continue
 
-    # Columns: Triton release | NGC Tag | Python | Torch | TensorRT |
-    #          TensorRT-LLM | CUDA | CUDA Driver | Size
-    ngc_tag_full = row[1].strip()
-    python_ver = row[2].strip()
-    trtllm_ver = row[5].strip()
-    cuda_ver = row[6].strip()
-    driver_ver = row[7].strip()
-    size_raw = row[8].strip()
-
-    # Extract NGC tag: "nvcr.io/nvidia/tritonserver:25.08-trtllm-python-py3" -> "25.08"
-    m = re.search(r':(\d+\.\d+)-trtllm', ngc_tag_full)
+    m = re.match(r'(\d{2}\.\d{2})$', row[0].strip())
     if not m:
         continue
     ngc_tag = m.group(1)
 
-    # Normalize python version: "Python 3.12.3" -> "3.12"
-    pm = re.search(r'(\d+\.\d+)', python_ver)
-    py_ver = pm.group(1) if pm else "-"
+    cuda_cell = next((cell for cell in row if "cuda" in cell.lower()), "")
+    cuda, cuda_patch = normalize_cuda(cuda_cell)
+    tensorrt = normalize_version(next((cell for cell in row if "tensorrt" in cell.lower()), ""))
+    if cuda == "-" or tensorrt == "-":
+        continue
 
-    # Normalize driver: take major.minor (e.g. "575.51.03" -> "575.51")
-    dm = re.match(r'(\d+\.\d+)', driver_ver)
-    min_driver = dm.group(1) if dm else driver_ver
+    min_driver = min_driver_for_cuda(cuda, cuda_patch)
+    if min_driver == "-":
+        continue
+    py_ver = infer_python_version(ngc_tag)
 
-    # Normalize CUDA: take major.minor (e.g. "12.9.0.043" -> "12.9")
-    cm = re.match(r'(\d+\.\d+)', cuda_ver)
-    cuda = cm.group(1) if cm else cuda_ver
-
-    # Normalize TRT-LLM version: strip suffixes like ".post1"
-    trtllm = re.sub(r'\.post\d+$', '', trtllm_ver)
-
-    # Normalize size: "20.49 GB" -> "20.49", "18.3G" -> "18.3"
-    sm = re.search(r'([\d.]+)\s*G', size_raw)
-    size = sm.group(1) if sm else "-"
-
-    print(f"{ngc_tag}  {min_driver}  {trtllm}  {cuda}  {py_ver}  {size}")
+    print(f"{ngc_tag:6s}  {min_driver:7s}  {tensorrt:12s}  {cuda:5s}  {py_ver:5s}  -")
 PYEOF
+    local status=$?
+    rm -f "$tmp_index" "$tmp_release"
+    return $status
 }
 
 # ---------------------------------------------------------------------------
@@ -194,7 +292,8 @@ with open(scraped_file) as f:
 # Parse existing conf
 comments, existing = parse_conf(existing_conf)
 
-# Merge: scraped wins for fields that are "-" in existing
+# Merge: release-notes data wins for the version fields. Existing size is
+# preserved when the release-notes table does not publish image size.
 merged = OrderedDict()
 all_tags = set(list(scraped.keys()) + list(existing.keys()))
 
@@ -203,21 +302,19 @@ for tag in all_tags:
     e = existing.get(tag)
 
     if s and e:
-        # Merge: prefer non-"-" values
-        result = list(e)
-        # Pad both to 6 fields
-        while len(result) < 6:
-            result.append("-")
+        # Prefer freshly scraped release-note values for tag/min_driver/
+        # TensorRT/CUDA/Python. Preserve existing size if scraped size is "-".
+        result = list(s)
         s_padded = list(s)
         while len(s_padded) < 6:
             s_padded.append("-")
+        e_padded = list(e)
+        while len(e_padded) < 6:
+            e_padded.append("-")
 
-        for i in range(len(result)):
-            if result[i] == "-" and i < len(s_padded) and s_padded[i] != "-":
-                result[i] = s_padded[i]
-            # Also update size if scraped has a real value
-            if i == 5 and s_padded[i] != "-":
-                result[i] = s_padded[i]
+        result = s_padded[:6]
+        if result[5] == "-" and e_padded[5] != "-":
+            result[5] = e_padded[5]
         merged[tag] = result
     elif s:
         while len(s) < 6:
@@ -242,7 +339,7 @@ for c in comments:
 for tag in sorted_tags:
     fields = merged[tag]
     # Format with consistent spacing
-    print(f"{fields[0]:6s} {fields[1]:8s} {fields[2]:8s} {fields[3]:5s} {fields[4]:5s} {fields[5]}")
+    print(f"{fields[0]:6s}  {fields[1]:7s}  {fields[2]:12s}  {fields[3]:5s}  {fields[4]:5s}  {fields[5]}")
 PYEOF
 }
 
@@ -262,7 +359,7 @@ update_ngc_matrix() {
     fi
 
     log_step "Updating NGC compatibility matrix"
-    log_info "Source: $_COMPAT_URL"
+    log_info "Source index: $_RELEASE_NOTES_INDEX_URL"
     log_info "Target: $conf_path"
 
     if [ ! -f "$conf_path" ]; then
@@ -283,9 +380,9 @@ update_ngc_matrix() {
             rm -f "$tmp_scraped"
             return 1
         fi
-        log_info "Scraped $count entries from official page"
+        log_info "Scraped $count entries from Triton release notes"
     else
-        log_warn "Failed to scrape compatibility page (network or parse error)"
+        log_warn "Failed to scrape Triton release notes (network or parse error)"
         log_info "Existing matrix preserved unchanged"
         rm -f "$tmp_scraped"
         return 1

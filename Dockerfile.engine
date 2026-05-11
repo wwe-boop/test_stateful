@@ -6,7 +6,9 @@
 # For repeated clean builds on the same host, enable BuildKit + pip cache mount
 # (see RUN below): wheels stay under Docker's build cache, not in the image.
 ARG BASE_IMAGE=nvcr.io/nvidia/tensorrt:26.02-py3
+ARG PYTORCH_CUDA_TAG=cu130
 FROM ${BASE_IMAGE} AS engine-deps
+ARG PYTORCH_CUDA_TAG
 
 WORKDIR /app
 ENV PYTHONPATH=/app
@@ -17,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
     --trusted-host mirrors.bfsu.edu.cn \
-    --extra-index-url https://download.pytorch.org/whl/cu130 \
+    --extra-index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_TAG} \
     torch \
     tokenizers \
     pyyaml \
