@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Phase C deploy image: Triton py3 + pip deps + bundled engine/ (optional import fallback).
 # Runtime still mounts workspace/model_repository for weights/engines (see triton_run).
 #

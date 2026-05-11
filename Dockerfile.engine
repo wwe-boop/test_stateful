@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 # Standalone TTS engine: TRT base + Python deps + bundled application code.
 # Large artifacts (tokenizer, exported weights, TRT engines) are NOT baked in;
 # mount host workspace/ at runtime (see scripts/bash/lib/engine.sh engine_start_docker).
