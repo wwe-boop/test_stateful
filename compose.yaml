@@ -16,6 +16,7 @@ services:
       MODEL_VARIANT: ${MODEL_VARIANT:-custom-1.7b}
       MODEL_ROOT: /models
       EXPORTED_ROOT: /exported
+      ENGINE_CONFIG: ${ENGINE_CONFIG:-/etc/qwen3-tts/engine.yaml}
       TOKENIZER_DIR: ${ENGINE_TOKENIZER_DIR:-}
       WEIGHTS_DIR: ${ENGINE_WEIGHTS_DIR:-}
       ENGINE_RUNTIME_DIR: ${ENGINE_RUNTIME_DIR:-}
@@ -34,6 +35,7 @@ services:
     volumes:
       - ${ENGINE_MODELS_DIR:-./workspace/models}:/models:ro
       - ${ENGINE_EXPORTED_DIR:-./workspace/exported}:/exported:ro
+      - ${ENGINE_CONFIG_FILE:-./engine.yaml}:/etc/qwen3-tts/engine.yaml:ro
     gpus: all
     init: true
     shm_size: "4g"

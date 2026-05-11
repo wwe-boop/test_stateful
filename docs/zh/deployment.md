@@ -105,7 +105,39 @@ bash scripts/bash/deploy.sh run \
 bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
 ```
 
-这个模式使用 engine 镜像作为环境层，运行时挂载 `workspace/` 作为模型和 engine 数据层。普通镜像里仍会包含 `/app/engine` 代码，因此代码更新后需要重建镜像。
+这个模式使用 engine 镜像作为固定应用层：镜像内包含 TensorRT/Python
+运行时、`/app/engine` 引擎代码、默认 `/app/engine.yaml` 和启动脚本；
+运行时只读挂载模型产物。普通镜像里已经包含 `/app/engine` 代码，因此
+代码更新后需要重新构建并发布镜像。
+
+生产环境推荐把“应用镜像、模型产物、部署配置”拆成三层：
+
+- 应用镜像：`qwen3-engine:<tag>`，包含依赖和引擎代码，不挂载源码目录。
+- 模型产物：tokenizer、weights、TensorRT engine 和 manifest，通过
+  `/models`、`/exported` 只读挂载。
+- 部署配置：端口、batch、seq_len、session、speaker 默认值等，通过
+  `ENGINE_CONFIG` 指向只读挂载的 YAML，或通过 `ENGINE_*` 环境变量覆盖。
+
+示例：
+
+```bash
+ENGINE_CONFIG=/etc/qwen3-tts/engine.yaml \
+ENGINE_CONFIG_FILE=/srv/qwen3/config/engine.yaml \
+ENGINE_MODELS_DIR=/srv/qwen3/models \
+ENGINE_EXPORTED_DIR=/srv/qwen3/exported \
+bash scripts/bash/compose.sh up --gateway engine --variant custom-1.7b
+```
+
+如果直接写 compose volume，可挂载：
+
+```yaml
+volumes:
+  - /srv/qwen3/models:/models:ro
+  - /srv/qwen3/exported:/exported:ro
+  - /srv/qwen3/config/engine.yaml:/etc/qwen3-tts/engine.yaml:ro
+environment:
+  ENGINE_CONFIG: /etc/qwen3-tts/engine.yaml
+```
 
 开发期推荐改用：
 

@@ -22,6 +22,7 @@ esac
 
 model_root="${MODEL_ROOT:-/models}"
 exported_root="${EXPORTED_ROOT:-/exported}"
+config_path="${ENGINE_CONFIG:-/app/engine.yaml}"
 
 tokenizer_dir="${TOKENIZER_DIR:-}"
 weights_dir="${WEIGHTS_DIR:-}"
@@ -51,6 +52,10 @@ if [[ ! -d "$weights_dir" ]]; then
     echo "Weights directory not found: $weights_dir" >&2
     exit 1
 fi
+if [[ ! -f "$config_path" ]]; then
+    echo "Config file not found: $config_path" >&2
+    exit 1
+fi
 
 export ENGINE_SCHEDULER_MAX_BATCH_SIZE="${ENGINE_MAX_BATCH_SIZE:-48}"
 export ENGINE_SERVER_WEBSOCKET_PORT="${ENGINE_WEBSOCKET_PORT:-50052}"
@@ -61,7 +66,7 @@ fi
 
 cmd=(
     python3 -m engine.server
-    --config /app/engine.yaml
+    --config "$config_path"
     --tokenizer-dir "$tokenizer_dir"
     --weights-dir "$weights_dir"
     --device "${ENGINE_DEVICE:-0}"
@@ -74,6 +79,7 @@ if [[ -n "$engine_dir" ]]; then
 fi
 
 echo "Starting engine for variant=${variant}" >&2
+echo "  config=${config_path}" >&2
 echo "  tokenizer=${tokenizer_dir}" >&2
 echo "  weights=${weights_dir}" >&2
 echo "  model_root=${model_root}" >&2

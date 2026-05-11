@@ -1,4 +1,4 @@
-# Standalone TTS engine: TRT base + Python deps + bundled application code.
+ # Standalone TTS engine: TRT base + Python deps + bundled application code.
 # Large artifacts (tokenizer, exported weights, TRT engines) are NOT baked in;
 # mount host workspace/ at runtime (see scripts/bash/lib/engine.sh engine_start_docker).
 #
@@ -36,6 +36,9 @@ print(f'grpcio {grpc.__version__}')"
 
 FROM engine-deps AS engine-runtime
 
+RUN mkdir -p /etc/qwen3-tts
+
 COPY engine.yaml /app/engine.yaml
+COPY engine.yaml /etc/qwen3-tts/engine.yaml
 COPY engine/ /app/engine/
 COPY scripts/compose/ /app/scripts/compose/
