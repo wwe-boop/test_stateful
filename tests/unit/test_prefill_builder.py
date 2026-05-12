@@ -24,6 +24,57 @@ TOKENIZER_DIR_CANDIDATES = [
     REPO_ROOT / "workspace" / "exported" / "tokenizer" / "Qwen3-TTS-Tokenizer-12Hz",
     REPO_ROOT / "workspace" / "exported" / "tokenizer",
 ]
+SCRIPTS_EXPORT_DIR = REPO_ROOT / "scripts" / "export"
+
+
+def test_ref_codec_fused_export_preserves_temporal_frames():
+    if str(SCRIPTS_EXPORT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_EXPORT_DIR))
+    from export_04_speech_tokenizer_codec_fused import RefCodecSumFromAudioCodes
+
+    groups, vocab, hidden, frames = 3, 8, 2, 4
+    stacked = torch.arange(groups * vocab * hidden, dtype=torch.float32).reshape(
+        groups, vocab, hidden,
+    )
+    audio_codes = torch.tensor(
+        [[[0, 1, 2, 3], [3, 2, 1, 0], [1, 1, 2, 2]]],
+        dtype=torch.int64,
+    )
+
+    out = RefCodecSumFromAudioCodes(stacked)(audio_codes)
+    expected = torch.stack([
+        sum(stacked[g, audio_codes[0, g, t]] for g in range(groups))
+        for t in range(frames)
+    ]).unsqueeze(0)
+
+    assert out.shape == (1, frames, hidden)
+    torch.testing.assert_close(out, expected)
+
+
+def test_voice_clone_icl_does_not_prepend_streaming_first_text_token():
+    from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
+
+    class _StubTokenizer:
+        def encode_ids(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return list(range(10, 10 + max(3, len(text))))
+
+    weights = EmbeddingWeights(_weights_dir(), device="cpu")
+    builder = PrefillBuilder(weights, _StubTokenizer())
+    ref_frames = 8
+    plan = builder.build_plan_from_ids(
+        task_type=TaskType.VOICE_CLONE_ICL,
+        token_ids=[101, 102, 103],
+        spk_embedding=torch.zeros(1, weights.hidden_size),
+        ref_text_token_ids=[201, 202],
+        ref_codec_sum_vec=torch.zeros(1, ref_frames, weights.hidden_size),
+    )
+
+    role_len = 3
+    codec_prefix_len = 3 + 1 + 2  # nothink/think tags + speaker embedding + pad/bos
+    dual_track_len = codec_prefix_len - 1
+    icl_len = 1 + ref_frames  # codec BOS + temporal ref codec frames
+    assert plan.prefill_embeds.shape[1] == role_len + dual_track_len + icl_len
 
 
 def _weights_dir():
