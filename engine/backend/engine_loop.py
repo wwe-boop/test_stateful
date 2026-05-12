@@ -523,6 +523,11 @@ class EngineLoop:
                     if req_cfg is not None and req_cfg.instruct_spec is not None
                     else None
                 ),
+                spk_embedding=(
+                    req_cfg.spk_embedding
+                    if req_cfg is not None
+                    else None
+                ),
             )
             cached = self._prefix_cache.get(cache_key)
 
@@ -558,10 +563,20 @@ class EngineLoop:
                         if req_cfg is not None and req_cfg.instruct_spec is not None
                         else None
                     ),
+                    spk_embedding=(
+                        req_cfg.spk_embedding
+                        if req_cfg is not None
+                        else None
+                    ),
                     ref_text=req_cfg.ref_text if req_cfg is not None else None,
                     ref_text_token_ids=(
                         list(req_cfg.ref_text_spec.token_ids)
                         if req_cfg is not None and req_cfg.ref_text_spec is not None
+                        else None
+                    ),
+                    ref_codec_sum_vec=(
+                        req_cfg.ref_codec_sum_vec
+                        if req_cfg is not None
                         else None
                     ),
                     include_eos=best.input_complete,
@@ -590,6 +605,26 @@ class EngineLoop:
                     )
                     prefill_audio, prefill_eos = None, False
                 else:
+                    if (
+                        task_type == TaskType.VOICE_CLONE_ICL
+                        and req_cfg is not None
+                        and req_cfg.ref_c2w_kv is not None
+                    ):
+                        warmed = self._executor.apply_c2w_warm_state(
+                            slot,
+                            req_cfg.ref_c2w_kv,
+                            req_cfg.ref_c2w_conv_states,
+                            req_cfg.ref_c2w_transconv_states,
+                            req_cfg.ref_c2w_frame_idx,
+                        )
+                        if warmed:
+                            logger.info(
+                                "Applied Code2Wav ref warm state for %s "
+                                "(slot=%d, frame_idx=%d)",
+                                best.session_id,
+                                slot.slot_id,
+                                int(req_cfg.ref_c2w_frame_idx),
+                            )
                     prefill_audio, prefill_eos = self._executor.prefill(
                         slot, plan.prefill_embeds,
                     )

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-[Step 04] Export Speech Tokenizer Encoder + ICL ref codec sum (3D gather) to ONNX.
+[Step 04] Export Speech Tokenizer Encoder + ICL ref codec embeddings to ONNX.
 
-Fuses: waveform -> audio_codes (Mimi encoder) -> ref_codec_sum_vec [B, 1, H]
-Matches PrefillBuilder ICL path: codec_embeddings_3d[g_idx, ref_codes, :].sum(dim=(0,1), keepdim=True).
+Fuses: waveform -> audio_codes (Mimi encoder) -> ref_codec_sum_vec [B, T, H]
+Matches the official ICL path: sum codec-codebook embeddings per audio frame,
+but keep the temporal ref-codec sequence aligned with ref_text.
 
 Per-variant: stacked weights come from export_01 (codec_embeddings_3d.pt).
 Shared: speech tokenizer from tokenizer checkpoint.
@@ -40,7 +41,7 @@ logger = logging.getLogger("onnx_export")
 
 
 class RefCodecSumFromAudioCodes(nn.Module):
-    """Sum over (time, codebook) of stacked_3d[g, token_id, :]; output [B, 1, H]."""
+    """Sum codebook embeddings per frame while preserving time; output [B, T, H]."""
 
     def __init__(self, stacked_3d: torch.Tensor):
         super().__init__()
@@ -49,7 +50,7 @@ class RefCodecSumFromAudioCodes(nn.Module):
     def forward(self, audio_codes: torch.Tensor) -> torch.Tensor:
         """
         audio_codes: [B, 16, T] int64
-        Returns: [B, 1, H] same dtype as stacked_3d
+        Returns: [B, T, H] same dtype as stacked_3d
         """
         B, G, Tlen = audio_codes.shape
         rc = audio_codes.permute(0, 2, 1).contiguous()
@@ -59,7 +60,7 @@ class RefCodecSumFromAudioCodes(nn.Module):
             .expand(B, Tlen, G)
         )
         gathered = self.stacked_3d[g_idx, rc, :]
-        return gathered.sum(dim=(1, 2), keepdim=True)
+        return gathered.sum(dim=2)
 
 
 class SpeechTokenizerCodecFusedONNX(nn.Module):
@@ -68,9 +69,9 @@ class SpeechTokenizerCodecFusedONNX(nn.Module):
         self.speech = speech_wrapper
         self.ref_sum = RefCodecSumFromAudioCodes(stacked_3d)
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+    def forward(self, waveform: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         codes = self.speech(waveform)
-        return self.ref_sum(codes.long())
+        return self.ref_sum(codes.long()), codes.long()
 
 
 def _load_stacked_3d_for_variant(variant: str, models_dir: str, output_dir: str, device: str) -> torch.Tensor:
@@ -113,34 +114,39 @@ def export_speech_tokenizer_codec_fused(
     dummy_wav = torch.randn(B, 1, samples, device=device, dtype=torch.float32)
 
     with torch.no_grad():
-        ref_out = fused(dummy_wav)
-    logger.info(f"Fused output shape: {ref_out.shape} (expected [1, 1, H])")
+        ref_out, codes_out = fused(dummy_wav)
+    logger.info(
+        f"Fused output shapes: ref={ref_out.shape} (expected [1, T, H]), "
+        f"codes={codes_out.shape} (expected [1, 16, T])"
+    )
 
     onnx_path = str(out_dir / "speech_tokenizer_codec_fused.onnx")
     export_onnx(
         model=fused,
         dummy_inputs=(dummy_wav,),
         input_names=["waveform"],
-        output_names=["ref_codec_sum_vec"],
+        output_names=["ref_codec_sum_vec", "ref_audio_codes"],
         dynamic_axes={
             "waveform": {0: "batch", 2: "samples"},
-            "ref_codec_sum_vec": {0: "batch"},
+            "ref_codec_sum_vec": {0: "batch", 1: "codec_frames"},
+            "ref_audio_codes": {0: "batch", 2: "codec_frames"},
         },
         onnx_path=onnx_path,
         opset_version=18,
         simplify=True,
     )
 
-    cpu_wav = dummy_wav.cpu()
-    cpu_fused = fused.cpu().eval()
-    with torch.no_grad():
-        cpu_ref = cpu_fused(cpu_wav)
-    fused.to(device)
+    cpu_wav = dummy_wav.detach().cpu()
+    cpu_ref = ref_out.detach().cpu()
+    cpu_codes = codes_out.detach().cpu()
 
     ok = verify_onnx(
         onnx_path,
         {"waveform": to_numpy(cpu_wav)},
-        {"ref_codec_sum_vec": to_numpy(cpu_ref)},
+        {
+            "ref_codec_sum_vec": to_numpy(cpu_ref),
+            "ref_audio_codes": to_numpy(cpu_codes),
+        },
         atol=1e-2,
         rtol=1e-2,
     )
@@ -158,7 +164,7 @@ def export_speech_tokenizer_codec_fused(
 def main():
     setup_logging()
     parser = argparse.ArgumentParser(
-        description="Export Speech Tokenizer + ICL ref codec sum (3D) fused ONNX"
+        description="Export Speech Tokenizer + ICL temporal ref codec embeddings fused ONNX"
     )
     parser.add_argument("--variant", type=str, required=True, help="Model variant (base-* for ICL)")
     add_common_args(parser)

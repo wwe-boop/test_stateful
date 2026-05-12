@@ -33,8 +33,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import queue
 import signal
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import torch
@@ -68,6 +70,20 @@ _EXTERNAL_TO_INTERNAL_TASK_TYPE = {
     "voice_design": "voice_design",
     "instruct": "voice_design",
 }
+
+_DEFAULT_BASE_REF_TEXT = (
+    os.environ.get("ENGINE_DEFAULT_REF_TEXT")
+    or os.environ.get("ENGINE_DEFAULT_BASE_REF_TEXT")
+    or "爱护环境，人人有责，让我们一起守护前海石公园环境卫生！"
+)
+
+_DEFAULT_BASE_REF_AUDIO_CANDIDATES = (
+    os.environ.get("ENGINE_DEFAULT_REF_AUDIO_PATH", ""),
+    os.environ.get("ENGINE_DEFAULT_BASE_REF_AUDIO_PATH", ""),
+    "/models/Qwen3-TTS-Triton/workspace/default_refs/base_ref.wav",
+    "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/default_refs/base_ref.wav",
+    "workspace/default_refs/base_ref.wav",
+)
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -119,6 +135,7 @@ class TTSEngine:
         self._engine_loop: Optional[EngineLoop] = None
         self._relay_task: Optional[asyncio.Task] = None
         self._ref_audio_processor: Optional[ReferenceAudioProcessor] = None
+        self._default_base_ref_audio: Optional[bytes] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -204,6 +221,7 @@ class TTSEngine:
         self._ref_audio_processor = ReferenceAudioProcessor(
             self._engine_dir,
             self._model_arch.variant,
+            device_id=self._device_id,
         )
 
         prefill_builder = None
@@ -347,6 +365,7 @@ class TTSEngine:
         transport layer from reaching into frontend internals directly.
         """
         self._validate_session_config(config)
+        self._prepare_reference_audio_features(config)
         return await self._frontend.create_session(
             session_id,
             config=config,
@@ -477,18 +496,54 @@ class TTSEngine:
             return internal
         raise ValueError(f"Unknown loaded model type: '{normalized}'")
 
+    def _apply_default_base_reference(self, config: SessionConfig) -> None:
+        using_default_ref_audio = False
+        if not config.ref_audio:
+            config.ref_audio = self._load_default_base_ref_audio()
+            using_default_ref_audio = True
+        if using_default_ref_audio and not (config.ref_text or "").strip():
+            config.ref_text = _DEFAULT_BASE_REF_TEXT
+
+    def _load_default_base_ref_audio(self) -> bytes:
+        if self._default_base_ref_audio is not None:
+            return self._default_base_ref_audio
+
+        checked_paths = []
+        for raw_path in _DEFAULT_BASE_REF_AUDIO_CANDIDATES:
+            if not raw_path:
+                continue
+            path = Path(raw_path).expanduser()
+            checked_paths.append(str(path))
+            try:
+                if not path.is_file():
+                    continue
+                data = path.read_bytes()
+            except OSError as exc:
+                logger.warning("Could not read default Base ref_audio %s: %s", path, exc)
+                continue
+            if not data:
+                logger.warning("Default Base ref_audio %s is empty", path)
+                continue
+            self._default_base_ref_audio = data
+            logger.info("Loaded default Base ref_audio from %s (%d bytes)", path, len(data))
+            return data
+
+        raise ValueError(
+            "ref_audio is required for loaded model_type 'base' and no default Base "
+            "reference audio was found; checked: " + ", ".join(checked_paths)
+        )
+
     def _validate_model_specific_fields(self, model_type: str, config: SessionConfig) -> None:
         normalized = (model_type or "").strip()
         if normalized == "base":
+            self._apply_default_base_reference(config)
             if not config.ref_audio:
                 raise ValueError("ref_audio is required for loaded model_type 'base'")
-            if config.ref_text:
-                raise ValueError("ref_text is not used for loaded model_type 'base'")
             if config.instruct:
                 raise ValueError("instruct is not supported for loaded model_type 'base'")
             if config.speaker:
                 raise ValueError("speaker is not supported for loaded model_type 'base'")
-            config.x_vector_only = True
+            config.x_vector_only = not bool((config.ref_text or "").strip())
             return
 
         if normalized in ("icl",):
@@ -529,6 +584,29 @@ class TTSEngine:
             return
 
         raise ValueError(f"Unknown loaded model type: '{normalized}'")
+
+    def _prepare_reference_audio_features(self, config: SessionConfig) -> None:
+        if (config.task_type or "").strip() != "voice_clone":
+            return
+        if config.spk_embedding is not None:
+            return
+        if not config.ref_audio:
+            return
+        if self._ref_audio_processor is None:
+            raise ValueError("reference-audio processor unavailable")
+
+        features = self._ref_audio_processor.process(
+            config.ref_audio,
+            require_ref_codec=not bool(config.x_vector_only),
+        )
+        config.spk_embedding = features.spk_embedding
+        if not config.x_vector_only:
+            config.ref_codec_sum_vec = features.ref_codec_sum_vec
+            config.ref_audio_codes = features.ref_audio_codes
+            config.ref_c2w_kv = features.ref_c2w_kv
+            config.ref_c2w_conv_states = features.ref_c2w_conv_states
+            config.ref_c2w_transconv_states = features.ref_c2w_transconv_states
+            config.ref_c2w_frame_idx = features.ref_c2w_frame_idx
 
     # ------------------------------------------------------------------
     # Internal: relay asyncio.Queue → stdlib queue.Queue
