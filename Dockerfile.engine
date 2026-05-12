@@ -11,7 +11,8 @@ FROM ${BASE_IMAGE} AS engine-deps
 ARG PYTORCH_CUDA_TAG
 
 WORKDIR /app
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app \
+    ENGINE_PYTORCH_CUDA_TAG=${PYTORCH_CUDA_TAG}
 
 # BuildKit: persist ~/.cache/pip across builds so torch/grpc wheels are not re-fetched every time.
 # Requires: DOCKER_BUILDKIT=1 (set in engine_build_image).
@@ -19,14 +20,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
     --trusted-host mirrors.bfsu.edu.cn \
-    --extra-index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_TAG} \
-    torch \
+    filelock \
+    fsspec \
+    jinja2 \
+    mpmath \
+    networkx \
+    sympy \
     tokenizers \
     pyyaml \
     numpy \
     aiohttp \
     grpcio \
     grpcio-tools \
+    && pip install \
+    --timeout 120 \
+    --retries 10 \
+    --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_TAG} \
+    torch \
     && python3 -c "\
 import tensorrt as trt; \
 import torch, tokenizers, yaml, grpc, numpy; \

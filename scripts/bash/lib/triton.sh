@@ -614,13 +614,24 @@ FROM \${BASE_IMAGE}
 ARG TENSORRT_PYTHON_VERSION
 ARG PYTORCH_CUDA_TAG
 
+ENV TRITON_PYTORCH_CUDA_TAG=\${PYTORCH_CUDA_TAG}
+
 RUN python3 -m pip install --no-cache-dir \
     -i https://mirrors.bfsu.edu.cn/pypi/web/simple \
     --trusted-host mirrors.bfsu.edu.cn \
-    --extra-index-url https://download.pytorch.org/whl/\${PYTORCH_CUDA_TAG} \
-    torch \
+    filelock \
+    fsspec \
+    jinja2 \
+    mpmath \
+    networkx \
+    sympy \
     tokenizers \
-    "tensorrt==\${TENSORRT_PYTHON_VERSION}"
+    "tensorrt==\${TENSORRT_PYTHON_VERSION}" \
+    && python3 -m pip install --no-cache-dir \
+    --timeout 120 \
+    --retries 10 \
+    --index-url https://download.pytorch.org/whl/\${PYTORCH_CUDA_TAG} \
+    torch
 
 COPY workspace/model_repository /models
 

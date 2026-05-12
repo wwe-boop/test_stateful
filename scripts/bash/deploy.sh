@@ -445,6 +445,7 @@ cmd_run_engine_docker() {
             export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
         fi
     fi
+    local expected_torch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}"
 
     if $DRY_RUN; then
         log_info "[DRY RUN] Would start engine Docker container (Dockerfile.engine)"
@@ -471,6 +472,12 @@ cmd_run_engine_docker() {
         actual_release=$(engine_docker_image_tensorrt_release "$img" || true)
         log_warn "镜像 $img 的 TensorRT 版本是 ${actual_release:-unknown}，但 Phase B manifest 对应 $expected_release。"
         log_info "将按 Dockerfile.engine 使用 ENGINE_BASE_IMAGE=$ENGINE_BASE_IMAGE 重新构建..."
+        need_build=true
+    elif [ -n "$expected_torch_cuda_tag" ] && ! engine_docker_image_matches_torch_cuda "$img" "$expected_torch_cuda_tag"; then
+        local actual_torch_cuda_tag
+        actual_torch_cuda_tag=$(engine_docker_image_torch_cuda_tag "$img" || true)
+        log_warn "镜像 $img 的 PyTorch CUDA wheel 是 ${actual_torch_cuda_tag:-unknown}，但目标应为 $expected_torch_cuda_tag。"
+        log_info "将按 Dockerfile.engine 使用 ENGINE_PYTORCH_CUDA_TAG=$expected_torch_cuda_tag 重新构建..."
         need_build=true
     fi
     if $need_build; then

@@ -425,6 +425,33 @@ engine_docker_image_matches_release() {
 }
 
 # ---------------------------------------------------------------------------
+#  engine_docker_image_torch_cuda_tag <image_tag>
+#  Echoes the CUDA wheel tag from torch.version.cuda (e.g. cu128, cu130).
+# ---------------------------------------------------------------------------
+engine_docker_image_torch_cuda_tag() {
+    local image="$1"
+    docker run --rm --entrypoint python3 "$image" -c '
+import torch
+cuda = torch.version.cuda or ""
+parts = cuda.split(".")
+if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+    print(f"cu{parts[0]}{parts[1]}")
+' 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+#  engine_docker_image_matches_torch_cuda <image_tag> <cuda_tag>
+#  Returns 0 when the image's torch wheel matches the expected CUDA tag.
+# ---------------------------------------------------------------------------
+engine_docker_image_matches_torch_cuda() {
+    local image="$1"
+    local expected="$2"
+    local actual
+    actual=$(engine_docker_image_torch_cuda_tag "$image" || true)
+    [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
+# ---------------------------------------------------------------------------
 #  engine_build_image <repo_root> [image_tag]
 #  Builds the Docker image for the standalone engine.
 # ---------------------------------------------------------------------------

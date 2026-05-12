@@ -92,13 +92,6 @@ install_torch_cuda() {
         --only-binary=:all:
         --index-url "$whl_index")
 
-    local _cfg_index
-    _cfg_index=$(python3 -m pip config get global.index-url 2>/dev/null) || true
-    if [ -n "$_cfg_index" ]; then
-        pip_args+=(--extra-index-url "$_cfg_index")
-        log_info "附加依赖源: $_cfg_index"
-    fi
-
     python3 -m pip install "${pip_args[@]}" \
         || { log_error "PyTorch install failed for $tag (no pre-built wheel available?)"; return 1; }
 
