@@ -447,7 +447,7 @@ class PrefillBuilder:
                     speaker = None
         elif task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
             if spk_embedding is not None:
-                speaker_embed = spk_embedding.reshape(1, 1, -1)
+                speaker_embed = spk_embedding.to(device=device, dtype=w.dtype).reshape(1, 1, -1)
 
         if speaker_embed is not None:
             codec_input_embedding = torch.cat(
@@ -481,33 +481,37 @@ class PrefillBuilder:
         else:
             talker_input_embed = torch.cat([role_embed, dual_track], dim=1)
 
-        if text_ids.shape[1] > 0:
-            first_text_embed = w.text_embed(text_ids[:, :1])
-        else:
-            first_text_embed = w.tts_pad_embed
-        first_text_with_bos = first_text_embed + codec_input_embedding[:, -1:]
-        talker_input_embed = torch.cat([talker_input_embed, first_text_with_bos], dim=1)
-
         # ---- ICL path ----
+        icl_handled = False
         if task_type == TaskType.VOICE_CLONE_ICL and ref_codec_sum_vec is not None:
             prefill, trailing = self._build_icl_path(
                 w, device, text_ids, talker_input_embed,
                 ref_codec_sum_vec, ref_ids,
             )
             char_offsets = []
+            icl_handled = True
 
         elif (task_type == TaskType.VOICE_CLONE_ICL
               and ref_codes is not None and w.codec_embeddings_3d is not None):
             T_ref, _ = ref_codes.shape
             g_idx = torch.arange(16, device=device, dtype=torch.int64).reshape(1, -1).expand(T_ref, 16)
-            codec_sum_vec = w.codec_embeddings_3d[g_idx, ref_codes, :].sum(dim=(0, 1), keepdim=True)
+            codec_sum_vec = w.codec_embeddings_3d[g_idx, ref_codes, :].sum(dim=1).unsqueeze(0)
             prefill, trailing = self._build_icl_path(
                 w, device, text_ids, talker_input_embed,
                 codec_sum_vec, ref_ids,
             )
             char_offsets = []
+            icl_handled = True
 
-        elif non_streaming_mode:
+        if not icl_handled:
+            if text_ids.shape[1] > 0:
+                first_text_embed = w.text_embed(text_ids[:, :1])
+            else:
+                first_text_embed = w.tts_pad_embed
+            first_text_with_bos = first_text_embed + codec_input_embedding[:, -1:]
+            talker_input_embed = torch.cat([talker_input_embed, first_text_with_bos], dim=1)
+
+        if not icl_handled and non_streaming_mode:
             talker_input_embed = talker_input_embed[:, :-1]
             n_text = text_ids.shape[1]
             if n_text > 0:
@@ -526,7 +530,7 @@ class PrefillBuilder:
             trailing = [w.tts_pad_embed.clone()]
             char_offsets = []
 
-        else:
+        elif not icl_handled:
             # ---- Streaming mode ----
             prefill = talker_input_embed
             mid = text_ids[:, 1:] if text_ids.shape[1] > 1 else text_ids[:, :0]
@@ -581,6 +585,10 @@ class PrefillBuilder:
         codec_sum_vec = ref_codec_sum_vec.to(device=device, dtype=torch.bfloat16)
         if codec_sum_vec.dim() == 2:
             codec_sum_vec = codec_sum_vec.unsqueeze(0)
+        if codec_sum_vec.dim() != 3:
+            raise ValueError(
+                f"ICL ref_codec_sum_vec must be [B, T, H], got shape {tuple(codec_sum_vec.shape)}"
+            )
         codec_embed_icl = torch.cat([
             w.codec_embed(torch.tensor([[w.codec_bos_id]], device=device, dtype=torch.int64)),
             codec_sum_vec,
@@ -599,6 +607,12 @@ class PrefillBuilder:
         text_embed_icl = torch.cat([text_embed_icl, w.tts_eos_embed], dim=1)
         text_lens = text_embed_icl.shape[1]
         codec_lens = codec_embed_icl.shape[1]
+        ref_text_lens = ref_id.shape[1]
+        if ref_text_lens and codec_lens <= ref_text_lens:
+            raise ValueError(
+                "ICL reference codec frames do not cover ref_text tokens; "
+                "speech_tokenizer_codec_fused may be an old collapsed export"
+            )
 
         if text_lens > codec_lens:
             icl_embed = text_embed_icl[:, :codec_lens] + codec_embed_icl

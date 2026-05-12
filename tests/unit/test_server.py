@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import pytest
 
+import engine.server as server_module
 from engine.backend.ref_audio_processor import ReferenceAudioSupport
 from engine.config import EngineConfig, EngineProfileConfig, ModelArchConfig
 from engine.core.types import SessionConfig
@@ -36,7 +37,20 @@ def test_validate_session_config_rejects_unsupported_task_type():
         engine._validate_session_config(SessionConfig(task_type="voice_clone", ref_audio=b"x"))
 
 
-def test_validate_session_config_requires_ref_audio_for_voice_clone():
+def test_validate_session_config_uses_default_ref_audio_for_base(monkeypatch, tmp_path):
+    ref_path = tmp_path / "base_ref.wav"
+    ref_path.write_bytes(b"default-wav")
+    monkeypatch.setattr(
+        server_module,
+        "_DEFAULT_BASE_REF_AUDIO_CANDIDATES",
+        (str(ref_path),),
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_DEFAULT_BASE_REF_TEXT",
+        "默认参考文本",
+    )
+
     engine = TTSEngine(model_arch=ModelArchConfig(
         variant="base-1.7b",
         tts_model_type="base",
@@ -46,7 +60,32 @@ def test_validate_session_config_requires_ref_audio_for_voice_clone():
         ReferenceAudioSupport(available=True)
     )
 
-    with pytest.raises(ValueError, match="ref_audio is required for loaded model_type 'base'"):
+    config = SessionConfig(task_type="base")
+    engine._validate_session_config(config)
+
+    assert config.task_type == "voice_clone"
+    assert config.ref_audio == b"default-wav"
+    assert config.ref_text == "默认参考文本"
+    assert config.x_vector_only is False
+
+
+def test_validate_session_config_requires_ref_audio_when_default_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server_module,
+        "_DEFAULT_BASE_REF_AUDIO_CANDIDATES",
+        (str(tmp_path / "missing.wav"),),
+    )
+
+    engine = TTSEngine(model_arch=ModelArchConfig(
+        variant="base-1.7b",
+        tts_model_type="base",
+        supported_task_types=("base",),
+    ))
+    engine._ref_audio_processor = _StubSupportProbe(
+        ReferenceAudioSupport(available=True)
+    )
+
+    with pytest.raises(ValueError, match="no default Base reference audio"):
         engine._validate_session_config(SessionConfig(task_type="base"))
 
 
@@ -112,6 +151,23 @@ def test_validate_session_config_maps_base_model_to_internal_voice_clone():
 
     assert config.task_type == "voice_clone"
     assert config.x_vector_only is True
+
+
+def test_validate_session_config_maps_base_ref_text_to_icl():
+    engine = TTSEngine(model_arch=ModelArchConfig(
+        variant="base-1.7b",
+        tts_model_type="base",
+        supported_task_types=("base",),
+    ))
+    engine._ref_audio_processor = _StubSupportProbe(
+        ReferenceAudioSupport(available=True)
+    )
+
+    config = SessionConfig(task_type="base", ref_audio=b"wav", ref_text="你好")
+    engine._validate_session_config(config)
+
+    assert config.task_type == "voice_clone"
+    assert config.x_vector_only is False
 
 
 def test_validate_session_config_maps_icl_model_to_internal_voice_clone():

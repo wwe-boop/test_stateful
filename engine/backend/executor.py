@@ -628,6 +628,46 @@ class Executor:
             for shape in self._c2w_transconv_shapes
         ]
 
+    def apply_c2w_warm_state(
+        self,
+        slot: SlotKVState,
+        c2w_kv: Any,
+        conv_states: Optional[list[Any]],
+        transconv_states: Optional[list[Any]],
+        frame_idx: int,
+    ) -> bool:
+        """Install reference-warmed Code2Wav state before the first target frame."""
+        if c2w_kv is None or conv_states is None or transconv_states is None:
+            return False
+        if len(conv_states) != len(self._c2w_conv_input_names):
+            logger.warning(
+                "Skipping Code2Wav warm state: conv state count %d != expected %d",
+                len(conv_states), len(self._c2w_conv_input_names),
+            )
+            return False
+        if len(transconv_states) != len(self._c2w_transconv_input_names):
+            logger.warning(
+                "Skipping Code2Wav warm state: transconv state count %d != expected %d",
+                len(transconv_states), len(self._c2w_transconv_input_names),
+            )
+            return False
+
+        max_past = max(1, self._config.c2w_sliding_window - FUSED_CHUNK_T)
+        kv = c2w_kv.to(device=self._device, dtype=self._config.dtype).contiguous()
+        if kv.shape[3] > max_past:
+            kv = kv[:, :, :, -max_past:, :].contiguous()
+        slot.c2w_kv = kv
+        slot.c2w_conv_states = [
+            t.to(device=self._device, dtype=self._config.dtype).contiguous()
+            for t in conv_states
+        ]
+        slot.c2w_transconv_states = [
+            t.to(device=self._device, dtype=self._config.dtype).contiguous()
+            for t in transconv_states
+        ]
+        slot.frame_idx = max(0, int(frame_idx))
+        return True
+
     # ------------------------------------------------------------------
     # Prefill
     # ------------------------------------------------------------------
@@ -664,6 +704,7 @@ class Executor:
 
         seq = int(prefill_embeds.shape[1])
         self._validate_prefill_len(seq, "prefill")
+        c2w_past_before = slot.c2w_kv
 
         inputs = self._build_fused_inputs(
             input_embeds=prefill_embeds.to(self._config.dtype),
@@ -714,14 +755,20 @@ class Executor:
         c2w_kv = raw.get("c2w_new_kv")
         if c2w_kv is not None:
             c2w_kv = c2w_kv.clone().contiguous()
+            if c2w_past_before is not None:
+                c2w_kv = _append_c2w_delta(
+                    c2w_past_before,
+                    c2w_kv,
+                    self._config.c2w_sliding_window - FUSED_CHUNK_T,
+                )
             if self._kv_pool._preallocate:
-                self._kv_pool.scatter_prefill_c2w_kv(slot.slot_id, c2w_kv)
+                self._kv_pool.scatter_c2w_kv([slot.slot_id], c2w_kv)
             slot.c2w_kv = c2w_kv
         slot.c2w_conv_states = [raw[n].clone() for n in self._c2w_conv_output_names]
         slot.c2w_transconv_states = [raw[n].clone() for n in self._c2w_transconv_output_names]
         slot.init_pingpong_buffers()
 
-        slot.frame_idx = 1
+        slot.frame_idx = int(slot.frame_idx) + FUSED_CHUNK_T
         slot.token_counts = raw.get(
             "updated_token_counts",
             torch.zeros(1, self._config.codec_vocab_size,
@@ -834,6 +881,7 @@ class Executor:
             )
 
         original_past_len = int(slot.past_len)
+        c2w_past_before = slot.c2w_kv
         if self._kv_pool._preallocate:
             batched_talker_kv = self._kv_pool.gather_talker_kv(
                 [slot.slot_id],
@@ -906,18 +954,20 @@ class Executor:
         c2w_kv = raw.get("c2w_new_kv")
         if c2w_kv is not None:
             c2w_kv = c2w_kv.clone().contiguous()
-            if self._kv_pool._preallocate:
-                self._kv_pool.scatter_c2w_kv_delta(
-                    [slot.slot_id],
+            if c2w_past_before is not None:
+                c2w_kv = _append_c2w_delta(
+                    c2w_past_before,
                     c2w_kv,
-                    [0],
+                    self._config.c2w_sliding_window - FUSED_CHUNK_T,
                 )
+            if self._kv_pool._preallocate:
+                self._kv_pool.scatter_c2w_kv([slot.slot_id], c2w_kv)
             slot.c2w_kv = c2w_kv
         slot.c2w_conv_states = [raw[n].clone() for n in self._c2w_conv_output_names]
         slot.c2w_transconv_states = [raw[n].clone() for n in self._c2w_transconv_output_names]
         slot.init_pingpong_buffers()
 
-        slot.frame_idx = 1
+        slot.frame_idx = int(slot.frame_idx) + FUSED_CHUNK_T
         slot.token_counts = raw.get(
             "updated_token_counts",
             torch.zeros(

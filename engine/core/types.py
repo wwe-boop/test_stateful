@@ -77,6 +77,13 @@ class SessionConfig:
     ref_audio: Optional[bytes] = None
     ref_text: Optional[str] = None
     ref_text_spec: Optional[TokenizedText] = None
+    spk_embedding: Optional[Any] = None
+    ref_codec_sum_vec: Optional[Any] = None
+    ref_audio_codes: Optional[Any] = None
+    ref_c2w_kv: Optional[Any] = None
+    ref_c2w_conv_states: Optional[list[Any]] = None
+    ref_c2w_transconv_states: Optional[list[Any]] = None
+    ref_c2w_frame_idx: int = 0
     x_vector_only: bool = False
     input_mode: InputMode = InputMode.LONG_SEGMENT
     group_policy: GroupPolicy = GroupPolicy.AUTO
