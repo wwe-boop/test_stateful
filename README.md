@@ -12,9 +12,9 @@ Qwen3-TTS Triton 是一个 **工程预览版** 项目：把官方 Qwen3-TTS PyTo
 
 **请先读这一段。**
 
-- 当前建议的 v0.1 稳定范围是 `custom-1.7b` / `custom_voice` 路径。
-- `design-1.7b` / `voice_design` 处于实验状态：代码里已有部分路径，但不应当对外承诺完全测通。
-- `base` 语音克隆和 ICL 语音克隆仍是计划项：prefill/任务类型里能看到分支，但 standalone 引擎还没有完整打通 ref audio preprocessing、spk embedding/ref codes 注入和端到端验证。
+- 当前建议的 v0.1 稳定范围仍是 `custom-1.7b` / `custom_voice` 路径。
+- `design-1.7b` / `voice_design` 处于实验状态：代码里已有导出、协议和校验路径，但不应当对外承诺完全测通。
+- `base` / `icl` 语音克隆已接入 standalone 侧 ref audio 预处理：可以从请求或默认路径读取参考音频，生成 `spk_embedding`，ICL 路径还会生成 `ref_codec_sum_vec`、`ref_audio_codes` 和 Code2Wav warm state；但这条路径仍是实验能力，依赖 base 变体导出产物和 TensorRT ref-audio 相关 engine，端到端质量与稳定性还需要继续验证。
 - 流式模式仍可能出现幻觉、重复、漏读、插入未提供内容、长文本不稳定等问题。请把当前版本当作工程预览或研究预览，不要直接用于生产内容生成。
 - README、WebUI 和 benchmark 会优先使用中文说明。中文口径稳定后再整理英文版。
 
@@ -35,8 +35,8 @@ Qwen3-TTS Triton 是一个 **工程预览版** 项目：把官方 Qwen3-TTS PyTo
 | --- | --- | --- |
 | `custom-1.7b` / `custom_voice` | 优先稳定 | v0.1 推荐路径，WebUI 和 demo 默认围绕它展示 |
 | `design-1.7b` / `voice_design` | 实验 | 可保留代码和导出入口，但需要标注未充分测通 |
-| `base-1.7b` / x-vector voice clone | 计划中 | 当前不应标为可用；需要 ref audio 预处理和端到端测试 |
-| `icl` voice clone | 计划中 | 当前不应标为可用；需要 ref audio/ref text/code 注入链路 |
+| `base-1.7b` / x-vector voice clone | 实验 | standalone 已接入 ref audio → speaker embedding；需要 base 导出产物、speaker encoder TRT engine 和真实端到端验证 |
+| `icl` voice clone | 实验 | standalone 已接入 ref audio + ref text → ref codec/code 注入；需要 `speech_tokenizer_codec_fused`、Code2Wav warmup 相关产物和真实端到端验证 |
 | `0.6b` variants | 未作为 v0.1 主线 | 可保留导出/下载入口，发布前需要单独验证 |
 
 ## 快速开始
@@ -64,6 +64,95 @@ Phase B: build_engines.sh
 Phase C: deploy.sh / compose.sh
   以 standalone engine、engine Docker 或 Triton gateway 启动服务
 ```
+
+## 部署流程
+
+推荐先部署 `custom-1.7b` 验证环境和链路；`base-1.7b` / `icl` 需要额外准备参考音频，并按实验路径处理。
+
+1. 拉取代码和子模块：
+
+```bash
+git clone --recursive https://github.com/user/Qwen3-TTS-Triton.git
+cd Qwen3-TTS-Triton
+git switch dev-base-icl-min
+git pull
+git submodule update --init --recursive
+```
+
+2. 准备模型权重。权重默认放在 `workspace/models/`，目录名需要和导出脚本识别的官方模型名一致：
+
+```text
+workspace/models/
+├── Qwen3-TTS-Tokenizer-12Hz/
+├── Qwen3-TTS-12Hz-1.7B-CustomVoice/
+├── Qwen3-TTS-12Hz-1.7B-Base/
+└── Qwen3-TTS-12Hz-1.7B-VoiceDesign/
+```
+
+如果只部署推荐路径，至少准备 `Qwen3-TTS-Tokenizer-12Hz` 和 `Qwen3-TTS-12Hz-1.7B-CustomVoice`。如果部署 `base-1.7b`，还需要 `Qwen3-TTS-12Hz-1.7B-Base`。
+
+3. 一键执行导出、构建和部署：
+
+```bash
+bash scripts/bash/autorun.sh all -m custom-1.7b --gateway standalone --engine-mode trt
+```
+
+这会按顺序执行 Phase A 环境/导出、Phase B TensorRT engine 编译、Phase C 模型包组装和服务启动。默认使用 `bf16`，并根据 GPU 显存选择保守的 TensorRT profile。
+
+4. 也可以分阶段执行，适合排查问题或复用已导出的产物：
+
+```bash
+# Phase A: 安装环境、下载/检查权重、导出 ONNX / weights / manifest
+bash scripts/bash/autorun.sh setup -m custom-1.7b
+
+# Phase B: 构建 TensorRT engine
+bash scripts/bash/autorun.sh build -m custom-1.7b \
+  --max-batch-size 64 \
+  --max-input-len 128 \
+  --max-seq-len 512 \
+  --dtype bf16
+
+# Phase C: 启动 standalone engine
+bash scripts/bash/autorun.sh deploy -m custom-1.7b \
+  --gateway standalone \
+  --engine-mode trt
+```
+
+5. 如需 Triton 或 engine Docker，把 Phase C 的 gateway 换掉：
+
+```bash
+# Triton Python backend / model repository
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway triton --engine-mode trt
+
+# 独立 engine 容器
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker --engine-mode trt
+```
+
+6. 部署 `base-1.7b` 实验路径时，建议先准备默认参考音频：
+
+```bash
+mkdir -p workspace/default_refs
+# 放入一段 3-10 秒、24k 或可重采样的 wav:
+# workspace/default_refs/base_ref.wav
+
+ENGINE_DEFAULT_BASE_REF_AUDIO_PATH=workspace/default_refs/base_ref.wav \
+ENGINE_DEFAULT_BASE_REF_TEXT="参考音频对应文本" \
+bash scripts/bash/autorun.sh all -m base-1.7b --gateway standalone --engine-mode trt
+```
+
+`base` 请求没有显式传 `ref_audio` 时会读取默认参考音频；显式传 `ref_audio` 但没有 `ref_text` 时走 x-vector-only，传入 `ref_text` 时走 ICL。
+
+7. 验收服务：
+
+```bash
+# 查看服务能力
+curl http://localhost:50052/v1/capabilities
+
+# 运行 serving 工具，服务未启动或能力不匹配时会报出原因
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --targets engine-grpc
+```
+
+常用端口：standalone gRPC `50051`，standalone HTTP/WebSocket `50052`，health `8080`；Triton HTTP/gRPC 端口由 compose/部署脚本配置。
 
 ## 统一入口与控制参数
 
@@ -205,6 +294,8 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b \
 ```bash
 bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway standalone
 ```
+
+`base` / `icl` 语音克隆目前只建议作为实验路径使用，参考音频准备和默认路径见上面的“部署流程”。
 
 默认端口：
 
