@@ -61,7 +61,8 @@ def _require_engine_gateway():
     return tts_pb2, tts_pb2_grpc
 
 DEFAULT_ENGINE_GRPC = "localhost:50051"
-DEFAULT_ENGINE_WS = "ws://localhost:50052/v1/ws"
+# DEFAULT_ENGINE_WS = "ws://localhost:50052/v1/ws"
+DEFAULT_ENGINE_WS = "ws://8.160.176.148:1181/v1/ws"
 DEFAULT_TRITON_HTTP = "http://localhost:8000"
 DEFAULT_TRITON_GRPC = "localhost:8001"
 DEFAULT_TRITON_MODEL = "tts_orchestrator"
@@ -371,6 +372,22 @@ def _summarize_ttft_distribution(
         "summary": summary,
         "bar_data": bar_data,
         "failures": [sample.to_summary() for sample in failed],
+    }
+
+
+def _summarize_values(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0}
+    return {
+        "count": len(values),
+        "mean_ms": statistics.mean(values),
+        "stdev_ms": statistics.stdev(values) if len(values) > 1 else 0.0,
+        "min_ms": min(values),
+        "p50_ms": _percentile(values, 0.50),
+        "p90_ms": _percentile(values, 0.90),
+        "p95_ms": _percentile(values, 0.95),
+        "max_ms": max(values),
+        "range_ms": max(values) - min(values),
     }
 
 
@@ -1532,6 +1549,210 @@ def _run_ttft_distribution_case(
     )
 
 
+def _successful_ttft_lanes(results: list[SynthesisResult]) -> list[SynthesisResult]:
+    return [
+        result
+        for result in results
+        if result.error is None
+        and result.total_samples > 0
+        and result.ttft_ms is not None
+    ]
+
+
+def _run_concurrent_once(
+    transport,
+    spec: RequestSpec,
+    args: argparse.Namespace,
+    *,
+    target: str,
+    level: int,
+    phase: str,
+    run_idx: int,
+) -> tuple[list[SynthesisResult], float]:
+    started = time.perf_counter()
+    concurrent_results: list[SynthesisResult] = []
+    with ThreadPoolExecutor(max_workers=level) as executor:
+        futures = {
+            executor.submit(
+                transport.synthesize_oneshot,
+                spec,
+                TEST_TEXTS[idx % len(TEST_TEXTS)],
+                timeout=args.timeout,
+                session_id=f"{target}-c{level}-{phase}-{run_idx}-{idx}",
+            ): idx
+            for idx in range(level)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                concurrent_results.append(future.result())
+            except Exception as exc:
+                concurrent_results.append(
+                    SynthesisResult(
+                        target,
+                        f"{target}-c{level}-{phase}-{run_idx}-{idx}",
+                        TEST_TEXTS[idx % len(TEST_TEXTS)],
+                        error=_error_text(exc),
+                    )
+                )
+    return concurrent_results, (time.perf_counter() - started) * 1000.0
+
+
+def _make_concurrent_round_sample(
+    target: str,
+    *,
+    level: int,
+    phase: str,
+    run_idx: int,
+    results: list[SynthesisResult],
+    wall_ms: float,
+) -> SynthesisResult:
+    successful = _successful_ttft_lanes(results)
+    failed_count = len(results) - len(successful)
+    lane_ttfts = [float(result.ttft_ms) for result in successful if result.ttft_ms is not None]
+    lane_totals = [float(result.total_ms) for result in successful if result.total_ms > 0]
+    total_audio_sec = sum(result.duration_sec for result in successful)
+    throughput = total_audio_sec / (wall_ms / 1000.0) if wall_ms > 0 else 0.0
+
+    sample = SynthesisResult(
+        target,
+        f"{target}-c{level}-{phase}-{run_idx}",
+        f"concurrent x{level} {phase} run {run_idx}",
+    )
+    sample.total_ms = wall_ms
+    sample.num_chunks = sum(result.num_chunks for result in successful)
+    sample.total_samples = sum(result.total_samples for result in successful)
+    sample.details = {
+        "level": level,
+        "phase": phase,
+        "run": run_idx,
+        "requested": len(results),
+        "ok": len(successful),
+        "failed": failed_count,
+        "wall_ms": wall_ms,
+        "audio_sec": total_audio_sec,
+        "throughput_realtime": throughput,
+        "lane_ttft": _summarize_values(lane_ttfts),
+        "lane_total": _summarize_values(lane_totals),
+    }
+    if lane_ttfts:
+        sample.ttft_ms = _percentile(lane_ttfts, 0.50)
+        sample.first_chunk_ms = sample.ttft_ms
+        sample.start_to_first_audio_ms = sample.ttft_ms
+    if not lane_ttfts:
+        sample.error = "no successful concurrent lanes with TTFT"
+    return sample
+
+
+def _concurrent_round_detail(
+    sample: SynthesisResult,
+    lanes: list[SynthesisResult],
+) -> dict[str, Any]:
+    return {
+        "summary": sample.to_summary(),
+        "details": dict(sample.details),
+        "lanes": [lane.to_summary() for lane in lanes],
+    }
+
+
+def _run_concurrent_case(
+    transport,
+    spec: RequestSpec,
+    args: argparse.Namespace,
+    *,
+    target: str,
+    level: int,
+) -> CaseResult:
+    measured_rounds: list[SynthesisResult] = []
+    measured_lanes: list[SynthesisResult] = []
+    measured_details: list[dict[str, Any]] = []
+    warmup_details: list[dict[str, Any]] = []
+    total_runs = args.concurrency_warmup + args.concurrency_samples
+
+    for run_idx in range(total_runs):
+        phase = "warmup" if run_idx < args.concurrency_warmup else "measure"
+        phase_idx = run_idx if phase == "warmup" else run_idx - args.concurrency_warmup
+        lanes, wall_ms = _run_concurrent_once(
+            transport,
+            spec,
+            args,
+            target=target,
+            level=level,
+            phase=phase,
+            run_idx=phase_idx,
+        )
+        sample = _make_concurrent_round_sample(
+            target,
+            level=level,
+            phase=phase,
+            run_idx=phase_idx,
+            results=lanes,
+            wall_ms=wall_ms,
+        )
+        detail = _concurrent_round_detail(sample, lanes)
+        if phase == "warmup":
+            warmup_details.append(detail)
+            continue
+        measured_rounds.append(sample)
+        measured_lanes.extend(lanes)
+        measured_details.append(detail)
+
+    distribution = _summarize_ttft_distribution(
+        measured_rounds,
+        requested=args.concurrency_samples,
+        warmup=args.concurrency_warmup,
+        bar_width=args.ttft_bar_width,
+    )
+    distribution["summary"]["measurement"] = f"concurrent x{level} lane-p50 TTFT per round"
+    if not args.json and (args.concurrency_warmup > 0 or args.concurrency_samples > 1):
+        _print_ttft_distribution(target, distribution)
+
+    successful_lanes = _successful_ttft_lanes(measured_lanes)
+    lane_failures = len(measured_lanes) - len(successful_lanes)
+    lane_ttfts = [float(result.ttft_ms) for result in successful_lanes if result.ttft_ms is not None]
+    lane_summary = _summarize_values(lane_ttfts)
+    distribution["summary"]["lane_failures"] = lane_failures
+    summary = distribution["summary"]
+    ok = (
+        summary.get("count", 0) == args.concurrency_samples
+        and summary.get("failures", 0) == 0
+        and lane_failures == 0
+    )
+
+    if summary.get("count", 0) <= 0:
+        summary_text = f"no successful measured rounds; lane_failures={lane_failures}"
+    elif args.concurrency_warmup == 0 and args.concurrency_samples == 1:
+        summary_text = (
+            f"ok={len(successful_lanes)}/{len(measured_lanes)} "
+            f"median_first_chunk={summary['p50_ms']:.0f}ms"
+        )
+    else:
+        summary_text = (
+            f"rounds={summary['count']}/{summary['requested']} "
+            f"warmup={summary['warmup']} "
+            f"lane_ok={len(successful_lanes)}/{len(measured_lanes)} "
+            f"lane_p50={lane_summary.get('p50_ms', 0.0):.0f}ms "
+            f"lane_p95={lane_summary.get('p95_ms', 0.0):.0f}ms "
+            f"round_p50_mean={summary['mean_ms']:.2f}ms "
+            f"stdev={summary['stdev_ms']:.2f}ms"
+        )
+
+    return _make_case(
+        target,
+        f"concurrent-x{level}",
+        ok=ok,
+        summary=summary_text,
+        error="" if ok else "one or more concurrent measured rounds failed",
+        details={
+            "distribution": distribution,
+            "lane_ttft": lane_summary,
+            "lane_failures": lane_failures,
+            "warmup_rounds": warmup_details,
+            "measured_rounds": measured_details,
+        },
+    )
+
+
 def _run_engine_suite(
     transport,
     args: argparse.Namespace,
@@ -1623,34 +1844,13 @@ def _run_engine_suite(
     if not args.skip_concurrent:
         levels = [int(x.strip()) for x in args.concurrency.split(",") if x.strip()]
         for level in levels:
-            concurrent_results: list[SynthesisResult] = []
-            with ThreadPoolExecutor(max_workers=level) as executor:
-                futures = {
-                    executor.submit(
-                        transport.synthesize_oneshot,
-                        spec,
-                        TEST_TEXTS[idx % len(TEST_TEXTS)],
-                        timeout=args.timeout,
-                        session_id=f"{target}-c{level}-{idx}",
-                    ): idx
-                    for idx in range(level)
-                }
-                for future in as_completed(futures):
-                    concurrent_results.append(future.result())
-            ok = all(r.error is None and r.total_samples > 0 for r in concurrent_results)
-            summary = (
-                f"ok={sum(1 for r in concurrent_results if r.error is None)}/{len(concurrent_results)} "
-                f"median_first_chunk={statistics.median([r.first_chunk_ms for r in concurrent_results if r.first_chunk_ms is not None]):.0f}ms"
-                if concurrent_results and any(r.first_chunk_ms is not None for r in concurrent_results)
-                else f"ok={sum(1 for r in concurrent_results if r.error is None)}/{len(concurrent_results)}"
-            )
             results.append(
-                _make_case(
-                    target,
-                    f"concurrent-x{level}",
-                    ok=ok,
-                    summary=summary,
-                    details={"results": [r.to_summary() for r in concurrent_results]},
+                _run_concurrent_case(
+                    transport,
+                    spec,
+                    args,
+                    target=target,
+                    level=level,
                 )
             )
 
@@ -2083,6 +2283,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--story-path", default="")
     parser.add_argument("--chunk-delay-ms", type=float, default=200.0)
     parser.add_argument("--concurrency", default="1,2,4")
+    parser.add_argument(
+        "--concurrency-samples",
+        type=int,
+        default=1,
+        help="Measured repeat rounds for each --concurrency level; each round runs that many lanes",
+    )
+    parser.add_argument(
+        "--concurrency-warmup",
+        type=int,
+        default=0,
+        help="Concurrent warmup rounds per --concurrency level, excluded from measured statistics",
+    )
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "workspace" / "audio_samples" / "serving_e2e"))
     parser.add_argument(
         "--ttft-samples",
@@ -2134,6 +2346,10 @@ def main() -> int:
         raise SystemExit("--ttft-samples must be >= 0")
     if args.ttft_warmup < 0:
         raise SystemExit("--ttft-warmup must be >= 0")
+    if args.concurrency_samples < 1:
+        raise SystemExit("--concurrency-samples must be >= 1")
+    if args.concurrency_warmup < 0:
+        raise SystemExit("--concurrency-warmup must be >= 0")
     targets = [item.strip() for item in args.targets.split(",") if item.strip()]
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
