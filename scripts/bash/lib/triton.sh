@@ -43,8 +43,18 @@ TRITON_METRICS_PORT="${TRITON_METRICS_PORT:-8002}"
 # ---------------------------------------------------------------------------
 resolve_triton_deploy_image() {
     local ngc_tag
-    ngc_tag=$(resolve_ngc_tag "$@") \
-        || { log_error "Cannot determine NGC tag"; return 1; }
+    if [ -n "${NGC_TAG:-}" ]; then
+        ngc_tag=$(resolve_ngc_tag "$@") \
+            || { log_error "Cannot determine NGC tag"; return 1; }
+    else
+        ngc_tag=$(resolve_manifest_ngc_tag "${MODEL_REPO_DIR:-}" "${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}" 2>/dev/null || true)
+        if [ -z "$ngc_tag" ]; then
+            ngc_tag=$(resolve_ngc_tag "$@") \
+                || { log_error "Cannot determine NGC tag"; return 1; }
+        else
+            log_info "Using Triton image from model manifest (builder_image tag): $ngc_tag"
+        fi
+    fi
 
     local deploy_tag="${_DEPLOY_IMAGE_NAME}:${ngc_tag}"
     if docker image inspect "$deploy_tag" &>/dev/null; then

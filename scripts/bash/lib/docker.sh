@@ -94,6 +94,73 @@ _ngc_entry_by_tag() {
 }
 
 # ---------------------------------------------------------------------------
+#  resolve_manifest_ngc_tag [model_repo_or_manifest] [model_version]
+#  Reads the TensorRT builder image recorded in triton_manifest.json and
+#  echoes the matching NGC tag (e.g. 25.03).  The first argument may be a
+#  model_repository directory or a direct manifest path.  Returns 1 when no
+#  manifest or no builder_image is available.
+# ---------------------------------------------------------------------------
+resolve_manifest_ngc_tag() {
+    local model_repo_or_manifest="${1:-${MODEL_REPO_DIR:-}}"
+    local model_version="${2:-${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}}"
+
+    if [ -z "$model_repo_or_manifest" ]; then
+        return 1
+    fi
+
+    local manifests=()
+    if [ -f "$model_repo_or_manifest" ]; then
+        manifests+=("$model_repo_or_manifest")
+    else
+        local model_package="$model_repo_or_manifest/tts_orchestrator/$model_version"
+        manifests+=(
+            "$model_package/runtime/triton_manifest.json"
+            "$model_package/triton_manifest.json"
+            "$model_repo_or_manifest/triton_manifest.json"
+        )
+    fi
+
+    local manifest
+    for manifest in "${manifests[@]}"; do
+        [ -f "$manifest" ] || continue
+        local tag
+        tag=$(python3 - "$manifest" <<'PYEOF' 2>/dev/null || true
+import json
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+profile = data.get("engine_profile") or {}
+builder_image = ""
+if isinstance(profile, dict):
+    builder_image = str(profile.get("builder_image") or "").strip()
+
+if not builder_image:
+    sys.exit(1)
+
+match = re.search(r":(?P<tag>\d+\.\d+)(?:-py3)?$", builder_image)
+if not match:
+    match = re.search(r":(?P<tag>\d+\.\d+)$", builder_image)
+if match:
+    print(match.group("tag"))
+PYEOF
+)
+        if [ -n "$tag" ]; then
+            echo "$tag"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 #  detect_driver_version
 #  Echoes the NVIDIA driver version (e.g. "570.86.10").  Returns 1 if N/A.
 # ---------------------------------------------------------------------------
@@ -594,6 +661,9 @@ build_triton_deploy_image() {
     local ngc_tag="${1:-}"
     local trt_python_version="${TRITON_TENSORRT_PIP_VERSION:-10.15.1.29}"
 
+    if [ -z "$ngc_tag" ]; then
+        ngc_tag=$(resolve_manifest_ngc_tag "${MODEL_REPO_DIR:-}" "${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}" 2>/dev/null || true)
+    fi
     if [ -z "$ngc_tag" ]; then
         ngc_tag=$(resolve_ngc_tag) \
             || { log_error "Cannot determine NGC tag"; return 1; }

@@ -289,10 +289,18 @@ build_forward_args() {
     if [ -n "$TARGET_DRIVER" ]; then
         export TARGET_DRIVER
     fi
+    MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
+
     if [ -z "$NGC_TAG" ] && ! $BUILD_IMAGE_EXPLICIT; then
         case "${COMMAND:-all}" in
-            all|setup|build|deploy)
+            all|setup|build)
                 NGC_TAG=$(resolve_ngc_tag "${TARGET_DRIVER:-}" 2>/dev/null || true)
+                ;;
+            deploy)
+                # A deploy-only invocation must not re-derive NGC_TAG from the
+                # host driver here.  deploy.sh resolves the runtime image from
+                # the current Phase B manifest, then forces a fresh assemble.
+                :
                 ;;
         esac
     fi
@@ -327,7 +335,6 @@ build_forward_args() {
     if [ -z "$ENGINE_DOCKER_IMAGE" ]; then
         ENGINE_DOCKER_IMAGE="$(_env_or_empty ENGINE_IMAGE)"
     fi
-    MODEL_VERSION=$(resolve_model_version "$MODEL_VERSION") || exit 1
 
     # Phase A args
     SETUP_ARGS=()
@@ -381,7 +388,7 @@ build_forward_args() {
     if [ -n "$effective_runtime_device" ]; then DEPLOY_ARGS+=(--device "$effective_runtime_device"); fi
     if [ -n "$RUNTIME_MAX_BATCH_SIZE" ]; then DEPLOY_ARGS+=(--max-batch "$RUNTIME_MAX_BATCH_SIZE"); fi
     if [ -n "$RUNTIME_MAX_SEQ_LEN" ]; then DEPLOY_ARGS+=(--max-seq-len "$RUNTIME_MAX_SEQ_LEN"); fi
-    if $ENGINE_DOCKER_IMAGE_EXPLICIT || [ "${GATEWAY_MODE:-}" = "engine-docker" ]; then
+    if $ENGINE_DOCKER_IMAGE_EXPLICIT; then
         if [ -n "$ENGINE_DOCKER_IMAGE" ]; then DEPLOY_ARGS+=(--engine-image "$ENGINE_DOCKER_IMAGE"); fi
     fi
     if [ -n "$ENGINE_PORT" ]; then DEPLOY_ARGS+=(--port "$ENGINE_PORT"); fi
@@ -686,6 +693,21 @@ interactive_mode() {
         [ -n "$_rb" ] && RUNTIME_MAX_BATCH_SIZE="$_rb"
         [ -n "$_rs" ] && RUNTIME_MAX_SEQ_LEN="$_rs"
     fi
+
+    case "${choice:-1}" in
+        1) COMMAND="all" ;;
+        2) COMMAND="setup" ;;
+        3) COMMAND="build" ;;
+        4) COMMAND="deploy" ;;
+        5)
+            case "$resume_point" in
+                build)  COMMAND="build" ;;
+                deploy) COMMAND="deploy" ;;
+                *)      COMMAND="all" ;;
+            esac
+            ;;
+        *) COMMAND="all" ;;
+    esac
 
     build_forward_args
 

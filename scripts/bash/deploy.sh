@@ -70,7 +70,9 @@ FOREGROUND=false
 # Triton forwarding
 TRITON_ARGS=()
 
-# engine-docker: ENGINE_IMAGE is read by lib/engine.sh (default qwen3-engine:26.02).
+# engine-docker: use --engine-image for an explicit image.  Without it, Phase C
+# derives qwen3-engine:<tag> from the model manifest's Phase B builder_image.
+ENGINE_IMAGE_EXPLICIT=false
 
 # ── Help ──
 
@@ -91,7 +93,7 @@ Commands:
 
 Options:
   --gateway <mode>       Gateway: standalone | triton | engine-docker (default: standalone)
-  --engine-image <tag>   Image tag for engine-docker (default: qwen3-engine:26.02)
+  --engine-image <tag>   Image tag for engine-docker (default: Phase B NGC tag)
   --variant <name>       Model variant (default: auto-discover)
   --model-version <N>    Triton model version directory (default: 1)
   --dry-run              Show what would be done
@@ -169,7 +171,7 @@ while [[ $# -gt 0 ]]; do
         --variant)        VARIANT="$2"; shift 2 ;;
         --model-version)  MODEL_VERSION="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=true; shift ;;
-        --engine-image)   ENGINE_IMAGE="$2"; shift 2 ;;
+        --engine-image)   ENGINE_IMAGE="$2"; ENGINE_IMAGE_EXPLICIT=true; shift 2 ;;
         --help|-h)        usage; exit 0 ;;
 
         # Standalone options
@@ -342,14 +344,47 @@ cmd_run_standalone() {
 }
 
 cmd_run_triton() {
+    local has_image_override=false
+    local arg
+    for arg in "${TRITON_ARGS[@]}"; do
+        if [ "$arg" = "--image" ]; then
+            has_image_override=true
+            break
+        fi
+    done
+
     local compose_args=(
         up
         --gateway triton
+        --prepare
         --device "$GPU_DEVICE"
         --max-batch "$MAX_BATCH"
         --max-seq-len "$MAX_SEQ_LEN"
         --model-version "$MODEL_VERSION"
     )
+    if ! $has_image_override; then
+        local triton_image="${TRITON_IMAGE:-}"
+        if [ -z "$triton_image" ]; then
+            if [ -n "${NGC_TAG:-}" ]; then
+                triton_image=$(resolve_triton_deploy_image) || exit 1
+            fi
+        fi
+        if [ -z "$triton_image" ]; then
+            local manifest_tag
+            manifest_tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" 2>/dev/null || true)
+            if [ -z "$manifest_tag" ]; then
+                manifest_tag=$(resolve_manifest_ngc_tag "$MODEL_REPO_DIR" "$MODEL_VERSION" 2>/dev/null || true)
+            fi
+            if [ -n "$manifest_tag" ]; then
+                triton_image="qwen3-tts-triton:${manifest_tag}"
+                log_info "Using Triton image from Phase B manifest: $triton_image"
+            fi
+        fi
+        if [ -z "$triton_image" ]; then
+            triton_image=$(resolve_triton_deploy_image) || exit 1
+        fi
+        compose_args+=(--image "$triton_image")
+    fi
     [ -n "$VARIANT" ] && compose_args+=(--variant "$VARIANT")
     $DRY_RUN && compose_args+=(--dry-run)
     compose_args+=("${TRITON_ARGS[@]}")
@@ -364,6 +399,52 @@ cmd_run_engine_docker() {
     fi
 
     local img="${ENGINE_IMAGE:-qwen3-engine:26.02}"
+    local expected_release=""
+    local manifest_tag=""
+    if ! $ENGINE_IMAGE_EXPLICIT && [[ "$img" == qwen3-engine:* ]]; then
+        if [[ "$img" =~ ^qwen3-engine:([0-9]+\.[0-9]+)$ ]]; then
+            expected_release="${BASH_REMATCH[1]}"
+        fi
+        if [ -z "$expected_release" ] || [ "$expected_release" = "26.02" ]; then
+            manifest_tag="${NGC_TAG:-}"
+            local tag_source="manifest"
+            if [ -n "$manifest_tag" ]; then
+                tag_source="ngc_tag"
+            fi
+            if [ -z "$manifest_tag" ]; then
+                manifest_tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" 2>/dev/null || true)
+            fi
+            if [ -z "$manifest_tag" ]; then
+                manifest_tag=$(resolve_manifest_ngc_tag "$MODEL_REPO_DIR" "$MODEL_VERSION" 2>/dev/null || true)
+            fi
+            if [ -z "$manifest_tag" ]; then
+                tag_source="driver"
+                manifest_tag=$(resolve_ngc_tag 2>/dev/null || true)
+            fi
+            if [ -n "$manifest_tag" ]; then
+                img="qwen3-engine:${manifest_tag}"
+                expected_release="$manifest_tag"
+                if [ "$tag_source" = "manifest" ]; then
+                    log_info "Using engine Docker image from Phase B manifest: $img"
+                elif [ "$tag_source" = "ngc_tag" ]; then
+                    log_info "Using engine Docker image from NGC_TAG: $img"
+                else
+                    log_info "Using engine Docker image from driver-compatible NGC tag: $img"
+                fi
+            fi
+        fi
+    fi
+
+    if [ -n "$expected_release" ] && [ -z "${ENGINE_BASE_IMAGE:-}" ]; then
+        export ENGINE_BASE_IMAGE="nvcr.io/nvidia/tensorrt:${expected_release}-py3"
+    fi
+    if [ -n "$expected_release" ] && [ -z "${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]; then
+        local torch_cuda_tag
+        torch_cuda_tag=$(resolve_ngc_torch_index_tag "$expected_release" 2>/dev/null || true)
+        if [ -n "$torch_cuda_tag" ]; then
+            export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
+        fi
+    fi
 
     if $DRY_RUN; then
         log_info "[DRY RUN] Would start engine Docker container (Dockerfile.engine)"
@@ -385,6 +466,12 @@ cmd_run_engine_docker() {
         log_warn "镜像 $img 存在但未包含 /app 下的 engine 包（常见于把 TensorRT 基础镜像误打成同名 tag）。"
         log_info "将按 Dockerfile.engine 重新构建..."
         need_build=true
+    elif [ -n "$expected_release" ] && ! engine_docker_image_matches_release "$img" "$expected_release"; then
+        local actual_release
+        actual_release=$(engine_docker_image_tensorrt_release "$img" || true)
+        log_warn "镜像 $img 的 TensorRT 版本是 ${actual_release:-unknown}，但 Phase B manifest 对应 $expected_release。"
+        log_info "将按 Dockerfile.engine 使用 ENGINE_BASE_IMAGE=$ENGINE_BASE_IMAGE 重新构建..."
+        need_build=true
     fi
     if $need_build; then
         bash "${SCRIPT_DIR}/compose.sh" build --gateway engine --image "$img" || exit 1
@@ -393,6 +480,7 @@ cmd_run_engine_docker() {
     local compose_args=(
         up
         --gateway engine
+        --prepare
         --variant "$VARIANT"
         --image "$img"
         --port "$ENGINE_PORT"

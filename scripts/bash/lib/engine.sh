@@ -402,6 +402,29 @@ engine_docker_image_has_app() {
 }
 
 # ---------------------------------------------------------------------------
+#  engine_docker_image_tensorrt_release <image_tag>
+#  Echoes NVIDIA_TENSORRT_VERSION from the image (e.g. 25.03, 26.02).
+# ---------------------------------------------------------------------------
+engine_docker_image_tensorrt_release() {
+    local image="$1"
+    docker image inspect "$image" \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+        | awk -F= '$1 == "NVIDIA_TENSORRT_VERSION" { print $2; exit }'
+}
+
+# ---------------------------------------------------------------------------
+#  engine_docker_image_matches_release <image_tag> <ngc_tag>
+#  Returns 0 when the existing image base matches the expected NGC release tag.
+# ---------------------------------------------------------------------------
+engine_docker_image_matches_release() {
+    local image="$1"
+    local expected="$2"
+    local actual
+    actual=$(engine_docker_image_tensorrt_release "$image" || true)
+    [ -n "$actual" ] && [ "$actual" = "$expected" ]
+}
+
+# ---------------------------------------------------------------------------
 #  engine_build_image <repo_root> [image_tag]
 #  Builds the Docker image for the standalone engine.
 # ---------------------------------------------------------------------------
@@ -416,9 +439,11 @@ engine_build_image() {
     fi
 
     log_step "Building engine Docker image: $image_tag"
+    local base_image="${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:26.02-py3}"
     local pytorch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-cu130}}"
     # BuildKit: enables RUN --mount cache for pip (faster rebuilds; see Dockerfile.engine).
     DOCKER_BUILDKIT=1 docker build \
+        --build-arg "BASE_IMAGE=$base_image" \
         --build-arg "PYTORCH_CUDA_TAG=$pytorch_cuda_tag" \
         -t "$image_tag" \
         -f "$dockerfile" \
