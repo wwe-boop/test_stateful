@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, TYPE_CHECKING
 
 from ..core.session import Session, SegmentOrderMeta
 from ..core.types import (
@@ -30,7 +30,9 @@ from .dispatcher import Dispatcher
 from .spliter import Spliter
 from .spliter.driver import ActionType
 from .spliter.reorder import AudioReorder
-from .spliter.tokenizer import LightQwen3TTSTokenizer
+
+if TYPE_CHECKING:
+    from .spliter.tokenizer import LightQwen3TTSTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +205,7 @@ class FrontendInterface:
         if not tokens:
             return
 
+        session.mark_input_complete()
         seg_actions = session.spliter.set_full_text(tokens)
         await self._dispatch_segment_actions(session, seg_actions)
         await self._dispatcher.maybe_send_session_tokens_done(session)
@@ -230,8 +233,7 @@ class FrontendInterface:
 
         seg_actions = session.spliter.input_done()
         await self._dispatch_segment_actions(session, seg_actions)
-        await self._dispatcher.submit_session_tokens_done(session_id)
-        session.engine_tokens_done_sent = True
+        await self._dispatcher.maybe_send_session_tokens_done(session)
 
     async def _consume_results(
         self,
@@ -259,6 +261,21 @@ class FrontendInterface:
                     if ready and on_audio:
                         for chunk in ready:
                             await on_audio(session.session_id, chunk)
+
+                elif result.type == ResultType.PREFILL_DONE:
+                    if on_event:
+                        await on_event(
+                            session.session_id,
+                            {
+                                "type": "prefill_done",
+                                "segment_idx": result.segment_idx,
+                                "text": session.segment_texts.get(result.segment_idx, ""),
+                                "meta": {
+                                    str(k): str(v)
+                                    for k, v in (result.metrics or {}).items()
+                                },
+                            },
+                        )
 
                 elif result.type == ResultType.SEGMENT_END:
                     seg_idx = result.segment_idx

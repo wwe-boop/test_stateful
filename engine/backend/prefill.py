@@ -227,6 +227,7 @@ OFFICIAL_REF_TEXT_PREFIX = "<|im_start|>assistant\n"
 OFFICIAL_REF_TEXT_SUFFIX = "<|im_end|>\n"
 OFFICIAL_INSTRUCT_PREFIX = "<|im_start|>user\n"
 OFFICIAL_INSTRUCT_SUFFIX = "<|im_end|>\n"
+PROMPT_TEMPLATE_VERSION = "qwen3-tts-official-chat-v1"
 
 
 class PrefillBuilder:
@@ -289,6 +290,8 @@ class PrefillBuilder:
         ref_text: Optional[str] = None,
         ref_text_token_ids: Optional[list[int]] = None,
         ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        ref_audio_sha256: Optional[str] = None,
+        ref_feature_cache_key: Optional[str] = None,
         include_eos: bool = True,
     ) -> PrefillPlan:
         text = normalize_tts_text(text)
@@ -305,6 +308,8 @@ class PrefillBuilder:
             ref_text=ref_text,
             ref_text_token_ids=ref_text_token_ids,
             ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_audio_sha256=ref_audio_sha256,
+            ref_feature_cache_key=ref_feature_cache_key,
             include_eos=include_eos,
         )
 
@@ -321,6 +326,8 @@ class PrefillBuilder:
         ref_text: Optional[str] = None,
         ref_text_token_ids: Optional[list[int]] = None,
         ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        ref_audio_sha256: Optional[str] = None,
+        ref_feature_cache_key: Optional[str] = None,
         include_eos: bool = True,
     ) -> tuple[torch.Tensor, list]:
         """Compatibility wrapper for older tests and verification scripts."""
@@ -336,6 +343,8 @@ class PrefillBuilder:
             ref_text=ref_text,
             ref_text_token_ids=ref_text_token_ids,
             ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_audio_sha256=ref_audio_sha256,
+            ref_feature_cache_key=ref_feature_cache_key,
             include_eos=include_eos,
         )
         return plan.prefill_embeds, plan.trailing
@@ -353,6 +362,8 @@ class PrefillBuilder:
         ref_text: Optional[str] = None,
         ref_text_token_ids: Optional[list[int]] = None,
         ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        ref_audio_sha256: Optional[str] = None,
+        ref_feature_cache_key: Optional[str] = None,
         include_eos: bool = True,
     ) -> PrefillPlan:
         w = self.w
@@ -483,25 +494,30 @@ class PrefillBuilder:
 
         # ---- ICL path ----
         icl_handled = False
+        icl_cacheable_prefix = None
+        icl_request_prefill = None
+        icl_cache_vec = None
         if task_type == TaskType.VOICE_CLONE_ICL and ref_codec_sum_vec is not None:
-            prefill, trailing = self._build_icl_path(
+            prefill, trailing, icl_cacheable_prefix, icl_request_prefill = self._build_icl_path(
                 w, device, text_ids, talker_input_embed,
                 ref_codec_sum_vec, ref_ids,
             )
             char_offsets = []
             icl_handled = True
+            icl_cache_vec = ref_codec_sum_vec
 
         elif (task_type == TaskType.VOICE_CLONE_ICL
               and ref_codes is not None and w.codec_embeddings_3d is not None):
             T_ref, _ = ref_codes.shape
             g_idx = torch.arange(16, device=device, dtype=torch.int64).reshape(1, -1).expand(T_ref, 16)
             codec_sum_vec = w.codec_embeddings_3d[g_idx, ref_codes, :].sum(dim=1).unsqueeze(0)
-            prefill, trailing = self._build_icl_path(
+            prefill, trailing, icl_cacheable_prefix, icl_request_prefill = self._build_icl_path(
                 w, device, text_ids, talker_input_embed,
                 codec_sum_vec, ref_ids,
             )
             char_offsets = []
             icl_handled = True
+            icl_cache_vec = codec_sum_vec
 
         if not icl_handled:
             if text_ids.shape[1] > 0:
@@ -549,7 +565,39 @@ class PrefillBuilder:
         prefix_cache_key = None
         cacheable_prefix_embeds = None
         request_prefill_embeds = None
-        if task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN, TaskType.VOICE_CLONE_XVEC):
+        if task_type == TaskType.VOICE_CLONE_ICL and icl_handled:
+            cacheable_prefix_embeds = (
+                icl_cacheable_prefix.clone().contiguous()
+                if icl_cacheable_prefix is not None
+                else None
+            )
+            request_prefill_embeds = (
+                icl_request_prefill.clone().contiguous()
+                if icl_request_prefill is not None
+                else None
+            )
+            if (
+                cacheable_prefix_embeds is not None
+                and request_prefill_embeds is not None
+                and int(cacheable_prefix_embeds.shape[1]) > 0
+                and int(request_prefill_embeds.shape[1]) > 0
+            ):
+                prefix_cache_key = self._prefix_cache_key(
+                    task_type,
+                    language,
+                    speaker,
+                    instruct,
+                    spk_embedding,
+                    instruct_token_ids=instruct_ids,
+                    ref_text_token_ids=ref_ids,
+                    ref_audio_sha256=ref_audio_sha256,
+                    ref_codec_sum_vec=icl_cache_vec,
+                    ref_feature_cache_key=ref_feature_cache_key,
+                )
+            else:
+                cacheable_prefix_embeds = None
+                request_prefill_embeds = None
+        elif task_type in (TaskType.CUSTOM_VOICE, TaskType.VOICE_DESIGN, TaskType.VOICE_CLONE_XVEC):
             if non_streaming_mode:
                 cacheable_prefix_embeds = talker_input_embed.clone().contiguous()
                 request_prefill_embeds = prefill[:, cacheable_prefix_embeds.shape[1]:, :].clone().contiguous()
@@ -610,7 +658,7 @@ class PrefillBuilder:
         ref_text_lens = ref_id.shape[1]
         if ref_text_lens and codec_lens <= ref_text_lens:
             raise ValueError(
-                "ICL reference codec frames do not cover ref_text tokens; "
+                "icl_ref_codec_collapsed: ICL reference codec frames do not cover ref_text tokens; "
                 "speech_tokenizer_codec_fused may be an old collapsed export"
             )
 
@@ -626,7 +674,15 @@ class PrefillBuilder:
             trailing = [w.tts_pad_embed]
 
         prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
-        return prefill, trailing
+        cacheable_prefix = None
+        request_prefill = None
+        if ref_text_lens > 0 and ref_text_lens < icl_embed.shape[1]:
+            cacheable_prefix = torch.cat(
+                [talker_input_embed, icl_embed[:, :ref_text_lens, :]],
+                dim=1,
+            )
+            request_prefill = icl_embed[:, ref_text_lens:, :]
+        return prefill, trailing, cacheable_prefix, request_prefill
 
     def build_trailing_embeds(self, text: str, include_eos: bool = True) -> list[torch.Tensor]:
         """Build trailing embeddings for streaming text continuation."""
@@ -686,6 +742,10 @@ class PrefillBuilder:
         instruct: Optional[str] = None,
         instruct_token_ids: Optional[list[int]] = None,
         spk_embedding: Optional[torch.Tensor] = None,
+        ref_text_token_ids: Optional[list[int]] = None,
+        ref_audio_sha256: Optional[str] = None,
+        ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        ref_feature_cache_key: Optional[str] = None,
     ) -> Optional[str]:
         """Compute prefix cache key without building the full plan.
 
@@ -696,6 +756,10 @@ class PrefillBuilder:
         return self._prefix_cache_key(
             task_type, language, speaker, instruct, spk_embedding,
             instruct_token_ids=instruct_token_ids,
+            ref_text_token_ids=ref_text_token_ids,
+            ref_audio_sha256=ref_audio_sha256,
+            ref_codec_sum_vec=ref_codec_sum_vec,
+            ref_feature_cache_key=ref_feature_cache_key,
         )
 
     def build_suffix_from_ids(
@@ -792,6 +856,10 @@ class PrefillBuilder:
         spk_embedding,
         *,
         instruct_token_ids: Optional[list[int]] = None,
+        ref_text_token_ids: Optional[list[int]] = None,
+        ref_audio_sha256: Optional[str] = None,
+        ref_codec_sum_vec: Optional[torch.Tensor] = None,
+        ref_feature_cache_key: Optional[str] = None,
     ):
         instruct_ids = self._normalize_prompt_token_ids(instruct_token_ids, instruct)
         if instruct_ids:
@@ -800,8 +868,27 @@ class PrefillBuilder:
             ).hexdigest()[:16]
         else:
             instruct_key = ""
-        key_parts = [self.w.variant, task_type.value, (language or "auto").strip().lower(),
-                     instruct_key]
+        template_key = hashlib.sha1(
+            "|".join(
+                (
+                    PROMPT_TEMPLATE_VERSION,
+                    OFFICIAL_ASSISTANT_FMT,
+                    OFFICIAL_REF_TEXT_FMT,
+                    OFFICIAL_INSTRUCT_FMT,
+                    OFFICIAL_REF_TEXT_PREFIX,
+                    OFFICIAL_REF_TEXT_SUFFIX,
+                    OFFICIAL_INSTRUCT_PREFIX,
+                    OFFICIAL_INSTRUCT_SUFFIX,
+                )
+            ).encode("utf-8"),
+        ).hexdigest()[:16]
+        key_parts = [
+            self.w.variant,
+            task_type.value,
+            (language or "auto").strip().lower(),
+            instruct_key,
+            template_key,
+        ]
         if task_type == TaskType.CUSTOM_VOICE:
             key_parts.append((speaker or "").strip().lower())
         elif task_type == TaskType.VOICE_CLONE_XVEC:
@@ -809,6 +896,45 @@ class PrefillBuilder:
                 return None
             arr = spk_embedding.detach().cpu().float().contiguous().numpy()
             key_parts.append(hashlib.sha1(arr.tobytes()).hexdigest()[:16])
+        elif task_type == TaskType.VOICE_CLONE_ICL:
+            ref_ids = list(ref_text_token_ids or [])
+            if not ref_ids:
+                return None
+            ref_text_key = hashlib.sha1(
+                np.asarray(ref_ids, dtype=np.int64).tobytes(),
+            ).hexdigest()[:16]
+            if ref_audio_sha256:
+                ref_audio_key = str(ref_audio_sha256)[:16]
+            elif ref_codec_sum_vec is not None:
+                arr = ref_codec_sum_vec.detach().cpu().float().contiguous().numpy()
+                ref_audio_key = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+            else:
+                return None
+            if spk_embedding is not None:
+                arr = spk_embedding.detach().cpu().float().contiguous().numpy()
+                spk_key = hashlib.sha1(arr.tobytes()).hexdigest()[:16]
+            else:
+                spk_key = ""
+            special_key = hashlib.sha1(
+                "|".join(
+                    str(v)
+                    for v in (
+                        getattr(self.w, "codec_nothink_id", ""),
+                        getattr(self.w, "codec_think_id", ""),
+                        getattr(self.w, "codec_think_bos_id", ""),
+                        getattr(self.w, "codec_think_eos_id", ""),
+                        self.w.codec_bos_id,
+                        self.w.codec_pad_id,
+                        self.w.tts_bos_token_id,
+                        self.w.tts_eos_token_id,
+                        self.w.tts_pad_token_id,
+                    )
+                ).encode("ascii"),
+            ).hexdigest()[:16]
+            feature_key = hashlib.sha1(
+                str(ref_feature_cache_key or "").encode("utf-8"),
+            ).hexdigest()[:16]
+            key_parts.extend([ref_audio_key, ref_text_key, spk_key, feature_key, special_key])
         elif task_type != TaskType.VOICE_DESIGN:
             return None
         return "|".join(key_parts)

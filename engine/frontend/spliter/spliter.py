@@ -444,6 +444,8 @@ class Spliter:
             end_evt = SpliterEvent(type=ET.END)
             for r in driver.feed(end_evt):
                 actions.append(SegmentAction(active_idx, r))
+                if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
+                    self._flushing.add(active_idx)
 
         return actions
 
@@ -490,6 +492,8 @@ class Spliter:
             end_evt = SpliterEvent(type=ET.END)
             for r in driver.feed(end_evt):
                 actions.append(SegmentAction(idx, r))
+                if r.type in (ActionType.FLUSH_EOS, ActionType.FLUSH_NOP):
+                    self._flushing.add(idx)
 
         return actions
 
@@ -510,7 +514,7 @@ class Spliter:
         if self._presplit_thresholds is not None:
             return self._drive_presplit_batch()
 
-        if self._token_buffer or self._input_complete:
+        if self._token_buffer:
             return self._try_start_next()
         return []
 

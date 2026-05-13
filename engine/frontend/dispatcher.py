@@ -12,7 +12,7 @@ import asyncio
 from typing import List
 
 from ..core.session import Session, SegmentOrderMeta
-from ..core.types import EngineRequest, InputMode, RequestPriority, RequestType
+from ..core.types import EngineRequest, RequestPriority, RequestType
 from .spliter import SegmentAction
 from .spliter.driver import ActionType
 
@@ -97,15 +97,34 @@ class Dispatcher:
         """Signal session-level token completion when no more groups remain."""
         if session.engine_tokens_done_sent or session.spliter is None:
             return
-        spliter = session.spliter
-        pending_groups = getattr(spliter, "_presplit_groups", None)
-        has_presplit_mode = getattr(spliter, "_presplit_thresholds", None) is not None
-        if not has_presplit_mode and session.config.input_mode != InputMode.LONG_SEGMENT:
+        if not session.input_complete:
             return
-        if pending_groups:
+        if not self._spliter_has_dispatched_all_input(session):
             return
         await self.submit_session_tokens_done(session.session_id)
         session.engine_tokens_done_sent = True
+
+    @staticmethod
+    def _spliter_has_dispatched_all_input(session: Session) -> bool:
+        spliter = session.spliter
+        if spliter is None:
+            return True
+
+        pending_groups = getattr(spliter, "_presplit_groups", None)
+        if pending_groups:
+            return False
+
+        token_buffer = getattr(spliter, "_token_buffer", None)
+        if token_buffer:
+            return False
+
+        drivers = getattr(spliter, "_drivers", {}) or {}
+        flushing = getattr(spliter, "_flushing", set()) or set()
+        done = getattr(spliter, "_done", set()) or set()
+        for segment_idx in drivers:
+            if segment_idx not in flushing and segment_idx not in done:
+                return False
+        return True
 
     def _segment_priority(
         self,

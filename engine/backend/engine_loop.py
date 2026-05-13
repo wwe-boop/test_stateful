@@ -511,27 +511,32 @@ class EngineLoop:
                     error_msg=str(exc),
                 ))
                 return False
-            # Check prefix cache BEFORE build_plan to skip the
-            # token→text→retokenize round-trip on cache hits.
-            cache_key = self._prefill_builder.compute_cache_key(
-                task_type,
-                req_cfg.language if req_cfg is not None else "auto",
-                req_cfg.speaker if req_cfg is not None else best_group.request.speaker_key,
-                req_cfg.instruct if req_cfg is not None else None,
-                (
-                    list(req_cfg.instruct_spec.token_ids)
-                    if req_cfg is not None and req_cfg.instruct_spec is not None
-                    else None
-                ),
-                spk_embedding=(
-                    req_cfg.spk_embedding
-                    if req_cfg is not None
-                    else None
-                ),
-            )
-            cached = self._prefix_cache.get(cache_key)
+            prefill_metrics = self._prefill_metrics(task_type, req_cfg)
+            # Non-ICL tasks can check cache before building the full plan. ICL
+            # needs the plan first because its request suffix includes ref
+            # codec frames plus target text.
+            cache_key = None
+            cached = None
+            if task_type != TaskType.VOICE_CLONE_ICL:
+                cache_key = self._prefill_builder.compute_cache_key(
+                    task_type,
+                    req_cfg.language if req_cfg is not None else "auto",
+                    req_cfg.speaker if req_cfg is not None else best_group.request.speaker_key,
+                    req_cfg.instruct if req_cfg is not None else None,
+                    (
+                        list(req_cfg.instruct_spec.token_ids)
+                        if req_cfg is not None and req_cfg.instruct_spec is not None
+                        else None
+                    ),
+                    spk_embedding=(
+                        req_cfg.spk_embedding
+                        if req_cfg is not None
+                        else None
+                    ),
+                )
+                cached = self._prefix_cache.get(cache_key)
 
-            if cached is not None and best.pending_token_ids:
+            if task_type != TaskType.VOICE_CLONE_ICL and cached is not None and best.pending_token_ids:
                 # ── Cache HIT: restore prefix KV and let decode consume first text token ──
                 req_embeds, trailing = (
                     self._prefill_builder.build_suffix_from_ids(
@@ -579,11 +584,29 @@ class EngineLoop:
                         if req_cfg is not None
                         else None
                     ),
+                    ref_audio_sha256=(
+                        req_cfg.ref_audio_sha256
+                        if req_cfg is not None
+                        else None
+                    ),
+                    ref_feature_cache_key=(
+                        req_cfg.ref_feature_cache_key
+                        if req_cfg is not None
+                        else None
+                    ),
                     include_eos=best.input_complete,
                 )
                 best.prefill_plan = plan
                 slot.prefill_source = "full_prefill"
 
+                if req_cfg is not None and req_cfg.ref_warnings:
+                    for warning_msg in req_cfg.ref_warnings:
+                        self._send_result(best_group, EngineResult(
+                            type=ResultType.WARNING,
+                            session_id=best.session_id,
+                            segment_idx=best.segment_idx,
+                            warning_msg=str(warning_msg),
+                        ))
                 if plan.warnings:
                     for warning_msg in plan.warnings:
                         self._send_result(best_group, EngineResult(
@@ -596,71 +619,98 @@ class EngineLoop:
                 split_prefix_prefill = (
                     plan.cacheable_prefix_embeds is not None
                     and plan.request_prefill_embeds is not None
-                    and int(plan.request_prefill_embeds.shape[1]) == 1
+                    and (
+                        task_type == TaskType.VOICE_CLONE_ICL
+                        or int(plan.request_prefill_embeds.shape[1]) == 1
+                    )
                 )
+                if task_type == TaskType.VOICE_CLONE_ICL and split_prefix_prefill:
+                    icl_prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
+                    if plan.prefix_cache_key is None:
+                        split_prefix_prefill = False
+                    elif icl_prefix_len > self._prefix_cache.max_prefix_len:
+                        split_prefix_prefill = False
+                        prefill_metrics["icl_cache_miss"] = "skipped_prefix_too_long"
+                        logger.info(
+                            "ICL prefix cache skipped for %s: prefix_len=%d exceeds max_prefix_len=%d",
+                            best.session_id,
+                            icl_prefix_len,
+                            self._prefix_cache.max_prefix_len,
+                        )
 
-                if split_prefix_prefill:
+                if task_type == TaskType.VOICE_CLONE_ICL and split_prefix_prefill:
+                    effective_key = plan.prefix_cache_key or cache_key
+                    cached_icl = self._prefix_cache.get(effective_key)
+                    if cached_icl is not None:
+                        self._restore_prefix_cache(slot, cached_icl)
+                        prefill_metrics["icl_cache_hit"] = "true"
+                        logger.info(
+                            "ICL prefix cache hit: copied %d KV tokens for %s (slot=%d)",
+                            cached_icl.prefix_len,
+                            best.session_id,
+                            slot.slot_id,
+                        )
+                    else:
+                        self._executor.prefill_prefix_only(
+                            slot, plan.cacheable_prefix_embeds,
+                        )
+                        prefill_metrics["icl_cache_miss"] = "true"
+                        prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
+                        prefix_kv = self._read_prefix_kv(slot, prefix_len)
+                        if effective_key is not None and prefix_kv is not None:
+                            self._prefix_cache.put(
+                                effective_key, prefix_kv, prefix_len,
+                            )
+
+                    self._apply_ref_c2w_warm_state(best_group, best, req_cfg)
+                    prefill_audio, prefill_eos = self._executor.prefill_from_prefix(
+                        slot,
+                        plan.request_prefill_embeds,
+                    )
+                    self._attach_trailing_after_prefill(slot, plan.trailing)
+                    best.eos_trailing_added = best.input_complete
+
+                elif split_prefix_prefill:
                     self._executor.prefill_prefix_only(
                         slot, plan.cacheable_prefix_embeds,
                     )
                     prefill_audio, prefill_eos = None, False
                 else:
-                    if (
-                        task_type == TaskType.VOICE_CLONE_ICL
-                        and req_cfg is not None
-                        and req_cfg.ref_c2w_kv is not None
-                    ):
-                        warmed = self._executor.apply_c2w_warm_state(
-                            slot,
-                            req_cfg.ref_c2w_kv,
-                            req_cfg.ref_c2w_conv_states,
-                            req_cfg.ref_c2w_transconv_states,
-                            req_cfg.ref_c2w_frame_idx,
-                        )
-                        if warmed:
-                            logger.info(
-                                "Applied Code2Wav ref warm state for %s "
-                                "(slot=%d, frame_idx=%d)",
-                                best.session_id,
-                                slot.slot_id,
-                                int(req_cfg.ref_c2w_frame_idx),
-                            )
+                    if task_type == TaskType.VOICE_CLONE_ICL:
+                        self._apply_ref_c2w_warm_state(best_group, best, req_cfg)
                     prefill_audio, prefill_eos = self._executor.prefill(
                         slot, plan.prefill_embeds,
                     )
-                # Populate cache — read from pool when preallocated
-                effective_key = plan.prefix_cache_key or cache_key
-                if (
-                    effective_key is not None
-                    and plan.cacheable_prefix_embeds is not None
-                ):
-                    prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
-                    prefix_kv = self._read_prefix_kv(slot, prefix_len)
-                    if prefix_kv is not None:
-                        self._prefix_cache.put(
-                            effective_key, prefix_kv, prefix_len,
+                if task_type != TaskType.VOICE_CLONE_ICL:
+                    # Populate cache — read from pool when preallocated.
+                    effective_key = plan.prefix_cache_key or cache_key
+                    if (
+                        effective_key is not None
+                        and plan.cacheable_prefix_embeds is not None
+                    ):
+                        prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
+                        prefix_kv = self._read_prefix_kv(slot, prefix_len)
+                        if prefix_kv is not None:
+                            self._prefix_cache.put(
+                                effective_key, prefix_kv, prefix_len,
+                            )
+
+                    if split_prefix_prefill:
+                        self._prime_decode_after_prefix_prefill(
+                            slot,
+                            plan.request_prefill_embeds,
+                            plan.trailing,
+                            source="full_prefill_prefix_only",
                         )
-
-                if split_prefix_prefill:
-                    self._prime_decode_after_prefix_prefill(
-                        slot,
-                        plan.request_prefill_embeds,
-                        plan.trailing,
-                        source="full_prefill_prefix_only",
-                    )
+                        best.eos_trailing_added = best.input_complete
+                    else:
+                        self._attach_trailing_after_prefill(slot, plan.trailing)
+                        best.eos_trailing_added = best.input_complete
+                elif not split_prefix_prefill:
+                    self._attach_trailing_after_prefill(slot, plan.trailing)
                     best.eos_trailing_added = best.input_complete
-                else:
-                    slot.trailing = plan.trailing
-                    best.eos_trailing_added = best.input_complete
-
-                    # Legacy path: prefill already consumed first text token.
-                    if slot.next_embed is not None and slot.trailing:
-                        first_trail = slot.trailing[0].to(slot.next_embed.dtype)
-                        slot.next_embed = (
-                            slot.next_embed + first_trail
-                        ).to(torch.float32)
-                        slot.text_idx = 1
         else:
+            prefill_metrics = {}
             prefill_audio, prefill_eos = self._executor.prefill(slot, torch.zeros(
                 1,
                 1,
@@ -672,10 +722,32 @@ class EngineLoop:
         best.state = "active"
         best.decode_start_frame = slot.frame_idx
         self._total_prefills += 1
+        if any(
+            key in prefill_metrics
+            for key in (
+                "ref_source",
+                "ref_id",
+                "ref_audio_sha256",
+                "ref_text_hash",
+                "icl_cache_hit",
+                "icl_cache_miss",
+                "ref_preprocess_runtime",
+            )
+        ):
+            logger.info(
+                "Prefill metadata: session=%s segment=%d %s",
+                best.session_id,
+                best.segment_idx,
+                " ".join(
+                    f"{key}={value}"
+                    for key, value in sorted(prefill_metrics.items())
+                ),
+            )
         self._send_result(best_group, EngineResult(
             type=ResultType.PREFILL_DONE,
             session_id=best.session_id,
             segment_idx=best.segment_idx,
+            metrics=prefill_metrics,
         ))
 
         if prefill_audio and len(prefill_audio) > 0:
@@ -715,6 +787,15 @@ class EngineLoop:
         next_embed so the first decode step processes it with full
         attention to the cached KV.
         """
+        self._restore_prefix_cache(slot, cached)
+        self._prime_decode_after_prefix_prefill(
+            slot,
+            request_prefill_embeds,
+            trailing,
+            source="prefix_cache_prefix_only",
+        )
+
+    def _restore_prefix_cache(self, slot: SlotKVState, cached) -> None:
         kv_pool = self._executor.kv_pool
         kv_pool.init_kv_tensors(slot)
         prefix_len = cached.prefix_len
@@ -726,12 +807,62 @@ class EngineLoop:
         else:
             slot.talker_kv = cached.talker_kv.clone()
         slot.past_len = prefix_len
-        self._prime_decode_after_prefix_prefill(
-            slot,
-            request_prefill_embeds,
-            trailing,
-            source="prefix_cache_prefix_only",
+
+    def _apply_ref_c2w_warm_state(
+        self,
+        group: EngineSessionGroup,
+        seg: EngineSegment,
+        req_cfg,
+    ) -> None:
+        if req_cfg is None or req_cfg.ref_c2w_kv is None or seg.slot is None:
+            return
+        warmed = self._executor.apply_c2w_warm_state(
+            seg.slot,
+            req_cfg.ref_c2w_kv,
+            req_cfg.ref_c2w_conv_states,
+            req_cfg.ref_c2w_transconv_states,
+            req_cfg.ref_c2w_frame_idx,
         )
+        if warmed:
+            logger.info(
+                "Applied Code2Wav ref warm state for %s "
+                "(slot=%d, frame_idx=%d)",
+                seg.session_id,
+                seg.slot.slot_id,
+                int(req_cfg.ref_c2w_frame_idx),
+            )
+
+    def _attach_trailing_after_prefill(
+        self,
+        slot: SlotKVState,
+        trailing: list,
+    ) -> None:
+        slot.trailing = trailing
+        if slot.next_embed is not None and slot.trailing:
+            first_trail = slot.trailing[0].to(slot.next_embed.dtype)
+            slot.next_embed = (
+                slot.next_embed + first_trail
+            ).to(torch.float32)
+            slot.text_idx = 1
+
+    def _prefill_metrics(self, task_type: TaskType, req_cfg) -> dict:
+        metrics: dict[str, str] = {"task_type": task_type.value}
+        if req_cfg is None:
+            return metrics
+        for attr in (
+            "ref_source",
+            "ref_id",
+            "ref_audio_sha256",
+            "ref_text_hash",
+            "ref_preprocess_runtime",
+        ):
+            value = getattr(req_cfg, attr, None)
+            if value:
+                text = str(value)
+                if attr in ("ref_audio_sha256", "ref_text_hash"):
+                    text = text[:12]
+                metrics[attr] = text
+        return metrics
 
     def _prime_decode_after_prefix_prefill(
         self,

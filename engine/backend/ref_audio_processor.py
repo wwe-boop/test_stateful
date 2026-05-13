@@ -20,7 +20,7 @@ import logging
 import re
 import threading
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -53,6 +53,8 @@ class ReferenceAudioFeatures:
     ref_c2w_frame_idx: int = 0
     sample_rate: int = _REF_SAMPLE_RATE
     duration_sec: float = 0.0
+    cache_key: str = ""
+    warnings: list[str] = field(default_factory=list)
 
 
 class ReferenceAudioProcessor:
@@ -68,19 +70,33 @@ class ReferenceAudioProcessor:
         self._codec_engine = None
         self._c2w_engine = None
         self._stream = None
-        self._cache: dict[tuple[str, bool], ReferenceAudioFeatures] = {}
+        self._cache: dict[str, ReferenceAudioFeatures] = {}
 
     @property
     def support(self) -> ReferenceAudioSupport:
         return self._support
 
-    def process(self, ref_audio: bytes, *, require_ref_codec: bool) -> ReferenceAudioFeatures:
+    def process(
+        self,
+        ref_audio: bytes,
+        *,
+        require_ref_codec: bool,
+        cache_tag: str = "",
+    ) -> ReferenceAudioFeatures:
         if not self._support.available:
             raise RuntimeError(self._support.reason or "reference-audio preprocessing is unavailable")
         if require_ref_codec and self._support.speech_tokenizer_codec_fused_path is None:
-            raise RuntimeError("speech_tokenizer_codec_fused engine is required for Base ICL mode")
+            raise RuntimeError(
+                "speech_tokenizer_codec_fused_trt_missing: "
+                "speech_tokenizer_codec_fused TensorRT engine is required for Base ICL mode"
+            )
 
-        cache_key = (hashlib.sha256(ref_audio).hexdigest(), bool(require_ref_codec))
+        audio_sha = hashlib.sha256(ref_audio).hexdigest()
+        cache_key = self._feature_cache_key(
+            audio_sha,
+            require_ref_codec=bool(require_ref_codec),
+            cache_tag=cache_tag,
+        )
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
@@ -91,9 +107,13 @@ class ReferenceAudioProcessor:
                 return cached
 
             self._ensure_engines(require_ref_codec=require_ref_codec)
-            wav, sr = _decode_wav_bytes(ref_audio)
+            try:
+                wav, sr = _decode_wav_bytes(ref_audio)
+            except Exception as exc:
+                raise ValueError(f"invalid_ref_audio: {exc}") from exc
             wav_24k = _resample_linear(wav, sr, _REF_SAMPLE_RATE)
             duration_sec = float(wav_24k.shape[0]) / float(_REF_SAMPLE_RATE)
+            warnings = _validate_reference_audio_quality(wav_24k, duration_sec)
 
             spk_embedding = self._run_speaker_encoder(wav_24k)
             ref_codec_sum_vec = None
@@ -119,12 +139,14 @@ class ReferenceAudioProcessor:
                 ref_c2w_transconv_states=ref_c2w_transconv_states,
                 ref_c2w_frame_idx=ref_c2w_frame_idx,
                 duration_sec=duration_sec,
+                cache_key=cache_key,
+                warnings=warnings,
             )
             self._cache[cache_key] = features
             return features
 
     def _probe(self) -> ReferenceAudioSupport:
-        if not self._variant.startswith("base-"):
+        if not (self._variant.startswith("base-") or self._variant.startswith("icl-")):
             return ReferenceAudioSupport(
                 available=False,
                 reason=f"variant '{self._variant}' is not a base model; voice_clone is unsupported",
@@ -135,13 +157,11 @@ class ReferenceAudioProcessor:
             engine_dir / "speaker_encoder.engine",
             engine_dir / "speaker_encoder" / "model.plan",
             engine_dir / "speaker_encoder" / "speaker_encoder.engine",
-            engine_dir / "speaker_encoder.onnx",
         )
         speech_tokenizer_codec_fused = _first_existing(
             engine_dir / "speech_tokenizer_codec_fused.engine",
             engine_dir / "speech_tokenizer_codec_fused" / "model.plan",
             engine_dir / "speech_tokenizer_codec_fused" / "speech_tokenizer_codec_fused.engine",
-            engine_dir / "speech_tokenizer_codec_fused.onnx",
         )
         code2wav_decoder = _first_existing(
             engine_dir.parent / "tokenizer" / "code2wav_decoder.engine",
@@ -155,7 +175,10 @@ class ReferenceAudioProcessor:
         if speaker_encoder is None:
             return ReferenceAudioSupport(
                 available=False,
-                reason=f"missing speaker encoder TensorRT engine under: {engine_dir}",
+                reason=(
+                    "speaker_encoder_trt_missing: missing speaker_encoder TensorRT "
+                    f"engine under: {engine_dir}"
+                ),
                 speaker_encoder_path=engine_dir / "speaker_encoder.engine",
                 speech_tokenizer_encoder_path=speech_tokenizer_encoder,
                 speech_tokenizer_codec_fused_path=speech_tokenizer_codec_fused,
@@ -189,6 +212,25 @@ class ReferenceAudioProcessor:
             speech_tokenizer_codec_fused_path=speech_tokenizer_codec_fused,
             code2wav_decoder_path=code2wav_decoder,
         )
+
+    def _feature_cache_key(
+        self,
+        audio_sha: str,
+        *,
+        require_ref_codec: bool,
+        cache_tag: str,
+    ) -> str:
+        parts = [
+            self._variant,
+            cache_tag or "voice_clone",
+            audio_sha,
+            "codec" if require_ref_codec else "xvec",
+            _artifact_fingerprint(self._support.speaker_encoder_path),
+        ]
+        if require_ref_codec:
+            parts.append(_artifact_fingerprint(self._support.speech_tokenizer_codec_fused_path))
+            parts.append(_artifact_fingerprint(self._support.code2wav_decoder_path))
+        return "|".join(parts)
 
     def _ensure_engines(self, *, require_ref_codec: bool) -> None:
         import torch
@@ -261,7 +303,8 @@ class ReferenceAudioProcessor:
             )
         if wav_24k.shape[0] >= _REF_SAMPLE_RATE and ref.shape[1] <= 1:
             raise RuntimeError(
-                "speech_tokenizer_codec_fused returned a collapsed ICL ref codec sequence; "
+                "icl_ref_codec_collapsed: speech_tokenizer_codec_fused returned "
+                "a collapsed ICL ref codec sequence; "
                 "rebuild the ONNX/TRT engine with temporal ref codec output"
             )
         codes = out.get("ref_audio_codes")
@@ -441,6 +484,44 @@ def _first_existing(*paths: Path) -> Optional[Path]:
         if path.is_file():
             return path
     return None
+
+
+def _artifact_fingerprint(path: Optional[Path]) -> str:
+    if path is None:
+        return "none"
+    try:
+        st = path.stat()
+    except OSError:
+        return f"{path}:missing"
+    return f"{path}:{st.st_size}:{st.st_mtime_ns}"
+
+
+def _validate_reference_audio_quality(
+    audio: np.ndarray,
+    duration_sec: float,
+) -> list[str]:
+    if duration_sec < 1.0:
+        raise ValueError(
+            f"ref_audio_too_short: reference audio duration {duration_sec:.2f}s is below 1.0s"
+        )
+    if duration_sec > 20.0:
+        raise ValueError(
+            f"invalid_ref_audio: reference audio duration {duration_sec:.2f}s exceeds 20.0s"
+        )
+
+    warnings: list[str] = []
+    if duration_sec < 3.0 or duration_sec > 10.0:
+        warnings.append(
+            f"reference audio duration {duration_sec:.2f}s is outside the recommended 3-10s range"
+        )
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    mean_abs = float(np.mean(np.abs(audio))) if audio.size else 0.0
+    if peak < 1e-3 or mean_abs < 1e-4:
+        warnings.append("reference audio is near-silent")
+    clipping_ratio = float(np.mean(np.abs(audio) >= 0.999)) if audio.size else 0.0
+    if clipping_ratio > 0.01:
+        warnings.append(f"reference audio clipping ratio is high ({clipping_ratio:.2%})")
+    return warnings
 
 
 def _indexed_names(names: list[str], prefix: str) -> list[str]:

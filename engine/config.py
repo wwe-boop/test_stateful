@@ -180,6 +180,17 @@ class PrefillConfig:
 
 
 @dataclass
+class ReferencesConfig:
+    """Optional Base/ICL reference-audio library.
+
+    ``entries`` is intentionally kept as a raw mapping so deployments can add
+    reference ids without changing this dataclass.
+    """
+    default: str = ""
+    entries: dict = field(default_factory=dict)
+
+
+@dataclass
 class EngineConfig:
     """Top-level engine configuration (no model architecture)."""
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -189,6 +200,7 @@ class EngineConfig:
     spliter: SpliterConfig = field(default_factory=SpliterConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     prefill: PrefillConfig = field(default_factory=PrefillConfig)
+    references: ReferencesConfig = field(default_factory=ReferencesConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +264,7 @@ def _dict_to_config(raw: dict) -> EngineConfig:
         ("spliter", SpliterConfig),
         ("sampling", SamplingConfig),
         ("prefill", PrefillConfig),
+        ("references", ReferencesConfig),
     ]:
         section_data = raw.get(section_name, {})
         if not isinstance(section_data, dict):

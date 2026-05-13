@@ -864,21 +864,18 @@ class Executor:
         slot: SlotKVState,
         request_prefill_embeds: torch.Tensor,
     ) -> tuple[Optional[bytes], bool]:
-        """Consume the cached-prefix suffix token and emit the first c2w frame."""
+        """Consume cached-prefix suffix embeds and emit the first C2W frame."""
         self._kv_pool.init_kv_tensors(slot)
+        seq = int(request_prefill_embeds.shape[1])
 
         if self._fused_engine is None:
-            slot.past_len += int(request_prefill_embeds.shape[1])
+            slot.past_len += seq
             slot.c2w_conv_states = []
             slot.c2w_transconv_states = []
-            slot.frame_idx = 1
+            slot.frame_idx += FUSED_CHUNK_T
             return None, False
 
-        seq = int(request_prefill_embeds.shape[1])
-        if seq != 1:
-            raise ValueError(
-                f"prefill_from_prefix expects seq=1, got seq={seq}"
-            )
+        self._validate_prefill_len(seq, "prefill_from_prefix")
 
         original_past_len = int(slot.past_len)
         c2w_past_before = slot.c2w_kv

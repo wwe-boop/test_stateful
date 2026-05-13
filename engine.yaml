@@ -65,3 +65,10 @@ sampling:
 prefill:
   default_speaker: vivian
   fallback_speaker: vivian
+
+# Optional Base/ICL reference library. When entries is empty, Base/ICL default
+# reference still falls back to ENGINE_DEFAULT_BASE_REF_AUDIO_PATH /
+# ENGINE_DEFAULT_BASE_REF_TEXT or workspace/default_refs/base_ref.wav.
+references:
+  default: default
+  entries: {}

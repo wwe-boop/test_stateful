@@ -106,10 +106,81 @@ requests to the already loaded model type from the manifest. Clients may omit
 
 The server also validates model-specific fields before synthesis:
 
-- `base`: requires `ref_audio`
-- `icl`: requires `ref_audio` and `ref_text`
-- `custom_voice`: rejects ref-audio clone fields
+- `base`: resolves a reference first; explicit `ref_audio` without `ref_text`
+  remains x-vector-only, explicit `ref_audio + ref_text` enters ICL, `speaker`
+  is a reference alias when no explicit reference is present
+- `icl`: resolves a full reference first; explicit reference must include both
+  `ref_audio` and `ref_text`, and `speaker` is a reference alias when no
+  explicit reference is present
+- `custom_voice`: `speaker` is a built-in custom voice name; rejects
+  `ref_audio`, `ref_text`, and `x_vector_only`
 - `voice_design`: requires `instruct`
+
+No new protocol field is introduced for reference aliases. The meaning of
+`speaker` depends on the loaded model contract:
+
+- `custom_voice`: built-in custom voice name such as `Serena`
+- `base` / `icl`: reference alias when `ref_audio` / `ref_text` are absent
+
+Reference resolution order for `base` / `icl` is:
+
+1. Explicit `ref_audio + ref_text` wins. If `speaker` is also present, it is
+   retained only as reference metadata and is not used for lookup.
+2. If no explicit reference is present and `speaker` is set, the server looks
+   it up case-insensitively in `engine.yaml` `references.entries`.
+3. If `ref_audio`, `ref_text`, and `speaker` are all absent, the server uses
+   the default reference. `references.default` is preferred; otherwise the
+   legacy `ENGINE_DEFAULT_BASE_REF_AUDIO_PATH` /
+   `ENGINE_DEFAULT_BASE_REF_TEXT` / `workspace/default_refs/base_ref.wav`
+   mechanism is used.
+4. Partial references are rejected for `icl`. For `base`, `ref_audio`-only
+   remains x-vector-only, while `ref_text`-only is rejected.
+
+Optional reference library configuration:
+
+```yaml
+references:
+  default: default
+  entries:
+    default:
+      audio_path: workspace/default_refs/base_ref.wav
+      ref_text: 参考音频对应文本
+      language: auto
+    vivian:
+      audio_path: workspace/default_refs/vivian.wav
+      ref_text: 这是一段与 vivian 参考音频完全一致的文本。
+      language: auto
+```
+
+For standalone ICL preprocessing in TRT mode, the runtime package must contain
+TensorRT artifacts:
+
+```text
+runtime/speaker_encoder.engine
+runtime/speech_tokenizer_codec_fused.engine
+```
+
+or the equivalent plan layout:
+
+```text
+runtime/speaker_encoder/model.plan
+runtime/speech_tokenizer_codec_fused/model.plan
+```
+
+The standalone ICL path intentionally does not fall back to ONNX Runtime. If
+`speech_tokenizer_codec_fused.engine` / `model.plan` is missing, the request
+fails with `speech_tokenizer_codec_fused_trt_missing`.
+
+Reference metadata is exposed through prefill events/logs:
+
+```text
+ref_source
+ref_id
+ref_audio_sha256
+ref_text_hash
+icl_cache_hit / icl_cache_miss
+ref_preprocess_runtime=trt
+```
 
 ### Text
 
@@ -181,9 +252,11 @@ Implemented in standalone engine:
 - backend prefill no longer waits for `text_complete` if initial text already exists
 - `FLUSH_EOS` / `FLUSH_NOP` distinction preserved into backend requests
 - streaming pause/resume semantics in backend instead of unconditional pad injection
+- standalone `base` / `icl` reference resolver, TensorRT-only reference
+  preprocessing, in-process reference feature cache, and ICL reference prefix
+  KV cache
 
 Still pending for full parity with Triton orchestrator:
 
-- standalone preprocessing for `voice_clone_xvec` / `voice_clone_icl` from `ref_audio`
 - complete sampling parameter plumbing
 - Triton gateway replacement for the current hand-written gRPC layer

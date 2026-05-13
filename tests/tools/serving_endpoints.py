@@ -61,8 +61,8 @@ def _require_engine_gateway():
     return tts_pb2, tts_pb2_grpc
 
 DEFAULT_ENGINE_GRPC = "localhost:50051"
-# DEFAULT_ENGINE_WS = "ws://localhost:50052/v1/ws"
-DEFAULT_ENGINE_WS = "ws://8.160.176.148:1181/v1/ws"
+DEFAULT_ENGINE_WS = "ws://localhost:50052/v1/ws"
+# DEFAULT_ENGINE_WS = "ws://8.160.176.148:1181/v1/ws"
 DEFAULT_TRITON_HTTP = "http://localhost:8000"
 DEFAULT_TRITON_GRPC = "localhost:8001"
 DEFAULT_TRITON_MODEL = "tts_orchestrator"
@@ -463,6 +463,19 @@ def _encode_ref_audio(raw: bytes | None) -> str | None:
     return base64.b64encode(raw).decode("ascii")
 
 
+def _capture_event_meta(result: SynthesisResult, event_type: str, meta: Any) -> None:
+    if not meta:
+        return
+    meta_dict = {str(k): str(v) for k, v in dict(meta).items()}
+    if not meta_dict:
+        return
+    result.details.setdefault("event_meta", []).append(
+        {"type": str(event_type), "meta": meta_dict}
+    )
+    if event_type == "prefill_done":
+        result.details["prefill_done"] = meta_dict
+
+
 def _parse_host_port(endpoint: str, default_port: int) -> tuple[str, int]:
     host, sep, port_text = endpoint.strip().rpartition(":")
     if not sep:
@@ -483,11 +496,7 @@ def _make_engine_request_spec(args: argparse.Namespace, loaded_model_type: str =
         speaker = "Serena"
     if task_type in {"voice_design", "instruct"} and not instruct:
         instruct = CUSTOM_VOICE_INSTRUCT_ZH
-    if task_type in {"base", "icl", "voice_clone"} and ref_audio_bytes is None:
-        raise ValueError(
-            f"task_type '{task_type}' requires --ref-audio-path for a full synthesis test"
-        )
-    if task_type == "icl" and not ref_text:
+    if task_type == "icl" and ref_audio_bytes is not None and not ref_text:
         raise ValueError("task_type 'icl' requires --ref-text for a full synthesis test")
 
     return RequestSpec(
@@ -512,6 +521,39 @@ def _custom_voice_instruct_supported(capabilities: dict[str, Any]) -> bool:
     if "0.6" in variant or "0b6" in variant:
         return False
     return True
+
+
+def _reference_tests_supported(capabilities: dict[str, Any]) -> bool:
+    return str(capabilities.get("loaded_model_type", "") or "").strip() in {"base", "icl"}
+
+
+def _prefill_done_meta(result: SynthesisResult) -> dict[str, str]:
+    meta = result.details.get("prefill_done", {}) or {}
+    if not isinstance(meta, dict):
+        return {}
+    return {str(k): str(v) for k, v in meta.items()}
+
+
+def _reference_spec(
+    args: argparse.Namespace,
+    loaded_model_type: str,
+    *,
+    speaker: str | None = None,
+    ref_audio_bytes: bytes | None = None,
+    ref_text: str | None = None,
+) -> RequestSpec:
+    return RequestSpec(
+        task_type=loaded_model_type,
+        language=args.language,
+        speaker=speaker or None,
+        instruct=None,
+        ref_audio_bytes=ref_audio_bytes,
+        ref_text=ref_text,
+        x_vector_only=False,
+        sample_rate=args.sample_rate,
+        channels=1,
+        encoding=args.audio_encoding,
+    )
 
 
 def _engine_audio_encoding_to_proto(name: str) -> int:
@@ -543,6 +585,44 @@ def _case_from_synth(
         error=synthesis.error or "",
         synthesis=synthesis,
     )
+
+
+def _case_from_reference_synth(
+    target: str,
+    case: str,
+    synthesis: SynthesisResult,
+    *,
+    expected_source: str | None = None,
+    expected_cache: str | None = None,
+    save_path: Path | None = None,
+) -> CaseResult:
+    result = _case_from_synth(
+        target,
+        case,
+        synthesis,
+        save_path=save_path,
+    )
+    meta = _prefill_done_meta(synthesis)
+    problems: list[str] = []
+    if synthesis.error is None:
+        if not meta:
+            problems.append("missing prefill_done metadata")
+        if expected_source and meta.get("ref_source") != expected_source:
+            problems.append(
+                f"ref_source={meta.get('ref_source')!r}, expected {expected_source!r}"
+            )
+        if expected_cache and meta.get(expected_cache) != "true":
+            problems.append(f"{expected_cache}=true not observed")
+        if meta.get("ref_preprocess_runtime") != "trt":
+            problems.append(
+                f"ref_preprocess_runtime={meta.get('ref_preprocess_runtime')!r}, expected 'trt'"
+            )
+    if problems:
+        result.ok = False
+        result.error = "; ".join(problems)
+        result.summary = f"{result.summary} | {result.error}"
+    result.details["prefill_done"] = meta
+    return result
 
 
 def _story_path(args: argparse.Namespace) -> Path:
@@ -700,6 +780,7 @@ class EngineGrpcTransport:
                     result.sample_rate = int(resp.audio.sample_rate or spec.sample_rate)
                 elif which == "event":
                     result.events.append(resp.event.type)
+                    _capture_event_meta(result, resp.event.type, resp.event.meta)
                     if resp.event.type == "warning" and resp.event.message:
                         result.warnings.append(resp.event.message)
                     if resp.event.type == "error":
@@ -797,6 +878,7 @@ class EngineGrpcTransport:
                     result.sample_rate = int(resp.audio.sample_rate or spec.sample_rate)
                 elif which == "event":
                     result.events.append(resp.event.type)
+                    _capture_event_meta(result, resp.event.type, resp.event.meta)
                     if resp.event.type == "warning" and resp.event.message:
                         result.warnings.append(resp.event.message)
                     if resp.event.type == "error":
@@ -855,6 +937,7 @@ class EngineGrpcTransport:
                     chunks.append(_decode_audio_bytes(resp.audio.pcm_data, spec.encoding))
                 elif which == "event":
                     result.events.append(resp.event.type)
+                    _capture_event_meta(result, resp.event.type, resp.event.meta)
                     if resp.event.type == "error":
                         result.error = resp.event.message or "cancel stream error"
                         break
@@ -942,6 +1025,7 @@ class EngineWebSocketTransport:
             event = message.get("event", {})
             event_type = str(event.get("type", "") or "")
             result.events.append(event_type)
+            _capture_event_meta(result, event_type, event.get("meta", {}) or {})
             if event_type == "start" and isinstance(event.get("audio"), dict):
                 audio = event["audio"]
                 state["encoding"] = str(audio.get("encoding") or state["encoding"])
@@ -1753,6 +1837,192 @@ def _run_concurrent_case(
     )
 
 
+def _run_engine_reference_suite(
+    transport,
+    args: argparse.Namespace,
+    caps: dict[str, Any],
+    *,
+    output_dir: Path,
+) -> list[CaseResult]:
+    target = transport.name
+    loaded_model_type = str(caps.get("loaded_model_type", "") or "").strip()
+    if not _reference_tests_supported(caps):
+        return [
+            _make_case(
+                target,
+                "reference-suite",
+                ok=True,
+                skipped=True,
+                summary=(
+                    "skipped: current loaded model is not base/icl "
+                    f"(loaded_model_type={loaded_model_type or 'unknown'})"
+                ),
+            )
+        ]
+
+    results: list[CaseResult] = []
+    default_spec = _reference_spec(args, loaded_model_type)
+    default = transport.synthesize_oneshot(
+        default_spec,
+        "这是默认参考音频路径测试。",
+        timeout=args.timeout,
+        session_id=f"{target}-ref-default",
+    )
+    results.append(
+        _case_from_reference_synth(
+            target,
+            "reference-default",
+            default,
+            expected_source="default",
+            save_path=output_dir / f"{target}_reference_default.wav",
+        )
+    )
+
+    alias_spec: RequestSpec | None = None
+    if args.reference_alias:
+        alias_spec = _reference_spec(
+            args,
+            loaded_model_type,
+            speaker=args.reference_alias.strip(),
+        )
+        alias = transport.synthesize_oneshot(
+            alias_spec,
+            f"这是 reference alias {args.reference_alias} 的测试。",
+            timeout=args.timeout,
+            session_id=f"{target}-ref-alias",
+        )
+        results.append(
+            _case_from_reference_synth(
+                target,
+                "reference-alias",
+                alias,
+                expected_source="registry",
+                save_path=output_dir / f"{target}_reference_alias.wav",
+            )
+        )
+    else:
+        results.append(
+            _make_case(
+                target,
+                "reference-alias",
+                ok=True,
+                skipped=True,
+                summary="skipped: pass --reference-alias to test registry lookup",
+            )
+        )
+
+    explicit_spec: RequestSpec | None = None
+    explicit_ref_audio = _load_ref_audio(args.ref_audio_path) if args.ref_audio_path else None
+    explicit_ref_text = args.ref_text.strip() if args.ref_text else ""
+    if explicit_ref_audio is not None and explicit_ref_text:
+        explicit_spec = _reference_spec(
+            args,
+            loaded_model_type,
+            ref_audio_bytes=explicit_ref_audio,
+            ref_text=explicit_ref_text,
+        )
+        explicit = transport.synthesize_oneshot(
+            explicit_spec,
+            "这是显式上传参考音频和文本的 ICL 测试。",
+            timeout=args.timeout,
+            session_id=f"{target}-ref-explicit",
+        )
+        results.append(
+            _case_from_reference_synth(
+                target,
+                "reference-explicit",
+                explicit,
+                expected_source="explicit",
+                save_path=output_dir / f"{target}_reference_explicit.wav",
+            )
+        )
+    else:
+        results.append(
+            _make_case(
+                target,
+                "reference-explicit",
+                ok=True,
+                skipped=True,
+                summary="skipped: pass --ref-audio-path and --ref-text to test explicit reference",
+            )
+        )
+
+    if args.reference_negative_tests and loaded_model_type == "icl" and explicit_ref_audio is not None:
+        partial = transport.synthesize_oneshot(
+            _reference_spec(
+                args,
+                loaded_model_type,
+                ref_audio_bytes=explicit_ref_audio,
+                ref_text=None,
+            ),
+            "这是 ICL partial reference 负例。",
+            timeout=min(args.timeout, 30.0),
+            session_id=f"{target}-ref-partial",
+        )
+        ok = bool(partial.error) and "ref_text" in partial.error
+        results.append(
+            _make_case(
+                target,
+                "reference-partial-ref-error",
+                ok=ok,
+                summary=partial.to_summary(),
+                error="" if ok else (partial.error or "expected ref_text_required error"),
+                details={"error": partial.error or ""},
+            )
+        )
+    elif args.reference_negative_tests:
+        results.append(
+            _make_case(
+                target,
+                "reference-partial-ref-error",
+                ok=True,
+                skipped=True,
+                summary="skipped: requires loaded_model_type=icl and --ref-audio-path",
+            )
+        )
+
+    if not args.skip_reference_cache:
+        cache_spec = alias_spec or explicit_spec or default_spec
+        cache_source = (
+            "registry" if alias_spec is not None
+            else "explicit" if explicit_spec is not None
+            else "default"
+        )
+        prime = transport.synthesize_oneshot(
+            cache_spec,
+            "这是 ICL cache 第一次请求。",
+            timeout=args.timeout,
+            session_id=f"{target}-icl-cache-prime",
+        )
+        results.append(
+            _case_from_reference_synth(
+                target,
+                "icl-cache-prime",
+                prime,
+                expected_source=cache_source,
+                save_path=output_dir / f"{target}_icl_cache_prime.wav",
+            )
+        )
+        hit = transport.synthesize_oneshot(
+            cache_spec,
+            "这是 ICL cache 第二次请求，正文不同但参考相同。",
+            timeout=args.timeout,
+            session_id=f"{target}-icl-cache-hit",
+        )
+        results.append(
+            _case_from_reference_synth(
+                target,
+                "icl-cache-hit",
+                hit,
+                expected_source=cache_source,
+                expected_cache="icl_cache_hit",
+                save_path=output_dir / f"{target}_icl_cache_hit.wav",
+            )
+        )
+
+    return results
+
+
 def _run_engine_suite(
     transport,
     args: argparse.Namespace,
@@ -1781,6 +2051,16 @@ def _run_engine_suite(
     except Exception as exc:
         results.append(_make_case(target, "request-spec", ok=False, error=_error_text(exc)))
         return results
+
+    if args.reference_tests:
+        results.extend(
+            _run_engine_reference_suite(
+                transport,
+                args,
+                caps,
+                output_dir=output_dir,
+            )
+        )
 
     if not args.skip_single:
         synth = transport.synthesize_oneshot(spec, "你好，这是单路测试。", timeout=args.timeout, session_id=f"{target}-single")
@@ -2268,13 +2548,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--triton-grpc", default=DEFAULT_TRITON_GRPC)
     parser.add_argument("--triton-model", default=DEFAULT_TRITON_MODEL)
     parser.add_argument("--triton-http-model", default=DEFAULT_TRITON_HTTP_MODEL)
-    parser.add_argument("--task-type", default="custom_voice")
-    parser.add_argument("--speaker", default="Serena")
+    parser.add_argument("--task-type", default="")
+    parser.add_argument("--speaker", default="")
     parser.add_argument("--instruct", default="")
     parser.add_argument("--language", default="auto")
     parser.add_argument("--ref-audio-path", default="")
     parser.add_argument("--ref-text", default="")
     parser.add_argument("--x-vector-only", action="store_true")
+    parser.add_argument(
+        "--reference-tests",
+        action="store_true",
+        help=(
+            "Run Base/ICL reference resolver tests for standalone engine targets: "
+            "default reference, optional alias, optional explicit reference, and ICL cache metadata"
+        ),
+    )
+    parser.add_argument(
+        "--reference-alias",
+        default="",
+        help="Reference alias to use with --reference-tests, e.g. vivian",
+    )
+    parser.add_argument(
+        "--skip-reference-cache",
+        action="store_true",
+        help="With --reference-tests, skip the repeated-reference ICL prefix cache hit check",
+    )
+    parser.add_argument(
+        "--reference-negative-tests",
+        action="store_true",
+        help="With --reference-tests, also verify ICL partial reference requests fail clearly",
+    )
     parser.add_argument("--audio-encoding", choices=["pcm_f32", "pcm_s16le"], default="pcm_f32")
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     parser.add_argument("--timeout", type=float, default=60.0)

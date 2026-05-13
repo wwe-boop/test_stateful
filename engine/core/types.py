@@ -84,6 +84,13 @@ class SessionConfig:
     ref_c2w_conv_states: Optional[list[Any]] = None
     ref_c2w_transconv_states: Optional[list[Any]] = None
     ref_c2w_frame_idx: int = 0
+    ref_source: str = ""
+    ref_id: Optional[str] = None
+    ref_audio_sha256: str = ""
+    ref_text_hash: str = ""
+    ref_feature_cache_key: str = ""
+    ref_warnings: list[str] = field(default_factory=list)
+    ref_preprocess_runtime: str = ""
     x_vector_only: bool = False
     input_mode: InputMode = InputMode.LONG_SEGMENT
     group_policy: GroupPolicy = GroupPolicy.AUTO

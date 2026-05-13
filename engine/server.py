@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import logging
 import os
 import queue
@@ -533,28 +534,155 @@ class TTSEngine:
             "reference audio was found; checked: " + ", ".join(checked_paths)
         )
 
+    def _resolve_reference_entry(self, ref_id: str) -> tuple[bytes, str, str]:
+        refs = self._cfg.references
+        entries = refs.entries or {}
+        normalized = (ref_id or "").strip().lower()
+        if not normalized:
+            raise ValueError("reference_not_found: empty reference alias")
+
+        raw_entry = None
+        raw_key = ""
+        for key, value in entries.items():
+            if str(key).strip().lower() == normalized:
+                raw_key = str(key).strip()
+                raw_entry = value
+                break
+        if raw_entry is None:
+            raise ValueError(f"reference_not_found: {ref_id!r}")
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"reference_not_found: entry {ref_id!r} is not an object")
+
+        audio_path = str(raw_entry.get("audio_path") or "").strip()
+        ref_text = str(raw_entry.get("ref_text") or "").strip()
+        if not audio_path:
+            raise ValueError(f"reference_not_found: entry {ref_id!r} has no audio_path")
+        if not ref_text:
+            raise ValueError(f"ref_text_required: reference {ref_id!r} has empty ref_text")
+        return self._read_reference_audio_path(audio_path), ref_text, raw_key or normalized
+
+    def _read_reference_audio_path(self, raw_path: str) -> bytes:
+        path = Path(raw_path).expanduser()
+        candidates = [path] if path.is_absolute() else []
+        if not path.is_absolute():
+            if self._cfg.paths.model_package_dir:
+                candidates.append(Path(self._cfg.paths.model_package_dir) / path)
+            candidates.append(Path(__file__).resolve().parents[1] / path)
+            candidates.append(Path.cwd() / path)
+
+        checked: list[str] = []
+        for candidate in candidates:
+            checked.append(str(candidate))
+            try:
+                if not candidate.is_file():
+                    continue
+                data = candidate.read_bytes()
+            except OSError as exc:
+                logger.warning("Could not read reference audio %s: %s", candidate, exc)
+                continue
+            if data:
+                return data
+            logger.warning("Reference audio %s is empty", candidate)
+        raise ValueError(
+            "reference_not_found: reference audio path not found or empty; checked: "
+            + ", ".join(checked)
+        )
+
+    def _resolve_default_reference(self) -> tuple[bytes, str, str, str]:
+        refs = self._cfg.references
+        if refs.entries:
+            ref_id = (refs.default or "default").strip() or "default"
+            try:
+                audio, text, resolved_id = self._resolve_reference_entry(ref_id)
+            except ValueError as exc:
+                raise ValueError(f"default_reference_missing: {exc}") from exc
+            return audio, text, resolved_id, "default"
+        try:
+            return (
+                self._load_default_base_ref_audio(),
+                _DEFAULT_BASE_REF_TEXT,
+                "default",
+                "default",
+            )
+        except ValueError as exc:
+            raise ValueError(f"default_reference_missing: {exc}") from exc
+
+    def _mark_reference_metadata(
+        self,
+        config: SessionConfig,
+        *,
+        source: str,
+        ref_id: Optional[str] = None,
+    ) -> None:
+        config.ref_source = source
+        config.ref_id = (ref_id or config.ref_id or "").strip() or None
+        if config.ref_audio:
+            config.ref_audio_sha256 = hashlib.sha256(config.ref_audio).hexdigest()
+        if (config.ref_text or "").strip():
+            config.ref_text_hash = hashlib.sha1(
+                (config.ref_text or "").strip().encode("utf-8"),
+            ).hexdigest()
+        config.ref_preprocess_runtime = "trt"
+
+    def _resolve_voice_clone_reference(self, model_type: str, config: SessionConfig) -> None:
+        normalized = (model_type or "").strip()
+        has_audio = bool(config.ref_audio)
+        has_text = bool((config.ref_text or "").strip())
+        alias = (config.speaker or "").strip()
+
+        if has_audio and has_text:
+            self._mark_reference_metadata(config, source="explicit", ref_id=alias or None)
+            config.speaker = None
+            config.x_vector_only = False
+            return
+
+        if has_audio and not has_text:
+            if normalized == "icl":
+                raise ValueError("ref_text_required: ref_text is required for loaded model_type 'icl'")
+            self._mark_reference_metadata(config, source="explicit", ref_id=alias or None)
+            config.speaker = None
+            config.x_vector_only = True
+            return
+
+        if has_text and not has_audio:
+            raise ValueError(
+                f"ref_audio is required when ref_text is provided for loaded model_type '{normalized}'"
+            )
+
+        if alias:
+            audio, text, resolved_id = self._resolve_reference_entry(alias)
+            config.ref_audio = audio
+            config.ref_text = text
+            self._mark_reference_metadata(config, source="registry", ref_id=resolved_id)
+            config.speaker = None
+            config.x_vector_only = False
+            return
+
+        audio, text, resolved_id, source = self._resolve_default_reference()
+        config.ref_audio = audio
+        config.ref_text = text
+        self._mark_reference_metadata(config, source=source, ref_id=resolved_id)
+        config.speaker = None
+        config.x_vector_only = False
+
     def _validate_model_specific_fields(self, model_type: str, config: SessionConfig) -> None:
         normalized = (model_type or "").strip()
         if normalized == "base":
-            self._apply_default_base_reference(config)
+            self._resolve_voice_clone_reference(normalized, config)
             if not config.ref_audio:
                 raise ValueError("ref_audio is required for loaded model_type 'base'")
             if config.instruct:
                 raise ValueError("instruct is not supported for loaded model_type 'base'")
-            if config.speaker:
-                raise ValueError("speaker is not supported for loaded model_type 'base'")
-            config.x_vector_only = not bool((config.ref_text or "").strip())
             return
 
         if normalized in ("icl",):
+            self._resolve_voice_clone_reference(normalized, config)
             if not config.ref_audio:
                 raise ValueError("ref_audio is required for loaded model_type 'icl'")
             if not (config.ref_text or "").strip():
-                raise ValueError("ref_text is required for loaded model_type 'icl'")
+                raise ValueError("ref_text_required: ref_text is required for loaded model_type 'icl'")
             if config.instruct:
                 raise ValueError("instruct is not supported for loaded model_type 'icl'")
-            if config.speaker:
-                raise ValueError("speaker is not supported for loaded model_type 'icl'")
             config.x_vector_only = False
             return
 
@@ -598,8 +726,15 @@ class TTSEngine:
         features = self._ref_audio_processor.process(
             config.ref_audio,
             require_ref_codec=not bool(config.x_vector_only),
+            cache_tag=(
+                "voice_clone_icl" if not bool(config.x_vector_only)
+                else "voice_clone_xvec"
+            ),
         )
         config.spk_embedding = features.spk_embedding
+        config.ref_feature_cache_key = getattr(features, "cache_key", "") or ""
+        for warning_msg in getattr(features, "warnings", []) or []:
+            config.ref_warnings.append(str(warning_msg))
         if not config.x_vector_only:
             config.ref_codec_sum_vec = features.ref_codec_sum_vec
             config.ref_audio_codes = features.ref_audio_codes

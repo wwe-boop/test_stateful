@@ -63,6 +63,10 @@ class PrefixKVCache:
         return len(self._cache)
 
     @property
+    def max_prefix_len(self) -> int:
+        return self._max_prefix_len
+
+    @property
     def stats(self) -> dict:
         return {
             "size": self.size,

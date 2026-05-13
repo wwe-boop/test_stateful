@@ -163,38 +163,94 @@ assemble_model_repo() {
     # Returns: 0 + prints path on success, 1 on not found.
     _resolve_model_src() {
         local base="$1"
-        local ext; [ "$engine_mode" = "trt" ] && ext=".engine" || ext=".onnx"
-        if [ -f "${base}${ext}" ]; then
-            echo "${base}${ext}"; return 0
+        local model_name
+        model_name="$(basename "$base")"
+        local candidates=()
+        if [ "$engine_mode" = "trt" ]; then
+            candidates=(
+                "${base}.engine"
+                "${base}/model.plan"
+                "${base}/${model_name}.engine"
+            )
+        else
+            candidates=(
+                "${base}.onnx"
+                "${base}/model.onnx"
+                "${base}/${model_name}.onnx"
+            )
         fi
+        local candidate
+        for candidate in "${candidates[@]}"; do
+            if [ -f "$candidate" ]; then
+                echo "$candidate"; return 0
+            fi
+        done
         return 1
+    }
+
+    _has_onnx_model_src() {
+        local base="$1"
+        local model_name
+        model_name="$(basename "$base")"
+        local candidates=(
+            "${base}.onnx"
+            "${base}/model.onnx"
+            "${base}/${model_name}.onnx"
+        )
+        local candidate
+        for candidate in "${candidates[@]}"; do
+            if [ -f "$candidate" ]; then
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    _copy_onnx_external_data_if_present() {
+        local src="$1"
+        local dst_dir="$2"
+        if [ -f "${src}.data" ]; then
+            _link_or_copy "${src}.data" "$dst_dir/$(basename "${src}.data")"
+        fi
     }
 
     mkdir -p "$runtime_dir"
 
-    # ── 1. Optional voice-clone runtime ONNX assets ──
-    # These are consumed directly by the Python backend and should not be
-    # exposed as standalone Triton models.
-    if [ -f "$variant_dir/speaker_encoder.onnx" ]; then
-        _link_or_copy "$variant_dir/speaker_encoder.onnx" "$runtime_dir/speaker_encoder.onnx"
-        [ -f "$variant_dir/speaker_encoder.onnx.data" ] \
-            && _link_or_copy "$variant_dir/speaker_encoder.onnx.data" "$runtime_dir/speaker_encoder.onnx.data"
-        log_info "  runtime/speaker_encoder.onnx: OK"
+    # ── 1. Optional voice-clone runtime assets ──
+    # Standalone TRT preprocessing loads these through TRTEngine, so TRT mode
+    # must package .engine files instead of ONNX fallbacks.
+    local speaker_src
+    if speaker_src="$(_resolve_model_src "$variant_dir/speaker_encoder")"; then
+        if [ "$engine_mode" = "trt" ]; then
+            _link_or_copy "$speaker_src" "$runtime_dir/speaker_encoder.engine"
+            log_info "  runtime/speaker_encoder.engine: OK"
+        else
+            _link_or_copy "$speaker_src" "$runtime_dir/speaker_encoder.onnx"
+            _copy_onnx_external_data_if_present "$speaker_src" "$runtime_dir"
+            log_info "  runtime/speaker_encoder.onnx: OK"
+        fi
+    elif [ "$engine_mode" = "trt" ] && _has_onnx_model_src "$variant_dir/speaker_encoder"; then
+        log_error "  speaker_encoder.engine: MISSING for TRT voice-clone preprocessing. Run Phase B."
+        return 1
     else
-        log_warn "  runtime/speaker_encoder.onnx: SKIPPED (only needed for voice clone)"
+        log_warn "  runtime/speaker_encoder: SKIPPED (only needed for voice clone)"
     fi
 
-    if [ -f "$variant_dir/speech_tokenizer_codec_fused.onnx" ]; then
-        _link_or_copy \
-            "$variant_dir/speech_tokenizer_codec_fused.onnx" \
-            "$runtime_dir/speech_tokenizer_codec_fused.onnx"
-        [ -f "$variant_dir/speech_tokenizer_codec_fused.onnx.data" ] \
-            && _link_or_copy \
-                "$variant_dir/speech_tokenizer_codec_fused.onnx.data" \
-                "$runtime_dir/speech_tokenizer_codec_fused.onnx.data"
-        log_info "  runtime/speech_tokenizer_codec_fused.onnx: OK"
+    local speech_codec_src
+    if speech_codec_src="$(_resolve_model_src "$variant_dir/speech_tokenizer_codec_fused")"; then
+        if [ "$engine_mode" = "trt" ]; then
+            _link_or_copy "$speech_codec_src" "$runtime_dir/speech_tokenizer_codec_fused.engine"
+            log_info "  runtime/speech_tokenizer_codec_fused.engine: OK"
+        else
+            _link_or_copy "$speech_codec_src" "$runtime_dir/speech_tokenizer_codec_fused.onnx"
+            _copy_onnx_external_data_if_present "$speech_codec_src" "$runtime_dir"
+            log_info "  runtime/speech_tokenizer_codec_fused.onnx: OK"
+        fi
+    elif [ "$engine_mode" = "trt" ] && _has_onnx_model_src "$variant_dir/speech_tokenizer_codec_fused"; then
+        log_error "  speech_tokenizer_codec_fused.engine: MISSING for TRT ICL preprocessing. Run Phase B."
+        return 1
     else
-        log_warn "  runtime/speech_tokenizer_codec_fused.onnx: SKIPPED (not required for non-base / non-ICL)"
+        log_warn "  runtime/speech_tokenizer_codec_fused: SKIPPED (not required for non-base / non-ICL)"
     fi
 
     if [ -f "$tokenizer_dir/speech_tokenizer_encoder.onnx" ]; then

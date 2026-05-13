@@ -35,8 +35,8 @@ Qwen3-TTS Triton 是一个 **工程预览版** 项目：把官方 Qwen3-TTS PyTo
 | --- | --- | --- |
 | `custom-1.7b` / `custom_voice` | 优先稳定 | v0.1 推荐路径，WebUI 和 demo 默认围绕它展示 |
 | `design-1.7b` / `voice_design` | 实验 | 可保留代码和导出入口，但需要标注未充分测通 |
-| `base-1.7b` / x-vector voice clone | 实验 | standalone 已接入 ref audio → speaker embedding；需要 base 导出产物、speaker encoder TRT engine 和真实端到端验证 |
-| `icl` voice clone | 实验 | standalone 已接入 ref audio + ref text → ref codec/code 注入；需要 `speech_tokenizer_codec_fused`、Code2Wav warmup 相关产物和真实端到端验证 |
+| `base-1.7b` / x-vector voice clone | 实验 | standalone 已接入 ref audio → speaker embedding；需要 base 导出产物、`speaker_encoder.engine` 和真实端到端验证 |
+| `icl` voice clone | 实验 | standalone 已接入 ref audio + ref text → ref codec/code 注入；standalone TRT 模式必须包含 `speaker_encoder.engine` 和 `speech_tokenizer_codec_fused.engine`，并需要 Code2Wav warmup 相关产物和真实端到端验证 |
 | `0.6b` variants | 未作为 v0.1 主线 | 可保留导出/下载入口，发布前需要单独验证 |
 
 ## 快速开始
@@ -128,7 +128,7 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway triton --engine-mod
 bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker --engine-mode trt
 ```
 
-6. 部署 `base-1.7b` 实验路径时，建议先准备默认参考音频：
+6. 部署 `base-1.7b` / `icl` 实验路径时，建议先准备默认参考音频和 reference registry：
 
 ```bash
 mkdir -p workspace/default_refs
@@ -140,7 +140,31 @@ ENGINE_DEFAULT_BASE_REF_TEXT="参考音频对应文本" \
 bash scripts/bash/autorun.sh all -m base-1.7b --gateway standalone --engine-mode trt
 ```
 
-`base` 请求没有显式传 `ref_audio` 时会读取默认参考音频；显式传 `ref_audio` 但没有 `ref_text` 时走 x-vector-only，传入 `ref_text` 时走 ICL。
+也可以在 `engine.yaml` 中显式配置 reference library：
+
+```yaml
+references:
+  default: default
+  entries:
+    default:
+      audio_path: workspace/default_refs/base_ref.wav
+      ref_text: 参考音频对应文本
+      language: auto
+    vivian:
+      audio_path: workspace/default_refs/vivian.wav
+      ref_text: 这是一段与 vivian 参考音频完全一致的文本。
+      language: auto
+```
+
+字段语义需要区分清楚：
+
+- `custom_voice`: `speaker` 是内置 custom voice 音色名；未传时服务端使用 `default_speaker`，非法音色走 `fallback_speaker`。
+- `base` / `icl`: 当没有显式 `ref_audio + ref_text` 时，`speaker` 被解释为 ICL reference alias，并从 `references.entries` 查找 `ref_audio + ref_text`。
+- `base` / `icl`: 没有传 `ref_audio`、`ref_text`、`speaker` 时使用默认 reference。优先使用 `engine.yaml references.default`，未配置时兼容 `ENGINE_DEFAULT_BASE_REF_AUDIO_PATH` / `ENGINE_DEFAULT_BASE_REF_TEXT` 和 `workspace/default_refs/base_ref.wav`。
+- `base`: 显式传 `ref_audio` 但没有 `ref_text` 时继续走 x-vector-only；显式传 `ref_audio + ref_text` 时走 ICL。
+- `icl`: 显式 reference 必须同时包含 `ref_audio + ref_text`；只传其中一个会报错。
+
+standalone `--engine-mode trt` 的 ICL 预处理强制使用 TensorRT，不做 ONNX Runtime fallback。部署包 `runtime/` 至少需要 `speaker_encoder.engine` 和 `speech_tokenizer_codec_fused.engine`，或等价的 `speaker_encoder/model.plan` 与 `speech_tokenizer_codec_fused/model.plan`。如果只存在 `.onnx`，服务会报出缺少 TensorRT engine 的明确错误。
 
 7. 验收服务：
 
@@ -150,6 +174,14 @@ curl http://localhost:50052/v1/capabilities
 
 # 运行 serving 工具，服务未启动或能力不匹配时会报出原因
 mamba run -n qwen3-tts python tests/tools/serving_endpoints.py --targets engine-grpc
+
+# 验证 base/icl reference resolver 与 ICL prefix cache
+mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
+  --targets engine-grpc \
+  --reference-tests \
+  --reference-alias vivian \
+  --ref-audio-path workspace/default_refs/vivian.wav \
+  --ref-text "这是一段与 vivian 参考音频完全一致的文本。"
 ```
 
 常用端口：standalone gRPC `50051`，standalone HTTP/WebSocket `50052`，health `8080`；Triton HTTP/gRPC 端口由 compose/部署脚本配置。
