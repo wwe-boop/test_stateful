@@ -73,6 +73,7 @@ class TRTEngine:
         self._engine = None
         self._context = None
         self._input_names: set[str] = set()
+        self._input_dtypes: Dict[str, torch.dtype] = {}
         self._output_dtypes: Dict[str, torch.dtype] = {}
         self._prev_input_shapes: Dict[str, tuple] = {}
         self._output_buffers: Dict[str, torch.Tensor] = {}
@@ -94,30 +95,59 @@ class TRTEngine:
         self._engine = runtime.deserialize_cuda_engine(engine_bytes)
         if self._engine is None:
             raise RuntimeError(
-                f"Failed to deserialize TRT engine: {plan_path}. "
-                "TensorRT plan files are not compatible across different TRT "
-                "library versions. Phase B builds engines with trtexec inside the "
-                "NGC Triton image (e.g. libnvinfer 10.15.x for tritonserver:26.02); "
-                "install a matching Python tensorrt, e.g. "
-                "`pip install 'tensorrt==10.15.1.29'`, or rebuild engines after "
-                "changing TensorRT."
+                self._format_load_failure(
+                    plan_path,
+                    "TensorRT returned no engine while deserializing the plan",
+                )
             )
 
         self._context = self._engine.create_execution_context()
+        if self._context is None:
+            self._engine = None
+            raise RuntimeError(
+                self._format_load_failure(
+                    plan_path,
+                    "TensorRT could not create an execution context for the plan",
+                )
+            )
         self._cache_io_names()
         self._cache_output_dtypes()
         logger.info("Loaded TRT engine: %s (%d I/O tensors)",
                      plan_path.name, self._engine.num_io_tensors)
+
+    def _format_load_failure(self, plan_path: Path, reason: str) -> str:
+        memory_hint = ""
+        if torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(self._device)
+                memory_hint = (
+                    f" GPU memory on {self._device}: "
+                    f"free={free_bytes / (1024 ** 2):.0f} MiB, "
+                    f"total={total_bytes / (1024 ** 2):.0f} MiB."
+                )
+            except Exception:
+                memory_hint = ""
+        return (
+            f"Failed to load TRT engine: {plan_path}. {reason}."
+            f"{memory_hint} Check the TensorRT log lines immediately above: common "
+            "causes are CUDA out-of-memory, TensorRT library version mismatch, "
+            "or a plan built for a different GPU/SM. Rebuild engines after "
+            "changing TensorRT, CUDA, or GPU target."
+        )
 
     def _cache_io_names(self) -> None:
         """Cache input tensor names once at load time."""
         import tensorrt as trt
 
         self._input_names.clear()
+        self._input_dtypes.clear()
         for i in range(self._engine.num_io_tensors):
             name = self._engine.get_tensor_name(i)
             if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
                 self._input_names.add(name)
+                self._input_dtypes[name] = self._trt_to_torch_dtype(
+                    self._engine.get_tensor_dtype(name)
+                )
 
     def _cache_output_dtypes(self) -> None:
         """Cache output tensor dtypes once at load time."""
@@ -157,6 +187,10 @@ class TRTEngine:
             return tuple(int(dim) for dim in shapes[2])
         except TypeError:
             return None
+
+    def get_tensor_dtype(self, name: str) -> Optional[torch.dtype]:
+        """Return the cached torch dtype for an input or output tensor."""
+        return self._input_dtypes.get(name) or self._output_dtypes.get(name)
 
     def infer(
         self,

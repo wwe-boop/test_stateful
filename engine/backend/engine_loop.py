@@ -616,61 +616,17 @@ class EngineLoop:
                             warning_msg=str(warning_msg),
                         ))
 
+                # ICL keeps the reference codec path as one complete prefill.
+                # Splitting it into a cached reference prefix and request suffix
+                # changes the fused Talker/C2W state boundary and can corrupt
+                # generation quality.
                 split_prefix_prefill = (
-                    plan.cacheable_prefix_embeds is not None
+                    task_type != TaskType.VOICE_CLONE_ICL
+                    and plan.cacheable_prefix_embeds is not None
                     and plan.request_prefill_embeds is not None
-                    and (
-                        task_type == TaskType.VOICE_CLONE_ICL
-                        or int(plan.request_prefill_embeds.shape[1]) == 1
-                    )
+                    and int(plan.request_prefill_embeds.shape[1]) == 1
                 )
-                if task_type == TaskType.VOICE_CLONE_ICL and split_prefix_prefill:
-                    icl_prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
-                    if plan.prefix_cache_key is None:
-                        split_prefix_prefill = False
-                    elif icl_prefix_len > self._prefix_cache.max_prefix_len:
-                        split_prefix_prefill = False
-                        prefill_metrics["icl_cache_miss"] = "skipped_prefix_too_long"
-                        logger.info(
-                            "ICL prefix cache skipped for %s: prefix_len=%d exceeds max_prefix_len=%d",
-                            best.session_id,
-                            icl_prefix_len,
-                            self._prefix_cache.max_prefix_len,
-                        )
-
-                if task_type == TaskType.VOICE_CLONE_ICL and split_prefix_prefill:
-                    effective_key = plan.prefix_cache_key or cache_key
-                    cached_icl = self._prefix_cache.get(effective_key)
-                    if cached_icl is not None:
-                        self._restore_prefix_cache(slot, cached_icl)
-                        prefill_metrics["icl_cache_hit"] = "true"
-                        logger.info(
-                            "ICL prefix cache hit: copied %d KV tokens for %s (slot=%d)",
-                            cached_icl.prefix_len,
-                            best.session_id,
-                            slot.slot_id,
-                        )
-                    else:
-                        self._executor.prefill_prefix_only(
-                            slot, plan.cacheable_prefix_embeds,
-                        )
-                        prefill_metrics["icl_cache_miss"] = "true"
-                        prefix_len = int(plan.cacheable_prefix_embeds.shape[1])
-                        prefix_kv = self._read_prefix_kv(slot, prefix_len)
-                        if effective_key is not None and prefix_kv is not None:
-                            self._prefix_cache.put(
-                                effective_key, prefix_kv, prefix_len,
-                            )
-
-                    self._apply_ref_c2w_warm_state(best_group, best, req_cfg)
-                    prefill_audio, prefill_eos = self._executor.prefill_from_prefix(
-                        slot,
-                        plan.request_prefill_embeds,
-                    )
-                    self._attach_trailing_after_prefill(slot, plan.trailing)
-                    best.eos_trailing_added = best.input_complete
-
-                elif split_prefix_prefill:
+                if split_prefix_prefill:
                     self._executor.prefill_prefix_only(
                         slot, plan.cacheable_prefix_embeds,
                     )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import struct
+import wave
 from collections import OrderedDict
 
 import pytest
@@ -8,6 +10,7 @@ from engine.backend.ref_audio_processor import (
     ReferenceAudioProcessor,
     ReferenceAudioFeatures,
     ReferenceAudioSupport,
+    _decode_wav_bytes,
     _validate_reference_audio_quality,
 )
 
@@ -136,6 +139,42 @@ def test_codec_profile_max_duration_falls_back_to_8s():
             return None
 
     assert ReferenceAudioProcessor._infer_codec_max_duration_sec(_FakeCodecEngine()) == 8.0
+
+
+def test_decode_wav_bytes_supports_ieee_float_wav():
+    samples = [0.0, 0.5, -0.25, 1.0]
+    raw = b"".join(struct.pack("<f", item) for item in samples)
+    fmt = struct.pack("<HHIIHH", 3, 1, 24000, 24000 * 4, 4, 32)
+    data = (
+        b"RIFF"
+        + struct.pack("<I", 4 + (8 + len(fmt)) + (8 + len(raw)))
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<I", len(fmt))
+        + fmt
+        + b"data"
+        + struct.pack("<I", len(raw))
+        + raw
+    )
+
+    audio, sample_rate = _decode_wav_bytes(data)
+
+    assert sample_rate == 24000
+    assert audio.tolist() == pytest.approx(samples)
+
+
+def test_decode_wav_bytes_keeps_pcm_wav_support(tmp_path):
+    wav_path = tmp_path / "ref.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(struct.pack("<hhh", 0, 16384, -8192))
+
+    audio, sample_rate = _decode_wav_bytes(wav_path.read_bytes())
+
+    assert sample_rate == 24000
+    assert audio.tolist() == pytest.approx([0.0, 0.5, -0.25])
 
 
 def test_feature_cache_lru_evicts_oldest_and_refreshes_hits(tmp_path):

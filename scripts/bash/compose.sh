@@ -199,12 +199,62 @@ export_compose_env() {
     export ENGINE_MAX_DECODE_LEN="$TRITON_MAX_SEQ_LEN"
 }
 
+_compose_manifest_ngc_tag() {
+    local tag=""
+    tag=$(resolve_manifest_ngc_tag "$MODEL_REPO_DIR" "$MODEL_VERSION" 2>/dev/null || true)
+    if [[ -z "$tag" && -n "$VARIANT" && -f "$EXPORTED_DIR/$VARIANT/triton_manifest.json" ]]; then
+        tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" "$MODEL_VERSION" 2>/dev/null || true)
+    fi
+    if [[ -z "$tag" ]]; then
+        tag=$(resolve_ngc_tag 2>/dev/null || true)
+    fi
+    printf '%s\n' "$tag"
+}
+
+resolve_compose_image_defaults() {
+    local ngc_tag=""
+
+    if [[ "$GATEWAY" == "engine" || "$GATEWAY" == "all" ]]; then
+        if [[ -z "${IMAGE_OVERRIDE:-}" && ( -z "${ENGINE_IMAGE:-}" || "${ENGINE_IMAGE:-}" == "qwen3-engine:26.02" ) ]]; then
+            ngc_tag="$(_compose_manifest_ngc_tag)"
+            if [[ -n "$ngc_tag" ]]; then
+                export ENGINE_IMAGE="qwen3-engine:${ngc_tag}"
+                export ENGINE_BASE_IMAGE="${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:${ngc_tag}-py3}"
+                if [[ -z "${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]]; then
+                    local torch_cuda_tag
+                    torch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag" 2>/dev/null || true)
+                    [[ -n "$torch_cuda_tag" ]] && export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
+                fi
+                log_info "Using engine image from Phase B manifest: $ENGINE_IMAGE"
+            fi
+        fi
+    fi
+
+    if [[ "$GATEWAY" == "triton" || "$GATEWAY" == "all" ]]; then
+        if [[ -z "${IMAGE_OVERRIDE:-}" && ( -z "${TRITON_IMAGE:-}" || "${TRITON_IMAGE:-}" == "qwen3-tts-triton:26.02" ) ]]; then
+            ngc_tag="${ngc_tag:-$(_compose_manifest_ngc_tag)}"
+            if [[ -n "$ngc_tag" ]]; then
+                export TRITON_IMAGE="qwen3-tts-triton:${ngc_tag}"
+                export TRITON_BASE_IMAGE="${TRITON_BASE_IMAGE:-nvcr.io/nvidia/tritonserver:${ngc_tag}-py3}"
+                if [[ -z "${TRITON_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]]; then
+                    local torch_cuda_tag
+                    torch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag" 2>/dev/null || true)
+                    [[ -n "$torch_cuda_tag" ]] && export TRITON_PYTORCH_CUDA_TAG="$torch_cuda_tag"
+                fi
+                log_info "Using Triton image from Phase B manifest: $TRITON_IMAGE"
+            fi
+        fi
+    fi
+}
+
 log_compose_runtime_summary() {
     log_info "[DRY RUN] Resolved compose runtime:"
     log_info "  Gateway:          $GATEWAY"
     [ -n "$VARIANT" ] && log_info "  Variant:          $VARIANT"
     log_info "  Model version:    $MODEL_VERSION"
     log_info "  Model repo:       $MODEL_REPO_DIR"
+    [[ "$GATEWAY" == "engine" || "$GATEWAY" == "all" ]] && log_info "  Engine image:     ${ENGINE_IMAGE:-compose default}"
+    [[ "$GATEWAY" == "triton" || "$GATEWAY" == "all" ]] && log_info "  Triton image:     ${TRITON_IMAGE:-compose default}"
     log_info "  Engine device:    $ENGINE_DEVICE"
     log_info "  Engine max batch: $ENGINE_MAX_BATCH"
     log_info "  Engine max seq:   $ENGINE_MAX_SEQ_LEN"
@@ -232,6 +282,25 @@ if value not in ("", None):
 PY
 }
 
+compose_manifest_tts_model_type() {
+    local manifest="$EXPORTED_DIR/$VARIANT/triton_manifest.json"
+    if [[ -z "$VARIANT" || ! -f "$manifest" ]]; then
+        return 0
+    fi
+    python3 - "$manifest" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(
+    data.get("tts_model_type")
+    or data.get("orchestrator", {}).get("tts_model_type")
+    or ""
+)
+PY
+}
+
 resolve_compose_runtime_controls() {
     if [[ "${ENGINE_DEVICE:-auto}" = "auto" || -z "${ENGINE_DEVICE:-}" ]]; then
         ENGINE_DEVICE=$(resolve_gpu_device_index "${ENGINE_DEVICE:-auto}") || exit 1
@@ -245,8 +314,22 @@ resolve_compose_runtime_controls() {
     fi
 
     if [[ -z "${ENGINE_MAX_BATCH:-}" ]]; then
-        ENGINE_MAX_BATCH=$(compose_manifest_profile_value max_batch_size)
-        ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH:-128}"
+        local profile_max_batch model_type default_base_batch
+        profile_max_batch=$(compose_manifest_profile_value max_batch_size)
+        model_type="$(compose_manifest_tts_model_type | tr '[:upper:]' '[:lower:]')"
+        if [[ "$GATEWAY" == "engine" || "$GATEWAY" == "all" ]] \
+            && [[ "$model_type" == "base" || "$model_type" == "icl" || "$VARIANT" == base-* || "$VARIANT" == icl-* ]]; then
+            default_base_batch="${ENGINE_BASE_ICL_MAX_BATCH:-8}"
+            ENGINE_MAX_BATCH="$default_base_batch"
+            if [[ "$ENGINE_MAX_BATCH" =~ ^[1-9][0-9]*$ && "$profile_max_batch" =~ ^[1-9][0-9]*$ ]] \
+                && (( ENGINE_MAX_BATCH > profile_max_batch )); then
+                ENGINE_MAX_BATCH="$profile_max_batch"
+            fi
+            log_info "Using conservative Base/ICL engine max batch: $ENGINE_MAX_BATCH"
+        else
+            ENGINE_MAX_BATCH="$profile_max_batch"
+            ENGINE_MAX_BATCH="${ENGINE_MAX_BATCH:-128}"
+        fi
     fi
     if [[ -z "${ENGINE_MAX_SEQ_LEN:-}" ]]; then
         ENGINE_MAX_SEQ_LEN=$(compose_manifest_profile_value max_seq_len)
@@ -518,6 +601,40 @@ PY
         prepare_model_repo
         return 0
     fi
+    if model_package_engine_payload_stale "$REPO_ROOT" "$MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"; then
+        log_warn "Shared model_repository engine payload is missing or stale, re-assembling"
+        prepare_model_repo
+        return 0
+    fi
+    if model_package_resources_stale "$REPO_ROOT" "$MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"; then
+        log_warn "Shared model_repository resources are missing or stale, re-assembling"
+        prepare_model_repo
+        return 0
+    fi
+    local runtime_dir
+    runtime_dir="$(dirname "$artifact")"
+    local src_runtime_asset dst_runtime_asset
+    local runtime_asset_candidates=()
+    if [[ "$ENGINE_MODE" == "trt" ]]; then
+        runtime_asset_candidates=(
+            "$EXPORTED_DIR/$VARIANT/speaker_encoder.engine"
+            "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.engine"
+        )
+    else
+        runtime_asset_candidates=(
+            "$EXPORTED_DIR/$VARIANT/speaker_encoder.onnx"
+            "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.onnx"
+        )
+    fi
+    for src_runtime_asset in "${runtime_asset_candidates[@]}"; do
+        [[ -f "$src_runtime_asset" ]] || continue
+        dst_runtime_asset="$runtime_dir/$(basename "$src_runtime_asset")"
+        if [[ ! -f "$dst_runtime_asset" || "$src_runtime_asset" -nt "$dst_runtime_asset" ]]; then
+            log_warn "Shared model_repository runtime support asset is missing or stale: $(basename "$src_runtime_asset")"
+            prepare_model_repo
+            return 0
+        fi
+    done
 
     if [[ "$repo_variant" != "$VARIANT" || "$repo_mode" != "$ENGINE_MODE" ]]; then
         log_warn "Shared model_repository is for variant=${repo_variant:-unknown}, engine_mode=${repo_mode:-unknown}; requested variant=$VARIANT, engine_mode=$ENGINE_MODE"
@@ -527,7 +644,9 @@ PY
 
 cmd_build() {
     require_docker_compose_if_needed
+    resolve_variant_if_needed
     export_compose_env
+    resolve_compose_image_defaults
     case "$GATEWAY" in
         engine) compose_cmd build engine ;;
         triton) compose_cmd build triton ;;
@@ -547,6 +666,7 @@ cmd_up() {
             engine)
                 resolve_variant_if_needed
                 export_compose_env
+                resolve_compose_image_defaults
                 log_compose_runtime_summary
                 if $BUILD_BEFORE_UP; then
                     compose_cmd up --build -d engine
@@ -557,6 +677,7 @@ cmd_up() {
             triton)
                 resolve_variant_if_needed
                 export_compose_env
+                resolve_compose_image_defaults
                 log_compose_runtime_summary
                 if $BUILD_BEFORE_UP; then
                     compose_cmd up --build -d triton
@@ -567,6 +688,7 @@ cmd_up() {
             all)
                 resolve_variant_if_needed
                 export_compose_env
+                resolve_compose_image_defaults
                 log_compose_runtime_summary
                 if $BUILD_BEFORE_UP; then
                     compose_cmd up --build -d engine triton
@@ -578,12 +700,14 @@ cmd_up() {
         return 0
     fi
 
+    resolve_variant_if_needed
     export_compose_env
 
     case "$GATEWAY" in
         engine)
             ensure_model_repo
             export_compose_env
+            resolve_compose_image_defaults
             compose_preflight_service engine
             if $BUILD_BEFORE_UP; then
                 compose_cmd up --build -d engine
@@ -597,6 +721,7 @@ cmd_up() {
         triton)
             ensure_model_repo
             export_compose_env
+            resolve_compose_image_defaults
             compose_preflight_service triton
             if $BUILD_BEFORE_UP; then
                 compose_cmd up --build -d triton
@@ -610,6 +735,7 @@ cmd_up() {
         all)
             ensure_model_repo
             export_compose_env
+            resolve_compose_image_defaults
             compose_preflight_service engine
             compose_preflight_service triton
             if $BUILD_BEFORE_UP; then
@@ -646,6 +772,7 @@ cmd_watch() {
     esac
 
     export_compose_env
+    resolve_compose_image_defaults
 
     local args=(watch)
     $WATCH_NO_UP && args+=(--no-up)
@@ -700,7 +827,9 @@ cmd_ps() {
 
 cmd_config() {
     require_docker_compose_if_needed
+    resolve_variant_if_needed
     export_compose_env
+    resolve_compose_image_defaults
     compose_cmd config
 }
 

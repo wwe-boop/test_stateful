@@ -496,7 +496,9 @@ def _make_engine_request_spec(args: argparse.Namespace, loaded_model_type: str =
         speaker = "Serena"
     if task_type in {"voice_design", "instruct"} and not instruct:
         instruct = CUSTOM_VOICE_INSTRUCT_ZH
-    if task_type == "icl" and ref_audio_bytes is not None and not ref_text:
+    if task_type in {"base", "icl"} and not speaker and ref_audio_bytes is None:
+        speaker = args.reference_alias.strip() if args.reference_alias else ""
+    if task_type in {"base", "icl"} and ref_audio_bytes is not None and not ref_text:
         raise ValueError("task_type 'icl' requires --ref-text for a full synthesis test")
 
     return RequestSpec(
@@ -525,6 +527,41 @@ def _custom_voice_instruct_supported(capabilities: dict[str, Any]) -> bool:
 
 def _reference_tests_supported(capabilities: dict[str, Any]) -> bool:
     return str(capabilities.get("loaded_model_type", "") or "").strip() in {"base", "icl"}
+
+
+def _engine_loaded_model_type(caps: dict[str, Any]) -> str:
+    return str(caps.get("loaded_model_type", "") or "").strip()
+
+
+def _engine_needs_reference(caps: dict[str, Any]) -> bool:
+    return _engine_loaded_model_type(caps) in {"base", "icl"}
+
+
+def _engine_reference_args_supplied(args: argparse.Namespace) -> bool:
+    return any(
+        (
+            bool(args.speaker.strip()) if args.speaker else False,
+            bool(args.reference_alias.strip()) if args.reference_alias else False,
+            bool(args.ref_audio_path),
+        )
+    )
+
+
+def _engine_default_reference_available(caps: dict[str, Any]) -> bool:
+    if not _engine_needs_reference(caps):
+        return False
+    if bool(caps.get("ref_audio_available")):
+        return True
+    # Older servers may not expose ref_audio_available with the newer ICL semantics.
+    return "ref_audio_available" not in caps
+
+
+def _engine_has_reference_source(args: argparse.Namespace, caps: dict[str, Any]) -> bool:
+    return (
+        not _engine_needs_reference(caps)
+        or _engine_reference_args_supplied(args)
+        or _engine_default_reference_available(caps)
+    )
 
 
 def _prefill_done_meta(result: SynthesisResult) -> dict[str, str]:
@@ -711,6 +748,18 @@ class EngineGrpcTransport:
                     {"encoding": fmt.encoding, "sample_rate": fmt.sample_rate, "channels": fmt.channels}
                     for fmt in resp.supported_audio_formats
                 ],
+                "ref_audio_available": bool(getattr(resp, "ref_audio_available", False)),
+                "ref_audio_reason": str(getattr(resp, "ref_audio_reason", "") or ""),
+                "speaker_encoder_available": bool(getattr(resp, "speaker_encoder_available", False)),
+                "ref_codec_available": bool(getattr(resp, "ref_codec_available", False)),
+                "icl_available": bool(getattr(resp, "icl_available", False)),
+                "ref_audio_max_duration_sec": float(
+                    getattr(resp, "ref_audio_max_duration_sec", 0.0) or 0.0
+                ),
+                "ref_c2w_warm_state_available": bool(
+                    getattr(resp, "ref_c2w_warm_state_available", False)
+                ),
+                "ref_codec_reason": str(getattr(resp, "ref_codec_reason", "") or ""),
             }
         finally:
             channel.close()
@@ -1990,33 +2039,32 @@ def _run_engine_reference_suite(
         )
         prime = transport.synthesize_oneshot(
             cache_spec,
-            "这是 ICL cache 第一次请求。",
+            "这是第一次请求，使用同一个参考音频。",
             timeout=args.timeout,
-            session_id=f"{target}-icl-cache-prime",
+            session_id=f"{target}-reference-repeat-prime",
         )
         results.append(
             _case_from_reference_synth(
                 target,
-                "icl-cache-prime",
+                "reference-repeat-prime",
                 prime,
                 expected_source=cache_source,
-                save_path=output_dir / f"{target}_icl_cache_prime.wav",
+                save_path=output_dir / f"{target}_reference_repeat_prime.wav",
             )
         )
         hit = transport.synthesize_oneshot(
             cache_spec,
-            "这是 ICL cache 第二次请求，正文不同但参考相同。",
+            "这是第二次请求，正文不同但参考相同。",
             timeout=args.timeout,
-            session_id=f"{target}-icl-cache-hit",
+            session_id=f"{target}-reference-repeat-second",
         )
         results.append(
             _case_from_reference_synth(
                 target,
-                "icl-cache-hit",
+                "reference-repeat-second",
                 hit,
                 expected_source=cache_source,
-                expected_cache="icl_cache_hit",
-                save_path=output_dir / f"{target}_icl_cache_hit.wav",
+                save_path=output_dir / f"{target}_reference_repeat_second.wav",
             )
         )
 
@@ -2560,7 +2608,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Run Base/ICL reference resolver tests for standalone engine targets: "
-            "default reference, optional alias, optional explicit reference, and ICL cache metadata"
+            "default reference, optional alias, optional explicit reference, and repeated-reference synthesis"
         ),
     )
     parser.add_argument(
@@ -2571,7 +2619,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-reference-cache",
         action="store_true",
-        help="With --reference-tests, skip the repeated-reference ICL prefix cache hit check",
+        help="With --reference-tests, skip the repeated-reference synthesis check",
     )
     parser.add_argument(
         "--reference-negative-tests",

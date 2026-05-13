@@ -467,6 +467,10 @@ cmd_run_engine_docker() {
         log_warn "镜像 $img 存在但未包含 /app 下的 engine 包（常见于把 TensorRT 基础镜像误打成同名 tag）。"
         log_info "将按 Dockerfile.engine 重新构建..."
         need_build=true
+    elif ! engine_docker_image_supports_model_package_engine "$img"; then
+        log_warn "镜像 $img 的 engine 代码或启动脚本较旧，无法优先使用模型包内的 engine/。"
+        log_info "将按 Dockerfile.engine 重新构建..."
+        need_build=true
     elif [ -n "$expected_release" ] && ! engine_docker_image_matches_release "$img" "$expected_release"; then
         local actual_release
         actual_release=$(engine_docker_image_tensorrt_release "$img" || true)

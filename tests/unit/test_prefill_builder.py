@@ -51,6 +51,15 @@ def test_ref_codec_fused_export_preserves_temporal_frames():
     torch.testing.assert_close(out, expected)
 
 
+def test_prefill_language_aliases_normalize_to_manifest_names():
+    from engine.backend.prefill import _normalize_language_name
+
+    assert _normalize_language_name("zh") == "chinese"
+    assert _normalize_language_name("zh-CN") == "chinese"
+    assert _normalize_language_name("en") == "english"
+    assert _normalize_language_name("auto") == "auto"
+
+
 def test_voice_clone_icl_does_not_prepend_streaming_first_text_token():
     from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
 
@@ -75,14 +84,9 @@ def test_voice_clone_icl_does_not_prepend_streaming_first_text_token():
     dual_track_len = codec_prefix_len - 1
     icl_len = 1 + ref_frames  # codec BOS + temporal ref codec frames
     assert plan.prefill_embeds.shape[1] == role_len + dual_track_len + icl_len
-    assert plan.prefix_cache_key
-    assert plan.cacheable_prefix_embeds is not None
-    assert plan.request_prefill_embeds is not None
-    assert (
-        plan.cacheable_prefix_embeds.shape[1]
-        + plan.request_prefill_embeds.shape[1]
-        == plan.prefill_embeds.shape[1]
-    )
+    assert plan.prefix_cache_key is None
+    assert plan.cacheable_prefix_embeds is None
+    assert plan.request_prefill_embeds is None
 
 
 def _weights_dir():
@@ -332,7 +336,7 @@ def test_prefill_builder_moves_cpu_weights_outputs_to_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_prefill_plan_voice_clone_icl_exposes_reference_prefix_cache():
+def test_prefill_plan_voice_clone_icl_has_no_cross_request_prefix_cache():
     from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
     weights = EmbeddingWeights(_weights_dir(), device_id=0)
     if weights.codec_embeddings_3d is None:
@@ -347,14 +351,9 @@ def test_prefill_plan_voice_clone_icl_exposes_reference_prefix_cache():
         ref_codes=fake_codes,
         ref_text="参考文本",
     )
-    assert plan.prefix_cache_key
-    assert plan.cacheable_prefix_embeds is not None
-    assert plan.request_prefill_embeds is not None
-    assert (
-        plan.cacheable_prefix_embeds.shape[1]
-        + plan.request_prefill_embeds.shape[1]
-        == plan.prefill_embeds.shape[1]
-    )
+    assert plan.prefix_cache_key is None
+    assert plan.cacheable_prefix_embeds is None
+    assert plan.request_prefill_embeds is None
 
 
 def test_parse_task_type():

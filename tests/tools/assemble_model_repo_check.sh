@@ -55,6 +55,8 @@ RUNTIME_ONNX="${ORCH_1}/runtime"
 [ -f "${ORCH_1}/engine/frontend/interface.py" ] || { log_error "Missing TTSEngine payload: engine/frontend/interface.py"; exit 1; }
 [ -f "${ORCH_1}/engine/backend/engine_loop.py" ] || { log_error "Missing TTSEngine payload: engine/backend/engine_loop.py"; exit 1; }
 [ -f "${ORCH_1}/weights/config.json" ] || { log_error "Missing orchestrator weights/config.json"; exit 1; }
+[ -f "${ORCH_1}/resources/speakers/liangwuque/ref.wav" ] || { log_error "Missing packaged speaker ref.wav"; exit 1; }
+[ -f "${ORCH_1}/resources/speakers/liangwuque/ref.txt" ] || { log_error "Missing packaged speaker ref.txt"; exit 1; }
 [ -f "${ORCH_1}/triton_manifest.json" ] || { log_error "Missing package-root manifest"; exit 1; }
 [ -f "${RUNTIME_ONNX}/triton_manifest.json" ] || { log_error "Missing runtime manifest"; exit 1; }
 [ -f "${RUNTIME_ONNX}/model.onnx" ] || { log_error "Missing runtime/model.onnx"; exit 1; }
@@ -87,6 +89,8 @@ ORCH_HTTP_2="${TEST_REPO_V2}/tts_orchestrator_http/2"
 RUNTIME_ONNX_V2="${ORCH_2}/runtime"
 [ -f "${ORCH_2}/model.py" ] || { log_error "Missing ${ORCH_2}/model.py"; exit 1; }
 [ -f "${ORCH_HTTP_2}/model.py" ] || { log_error "Missing ${ORCH_HTTP_2}/model.py"; exit 1; }
+[ -f "${ORCH_2}/resources/speakers/liangwuque/ref.wav" ] || { log_error "Missing v2 packaged speaker ref.wav"; exit 1; }
+[ -f "${ORCH_2}/resources/speakers/liangwuque/ref.txt" ] || { log_error "Missing v2 packaged speaker ref.txt"; exit 1; }
 [ -f "${ORCH_2}/triton_manifest.json" ] || { log_error "Missing v2 package-root manifest"; exit 1; }
 [ -f "${RUNTIME_ONNX_V2}/triton_manifest.json" ] || { log_error "Missing v2 runtime manifest"; exit 1; }
 [ -f "${RUNTIME_ONNX_V2}/model.onnx" ] || { log_error "Missing v2 runtime/model.onnx"; exit 1; }
@@ -102,6 +106,8 @@ if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${E
   validate_model_repo "${TEST_REPO_TRT}" || { log_error "validate (trt) failed"; exit 1; }
   RUNTIME_TRT="${TEST_REPO_TRT}/tts_orchestrator/1/runtime"
   [ -f "${TEST_REPO_TRT}/tts_orchestrator/1/triton_manifest.json" ] || { log_error "Missing TRT package-root manifest"; exit 1; }
+  [ -f "${TEST_REPO_TRT}/tts_orchestrator/1/resources/speakers/liangwuque/ref.wav" ] || { log_error "Missing TRT packaged speaker ref.wav"; exit 1; }
+  [ -f "${TEST_REPO_TRT}/tts_orchestrator/1/resources/speakers/liangwuque/ref.txt" ] || { log_error "Missing TRT packaged speaker ref.txt"; exit 1; }
   [ -f "${RUNTIME_TRT}/triton_manifest.json" ] || { log_error "Missing TRT runtime manifest"; exit 1; }
   [ -f "${RUNTIME_TRT}/model.plan" ] || { log_error "Missing TRT runtime/model.plan"; exit 1; }
   [ ! -e "${TEST_REPO_TRT}/talker_code2wav_fused" ] || { log_error "Unexpected top-level talker_code2wav_fused model in TRT repo"; exit 1; }

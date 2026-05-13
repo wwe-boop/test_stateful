@@ -9,6 +9,12 @@ model_name="${ENGINE_MODEL_NAME:-tts_orchestrator}"
 model_version="${ENGINE_MODEL_VERSION:-${MODEL_VERSION:-1}}"
 model_package_dir="${ENGINE_MODEL_PACKAGE_DIR:-${model_repo}/${model_name}/${model_version}}"
 
+# If the package is already present, use its engine/ implementation even while
+# resolving paths. This keeps the runtime code in lockstep with Phase C assemble.
+if [[ -d "${model_package_dir}/engine" ]]; then
+    export PYTHONPATH="${model_package_dir}:${PYTHONPATH:-/app}"
+fi
+
 resolved_paths="$(
     python3 - "$model_package_dir" <<'PY'
 import sys
@@ -76,6 +82,11 @@ if [[ -n "${ENGINE_MAX_SEQ_LEN:-}" ]]; then
     export ENGINE_SCHEDULER_MAX_SEQ_LEN="${ENGINE_MAX_SEQ_LEN}"
 fi
 
+# Prefer the engine/ package copied into the assembled model package. The
+# Docker image supplies the Python/runtime environment; the model package
+# supplies the app code that was current at assemble time.
+export PYTHONPATH="${model_package_dir}:${PYTHONPATH:-/app}"
+
 cmd=(
     python3 -m engine.server
     --config "$config_path"
@@ -96,5 +107,7 @@ echo "  engine_dir=${engine_dir}" >&2
 echo "  manifest=${manifest_path}" >&2
 echo "  runtime_artifact=${runtime_artifact}" >&2
 echo "  engine_mode=${engine_mode}" >&2
+echo "  pythonpath=${PYTHONPATH}" >&2
 
+cd "$model_package_dir"
 exec "${cmd[@]}"

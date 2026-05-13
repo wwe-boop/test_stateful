@@ -169,6 +169,14 @@ class TTSEngine:
         self._async_inbox = asyncio.Queue(maxsize=4096)
 
         self._tokenizer = LightQwen3TTSTokenizer(self._tokenizer_dir)
+        self._ref_audio_processor = ReferenceAudioProcessor(
+            self._engine_dir,
+            self._model_arch.variant,
+            device_id=self._device_id,
+            cache_enabled=self._cfg.reference_cache.enabled,
+            cache_max_entries=self._cfg.reference_cache.max_entries,
+        )
+        self._prime_configured_reference_cache()
 
         model_config = to_model_config(self._model_arch, self._cfg)
         sampling = self._cfg.sampling
@@ -219,14 +227,6 @@ class TTSEngine:
             l2_split_cap_ratio=sc.l2_split_cap_ratio,
             l3_split_cap_ratio=sc.l3_split_cap_ratio,
         )
-        self._ref_audio_processor = ReferenceAudioProcessor(
-            self._engine_dir,
-            self._model_arch.variant,
-            device_id=self._device_id,
-            cache_enabled=self._cfg.reference_cache.enabled,
-            cache_max_entries=self._cfg.reference_cache.max_entries,
-        )
-
         prefill_builder = None
         if self._weights_dir:
             try:
@@ -599,14 +599,19 @@ class TTSEngine:
 
         audio_path = str(raw_entry.get("audio_path") or "").strip()
         ref_text = str(raw_entry.get("ref_text") or "").strip()
+        ref_text_path = str(
+            raw_entry.get("ref_text_path") or raw_entry.get("text_path") or ""
+        ).strip()
         language = str(raw_entry.get("language") or "").strip()
         if not audio_path:
             raise ValueError(f"reference_not_found: entry {ref_id!r} has no audio_path")
+        if not ref_text and ref_text_path:
+            ref_text = self._read_reference_text_path(ref_text_path)
         if not ref_text:
             raise ValueError(f"ref_text_required: reference {ref_id!r} has empty ref_text")
         return self._read_reference_audio_path(audio_path), ref_text, raw_key or normalized, language
 
-    def _read_reference_audio_path(self, raw_path: str) -> bytes:
+    def _reference_path_candidates(self, raw_path: str) -> list[Path]:
         path = Path(raw_path).expanduser()
         candidates = [path] if path.is_absolute() else []
         if not path.is_absolute():
@@ -614,7 +619,10 @@ class TTSEngine:
                 candidates.append(Path(self._cfg.paths.model_package_dir) / path)
             candidates.append(Path(__file__).resolve().parents[1] / path)
             candidates.append(Path.cwd() / path)
+        return candidates
 
+    def _read_reference_audio_path(self, raw_path: str) -> bytes:
+        candidates = self._reference_path_candidates(raw_path)
         checked: list[str] = []
         for candidate in candidates:
             checked.append(str(candidate))
@@ -630,6 +638,26 @@ class TTSEngine:
             logger.warning("Reference audio %s is empty", candidate)
         raise ValueError(
             "reference_not_found: reference audio path not found or empty; checked: "
+            + ", ".join(checked)
+        )
+
+    def _read_reference_text_path(self, raw_path: str) -> str:
+        candidates = self._reference_path_candidates(raw_path)
+        checked: list[str] = []
+        for candidate in candidates:
+            checked.append(str(candidate))
+            try:
+                if not candidate.is_file():
+                    continue
+                text = candidate.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                logger.warning("Could not read reference text %s: %s", candidate, exc)
+                continue
+            if text:
+                return text
+            logger.warning("Reference text %s is empty", candidate)
+        raise ValueError(
+            "ref_text_required: reference text path not found or empty; checked: "
             + ", ".join(checked)
         )
 
@@ -652,6 +680,64 @@ class TTSEngine:
             )
         except ValueError as exc:
             raise ValueError(f"default_reference_missing: {exc}") from exc
+
+    def _prime_configured_reference_cache(self) -> None:
+        if self._ref_audio_processor is None:
+            return
+        if not self._cfg.reference_cache.enabled:
+            return
+        if self._loaded_model_type() not in ("base", "icl", "voice_clone"):
+            return
+
+        support = self._ref_audio_processor.support
+        if not support.icl_available:
+            reason = support.ref_codec_reason or support.reason
+            logger.info("Skipping Base/ICL reference cache priming: %s", reason)
+            return
+
+        targets: list[tuple[str, str, bytes]] = []
+        seen_ids: set[str] = set()
+        try:
+            audio, _text, ref_id, source, _language = self._resolve_default_reference()
+            targets.append((source, ref_id, audio))
+            seen_ids.add(ref_id.strip().lower())
+        except Exception as exc:
+            logger.warning("Could not resolve default Base/ICL reference for cache priming: %s", exc)
+
+        for raw_id in (self._cfg.references.entries or {}).keys():
+            ref_id = str(raw_id).strip()
+            if not ref_id or ref_id.lower() in seen_ids:
+                continue
+            try:
+                audio, _text, resolved_id, _language = self._resolve_reference_entry(ref_id)
+            except Exception as exc:
+                logger.warning("Could not resolve Base/ICL reference %s for cache priming: %s", ref_id, exc)
+                continue
+            targets.append(("registry", resolved_id, audio))
+            seen_ids.add(resolved_id.strip().lower())
+
+        for source, ref_id, audio in targets:
+            try:
+                features = self._ref_audio_processor.process(
+                    audio,
+                    require_ref_codec=True,
+                    cache_tag="voice_clone_icl",
+                )
+                logger.info(
+                    "Primed Base/ICL reference cache: %s (%s, %.2fs)",
+                    ref_id,
+                    source,
+                    features.duration_sec,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not prime Base/ICL reference cache for %s (%s): %s",
+                    ref_id,
+                    source,
+                    exc,
+                )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _apply_reference_language(self, config: SessionConfig, language: str) -> None:
         language = (language or "").strip()

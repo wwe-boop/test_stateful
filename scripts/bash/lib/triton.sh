@@ -81,6 +81,97 @@ _link_or_copy() {
 }
 
 # ---------------------------------------------------------------------------
+#  model_package_resources_stale <repo_root> <model_package_dir>
+#  Returns 0 when repo_root/resources should be re-copied into the package.
+# ---------------------------------------------------------------------------
+model_package_resources_stale() {
+    local repo_root="$1"
+    local package_dir="$2"
+    python3 - "$repo_root/resources" "$package_dir/resources" <<'PY'
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+
+if not src.exists():
+    sys.exit(0 if dst.exists() else 1)
+if not src.is_dir():
+    sys.exit(1)
+if not dst.is_dir():
+    sys.exit(0)
+
+for path in src.rglob("*"):
+    if not path.is_file():
+        continue
+    rel = path.relative_to(src)
+    other = dst / rel
+    if not other.is_file():
+        sys.exit(0)
+    try:
+        src_stat = path.stat()
+        dst_stat = other.stat()
+    except OSError:
+        sys.exit(0)
+    if src_stat.st_size != dst_stat.st_size or src_stat.st_mtime_ns > dst_stat.st_mtime_ns:
+        sys.exit(0)
+
+for path in dst.rglob("*"):
+    if path.is_file() and not (src / path.relative_to(dst)).is_file():
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
+#  model_package_engine_payload_stale <repo_root> <model_package_dir>
+#  Returns 0 when repo_root/engine should be re-copied into the package.
+# ---------------------------------------------------------------------------
+model_package_engine_payload_stale() {
+    local repo_root="$1"
+    local package_dir="$2"
+    python3 - "$repo_root/engine" "$package_dir/engine" <<'PY'
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+
+def ignored(path: Path) -> bool:
+    return "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
+
+if not src.is_dir():
+    sys.exit(1)
+if not dst.is_dir():
+    sys.exit(0)
+
+for path in src.rglob("*"):
+    if not path.is_file() or ignored(path):
+        continue
+    rel = path.relative_to(src)
+    other = dst / rel
+    if not other.is_file():
+        sys.exit(0)
+    try:
+        src_stat = path.stat()
+        dst_stat = other.stat()
+    except OSError:
+        sys.exit(0)
+    if src_stat.st_size != dst_stat.st_size or src_stat.st_mtime_ns > dst_stat.st_mtime_ns:
+        sys.exit(0)
+
+for path in dst.rglob("*"):
+    if ignored(path):
+        continue
+    if path.is_file() and not (src / path.relative_to(dst)).is_file():
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+# ---------------------------------------------------------------------------
 #  assemble_model_repo <exported_dir> <variant> <model_repo_dir> [engine_mode] [model_version]
 #
 #  engine_mode: trt (default) | onnx
@@ -360,6 +451,15 @@ assemble_model_repo() {
         log_warn "  tts_orchestrator/tokenizer: SKIPPED (model dir not found)"
     fi
 
+    local resources_dir="$repo_root/resources"
+    if [ -d "$resources_dir" ]; then
+        rm -rf "$orch_model_dir/resources"
+        _link_or_copy "$resources_dir" "$orch_model_dir/resources"
+        log_info "  tts_orchestrator/resources: OK"
+    else
+        log_warn "  tts_orchestrator/resources: SKIPPED (resources/ not found)"
+    fi
+
     _write_tts_orchestrator_stub_if_missing "$repo_dir" "$model_version"
 
     if ! PYTHONPATH="$repo_root/scripts/python" python3 - \
@@ -405,6 +505,7 @@ PY
         ! -name "tokenizer" \
         ! -name "weights" \
         ! -name "runtime" \
+        ! -name "resources" \
         ! -name "triton_manifest.json" \
         -exec rm -rf {} +
     find "$orch_model_dir" -type d -name "__pycache__" -prune -exec rm -rf {} +
@@ -557,6 +658,12 @@ PY
         missing=$((missing + 1))
     else
         log_info "  tts_orchestrator/$model_version/triton_manifest.json: OK"
+    fi
+    if [ -d "$orch_dir/resources" ]; then
+        log_info "  tts_orchestrator/$model_version/resources/: OK"
+    elif [ -d "$repo_root/resources" ]; then
+        log_warn "  tts_orchestrator/$model_version/resources/: missing (references using resources/... may fail)"
+        warned=$((warned + 1))
     fi
 
     if [ ! -f "$runtime_engine" ]; then

@@ -153,6 +153,8 @@ references:
     vivian:
       audio_path: workspace/default_refs/vivian.wav
       ref_text: 这是一段与 vivian 参考音频完全一致的文本。
+      # 也可以改用 ref_text_path，路径同 audio_path 一样支持模型包相对路径：
+      # ref_text_path: workspace/default_refs/vivian.txt
       language: auto
 
 # Optional: cache ref-audio preprocessing features separately from Talker prefix KV.
@@ -166,12 +168,13 @@ reference_cache:
 - `custom_voice`: `speaker` 是内置 custom voice 音色名；未传时服务端使用 `default_speaker`，非法音色走 `fallback_speaker`。
 - `base` / `icl`: 当没有显式 `ref_audio + ref_text` 时，`speaker` 被解释为 ICL reference alias，并从 `references.entries` 查找 `ref_audio + ref_text`。
 - `base` / `icl`: 没有传 `ref_audio`、`ref_text`、`speaker` 时使用默认 reference。优先使用 `engine.yaml references.default`，未配置时兼容 `ENGINE_DEFAULT_BASE_REF_AUDIO_PATH` / `ENGINE_DEFAULT_BASE_REF_TEXT` 和 `workspace/default_refs/base_ref.wav`。
+- `references.entries.*.audio_path` 和 `ref_text_path` 支持相对模型包的路径；Phase C assemble 会把仓库 `resources/` 复制到 `model_repository/tts_orchestrator/<version>/resources/`，因此默认可以使用 `resources/speakers/<alias>/ref.wav` 和 `ref.txt`。
 - `base`: 显式传 `ref_audio` 但没有 `ref_text` 时继续走 x-vector-only；显式传 `ref_audio + ref_text` 时走 ICL。
 - `icl`: 显式 reference 必须同时包含 `ref_audio + ref_text`；只传其中一个会报错。
 
 standalone `--engine-mode trt` 的 ICL 预处理强制使用 TensorRT，不做 ONNX Runtime fallback。部署包 `runtime/` 至少需要 `speaker_encoder.engine` 和 `speech_tokenizer_codec_fused.engine`，或等价的 `speaker_encoder/model.plan` 与 `speech_tokenizer_codec_fused/model.plan`。如果只存在 `.onnx`，服务会报出缺少 TensorRT engine 的明确错误。
 
-ICL reference 音频会先经过单路串行的 TRT preprocessing：`speaker_encoder.engine` 生成 speaker embedding，`speech_tokenizer_codec_fused.engine` 生成 temporal `ref_codec_sum_vec`，可选 `code2wav_decoder.engine` 生成 reference warm state。当前不对这一路做 batch；`spliter.max_concurrent_segments` 只控制后续文本分段与 EngineLoop slot 并发，不控制 speech encoder 并发。reference 音频最大时长以 `/v1/capabilities` 的 `ref_audio_max_duration_sec` 为准；当前 TRT 构建默认是 8 秒。`reference_cache` 缓存这一步的 ref-audio features，`prefix_cache` 则缓存 Talker ICL prefix KV，两者相互独立。
+ICL reference 音频会先经过单路串行的 TRT preprocessing：`speaker_encoder.engine` 生成 speaker embedding，`speech_tokenizer_codec_fused.engine` 生成 temporal `ref_codec_sum_vec`，可选 `code2wav_decoder.engine` 生成 reference warm state。当前不对这一路做 batch；`spliter.max_concurrent_segments` 只控制后续文本分段与 EngineLoop slot 并发，不控制 speech encoder 并发。reference 音频最大时长以 `/v1/capabilities` 的 `ref_audio_max_duration_sec` 为准；当前 TRT 构建默认是 8 秒。`reference_cache` 缓存这一步的 ref-audio features，`prefix_cache` 则缓存 Talker ICL prefix KV，两者相互独立。启用 `reference_cache` 时，standalone engine 会在主 `model.plan` 加载前预热 `references.default` 和 registry entries，并在每个 preprocessing 阶段后释放 ref TRT engine，以避免 24GB 级显存上 request path 再加载 speaker/codec engine 造成 OOM。
 
 7. 验收服务：
 

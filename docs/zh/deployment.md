@@ -97,7 +97,11 @@ bash scripts/bash/deploy.sh run \
 只影响后续文本分段和 EngineLoop slot 并发，不控制 speech encoder。reference
 音频最大时长以 capabilities 中的 `ref_audio_max_duration_sec` 为准，当前
 TRT 构建默认是 8 秒。`reference_cache` 缓存 ref-audio preprocessing
-features，`prefix_cache` 缓存 Talker ICL prefix KV，两者独立配置。
+features，`prefix_cache` 缓存 Talker ICL prefix KV，两者独立配置。启用
+`reference_cache` 时，standalone engine 会在加载主 `model.plan` 之前预热
+`references.default` 和 registry entries，并在每个 preprocessing 阶段后释放
+ref TRT engine，减少 24GB 级显存上 request path 再加载 speaker/codec engine
+触发 OOM 的概率。
 
 ### Engine Docker
 
@@ -122,6 +126,11 @@ bash scripts/bash/autorun.sh deploy --gateway engine-docker -m custom-1.7b
 本机 standalone gateway 也使用同一个模型包，只是由本机 Python 承载
 `engine.server`。也就是说，standalone、engine-docker 和 Triton 的模型产物
 都是 `model_repository/tts_orchestrator/1`，差异只在运行时进程和容器层。
+Phase C assemble 会同步仓库 `resources/` 到
+`model_repository/tts_orchestrator/<version>/resources/`。Base/ICL 的
+reference registry 可以直接使用模型包相对路径，例如
+`resources/speakers/<alias>/ref.wav` 和 `resources/speakers/<alias>/ref.txt`
+（通过 `ref_text_path` 配置）。
 
 生产环境推荐把“应用镜像、模型产物、部署配置”拆成三层：
 

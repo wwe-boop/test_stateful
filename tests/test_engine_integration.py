@@ -49,6 +49,27 @@ class TestSpliter:
         assert Spliter.classify_punct_level("你好") == 0
         assert Spliter.classify_punct_level("hello!") == 1
 
+    def test_classify_punct_level_with_trailing_closers(self):
+        from engine.frontend.spliter.spliter import Spliter
+
+        assert Spliter.classify_punct_level("你好！”") == 1
+        assert Spliter.classify_punct_level("你好。）") == 1
+        assert Spliter.classify_punct_level('hello!")') == 1
+        assert Spliter.classify_punct_level("你好，”") == 2
+
+    def test_classify_punct_level_does_not_cross_opening_quote(self):
+        from engine.frontend.spliter.spliter import Spliter
+
+        assert Spliter.classify_punct_level("。“") == 0
+        assert Spliter.classify_punct_level("：“") == 0
+
+    def test_classify_punct_level_l3_suffixes(self):
+        from engine.frontend.spliter.spliter import Spliter
+
+        assert Spliter.classify_punct_level("你好……") == 3
+        assert Spliter.classify_punct_level("你好……”") == 3
+        assert Spliter.classify_punct_level("\n") == 3
+
     def test_compute_thresholds(self):
         from engine.frontend.spliter.driver import compute_thresholds
 

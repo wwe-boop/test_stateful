@@ -294,16 +294,26 @@ cmd_run() {
                 log_warn "Runtime fused ONNX is missing or stale"
             fi
         fi
-        local src_runtime_onnx
-        local dst_runtime_onnx
-        for src_runtime_onnx in \
-            "$EXPORTED_DIR/$VARIANT/speaker_encoder.onnx" \
-            "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.onnx"; do
-            [ -f "$src_runtime_onnx" ] || continue
-            dst_runtime_onnx="$runtime_dir/$(basename "$src_runtime_onnx")"
-            if [ ! -f "$dst_runtime_onnx" ] || [ "$src_runtime_onnx" -nt "$dst_runtime_onnx" ]; then
+        local src_runtime_asset
+        local dst_runtime_asset
+        local runtime_asset_candidates=()
+        if [ "$ENGINE_MODE" = "trt" ]; then
+            runtime_asset_candidates=(
+                "$EXPORTED_DIR/$VARIANT/speaker_encoder.engine"
+                "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.engine"
+            )
+        else
+            runtime_asset_candidates=(
+                "$EXPORTED_DIR/$VARIANT/speaker_encoder.onnx"
+                "$EXPORTED_DIR/$VARIANT/speech_tokenizer_codec_fused.onnx"
+            )
+        fi
+        for src_runtime_asset in "${runtime_asset_candidates[@]}"; do
+            [ -f "$src_runtime_asset" ] || continue
+            dst_runtime_asset="$runtime_dir/$(basename "$src_runtime_asset")"
+            if [ ! -f "$dst_runtime_asset" ] || [ "$src_runtime_asset" -nt "$dst_runtime_asset" ]; then
                 stale=true
-                log_warn "Runtime ONNX asset is missing or stale: $(basename "$src_runtime_onnx")"
+                log_warn "Runtime support asset is missing or stale: $(basename "$src_runtime_asset")"
                 break
             fi
         done
@@ -313,17 +323,25 @@ cmd_run() {
             stale=true
             log_warn "Runtime manifest is missing or stale"
         fi
-        # Also re-assemble when orchestrator Python source (e.g. model.py) is newer
+        # Also re-assemble when orchestrator Python source or packaged engine code is newer.
         local orch_src="$REPO_ROOT/model_repository/tts_orchestrator/1/model.py"
         local orch_dst="$package_dir/model.py"
         if [ -f "$orch_src" ] && [ -f "$orch_dst" ] && [ "$orch_src" -nt "$orch_dst" ]; then
             stale=true
             log_warn "Orchestrator Python source (model.py) is newer than assembled copy"
         fi
+        if model_package_engine_payload_stale "$REPO_ROOT" "$package_dir"; then
+            stale=true
+            log_warn "TTSEngine package is missing or stale in model repo"
+        fi
         # Re-assemble if the new TTSEngine payload is missing from an older assemble.
         if [ ! -f "$package_dir/engine/server.py" ]; then
             stale=true
             log_warn "TTSEngine package missing in model repo: tts_orchestrator/$MODEL_VERSION/engine/server.py"
+        fi
+        if model_package_resources_stale "$REPO_ROOT" "$package_dir"; then
+            stale=true
+            log_warn "Model package resources are missing or stale"
         fi
         local legacy_payload
         for legacy_payload in \

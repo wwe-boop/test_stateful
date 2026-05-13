@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +27,16 @@ class _StubFrontend:
     async def create_session(self, session_id: str, *, config, on_audio=None, on_done=None, on_event=None):
         self.calls.append((session_id, config, on_audio, on_done, on_event))
         return {"session_id": session_id, "config": config}
+
+
+class _StubReferenceProcessor:
+    def __init__(self, support: ReferenceAudioSupport):
+        self.support = support
+        self.calls = []
+
+    def process(self, ref_audio: bytes, *, require_ref_codec: bool, cache_tag: str):
+        self.calls.append((ref_audio, require_ref_codec, cache_tag))
+        return SimpleNamespace(duration_sec=1.25)
 
 
 def _available_ref_support(*, codec: bool = True) -> ReferenceAudioSupport:
@@ -84,6 +95,47 @@ def test_validate_session_config_uses_default_ref_audio_for_base(monkeypatch, tm
     assert config.x_vector_only is False
     assert config.ref_source == "default"
     assert config.ref_id == "default"
+
+
+def test_prime_configured_reference_cache_processes_default_and_aliases(tmp_path):
+    first = tmp_path / "first.wav"
+    second = tmp_path / "second.wav"
+    first_txt = tmp_path / "first.txt"
+    second_txt = tmp_path / "second.txt"
+    first.write_bytes(b"first-wav")
+    second.write_bytes(b"second-wav")
+    first_txt.write_text("first ref", encoding="utf-8")
+    second_txt.write_text("second ref", encoding="utf-8")
+
+    cfg = EngineConfig()
+    cfg.references.default = "first"
+    cfg.references.entries = {
+        "first": {
+            "audio_path": str(first),
+            "ref_text_path": str(first_txt),
+        },
+        "second": {
+            "audio_path": str(second),
+            "ref_text_path": str(second_txt),
+        },
+    }
+    engine = TTSEngine(
+        config=cfg,
+        model_arch=ModelArchConfig(
+            variant="base-1.7b",
+            tts_model_type="base",
+            supported_task_types=("base",),
+        ),
+    )
+    processor = _StubReferenceProcessor(_available_ref_support())
+    engine._ref_audio_processor = processor
+
+    engine._prime_configured_reference_cache()
+
+    assert processor.calls == [
+        (b"first-wav", True, "voice_clone_icl"),
+        (b"second-wav", True, "voice_clone_icl"),
+    ]
 
 
 def test_validate_session_config_requires_ref_audio_when_default_missing(monkeypatch, tmp_path):
@@ -468,6 +520,41 @@ def test_validate_session_config_uses_configured_default_reference(tmp_path):
     assert config.ref_source == "default"
     assert config.ref_audio == b"default-registry-wav"
     assert config.ref_text == "默认 registry 参考文本"
+
+
+def test_validate_session_config_reads_reference_assets_from_model_package(tmp_path):
+    package_dir = tmp_path / "tts_orchestrator" / "1"
+    ref_dir = package_dir / "resources" / "speakers" / "vivian"
+    ref_dir.mkdir(parents=True)
+    (ref_dir / "ref.wav").write_bytes(b"packaged-wav")
+    (ref_dir / "ref.txt").write_text("packaged reference text\n", encoding="utf-8")
+
+    cfg = EngineConfig()
+    cfg.paths.model_package_dir = str(package_dir)
+    cfg.references.entries = {
+        "vivian": {
+            "audio_path": "resources/speakers/vivian/ref.wav",
+            "ref_text_path": "resources/speakers/vivian/ref.txt",
+        }
+    }
+
+    engine = TTSEngine(
+        config=cfg,
+        model_arch=ModelArchConfig(
+            variant="icl-1.7b",
+            tts_model_type="icl",
+            supported_task_types=("icl",),
+        ),
+    )
+    engine._ref_audio_processor = _StubSupportProbe(_available_ref_support())
+
+    config = SessionConfig(task_type="icl", speaker="vivian")
+    engine._validate_session_config(config)
+
+    assert config.ref_audio == b"packaged-wav"
+    assert config.ref_text == "packaged reference text"
+    assert config.ref_source == "registry"
+    assert config.ref_id == "vivian"
 
 
 def test_validate_session_config_missing_reference_alias_errors():

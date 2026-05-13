@@ -402,6 +402,23 @@ engine_docker_image_has_app() {
 }
 
 # ---------------------------------------------------------------------------
+#  engine_docker_image_supports_model_package_engine <image_tag>
+#  Returns 0 if the image contains the entrypoint/code needed to run engine.server
+#  from the assembled model package payload.
+# ---------------------------------------------------------------------------
+engine_docker_image_supports_model_package_engine() {
+    local image="$1"
+    docker run --rm --entrypoint "" "$image" sh -lc '
+        grep -q "Prefer the engine/ package copied into the assembled model package" /app/scripts/compose/engine-entrypoint.sh &&
+        python3 - <<'"'"'PY'"'"'
+from engine.config import EngineConfig
+
+raise SystemExit(0 if hasattr(EngineConfig(), "references") else 1)
+PY
+    ' &>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 #  engine_docker_image_tensorrt_release <image_tag>
 #  Echoes NVIDIA_TENSORRT_VERSION from the image (e.g. 25.03, 26.02).
 # ---------------------------------------------------------------------------
@@ -566,8 +583,8 @@ engine_start_docker() {
 
     docker run --gpus all -d \
         --name "$container_name" \
-        -w /app \
-        -e "PYTHONPATH=/app" \
+        -w "$model_package_container" \
+        -e "PYTHONPATH=$model_package_container:/app" \
         -v "$model_repo_host:/models:ro" \
         -p "${port}:${port}" \
         -p "${ws_port}:${ws_port}" \

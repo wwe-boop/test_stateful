@@ -16,8 +16,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import gc
 import logging
 import re
+import struct
 import threading
 import wave
 from collections import OrderedDict
@@ -137,7 +139,6 @@ class ReferenceAudioProcessor:
             if cached is not None:
                 return cached
 
-            self._ensure_engines(require_ref_codec=require_ref_codec)
             try:
                 wav, sr = _decode_wav_bytes(ref_audio)
             except Exception as exc:
@@ -155,7 +156,12 @@ class ReferenceAudioProcessor:
                 max_duration_sec=max_duration_sec,
             )
 
-            spk_embedding = self._run_speaker_encoder(wav_24k)
+            try:
+                self._ensure_speaker_engine()
+                spk_embedding = self._run_speaker_encoder(wav_24k)
+            finally:
+                self._release_speaker_engine()
+
             ref_codec_sum_vec = None
             ref_audio_codes = None
             ref_c2w_kv = None
@@ -163,13 +169,32 @@ class ReferenceAudioProcessor:
             ref_c2w_transconv_states = None
             ref_c2w_frame_idx = 0
             if require_ref_codec:
-                ref_codec_sum_vec, ref_audio_codes = self._run_speech_tokenizer_codec(wav_24k)
-                (
-                    ref_c2w_kv,
-                    ref_c2w_conv_states,
-                    ref_c2w_transconv_states,
-                    ref_c2w_frame_idx,
-                ) = self._run_code2wav_warmup(ref_audio_codes)
+                try:
+                    self._ensure_codec_engine()
+                    max_duration_sec = self._resolve_ref_audio_max_duration_sec()
+                    if duration_sec > max_duration_sec:
+                        raise ValueError(
+                            f"invalid_ref_audio: reference audio duration {duration_sec:.2f}s "
+                            f"exceeds {max_duration_sec:.2f}s"
+                        )
+                    ref_codec_sum_vec, ref_audio_codes = self._run_speech_tokenizer_codec(wav_24k)
+                finally:
+                    self._release_codec_engine()
+
+                try:
+                    if ref_audio_codes is not None and self._ensure_c2w_engine():
+                        (
+                            ref_c2w_kv,
+                            ref_c2w_conv_states,
+                            ref_c2w_transconv_states,
+                            ref_c2w_frame_idx,
+                        ) = self._run_code2wav_warmup(ref_audio_codes)
+                except Exception as exc:
+                    msg = f"ref_c2w_warmup_unavailable: {exc}"
+                    warnings.append(msg)
+                    logger.warning("%s", msg)
+                finally:
+                    self._release_c2w_engine()
             features = ReferenceAudioFeatures(
                 spk_embedding=spk_embedding,
                 ref_codec_sum_vec=ref_codec_sum_vec,
@@ -301,6 +326,12 @@ class ReferenceAudioProcessor:
         return "|".join(parts)
 
     def _ensure_engines(self, *, require_ref_codec: bool) -> None:
+        self._ensure_speaker_engine()
+        if require_ref_codec:
+            self._ensure_codec_engine()
+            self._ensure_c2w_engine()
+
+    def _ensure_speaker_engine(self) -> None:
         import torch
 
         from .executor import TRTEngine
@@ -309,29 +340,86 @@ class ReferenceAudioProcessor:
         if self._stream is None:
             self._stream = torch.cuda.Stream(device=device)
         if self._speaker_engine is None:
-            self._speaker_engine = TRTEngine(str(self._support.speaker_encoder_path), device)
-            self._speaker_engine.load()
-        if require_ref_codec and self._codec_engine is None:
-            if self._support.speech_tokenizer_codec_fused_path is None:
-                raise RuntimeError("missing speech_tokenizer_codec_fused TensorRT engine")
-            self._codec_engine = TRTEngine(
+            self._empty_cuda_cache()
+            speaker_engine = TRTEngine(str(self._support.speaker_encoder_path), device)
+            speaker_engine.load()
+            self._speaker_engine = speaker_engine
+
+    def _ensure_codec_engine(self) -> None:
+        import torch
+
+        from .executor import TRTEngine
+
+        if self._support.speech_tokenizer_codec_fused_path is None:
+            raise RuntimeError("missing speech_tokenizer_codec_fused TensorRT engine")
+        device = torch.device("cuda", self._device_id)
+        if self._stream is None:
+            self._stream = torch.cuda.Stream(device=device)
+        if self._codec_engine is None:
+            self._empty_cuda_cache()
+            codec_engine = TRTEngine(
                 str(self._support.speech_tokenizer_codec_fused_path),
                 device,
             )
-            self._codec_engine.load()
+            codec_engine.load()
+            self._codec_engine = codec_engine
             self._support.ref_audio_max_duration_sec = (
                 self._infer_codec_max_duration_sec(self._codec_engine)
             )
-        if (
-            require_ref_codec
-            and self._support.code2wav_decoder_path is not None
-            and self._c2w_engine is None
-        ):
-            self._c2w_engine = TRTEngine(
+
+    def _ensure_c2w_engine(self) -> bool:
+        import torch
+
+        from .executor import TRTEngine
+
+        if self._support.code2wav_decoder_path is None:
+            return False
+        device = torch.device("cuda", self._device_id)
+        if self._stream is None:
+            self._stream = torch.cuda.Stream(device=device)
+        if self._c2w_engine is None:
+            self._empty_cuda_cache()
+            c2w_engine = TRTEngine(
                 str(self._support.code2wav_decoder_path),
                 device,
             )
-            self._c2w_engine.load()
+            c2w_engine.load()
+            self._c2w_engine = c2w_engine
+        return True
+
+    def _release_speaker_engine(self) -> None:
+        self._release_engine("_speaker_engine")
+
+    def _release_codec_engine(self) -> None:
+        self._release_engine("_codec_engine")
+
+    def _release_c2w_engine(self) -> None:
+        self._release_engine("_c2w_engine")
+
+    def _release_engine(self, attr_name: str) -> None:
+        engine = getattr(self, attr_name, None)
+        if engine is None:
+            return
+        try:
+            if getattr(engine, "_output_buffers", None) is not None:
+                engine._output_buffers.clear()
+            engine._context = None
+            engine._engine = None
+        except Exception:
+            logger.debug("Could not fully release %s", attr_name, exc_info=True)
+        setattr(self, attr_name, None)
+        gc.collect()
+        self._empty_cuda_cache()
+
+    def _empty_cuda_cache(self) -> None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                with torch.cuda.device(self._device_id):
+                    torch.cuda.empty_cache()
+        except Exception:
+            logger.debug("Could not empty CUDA cache", exc_info=True)
 
     def _resolve_ref_audio_max_duration_sec(self) -> float:
         if self._support.ref_audio_max_duration_sec > 0:
@@ -363,6 +451,9 @@ class ReferenceAudioProcessor:
 
         device = torch.device("cuda", self._device_id)
         mel = _mel_spectrogram_24k(wav_24k, device=device).transpose(1, 2).contiguous()
+        input_dtype = self._speaker_engine.get_tensor_dtype("mel") or mel.dtype
+        if mel.dtype != input_dtype:
+            mel = mel.to(dtype=input_dtype).contiguous()
         with torch.cuda.stream(self._stream):
             out = self._speaker_engine.infer(
                 {"mel": mel},
@@ -370,7 +461,13 @@ class ReferenceAudioProcessor:
                 self._stream,
             )
         self._stream.synchronize()
-        return out["speaker_embedding"].detach().float().cpu().contiguous()
+        embedding = out["speaker_embedding"].detach().float().cpu().contiguous()
+        if not torch.isfinite(embedding).all():
+            raise RuntimeError(
+                "speaker_encoder_non_finite: speaker_encoder returned NaN/Inf; "
+                "check TensorRT input dtype/profile and reference audio"
+            )
+        return embedding
 
     def _run_speech_tokenizer_codec(self, wav_24k: np.ndarray):
         import torch
@@ -396,6 +493,11 @@ class ReferenceAudioProcessor:
             raise RuntimeError(
                 f"speech_tokenizer_codec_fused returned invalid shape {tuple(ref.shape)}; "
                 "expected [B, T, H]"
+            )
+        if not torch.isfinite(ref).all():
+            raise RuntimeError(
+                "speech_tokenizer_codec_non_finite: speech_tokenizer_codec_fused "
+                "returned NaN/Inf"
             )
         if wav_24k.shape[0] >= _REF_SAMPLE_RATE and ref.shape[1] <= 1:
             raise RuntimeError(
@@ -659,30 +761,90 @@ def _profile_shape(engine, name: str, *, past_len: Optional[int] = None) -> tupl
 
 
 def _decode_wav_bytes(data: bytes) -> tuple[np.ndarray, int]:
-    with wave.open(io.BytesIO(data), "rb") as wf:
-        channels = int(wf.getnchannels())
-        sample_width = int(wf.getsampwidth())
-        sample_rate = int(wf.getframerate())
-        frames = int(wf.getnframes())
-        compression = wf.getcomptype()
-        if compression != "NONE":
-            raise ValueError(f"unsupported WAV compression: {compression}")
-        raw = wf.readframes(frames)
-
-    if sample_width == 1:
-        audio = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    elif sample_width == 2:
-        audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    elif sample_width == 3:
-        audio = _pcm24_to_float32(raw)
-    elif sample_width == 4:
-        audio = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
-    else:
-        raise ValueError(f"unsupported WAV sample width: {sample_width}")
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wf:
+            channels = int(wf.getnchannels())
+            sample_width = int(wf.getsampwidth())
+            sample_rate = int(wf.getframerate())
+            frames = int(wf.getnframes())
+            compression = wf.getcomptype()
+            if compression != "NONE":
+                raise ValueError(f"unsupported WAV compression: {compression}")
+            raw = wf.readframes(frames)
+            audio = _decode_pcm_samples(raw, sample_width)
+    except wave.Error:
+        audio, sample_rate, channels = _decode_wav_bytes_riff(data)
 
     if channels > 1:
         audio = audio.reshape(-1, channels).mean(axis=1)
     return np.ascontiguousarray(np.clip(audio, -1.0, 1.0), dtype=np.float32), sample_rate
+
+
+def _decode_pcm_samples(raw: bytes, sample_width: int) -> np.ndarray:
+    if sample_width == 1:
+        return (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+    if sample_width == 2:
+        return np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    if sample_width == 3:
+        return _pcm24_to_float32(raw)
+    if sample_width == 4:
+        return np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+    raise ValueError(f"unsupported WAV sample width: {sample_width}")
+
+
+def _decode_wav_bytes_riff(data: bytes) -> tuple[np.ndarray, int, int]:
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("not a RIFF/WAVE file")
+
+    fmt: bytes | None = None
+    raw: bytes | None = None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_id = data[offset:offset + 4]
+        chunk_size = struct.unpack_from("<I", data, offset + 4)[0]
+        chunk_start = offset + 8
+        chunk_end = chunk_start + chunk_size
+        if chunk_end > len(data):
+            raise ValueError("truncated WAV chunk")
+        if chunk_id == b"fmt ":
+            fmt = data[chunk_start:chunk_end]
+        elif chunk_id == b"data":
+            raw = data[chunk_start:chunk_end]
+        offset = chunk_end + (chunk_size & 1)
+
+    if fmt is None or raw is None:
+        raise ValueError("missing WAV fmt or data chunk")
+    if len(fmt) < 16:
+        raise ValueError("invalid WAV fmt chunk")
+
+    format_tag, channels, sample_rate, _, block_align, bits_per_sample = struct.unpack_from(
+        "<HHIIHH",
+        fmt,
+        0,
+    )
+    if format_tag == 0xFFFE and len(fmt) >= 40:
+        # WAVE_FORMAT_EXTENSIBLE stores the real format tag in the first two
+        # bytes of the subformat GUID.
+        format_tag = struct.unpack_from("<H", fmt, 24)[0]
+    if channels <= 0 or sample_rate <= 0:
+        raise ValueError("invalid WAV channel count or sample rate")
+    sample_width = max(1, int(bits_per_sample) // 8)
+    if block_align > 0:
+        usable = len(raw) - (len(raw) % block_align)
+        raw = raw[:usable]
+
+    if format_tag == 1:
+        audio = _decode_pcm_samples(raw, sample_width)
+    elif format_tag == 3:
+        if bits_per_sample == 32:
+            audio = np.frombuffer(raw, dtype="<f4").astype(np.float32)
+        elif bits_per_sample == 64:
+            audio = np.frombuffer(raw, dtype="<f8").astype(np.float32)
+        else:
+            raise ValueError(f"unsupported IEEE float WAV bit depth: {bits_per_sample}")
+    else:
+        raise ValueError(f"unsupported WAV format tag: {format_tag}")
+    return audio, sample_rate, channels
 
 
 def _pcm24_to_float32(raw: bytes) -> np.ndarray:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections import deque
 import logging
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
 
@@ -37,6 +38,44 @@ from .event import SpliterEvent, SpliterEventType as ET
 from .defines import LEVEL1_PUNCTIONS, LEVEL2_PUNCTIONS, LEVEL3_PUNCTIONS
 
 logger = logging.getLogger(__name__)
+
+_TRAILING_PUNCT_CLOSER_CATEGORIES = frozenset({"Pe", "Pf"})
+_AMBIGUOUS_TRAILING_QUOTES = frozenset({"'", '"', "＇", "＂"})
+
+
+def _tier_puncts(
+    puncts: Tuple[str, ...],
+    *lower_tiers: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    lower = set().union(*lower_tiers) if lower_tiers else set()
+    unique = {p for p in puncts if p not in lower}
+    return tuple(sorted(unique, key=len, reverse=True))
+
+
+_LEVEL1_TERMINALS = _tier_puncts(LEVEL1_PUNCTIONS)
+_LEVEL2_TERMINALS = _tier_puncts(LEVEL2_PUNCTIONS, LEVEL1_PUNCTIONS)
+_LEVEL3_TERMINALS = _tier_puncts(LEVEL3_PUNCTIONS, LEVEL2_PUNCTIONS)
+_LEVEL3_BREAK_WHITESPACE = frozenset(p for p in _LEVEL3_TERMINALS if p.isspace())
+_PUNCT_TERMINALS_BY_LEVEL = (
+    (1, _LEVEL1_TERMINALS),
+    (2, _LEVEL2_TERMINALS),
+    (3, _LEVEL3_TERMINALS),
+)
+
+
+def _is_trailing_punct_closer(ch: str) -> bool:
+    """True for quote/bracket chars that may close after terminal punctuation."""
+    return (
+        ch in _AMBIGUOUS_TRAILING_QUOTES
+        or unicodedata.category(ch) in _TRAILING_PUNCT_CLOSER_CATEGORIES
+    )
+
+
+def _match_terminal_punct(text: str) -> int:
+    for level, puncts in _PUNCT_TERMINALS_BY_LEVEL:
+        if any(text.endswith(punct) for punct in puncts):
+            return level
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -181,19 +220,35 @@ class Spliter:
         """Determine punctuation level from token text.
 
         Returns 0 (none), 1 (L1), 2 (L2), or 3 (L3).
-        Checks the last non-whitespace character.
+        Classifies punctuation at the token's right boundary. Closing quotes
+        or brackets after a boundary punctuation are ignored, while opening
+        quotes are kept as normal trailing text.
         """
-        stripped = text.rstrip()
-        if not stripped:
+        if not text:
             return 0
-        ch = stripped[-1]
-        if ch in LEVEL1_PUNCTIONS:
-            return 1
-        if ch in LEVEL2_PUNCTIONS:
-            return 2
-        if ch in LEVEL3_PUNCTIONS:
-            return 3
-        return 0
+
+        i = len(text) - 1
+        saw_level3_break = False
+
+        while i >= 0:
+            ch = text[i]
+            if ch.isspace():
+                if ch in _LEVEL3_BREAK_WHITESPACE:
+                    saw_level3_break = True
+                i -= 1
+                continue
+            if _is_trailing_punct_closer(ch):
+                i -= 1
+                continue
+            break
+
+        if i < 0:
+            return 3 if saw_level3_break else 0
+
+        level = _match_terminal_punct(text[: i + 1])
+        if level:
+            return level
+        return 3 if saw_level3_break else 0
 
     def _make_event(
         self, token_id: int, text: str, punct_level: int,
