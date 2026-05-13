@@ -223,6 +223,8 @@ class TTSEngine:
             self._engine_dir,
             self._model_arch.variant,
             device_id=self._device_id,
+            cache_enabled=self._cfg.reference_cache.enabled,
+            cache_max_entries=self._cfg.reference_cache.max_entries,
         )
 
         prefill_builder = None
@@ -365,8 +367,7 @@ class TTSEngine:
         This is the public session-entry API for gateways/adapters. It keeps the
         transport layer from reaching into frontend internals directly.
         """
-        self._validate_session_config(config)
-        self._prepare_reference_audio_features(config)
+        await asyncio.to_thread(self._validate_and_prepare_session_config, config)
         return await self._frontend.create_session(
             session_id,
             config=config,
@@ -409,20 +410,12 @@ class TTSEngine:
                 "triton_io_float_dtype": profile.triton_io_float_dtype,
             }
         if self._ref_audio_processor is not None:
-            support = self._ref_audio_processor.support
-            stats["ref_audio_available"] = support.available
-            if support.reason:
-                stats["ref_audio_reason"] = support.reason
+            stats.update(self._reference_capabilities())
         return stats
 
     def describe_capabilities(self) -> dict:
         """Return static standalone capability metadata for clients."""
-        ref_audio_available = False
-        ref_audio_reason = ""
-        if self._ref_audio_processor is not None:
-            support = self._ref_audio_processor.support
-            ref_audio_available = support.available
-            ref_audio_reason = support.reason or ""
+        ref_caps = self._reference_capabilities()
 
         return {
             "variant": self._model_arch.variant,
@@ -436,8 +429,7 @@ class TTSEngine:
                 {"encoding": "pcm_s16le", "sample_rate": 24000, "channels": 1},
                 {"encoding": "pcm_s16le", "sample_rate": 16000, "channels": 1},
             ],
-            "ref_audio_available": ref_audio_available,
-            "ref_audio_reason": ref_audio_reason,
+            **ref_caps,
             "engine_profile": {
                 "max_batch_size": self._model_arch.engine_profile.max_batch_size,
                 "max_input_len": self._model_arch.engine_profile.max_input_len,
@@ -446,6 +438,54 @@ class TTSEngine:
                 "triton_io_float_dtype": self._model_arch.engine_profile.triton_io_float_dtype,
             },
         }
+
+    def _reference_capabilities(self) -> dict:
+        support = self._ref_audio_processor.support if self._ref_audio_processor is not None else None
+        loaded_model_type = self._loaded_model_type()
+        speaker_encoder_available = bool(
+            support is not None and support.speaker_encoder_available
+        )
+        ref_codec_available = bool(
+            support is not None and support.ref_codec_available
+        )
+        icl_available = bool(
+            support is not None and support.icl_available
+        )
+        if loaded_model_type in ("base", "icl"):
+            ref_audio_available = icl_available
+        else:
+            ref_audio_available = False
+
+        ref_audio_reason = ""
+        ref_codec_reason = ""
+        if support is None:
+            ref_audio_reason = "reference-audio processor unavailable"
+        else:
+            ref_audio_reason = support.reason or ""
+            ref_codec_reason = support.ref_codec_reason or ""
+            if loaded_model_type in ("base", "icl") and not ref_audio_available:
+                ref_audio_reason = ref_audio_reason or ref_codec_reason
+
+        return {
+            "ref_audio_available": ref_audio_available,
+            "speaker_encoder_available": speaker_encoder_available,
+            "ref_codec_available": ref_codec_available,
+            "icl_available": icl_available,
+            "ref_audio_max_duration_sec": (
+                float(support.ref_audio_max_duration_sec)
+                if support is not None
+                else 0.0
+            ),
+            "ref_c2w_warm_state_available": bool(
+                support is not None and support.ref_c2w_warm_state_available
+            ),
+            "ref_audio_reason": ref_audio_reason,
+            "ref_codec_reason": ref_codec_reason,
+        }
+
+    def _validate_and_prepare_session_config(self, config: SessionConfig) -> None:
+        self._validate_session_config(config)
+        self._prepare_reference_audio_features(config)
 
     def _validate_session_config(self, config: SessionConfig) -> None:
         loaded_model_type = self._loaded_model_type()
@@ -473,13 +513,17 @@ class TTSEngine:
         if task_type == "voice_clone":
             if not config.ref_audio:
                 raise ValueError("ref_audio is required for task_type 'voice_clone'")
-            if self._ref_audio_processor is None or not self._ref_audio_processor.support.available:
+            support = self._ref_audio_processor.support if self._ref_audio_processor is not None else None
+            if support is None or not support.speaker_encoder_available:
                 reason = (
-                    self._ref_audio_processor.support.reason
-                    if self._ref_audio_processor is not None
+                    support.reason
+                    if support is not None
                     else "reference-audio processor unavailable"
                 )
                 raise ValueError(f"voice_clone is not available in standalone mode: {reason}")
+            if not config.x_vector_only and not support.ref_codec_available:
+                reason = support.ref_codec_reason or support.reason
+                raise ValueError(f"voice_clone ICL is not available in standalone mode: {reason}")
 
     def _loaded_model_type(self) -> str:
         model_type = (self._model_arch.tts_model_type or "").strip()
@@ -534,7 +578,7 @@ class TTSEngine:
             "reference audio was found; checked: " + ", ".join(checked_paths)
         )
 
-    def _resolve_reference_entry(self, ref_id: str) -> tuple[bytes, str, str]:
+    def _resolve_reference_entry(self, ref_id: str) -> tuple[bytes, str, str, str]:
         refs = self._cfg.references
         entries = refs.entries or {}
         normalized = (ref_id or "").strip().lower()
@@ -555,11 +599,12 @@ class TTSEngine:
 
         audio_path = str(raw_entry.get("audio_path") or "").strip()
         ref_text = str(raw_entry.get("ref_text") or "").strip()
+        language = str(raw_entry.get("language") or "").strip()
         if not audio_path:
             raise ValueError(f"reference_not_found: entry {ref_id!r} has no audio_path")
         if not ref_text:
             raise ValueError(f"ref_text_required: reference {ref_id!r} has empty ref_text")
-        return self._read_reference_audio_path(audio_path), ref_text, raw_key or normalized
+        return self._read_reference_audio_path(audio_path), ref_text, raw_key or normalized, language
 
     def _read_reference_audio_path(self, raw_path: str) -> bytes:
         path = Path(raw_path).expanduser()
@@ -588,24 +633,33 @@ class TTSEngine:
             + ", ".join(checked)
         )
 
-    def _resolve_default_reference(self) -> tuple[bytes, str, str, str]:
+    def _resolve_default_reference(self) -> tuple[bytes, str, str, str, str]:
         refs = self._cfg.references
         if refs.entries:
             ref_id = (refs.default or "default").strip() or "default"
             try:
-                audio, text, resolved_id = self._resolve_reference_entry(ref_id)
+                audio, text, resolved_id, language = self._resolve_reference_entry(ref_id)
             except ValueError as exc:
                 raise ValueError(f"default_reference_missing: {exc}") from exc
-            return audio, text, resolved_id, "default"
+            return audio, text, resolved_id, "default", language
         try:
             return (
                 self._load_default_base_ref_audio(),
                 _DEFAULT_BASE_REF_TEXT,
                 "default",
                 "default",
+                "",
             )
         except ValueError as exc:
             raise ValueError(f"default_reference_missing: {exc}") from exc
+
+    def _apply_reference_language(self, config: SessionConfig, language: str) -> None:
+        language = (language or "").strip()
+        if not language:
+            return
+        current = (config.language or "").strip().lower()
+        if not current or current == "auto":
+            config.language = language
 
     def _mark_reference_metadata(
         self,
@@ -650,17 +704,19 @@ class TTSEngine:
             )
 
         if alias:
-            audio, text, resolved_id = self._resolve_reference_entry(alias)
+            audio, text, resolved_id, language = self._resolve_reference_entry(alias)
             config.ref_audio = audio
             config.ref_text = text
+            self._apply_reference_language(config, language)
             self._mark_reference_metadata(config, source="registry", ref_id=resolved_id)
             config.speaker = None
             config.x_vector_only = False
             return
 
-        audio, text, resolved_id, source = self._resolve_default_reference()
+        audio, text, resolved_id, source, language = self._resolve_default_reference()
         config.ref_audio = audio
         config.ref_text = text
+        self._apply_reference_language(config, language)
         self._mark_reference_metadata(config, source=source, ref_id=resolved_id)
         config.speaker = None
         config.x_vector_only = False

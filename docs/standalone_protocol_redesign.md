@@ -70,6 +70,10 @@ This returns the standalone engine's loaded contract:
 - `declared_supported_task_types`
 - supported input modes / group policies / audio formats
 - ref-audio availability for standalone preprocessing
+- detailed reference preprocessing availability:
+  `speaker_encoder_available`, `ref_codec_available`, `icl_available`,
+  `ref_audio_max_duration_sec`, `ref_c2w_warm_state_available`,
+  `ref_codec_reason`
 
 The loaded model type is chosen when the engine is started. Runtime requests do
 not switch models; they can only confirm that the client and server are using
@@ -150,7 +154,22 @@ references:
       audio_path: workspace/default_refs/vivian.wav
       ref_text: 这是一段与 vivian 参考音频完全一致的文本。
       language: auto
+
+reference_cache:
+  enabled: true
+  max_entries: 16
 ```
+
+For `base` / `icl`, registry `language` is applied only when the request
+language is empty or `auto`; an explicit request language wins. Explicit
+`ref_audio + ref_text` does not load language from the registry even when
+`speaker` is also present as reference metadata.
+
+ICL reference preprocessing is intentionally single-request and serialized
+around the TRT engines. It is not batched, and `spliter.max_concurrent_segments`
+only affects downstream text segment / EngineLoop slot concurrency. The
+reference audio hard limit is reported as `ref_audio_max_duration_sec`; current
+TRT builds default to 8 seconds for `speech_tokenizer_codec_fused.engine`.
 
 For standalone ICL preprocessing in TRT mode, the runtime package must contain
 TensorRT artifacts:

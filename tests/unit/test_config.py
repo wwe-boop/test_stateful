@@ -57,6 +57,17 @@ class TestEnvOverrides:
         assert raw["server"]["websocket_port"] == 50052
         assert raw["server"]["websocket_path"] == "/stream/ws"
 
+    def test_applies_multiword_section_overrides(self):
+        raw: dict = {}
+        env = {
+            "ENGINE_REFERENCE_CACHE_ENABLED": "false",
+            "ENGINE_REFERENCE_CACHE_MAX_ENTRIES": "4",
+        }
+        with _patch_env(env):
+            _apply_env_overrides(raw)
+        assert raw["reference_cache"]["enabled"] is False
+        assert raw["reference_cache"]["max_entries"] == 4
+
     def test_ignores_non_engine(self):
         raw: dict = {}
         env = {"OTHER_VAR": "123"}
@@ -75,6 +86,8 @@ class TestLoadConfig:
             os.chdir(cwd)
         assert cfg.scheduler.max_batch_size == 48
         assert cfg.prefix_cache.enabled is True
+        assert cfg.reference_cache.enabled is True
+        assert cfg.reference_cache.max_entries == 16
 
     def test_yaml_file(self):
         try:
@@ -98,6 +111,18 @@ class TestLoadConfig:
     def test_cli_overrides(self):
         cfg = load_config(cli_overrides={"scheduler": {"max_batch_size": 8}})
         assert cfg.scheduler.max_batch_size == 8
+
+    def test_reference_cache_cli_overrides(self):
+        cfg = load_config(
+            cli_overrides={
+                "reference_cache": {
+                    "enabled": False,
+                    "max_entries": 3,
+                }
+            }
+        )
+        assert cfg.reference_cache.enabled is False
+        assert cfg.reference_cache.max_entries == 3
 
     def test_missing_file_uses_defaults(self):
         cfg = load_config("/nonexistent/path.yaml")

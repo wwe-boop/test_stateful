@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import pytest
 
 from engine.backend.ref_audio_processor import (
     ReferenceAudioProcessor,
+    ReferenceAudioFeatures,
     ReferenceAudioSupport,
     _validate_reference_audio_quality,
 )
@@ -89,12 +92,85 @@ def test_reference_audio_quality_validation_errors_and_warns():
     with pytest.raises(ValueError, match="ref_audio_too_short"):
         _validate_reference_audio_quality(np.zeros(12000, dtype=np.float32), 0.5)
 
-    with pytest.raises(ValueError, match="invalid_ref_audio"):
-        _validate_reference_audio_quality(np.zeros(24_000 * 21, dtype=np.float32), 21.0)
+    with pytest.raises(ValueError, match=r"exceeds 8\.00s"):
+        _validate_reference_audio_quality(np.zeros(24_000 * 9, dtype=np.float32), 9.0)
 
     warnings = _validate_reference_audio_quality(
         np.zeros(24_000 * 2, dtype=np.float32),
         2.0,
     )
-    assert any("outside the recommended 3-10s range" in item for item in warnings)
+    assert any("outside the recommended 3-8s range" in item for item in warnings)
     assert any("near-silent" in item for item in warnings)
+
+
+def test_reference_audio_quality_uses_dynamic_profile_cap():
+    import numpy as np
+
+    with pytest.raises(ValueError, match=r"exceeds 6\.00s"):
+        _validate_reference_audio_quality(
+            np.zeros(24_000 * 7, dtype=np.float32),
+            7.0,
+            max_duration_sec=6.0,
+        )
+
+    warnings = _validate_reference_audio_quality(
+        np.zeros(int(24_000 * 10.5), dtype=np.float32),
+        10.5,
+        max_duration_sec=12.0,
+    )
+    assert any("outside the recommended 3-10s range" in item for item in warnings)
+
+
+def test_codec_profile_max_duration_prefers_trt_profile():
+    class _FakeCodecEngine:
+        def get_input_profile_max_shape(self, name):
+            assert name == "waveform"
+            return (1, 1, 144_000)
+
+    assert ReferenceAudioProcessor._infer_codec_max_duration_sec(_FakeCodecEngine()) == 6.0
+
+
+def test_codec_profile_max_duration_falls_back_to_8s():
+    class _FakeCodecEngine:
+        def get_input_profile_max_shape(self, name):
+            return None
+
+    assert ReferenceAudioProcessor._infer_codec_max_duration_sec(_FakeCodecEngine()) == 8.0
+
+
+def test_feature_cache_lru_evicts_oldest_and_refreshes_hits(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    processor = ReferenceAudioProcessor(
+        str(runtime),
+        "base-1.7b",
+        cache_enabled=True,
+        cache_max_entries=2,
+    )
+    first = ReferenceAudioFeatures(spk_embedding="first")
+    second = ReferenceAudioFeatures(spk_embedding="second")
+    third = ReferenceAudioFeatures(spk_embedding="third")
+
+    processor._cache_put("a", first)
+    processor._cache_put("b", second)
+    assert processor._cache_get("a") is first
+    processor._cache_put("c", third)
+
+    assert list(processor._cache.keys()) == ["a", "c"]
+    assert processor._cache_get("b") is None
+
+
+def test_feature_cache_can_be_disabled(tmp_path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    processor = ReferenceAudioProcessor(
+        str(runtime),
+        "base-1.7b",
+        cache_enabled=False,
+        cache_max_entries=2,
+    )
+
+    processor._cache_put("a", ReferenceAudioFeatures(spk_embedding="first"))
+
+    assert processor._cache == OrderedDict()
+    assert processor._cache_get("a") is None

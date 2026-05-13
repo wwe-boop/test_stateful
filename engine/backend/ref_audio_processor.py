@@ -20,6 +20,7 @@ import logging
 import re
 import threading
 import wave
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 
 _REF_SAMPLE_RATE = 24000
+_DEFAULT_REF_AUDIO_MAX_DURATION_SEC = 8.0
 
 
 @dataclass
@@ -40,6 +42,24 @@ class ReferenceAudioSupport:
     speech_tokenizer_encoder_path: Optional[Path] = None
     speech_tokenizer_codec_fused_path: Optional[Path] = None
     code2wav_decoder_path: Optional[Path] = None
+    ref_audio_max_duration_sec: float = _DEFAULT_REF_AUDIO_MAX_DURATION_SEC
+    ref_codec_reason: str = ""
+
+    @property
+    def speaker_encoder_available(self) -> bool:
+        return self.available
+
+    @property
+    def ref_codec_available(self) -> bool:
+        return self.available and self.speech_tokenizer_codec_fused_path is not None
+
+    @property
+    def icl_available(self) -> bool:
+        return self.speaker_encoder_available and self.ref_codec_available
+
+    @property
+    def ref_c2w_warm_state_available(self) -> bool:
+        return self.ref_codec_available and self.code2wav_decoder_path is not None
 
 
 @dataclass
@@ -60,17 +80,28 @@ class ReferenceAudioFeatures:
 class ReferenceAudioProcessor:
     """Prepare Base voice-clone reference features with TensorRT engines."""
 
-    def __init__(self, engine_dir: str, variant: str, device_id: int = 0):
+    def __init__(
+        self,
+        engine_dir: str,
+        variant: str,
+        device_id: int = 0,
+        *,
+        cache_enabled: bool = True,
+        cache_max_entries: int = 16,
+    ):
         self._engine_dir = Path(engine_dir) if engine_dir else Path()
         self._variant = variant or ""
         self._device_id = int(device_id)
+        self._cache_enabled = bool(cache_enabled) and int(cache_max_entries) > 0
+        self._cache_max_entries = max(0, int(cache_max_entries))
         self._support = self._probe()
         self._lock = threading.Lock()
+        self._cache_lock = threading.Lock()
         self._speaker_engine = None
         self._codec_engine = None
         self._c2w_engine = None
         self._stream = None
-        self._cache: dict[str, ReferenceAudioFeatures] = {}
+        self._cache: OrderedDict[str, ReferenceAudioFeatures] = OrderedDict()
 
     @property
     def support(self) -> ReferenceAudioSupport:
@@ -97,12 +128,12 @@ class ReferenceAudioProcessor:
             require_ref_codec=bool(require_ref_codec),
             cache_tag=cache_tag,
         )
-        cached = self._cache.get(cache_key)
+        cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
 
         with self._lock:
-            cached = self._cache.get(cache_key)
+            cached = self._cache_get(cache_key)
             if cached is not None:
                 return cached
 
@@ -113,7 +144,16 @@ class ReferenceAudioProcessor:
                 raise ValueError(f"invalid_ref_audio: {exc}") from exc
             wav_24k = _resample_linear(wav, sr, _REF_SAMPLE_RATE)
             duration_sec = float(wav_24k.shape[0]) / float(_REF_SAMPLE_RATE)
-            warnings = _validate_reference_audio_quality(wav_24k, duration_sec)
+            max_duration_sec = (
+                self._resolve_ref_audio_max_duration_sec()
+                if require_ref_codec
+                else 20.0
+            )
+            warnings = _validate_reference_audio_quality(
+                wav_24k,
+                duration_sec,
+                max_duration_sec=max_duration_sec,
+            )
 
             spk_embedding = self._run_speaker_encoder(wav_24k)
             ref_codec_sum_vec = None
@@ -142,8 +182,26 @@ class ReferenceAudioProcessor:
                 cache_key=cache_key,
                 warnings=warnings,
             )
-            self._cache[cache_key] = features
+            self._cache_put(cache_key, features)
             return features
+
+    def _cache_get(self, cache_key: str) -> Optional[ReferenceAudioFeatures]:
+        if not self._cache_enabled:
+            return None
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._cache.move_to_end(cache_key)
+            return cached
+
+    def _cache_put(self, cache_key: str, features: ReferenceAudioFeatures) -> None:
+        if not self._cache_enabled:
+            return
+        with self._cache_lock:
+            self._cache[cache_key] = features
+            self._cache.move_to_end(cache_key)
+            while len(self._cache) > self._cache_max_entries:
+                self._cache.popitem(last=False)
 
     def _probe(self) -> ReferenceAudioSupport:
         if not (self._variant.startswith("base-") or self._variant.startswith("icl-")):
@@ -163,6 +221,12 @@ class ReferenceAudioProcessor:
             engine_dir / "speech_tokenizer_codec_fused" / "model.plan",
             engine_dir / "speech_tokenizer_codec_fused" / "speech_tokenizer_codec_fused.engine",
         )
+        ref_codec_reason = ""
+        if speech_tokenizer_codec_fused is None:
+            ref_codec_reason = (
+                "speech_tokenizer_codec_fused_trt_missing: missing "
+                f"speech_tokenizer_codec_fused TensorRT engine under: {engine_dir}"
+            )
         code2wav_decoder = _first_existing(
             engine_dir.parent / "tokenizer" / "code2wav_decoder.engine",
             Path("workspace/exported/tokenizer/code2wav_decoder.engine"),
@@ -183,6 +247,7 @@ class ReferenceAudioProcessor:
                 speech_tokenizer_encoder_path=speech_tokenizer_encoder,
                 speech_tokenizer_codec_fused_path=speech_tokenizer_codec_fused,
                 code2wav_decoder_path=code2wav_decoder,
+                ref_codec_reason=ref_codec_reason,
             )
 
         if not importlib.util.find_spec("torch"):
@@ -193,6 +258,7 @@ class ReferenceAudioProcessor:
                 speech_tokenizer_encoder_path=speech_tokenizer_encoder,
                 speech_tokenizer_codec_fused_path=speech_tokenizer_codec_fused,
                 code2wav_decoder_path=code2wav_decoder,
+                ref_codec_reason=ref_codec_reason,
             )
 
         if not importlib.util.find_spec("tensorrt"):
@@ -203,6 +269,7 @@ class ReferenceAudioProcessor:
                 speech_tokenizer_encoder_path=speech_tokenizer_encoder,
                 speech_tokenizer_codec_fused_path=speech_tokenizer_codec_fused,
                 code2wav_decoder_path=code2wav_decoder,
+                ref_codec_reason=ref_codec_reason,
             )
 
         return ReferenceAudioSupport(
@@ -211,6 +278,7 @@ class ReferenceAudioProcessor:
             speech_tokenizer_encoder_path=speech_tokenizer_encoder if speech_tokenizer_encoder.is_file() else None,
             speech_tokenizer_codec_fused_path=speech_tokenizer_codec_fused,
             code2wav_decoder_path=code2wav_decoder,
+            ref_codec_reason=ref_codec_reason,
         )
 
     def _feature_cache_key(
@@ -251,6 +319,9 @@ class ReferenceAudioProcessor:
                 device,
             )
             self._codec_engine.load()
+            self._support.ref_audio_max_duration_sec = (
+                self._infer_codec_max_duration_sec(self._codec_engine)
+            )
         if (
             require_ref_codec
             and self._support.code2wav_decoder_path is not None
@@ -261,6 +332,31 @@ class ReferenceAudioProcessor:
                 device,
             )
             self._c2w_engine.load()
+
+    def _resolve_ref_audio_max_duration_sec(self) -> float:
+        if self._support.ref_audio_max_duration_sec > 0:
+            return float(self._support.ref_audio_max_duration_sec)
+        if self._codec_engine is not None:
+            self._support.ref_audio_max_duration_sec = (
+                self._infer_codec_max_duration_sec(self._codec_engine)
+            )
+            return float(self._support.ref_audio_max_duration_sec)
+        return _DEFAULT_REF_AUDIO_MAX_DURATION_SEC
+
+    @staticmethod
+    def _infer_codec_max_duration_sec(codec_engine) -> float:
+        try:
+            max_shape = codec_engine.get_input_profile_max_shape("waveform")
+        except Exception:
+            max_shape = None
+        if max_shape:
+            try:
+                max_samples = int(max_shape[-1])
+            except (TypeError, ValueError):
+                max_samples = 0
+            if max_samples > 0:
+                return float(max_samples) / float(_REF_SAMPLE_RATE)
+        return _DEFAULT_REF_AUDIO_MAX_DURATION_SEC
 
     def _run_speaker_encoder(self, wav_24k: np.ndarray):
         import torch
@@ -499,20 +595,26 @@ def _artifact_fingerprint(path: Optional[Path]) -> str:
 def _validate_reference_audio_quality(
     audio: np.ndarray,
     duration_sec: float,
+    *,
+    max_duration_sec: float = _DEFAULT_REF_AUDIO_MAX_DURATION_SEC,
 ) -> list[str]:
     if duration_sec < 1.0:
         raise ValueError(
             f"ref_audio_too_short: reference audio duration {duration_sec:.2f}s is below 1.0s"
         )
-    if duration_sec > 20.0:
+    max_duration_sec = float(max_duration_sec or _DEFAULT_REF_AUDIO_MAX_DURATION_SEC)
+    if duration_sec > max_duration_sec:
         raise ValueError(
-            f"invalid_ref_audio: reference audio duration {duration_sec:.2f}s exceeds 20.0s"
+            f"invalid_ref_audio: reference audio duration {duration_sec:.2f}s "
+            f"exceeds {max_duration_sec:.2f}s"
         )
 
     warnings: list[str] = []
-    if duration_sec < 3.0 or duration_sec > 10.0:
+    recommended_max = min(10.0, max_duration_sec)
+    if duration_sec < 3.0 or duration_sec > recommended_max:
         warnings.append(
-            f"reference audio duration {duration_sec:.2f}s is outside the recommended 3-10s range"
+            f"reference audio duration {duration_sec:.2f}s is outside the recommended "
+            f"3-{recommended_max:g}s range"
         )
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     mean_abs = float(np.mean(np.abs(audio))) if audio.size else 0.0

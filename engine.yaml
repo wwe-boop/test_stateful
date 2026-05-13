@@ -43,6 +43,10 @@ prefix_cache:
   max_entries: 16            # number of distinct prefix KV entries to cache
   max_prefix_len: 512        # max token length for a cached prefix
 
+reference_cache:
+  enabled: true
+  max_entries: 16            # cached ref-audio preprocessing results (separate from prefix KV)
+
 spliter:
   ema_ratio_initial: 6.0
   ema_alpha: 0.1
@@ -70,5 +74,9 @@ prefill:
 # reference still falls back to ENGINE_DEFAULT_BASE_REF_AUDIO_PATH /
 # ENGINE_DEFAULT_BASE_REF_TEXT or workspace/default_refs/base_ref.wav.
 references:
-  default: default
-  entries: {}
+  default: liangwuque
+  entries:
+    liangwuque:
+      audio_path: resources/speakers/liangwuque/ref.wav
+      ref_text: 爱护环境，人人有责，让我们一起守护前海石公园环境卫生！
+      language: zh

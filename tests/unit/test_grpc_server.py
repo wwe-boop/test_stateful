@@ -75,6 +75,12 @@ def test_make_capabilities_response_maps_contract_fields():
         ],
         "ref_audio_available": False,
         "ref_audio_reason": "voice_clone unavailable",
+        "speaker_encoder_available": True,
+        "ref_codec_available": True,
+        "icl_available": True,
+        "ref_audio_max_duration_sec": 8.0,
+        "ref_c2w_warm_state_available": False,
+        "ref_codec_reason": "",
     })
 
     assert response.variant == "custom-1.7b"
@@ -91,10 +97,14 @@ def test_make_capabilities_response_maps_contract_fields():
     assert response.supported_audio_formats[1].encoding == tts_pb2.AUDIO_ENCODING_PCM_S16LE
     assert response.supported_audio_formats[1].sample_rate == 16000
     assert response.ref_audio_available is False
+    assert response.speaker_encoder_available is True
+    assert response.ref_codec_available is True
+    assert response.icl_available is True
+    assert response.ref_audio_max_duration_sec == pytest.approx(8.0)
+    assert response.ref_c2w_warm_state_available is False
 
 
-@pytest.mark.asyncio
-async def test_get_capabilities_returns_engine_contract():
+def test_get_capabilities_returns_engine_contract():
     class _StubEngine:
         def describe_capabilities(self):
             return {
@@ -108,17 +118,24 @@ async def test_get_capabilities_returns_engine_contract():
                 ],
                 "ref_audio_available": False,
                 "ref_audio_reason": "",
+                "speaker_encoder_available": False,
+                "ref_codec_available": False,
+                "icl_available": False,
+                "ref_audio_max_duration_sec": 0.0,
+                "ref_c2w_warm_state_available": False,
+                "ref_codec_reason": "",
             }
 
     servicer = TTSServicer(_StubEngine())
-    response = await servicer.GetCapabilities(tts_pb2.GetCapabilitiesRequest(), context=None)
+    response = asyncio.run(
+        servicer.GetCapabilities(tts_pb2.GetCapabilitiesRequest(), context=None)
+    )
 
     assert response.loaded_model_type == "custom_voice"
     assert response.supported_audio_formats[0].sample_rate == 24000
 
 
-@pytest.mark.asyncio
-async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
+def test_streaming_audio_is_not_blocked_by_next_text_chunk():
     class _StubEngine:
         def __init__(self):
             self._on_audio = None
@@ -165,9 +182,13 @@ async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
         await asyncio.sleep(0.2)
         yield tts_pb2.SynthesizeRequest(end=tts_pb2.EndRequest())
 
-    stream = servicer.SynthesizeStream(request_gen(), context=None)
-    first_response = await asyncio.wait_for(anext(stream), timeout=0.1)
-    second_response = await asyncio.wait_for(anext(stream), timeout=0.1)
+    async def _run():
+        stream = servicer.SynthesizeStream(request_gen(), context=None)
+        first_response = await asyncio.wait_for(anext(stream), timeout=0.1)
+        second_response = await asyncio.wait_for(anext(stream), timeout=0.1)
+        return first_response, second_response
+
+    first_response, second_response = asyncio.run(_run())
 
     assert first_response.WhichOneof("response") == "event"
     assert first_response.event.type == "start"
@@ -175,8 +196,7 @@ async def test_streaming_audio_is_not_blocked_by_next_text_chunk():
     assert second_response.WhichOneof("response") == "audio"
 
 
-@pytest.mark.asyncio
-async def test_streaming_text_protocol_events_are_forwarded():
+def test_streaming_text_protocol_events_are_forwarded():
     class _StubEngine:
         def __init__(self):
             self._on_audio = None
@@ -231,9 +251,13 @@ async def test_streaming_text_protocol_events_are_forwarded():
         yield tts_pb2.SynthesizeRequest(text=tts_pb2.TextChunk(text="你好。"))
         yield tts_pb2.SynthesizeRequest(end=tts_pb2.EndRequest())
 
-    responses = []
-    async for response in servicer.SynthesizeStream(request_gen(), context=None):
-        responses.append(response)
+    async def _run():
+        responses = []
+        async for response in servicer.SynthesizeStream(request_gen(), context=None):
+            responses.append(response)
+        return responses
+
+    responses = asyncio.run(_run())
 
     event_types = [
         response.event.type

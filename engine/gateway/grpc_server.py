@@ -369,6 +369,12 @@ def _make_capabilities_response(cap: dict) -> tts_pb2.GetCapabilitiesResponse:
         ],
         ref_audio_available=bool(cap.get("ref_audio_available", False)),
         ref_audio_reason=str(cap.get("ref_audio_reason", "") or ""),
+        speaker_encoder_available=bool(cap.get("speaker_encoder_available", False)),
+        ref_codec_available=bool(cap.get("ref_codec_available", False)),
+        icl_available=bool(cap.get("icl_available", False)),
+        ref_audio_max_duration_sec=float(cap.get("ref_audio_max_duration_sec", 0.0) or 0.0),
+        ref_c2w_warm_state_available=bool(cap.get("ref_c2w_warm_state_available", False)),
+        ref_codec_reason=str(cap.get("ref_codec_reason", "") or ""),
     )
 
 

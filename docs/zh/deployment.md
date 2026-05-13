@@ -91,6 +91,14 @@ bash scripts/bash/deploy.sh run \
 - capabilities: `http://localhost:50052/v1/capabilities`
 - health: `http://localhost:8080/health`
 
+`base` / `icl` reference preprocessing 在 standalone TRT 路径中由
+`speaker_encoder.engine`、`speech_tokenizer_codec_fused.engine` 和可选
+`code2wav_decoder.engine` 串行执行，目前不做 batch。`spliter.max_concurrent_segments`
+只影响后续文本分段和 EngineLoop slot 并发，不控制 speech encoder。reference
+音频最大时长以 capabilities 中的 `ref_audio_max_duration_sec` 为准，当前
+TRT 构建默认是 8 秒。`reference_cache` 缓存 ref-audio preprocessing
+features，`prefix_cache` 缓存 Talker ICL prefix KV，两者独立配置。
+
 ### Engine Docker
 
 ```bash

@@ -59,6 +59,12 @@ message GetCapabilitiesResponse {
   repeated AudioFormat supported_audio_formats = 6;
   bool ref_audio_available = 7;
   string ref_audio_reason = 8;
+  bool speaker_encoder_available = 9;
+  bool ref_codec_available = 10;
+  bool icl_available = 11;
+  float ref_audio_max_duration_sec = 12;
+  bool ref_c2w_warm_state_available = 13;
+  string ref_codec_reason = 14;
 }
 
 message SessionConfig {

@@ -146,6 +146,13 @@ class PrefixCacheConfig:
 
 
 @dataclass
+class ReferenceCacheConfig:
+    """Cross-request reference-audio feature cache."""
+    enabled: bool = True
+    max_entries: int = 16
+
+
+@dataclass
 class SpliterConfig:
     """Text segmentation / Spliter parameters."""
     ema_ratio_initial: float = 5.5
@@ -197,6 +204,7 @@ class EngineConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     prefix_cache: PrefixCacheConfig = field(default_factory=PrefixCacheConfig)
+    reference_cache: ReferenceCacheConfig = field(default_factory=ReferenceCacheConfig)
     spliter: SpliterConfig = field(default_factory=SpliterConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     prefill: PrefillConfig = field(default_factory=PrefillConfig)
@@ -206,6 +214,18 @@ class EngineConfig:
 # ---------------------------------------------------------------------------
 # Loading helpers
 # ---------------------------------------------------------------------------
+
+_CONFIG_SECTION_NAMES = (
+    "paths",
+    "server",
+    "scheduler",
+    "prefix_cache",
+    "reference_cache",
+    "spliter",
+    "sampling",
+    "prefill",
+    "references",
+)
 
 def _deep_update(base: dict, override: dict) -> dict:
     """Recursively merge override into base dict."""
@@ -226,10 +246,22 @@ def _apply_env_overrides(raw: dict) -> dict:
     for key, val in os.environ.items():
         if not key.startswith(prefix):
             continue
-        parts = key[len(prefix):].lower().split("_", 1)
-        if len(parts) < 2:
+        body = key[len(prefix):].lower()
+        section = ""
+        field_name = ""
+        for candidate in sorted(_CONFIG_SECTION_NAMES, key=len, reverse=True):
+            candidate_prefix = f"{candidate}_"
+            if body.startswith(candidate_prefix):
+                section = candidate
+                field_name = body[len(candidate_prefix):]
+                break
+        if not section:
+            parts = body.split("_", 1)
+            if len(parts) < 2:
+                continue
+            section, field_name = parts
+        if not field_name:
             continue
-        section, field_name = parts[0], parts[1]
         if section not in raw:
             raw[section] = {}
         raw[section][field_name] = _coerce_value(val)
@@ -261,6 +293,7 @@ def _dict_to_config(raw: dict) -> EngineConfig:
         ("server", ServerConfig),
         ("scheduler", SchedulerConfig),
         ("prefix_cache", PrefixCacheConfig),
+        ("reference_cache", ReferenceCacheConfig),
         ("spliter", SpliterConfig),
         ("sampling", SamplingConfig),
         ("prefill", PrefillConfig),

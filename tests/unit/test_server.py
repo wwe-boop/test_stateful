@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +26,19 @@ class _StubFrontend:
     async def create_session(self, session_id: str, *, config, on_audio=None, on_done=None, on_event=None):
         self.calls.append((session_id, config, on_audio, on_done, on_event))
         return {"session_id": session_id, "config": config}
+
+
+def _available_ref_support(*, codec: bool = True) -> ReferenceAudioSupport:
+    return ReferenceAudioSupport(
+        available=True,
+        speaker_encoder_path=Path("speaker_encoder.engine"),
+        speech_tokenizer_codec_fused_path=(
+            Path("speech_tokenizer_codec_fused.engine") if codec else None
+        ),
+        ref_codec_reason=(
+            "" if codec else "speech_tokenizer_codec_fused_trt_missing: missing codec"
+        ),
+    )
 
 
 def test_validate_session_config_rejects_unsupported_task_type():
@@ -57,7 +72,7 @@ def test_validate_session_config_uses_default_ref_audio_for_base(monkeypatch, tm
         supported_task_types=("base",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="base")
@@ -84,7 +99,7 @@ def test_validate_session_config_requires_ref_audio_when_default_missing(monkeyp
         supported_task_types=("base",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     with pytest.raises(ValueError, match="no default Base reference audio"):
@@ -125,6 +140,39 @@ def test_start_session_validates_before_delegating():
     assert frontend.calls[0][1] is config
 
 
+def test_start_session_reference_preprocessing_runs_off_event_loop(monkeypatch):
+    engine = TTSEngine(model_arch=ModelArchConfig(
+        variant="custom-1.7b",
+        tts_model_type="custom_voice",
+        supported_task_types=("custom_voice",),
+    ))
+    engine._frontend = _StubFrontend()
+
+    def _blocking_prepare(config):
+        time.sleep(0.05)
+
+    monkeypatch.setattr(engine, "_prepare_reference_audio_features", _blocking_prepare)
+
+    async def _run():
+        task = asyncio.create_task(
+            engine.start_session(
+                "sid-offload",
+                config=SessionConfig(task_type="custom_voice", speaker="Serena"),
+            )
+        )
+        ticks = []
+
+        async def _tick():
+            await asyncio.sleep(0.01)
+            ticks.append("tick")
+
+        await asyncio.wait_for(_tick(), timeout=0.03)
+        assert ticks == ["tick"]
+        await task
+
+    asyncio.run(_run())
+
+
 def test_validate_session_config_binds_empty_task_type_to_loaded_model():
     engine = TTSEngine(model_arch=ModelArchConfig(
         variant="custom-1.7b",
@@ -145,7 +193,7 @@ def test_validate_session_config_maps_base_model_to_internal_voice_clone():
         supported_task_types=("base",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="", ref_audio=b"wav")
@@ -162,7 +210,7 @@ def test_validate_session_config_maps_base_ref_text_to_icl():
         supported_task_types=("base",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="base", ref_audio=b"wav", ref_text="你好")
@@ -181,7 +229,7 @@ def test_validate_session_config_explicit_reference_ignores_speaker_alias():
         supported_task_types=("base",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(
@@ -206,7 +254,7 @@ def test_validate_session_config_maps_icl_model_to_internal_voice_clone():
         supported_task_types=("icl",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="", ref_audio=b"wav", ref_text="你好")
@@ -223,7 +271,7 @@ def test_validate_session_config_requires_ref_text_for_icl():
         supported_task_types=("icl",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     with pytest.raises(ValueError, match="ref_text is required for loaded model_type 'icl'"):
@@ -250,7 +298,7 @@ def test_validate_session_config_uses_default_ref_audio_for_icl(monkeypatch, tmp
         supported_task_types=("icl",),
     ))
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="icl")
@@ -283,7 +331,7 @@ def test_validate_session_config_resolves_base_speaker_as_reference_alias(tmp_pa
         ),
     )
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="base", speaker="vivian")
@@ -295,6 +343,97 @@ def test_validate_session_config_resolves_base_speaker_as_reference_alias(tmp_pa
     assert config.ref_source == "registry"
     assert config.ref_audio == b"alias-wav"
     assert config.ref_text == "别名参考文本"
+
+
+def test_validate_session_config_applies_registry_language_for_auto(tmp_path):
+    ref_path = tmp_path / "vivian.wav"
+    ref_path.write_bytes(b"alias-wav")
+    cfg = EngineConfig()
+    cfg.references.entries = {
+        "Vivian": {
+            "audio_path": str(ref_path),
+            "ref_text": "别名参考文本",
+            "language": "zh",
+        }
+    }
+
+    engine = TTSEngine(
+        config=cfg,
+        model_arch=ModelArchConfig(
+            variant="base-1.7b",
+            tts_model_type="base",
+            supported_task_types=("base",),
+        ),
+    )
+    engine._ref_audio_processor = _StubSupportProbe(_available_ref_support())
+
+    config = SessionConfig(task_type="base", speaker="vivian", language="auto")
+    engine._validate_session_config(config)
+
+    assert config.language == "zh"
+
+
+def test_validate_session_config_keeps_explicit_language_over_registry(tmp_path):
+    ref_path = tmp_path / "vivian.wav"
+    ref_path.write_bytes(b"alias-wav")
+    cfg = EngineConfig()
+    cfg.references.entries = {
+        "Vivian": {
+            "audio_path": str(ref_path),
+            "ref_text": "别名参考文本",
+            "language": "zh",
+        }
+    }
+
+    engine = TTSEngine(
+        config=cfg,
+        model_arch=ModelArchConfig(
+            variant="base-1.7b",
+            tts_model_type="base",
+            supported_task_types=("base",),
+        ),
+    )
+    engine._ref_audio_processor = _StubSupportProbe(_available_ref_support())
+
+    config = SessionConfig(task_type="base", speaker="vivian", language="en")
+    engine._validate_session_config(config)
+
+    assert config.language == "en"
+
+
+def test_validate_session_config_explicit_reference_does_not_apply_registry_language(tmp_path):
+    ref_path = tmp_path / "vivian.wav"
+    ref_path.write_bytes(b"alias-wav")
+    cfg = EngineConfig()
+    cfg.references.entries = {
+        "Vivian": {
+            "audio_path": str(ref_path),
+            "ref_text": "别名参考文本",
+            "language": "zh",
+        }
+    }
+
+    engine = TTSEngine(
+        config=cfg,
+        model_arch=ModelArchConfig(
+            variant="base-1.7b",
+            tts_model_type="base",
+            supported_task_types=("base",),
+        ),
+    )
+    engine._ref_audio_processor = _StubSupportProbe(_available_ref_support())
+
+    config = SessionConfig(
+        task_type="base",
+        speaker="vivian",
+        ref_audio=b"wav",
+        ref_text="你好",
+        language="auto",
+    )
+    engine._validate_session_config(config)
+
+    assert config.language == "auto"
+    assert config.ref_source == "explicit"
 
 
 def test_validate_session_config_uses_configured_default_reference(tmp_path):
@@ -318,7 +457,7 @@ def test_validate_session_config_uses_configured_default_reference(tmp_path):
         ),
     )
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     config = SessionConfig(task_type="icl")
@@ -348,7 +487,7 @@ def test_validate_session_config_missing_reference_alias_errors():
         ),
     )
     engine._ref_audio_processor = _StubSupportProbe(
-        ReferenceAudioSupport(available=True)
+        _available_ref_support()
     )
 
     with pytest.raises(ValueError, match="reference_not_found"):
@@ -404,6 +543,23 @@ def test_describe_capabilities_reports_loaded_model_contract():
     assert cap["supported_input_modes"] == ["token", "clause", "long_segment", "full_text"]
     assert cap["supported_group_policies"] == ["none", "auto"]
     assert cap["ref_audio_available"] is False
+
+
+def test_describe_capabilities_reports_missing_icl_codec():
+    engine = TTSEngine(model_arch=ModelArchConfig(
+        variant="base-1.7b",
+        tts_model_type="base",
+        supported_task_types=("base",),
+    ))
+    engine._ref_audio_processor = _StubSupportProbe(_available_ref_support(codec=False))
+
+    cap = engine.describe_capabilities()
+
+    assert cap["speaker_encoder_available"] is True
+    assert cap["ref_codec_available"] is False
+    assert cap["icl_available"] is False
+    assert cap["ref_audio_available"] is False
+    assert "speech_tokenizer_codec_fused_trt_missing" in cap["ref_audio_reason"]
 
 
 def test_runtime_profile_rejects_oversized_batch():

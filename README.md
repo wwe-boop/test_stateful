@@ -154,6 +154,11 @@ references:
       audio_path: workspace/default_refs/vivian.wav
       ref_text: 这是一段与 vivian 参考音频完全一致的文本。
       language: auto
+
+# Optional: cache ref-audio preprocessing features separately from Talker prefix KV.
+reference_cache:
+  enabled: true
+  max_entries: 16
 ```
 
 字段语义需要区分清楚：
@@ -165,6 +170,8 @@ references:
 - `icl`: 显式 reference 必须同时包含 `ref_audio + ref_text`；只传其中一个会报错。
 
 standalone `--engine-mode trt` 的 ICL 预处理强制使用 TensorRT，不做 ONNX Runtime fallback。部署包 `runtime/` 至少需要 `speaker_encoder.engine` 和 `speech_tokenizer_codec_fused.engine`，或等价的 `speaker_encoder/model.plan` 与 `speech_tokenizer_codec_fused/model.plan`。如果只存在 `.onnx`，服务会报出缺少 TensorRT engine 的明确错误。
+
+ICL reference 音频会先经过单路串行的 TRT preprocessing：`speaker_encoder.engine` 生成 speaker embedding，`speech_tokenizer_codec_fused.engine` 生成 temporal `ref_codec_sum_vec`，可选 `code2wav_decoder.engine` 生成 reference warm state。当前不对这一路做 batch；`spliter.max_concurrent_segments` 只控制后续文本分段与 EngineLoop slot 并发，不控制 speech encoder 并发。reference 音频最大时长以 `/v1/capabilities` 的 `ref_audio_max_duration_sec` 为准；当前 TRT 构建默认是 8 秒。`reference_cache` 缓存这一步的 ref-audio features，`prefix_cache` 则缓存 Talker ICL prefix KV，两者相互独立。
 
 7. 验收服务：
 
