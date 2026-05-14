@@ -110,6 +110,10 @@ if [ -f "${EXPORTED_DIR}/${VARIANT}/talker_code2wav_fused.engine" ] || [ -f "${E
   [ -f "${TEST_REPO_TRT}/tts_orchestrator/1/resources/speakers/liangwuque/ref.txt" ] || { log_error "Missing TRT packaged speaker ref.txt"; exit 1; }
   [ -f "${RUNTIME_TRT}/triton_manifest.json" ] || { log_error "Missing TRT runtime manifest"; exit 1; }
   [ -f "${RUNTIME_TRT}/model.plan" ] || { log_error "Missing TRT runtime/model.plan"; exit 1; }
+  if [ -f "${EXPORTED_DIR}/tokenizer/code2wav_decoder.engine" ]; then
+    [ -f "${TEST_REPO_TRT}/tts_orchestrator/1/tokenizer/code2wav_decoder.engine" ] \
+      || { log_error "Missing TRT tokenizer/code2wav_decoder.engine for ICL warm state"; exit 1; }
+  fi
   [ ! -e "${TEST_REPO_TRT}/talker_code2wav_fused" ] || { log_error "Unexpected top-level talker_code2wav_fused model in TRT repo"; exit 1; }
   grep -q 'key: "model_package_dir"' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config missing model_package_dir"; exit 1; }
   grep -q '/models/tts_orchestrator/1' "${TEST_REPO_TRT}/tts_orchestrator/config.pbtxt" || { log_error "TRT orchestrator config has wrong model_package_dir"; exit 1; }

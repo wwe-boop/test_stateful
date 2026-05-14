@@ -59,7 +59,7 @@ spliter:
   l3_split_cap_ratio: 0.90
 
 sampling:
-  do_sample: true
+  do_sample: false
   temperature: 0.9
   repetition_penalty: 1.05
   top_k: 50

@@ -1112,7 +1112,9 @@ class EngineWebSocketTransport:
             try:
                 opcode, payload = ws_recv_frame(conn)
             except socket.timeout:
-                return False if stop_on_idle else False
+                if stop_on_idle:
+                    return False
+                continue
             terminal = self._consume_frame(
                 result,
                 chunks,

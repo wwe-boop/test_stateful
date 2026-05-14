@@ -446,6 +446,13 @@ assemble_model_repo() {
             [ -f "$tok_dir/$tf" ] && \
                 _link_or_copy "$tok_dir/$tf" "$orch_model_dir/tokenizer/$tf"
         done
+        if [ "$engine_mode" = "trt" ] && [ -f "$tokenizer_dir/code2wav_decoder.engine" ]; then
+            _link_or_copy "$tokenizer_dir/code2wav_decoder.engine" \
+                "$orch_model_dir/tokenizer/code2wav_decoder.engine"
+            log_info "  tts_orchestrator/tokenizer/code2wav_decoder.engine: OK (ICL warm state)"
+        elif [ "$engine_mode" = "trt" ] && [ -f "$tokenizer_dir/code2wav_decoder.onnx" ]; then
+            log_warn "  tts_orchestrator/tokenizer/code2wav_decoder.engine: SKIPPED (run Phase B to enable ICL warm state)"
+        fi
         log_info "  tts_orchestrator/tokenizer: OK"
     else
         log_warn "  tts_orchestrator/tokenizer: SKIPPED (model dir not found)"
