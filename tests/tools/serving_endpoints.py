@@ -42,6 +42,7 @@ from raw_websocket import (
     ws_close,
     ws_connect,
     ws_recv_frame,
+    ws_send_frame,
     ws_send_json,
 )
 
@@ -1114,6 +1115,11 @@ class EngineWebSocketTransport:
             except socket.timeout:
                 if stop_on_idle:
                     return False
+                continue
+            if opcode == 0x9:
+                ws_send_frame(conn, opcode=0xA, payload=payload)
+                continue
+            if opcode == 0xA:
                 continue
             terminal = self._consume_frame(
                 result,
