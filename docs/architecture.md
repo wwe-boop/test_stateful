@@ -1861,7 +1861,7 @@ message SamplingParams {
     float top_p = 3;                // default: 1.0
     float repetition_penalty = 4;   // default: 1.05
     int32 max_new_tokens = 5;       // default: 4096
-    bool do_sample = 6;             // default: true
+    bool do_sample = 6;             // default: false
     // Code Predictor 采样 (通常使用默认值)
     float subtalker_temperature = 7;
     int32 subtalker_top_k = 8;

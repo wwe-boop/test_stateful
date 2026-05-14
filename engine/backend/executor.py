@@ -448,7 +448,7 @@ class Executor:
         max_batch_size: int = 48,
         max_seq_len: int = 512,
         model_config: Optional[ModelConfig] = None,
-        do_sample: bool = True,
+        do_sample: bool = False,
         temperature: float = 0.9,
         repetition_penalty: float = 1.05,
         random_seed: int = 0,

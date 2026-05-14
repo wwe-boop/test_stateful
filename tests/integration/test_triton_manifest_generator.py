@@ -66,6 +66,7 @@ def test_render_orchestrator_custom_variant():
     assert 'string_value: "custom_voice"' in text
     assert 'key: "model_package_dir"' in text
     assert 'string_value: "/models/tts_orchestrator/1"' in text
+    assert 'key: "do_sample"\n  value: { string_value: "false" }' in text
 
 
 def test_render_orchestrator_http_custom_variant():
@@ -105,6 +106,7 @@ def test_load_manifest_merges_orchestrator_defaults(tmp_path):
     m = load_manifest(mpath, output_repo=None)
     assert m["orchestrator"]["tts_model_type"] == "custom_voice"
     assert m["orchestrator"]["model_package_dir"] == "/models/tts_orchestrator/1"
+    assert m["orchestrator"]["do_sample"] == "false"
 
 
 def test_build_manifest_for_export_roundtrip():

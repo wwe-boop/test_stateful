@@ -62,8 +62,8 @@ def _require_engine_gateway():
     return tts_pb2, tts_pb2_grpc
 
 DEFAULT_ENGINE_GRPC = "localhost:50051"
-DEFAULT_ENGINE_WS = "ws://localhost:50052/v1/ws"
-# DEFAULT_ENGINE_WS = "ws://8.160.176.148:1181/v1/ws"
+# DEFAULT_ENGINE_WS = "ws://localhost:50052/v1/ws"
+DEFAULT_ENGINE_WS = "ws://8.160.176.148:1181/v1/ws"
 DEFAULT_TRITON_HTTP = "http://localhost:8000"
 DEFAULT_TRITON_GRPC = "localhost:8001"
 DEFAULT_TRITON_MODEL = "tts_orchestrator"

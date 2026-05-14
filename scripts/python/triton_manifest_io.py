@@ -56,6 +56,7 @@ def variant_orchestrator_defaults(
         "audio_chunk_frames": "25",
         "first_chunk_frames": "4",
         "model_package_dir": model_package_dir,
+        "do_sample": "false",
     }
 
 

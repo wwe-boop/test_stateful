@@ -172,7 +172,7 @@ class SpliterConfig:
 @dataclass
 class SamplingConfig:
     """Decode sampling parameters (defaults, overridable per-request)."""
-    do_sample: bool = True
+    do_sample: bool = False
     temperature: float = 0.9
     repetition_penalty: float = 1.05
     top_k: int = 50

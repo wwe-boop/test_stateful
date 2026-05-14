@@ -103,6 +103,14 @@ def _parse_bool(raw: Any, default: bool) -> bool:
     return default
 
 
+def _env_string(*names: str, default: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
+
+
 def _normalize_request_task_type(requested: str, loaded_model_type: str) -> str:
     requested = (requested or "").strip()
     loaded_model_type = (loaded_model_type or "").strip()
@@ -264,17 +272,29 @@ class TritonPythonModel:
             )
         )
         cfg.sampling.do_sample = _parse_bool(
-            _param_string(params, "do_sample", os.environ.get("DO_SAMPLE", "1")),
-            True,
+            _param_string(
+                params,
+                "do_sample",
+                _env_string("ENGINE_SAMPLING_DO_SAMPLE", "DO_SAMPLE", default="false"),
+            ),
+            False,
         )
         cfg.sampling.temperature = float(
-            _param_string(params, "temperature", os.environ.get("TEMPERATURE", "0.9"))
+            _param_string(
+                params,
+                "temperature",
+                _env_string("ENGINE_SAMPLING_TEMPERATURE", "TEMPERATURE", default="0.9"),
+            )
         )
         cfg.sampling.repetition_penalty = float(
             _param_string(
                 params,
                 "repetition_penalty",
-                os.environ.get("REPETITION_PENALTY", "1.05"),
+                _env_string(
+                    "ENGINE_SAMPLING_REPETITION_PENALTY",
+                    "REPETITION_PENALTY",
+                    default="1.05",
+                ),
             )
         )
         cfg.spliter.ema_ratio_initial = float(

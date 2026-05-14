@@ -556,6 +556,7 @@ def render_orchestrator(
     achunk = orch.get("audio_chunk_frames", "25")
     fchunk = orch.get("first_chunk_frames", "4")
     pdir = orch.get("model_package_dir", "/models/tts_orchestrator/1")
+    do_sample = orch.get("do_sample", "false")
     profile = profile or {}
     max_batch_slots = _profile_int(profile, "max_batch_size", 128)
     engine_max_decode_len = _profile_int(profile, "max_seq_len", 512)
@@ -629,6 +630,10 @@ parameters: {{
 parameters: {{
   key: "engine_max_decode_len"
   value: {{ string_value: "{engine_max_decode_len}" }}
+}}
+parameters: {{
+  key: "do_sample"
+  value: {{ string_value: "{do_sample}" }}
 }}
 parameters: {{
   key: "max_decode_steps"
