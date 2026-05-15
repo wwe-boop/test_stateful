@@ -103,6 +103,76 @@ class _TinyTokenizer:
         return list(range(1, max(4, len(text) + 1)))
 
 
+class _TinyCustomWeights(_TinyICLWeights):
+    def __init__(self):
+        super().__init__()
+        self.spk_id_map = {
+            "customer_service_clone_1000": 3000,
+            "vivian": 3065,
+        }
+        self.spk_is_dialect = {
+            "customer_service_clone_1000": False,
+            "vivian": False,
+        }
+        self.default_speaker = "customer_service_clone_1000"
+        self.fallback_speaker = "customer_service_clone_1000"
+
+
+def test_custom_voice_cache_key_uses_resolved_speaker_id_for_unknown_speaker():
+    from engine.backend.prefill import PrefillBuilder, TaskType
+
+    weights = _TinyCustomWeights()
+    builder = PrefillBuilder(weights, _TinyTokenizer())
+    plan = builder.build_plan_from_ids(
+        task_type=TaskType.CUSTOM_VOICE,
+        token_ids=[101, 102],
+        speaker="Serena",
+    )
+    cache_key = builder.compute_cache_key(
+        TaskType.CUSTOM_VOICE,
+        speaker="Serena",
+    )
+
+    assert plan.prefix_cache_key == cache_key
+    assert plan.prefix_cache_key.endswith("|custom_spk:3000")
+    assert plan.warnings == [
+        "Speaker 'Serena' not found, using fallback_speaker 'customer_service_clone_1000'"
+    ]
+
+
+def test_custom_voice_cache_key_distinguishes_actual_speaker_ids():
+    from engine.backend.prefill import PrefillBuilder, TaskType
+
+    weights = _TinyCustomWeights()
+    builder = PrefillBuilder(weights, _TinyTokenizer())
+
+    default_key = builder.compute_cache_key(TaskType.CUSTOM_VOICE)
+    fallback_key = builder.compute_cache_key(TaskType.CUSTOM_VOICE, speaker="missing")
+    vivian_key = builder.compute_cache_key(TaskType.CUSTOM_VOICE, speaker="Vivian")
+
+    assert default_key == fallback_key
+    assert default_key.endswith("|custom_spk:3000")
+    assert vivian_key.endswith("|custom_spk:3065")
+    assert vivian_key != default_key
+
+
+def test_custom_voice_without_supported_speaker_disables_prefix_cache():
+    from engine.backend.prefill import PrefillBuilder, TaskType
+
+    weights = _TinyICLWeights()
+    builder = PrefillBuilder(weights, _TinyTokenizer())
+    plan = builder.build_plan_from_ids(
+        task_type=TaskType.CUSTOM_VOICE,
+        token_ids=[101],
+        speaker="Serena",
+    )
+
+    assert plan.prefix_cache_key is None
+    assert plan.warnings == [
+        "CustomVoice model has no spk_id map; continuing without speaker codec"
+    ]
+
+
 def test_voice_clone_icl_streaming_prefill_does_not_append_eos_or_pad_before_done():
     from engine.backend.prefill import PrefillBuilder, TaskType
 

@@ -102,20 +102,30 @@ class EmbeddingWeights:
         self.codec_think_eos_id = self.config.get("codec_think_eos_id", 2157)
         self.codec_think_id = self.config.get("codec_think_id", 2154)
         self.codec_language_id = self.config.get("codec_language_id", {})
-        self.spk_id_map = self.config.get("spk_id", {})
-        self.spk_is_dialect = self.config.get("spk_is_dialect") or {}
+        self.spk_id_map = {
+            str(name).strip().lower(): int(spk_id)
+            for name, spk_id in (self.config.get("spk_id", {}) or {}).items()
+            if str(name).strip()
+        }
+        self.spk_is_dialect = {
+            str(name).strip().lower(): dialect
+            for name, dialect in (self.config.get("spk_is_dialect") or {}).items()
+            if str(name).strip()
+        }
         # CustomVoice: empty → default_speaker; unknown name → fallback_speaker.
         # Prefer engine.yaml (passed in); else weights config.json; else vivian.
-        self.default_speaker = str(
+        self.default_speaker = self._canonical_config_speaker(
             default_speaker
             if default_speaker is not None
             else self.config.get("default_speaker", "vivian"),
-        ).strip()
-        self.fallback_speaker = str(
+            "default_speaker",
+        )
+        self.fallback_speaker = self._canonical_config_speaker(
             fallback_speaker
             if fallback_speaker is not None
             else self.config.get("fallback_speaker", "vivian"),
-        ).strip()
+            "fallback_speaker",
+        )
 
         self.device = (
             torch.device(device)
@@ -192,6 +202,24 @@ class EmbeddingWeights:
 
         logger.info("Weights: variant=%s, hidden=%d, vocab=%d",
                      self.variant, self.hidden_size, self.vocab_size)
+
+    def _canonical_config_speaker(self, speaker: Any, field_name: str) -> str:
+        """Normalize configured default/fallback speakers to existing spk_id keys."""
+        raw = str(speaker or "").strip().lower()
+        if not self.spk_id_map:
+            return raw
+        if raw in self.spk_id_map:
+            return raw
+
+        first_speaker = next(iter(self.spk_id_map))
+        if raw:
+            logger.warning(
+                "%s %r not in spk_id map; using first supported speaker %r",
+                field_name,
+                raw,
+                first_speaker,
+            )
+        return first_speaker
 
     def text_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -398,6 +426,18 @@ class PrefillBuilder:
         )
         role_embed = w.text_embed(self._assistant_role_ids_tensor(device))
 
+        speaker_embed = None
+        plan_warnings: list[str] = []
+        custom_speaker_id: Optional[int] = None
+        if task_type == TaskType.CUSTOM_VOICE:
+            resolved_speaker, custom_speaker_id, warn_msg = self._resolve_custom_speaker(
+                speaker,
+                warn=True,
+            )
+            speaker = resolved_speaker
+            if warn_msg:
+                plan_warnings.append(warn_msg)
+
         lang_lower = _normalize_language_name(language)
         language_id: Optional[int] = None
         if lang_lower != "auto":
@@ -429,49 +469,13 @@ class PrefillBuilder:
             torch.tensor([[w.codec_pad_id, w.codec_bos_id]], device=device, dtype=torch.int64)
         )
 
-        speaker_embed = None
-        plan_warnings: list[str] = []
-
         if task_type == TaskType.CUSTOM_VOICE:
-            raw_spk = (speaker or "").strip()
-            if not raw_spk:
-                ds_name = w.default_speaker
-                ds_id = w.spk_id_map.get(ds_name.lower())
-                if ds_id is not None:
-                    speaker_embed = w.codec_embed(
-                        torch.tensor([[ds_id]], device=device, dtype=torch.int64),
-                    )
-                    speaker = ds_name
-                else:
-                    logger.warning(
-                        "default_speaker %r not in spk_id map; continuing without speaker codec",
-                        ds_name,
-                    )
-            elif raw_spk.lower() in w.spk_id_map:
-                spk_id_val = w.spk_id_map[raw_spk.lower()]
+            if custom_speaker_id is not None:
                 speaker_embed = w.codec_embed(
-                    torch.tensor([[spk_id_val]], device=device, dtype=torch.int64),
+                    torch.tensor([[custom_speaker_id]], device=device, dtype=torch.int64),
                 )
-                speaker = raw_spk
             else:
-                fb_name = w.fallback_speaker
-                fb_id = w.spk_id_map.get(fb_name.lower())
-                if fb_id is not None:
-                    warn_msg = (
-                        f"Speaker {raw_spk!r} not found, using fallback_speaker {fb_name!r}"
-                    )
-                    logger.warning(warn_msg)
-                    plan_warnings.append(warn_msg)
-                    speaker_embed = w.codec_embed(
-                        torch.tensor([[fb_id]], device=device, dtype=torch.int64),
-                    )
-                    speaker = fb_name
-                else:
-                    logger.warning(
-                        "fallback_speaker %r not in spk_id map; continuing without speaker codec",
-                        fb_name,
-                    )
-                    speaker = None
+                speaker = None
         elif task_type in (TaskType.VOICE_CLONE_ICL, TaskType.VOICE_CLONE_XVEC):
             if spk_embedding is not None:
                 speaker_embed = spk_embedding.to(device=device, dtype=w.dtype).reshape(1, 1, -1)
@@ -634,7 +638,8 @@ class PrefillBuilder:
             ref_id = text_ids[:, :0]
 
         text_embed_icl = w.text_embed(torch.cat([ref_id, text_ids], dim=1))
-        text_embed_icl = torch.cat([text_embed_icl, w.tts_eos_embed], dim=1)
+        if include_eos:
+            text_embed_icl = torch.cat([text_embed_icl, w.tts_eos_embed], dim=1)
         text_lens = text_embed_icl.shape[1]
         codec_lens = codec_embed_icl.shape[1]
         ref_text_lens = ref_id.shape[1]
@@ -821,6 +826,49 @@ class PrefillBuilder:
             self._prompt_wrapper_ids[key] = cached
         return cached
 
+    def _resolve_custom_speaker(
+        self,
+        speaker: Optional[str],
+        *,
+        warn: bool = False,
+    ) -> tuple[Optional[str], Optional[int], Optional[str]]:
+        """Resolve a CustomVoice speaker to the actual codec embedding id."""
+        spk_map = self.w.spk_id_map or {}
+        if not spk_map:
+            msg = "CustomVoice model has no spk_id map; continuing without speaker codec"
+            if warn:
+                logger.warning(msg)
+            return None, None, msg
+
+        raw = (speaker or "").strip()
+        raw_key = raw.lower()
+        if raw_key:
+            spk_id = spk_map.get(raw_key)
+            if spk_id is not None:
+                return raw_key, int(spk_id), None
+
+            fallback_key = (self.w.fallback_speaker or "").strip().lower()
+            label = "fallback_speaker"
+            if fallback_key not in spk_map:
+                fallback_key = next(iter(spk_map))
+                label = "first supported speaker"
+            msg = f"Speaker {raw!r} not found, using {label} {fallback_key!r}"
+            if warn:
+                logger.warning(msg)
+            return fallback_key, int(spk_map[fallback_key]), msg
+
+        default_key = (self.w.default_speaker or "").strip().lower()
+        label = "default_speaker"
+        if default_key not in spk_map:
+            default_key = next(iter(spk_map))
+            label = "first supported speaker"
+        msg = None
+        if label != "default_speaker":
+            msg = f"default_speaker not found, using {label} {default_key!r}"
+            if warn:
+                logger.warning(msg)
+        return default_key, int(spk_map[default_key]), msg
+
     def _prefix_cache_key(
         self,
         task_type,
@@ -864,7 +912,13 @@ class PrefillBuilder:
             template_key,
         ]
         if task_type == TaskType.CUSTOM_VOICE:
-            key_parts.append((speaker or "").strip().lower())
+            resolved_speaker, spk_id, _ = self._resolve_custom_speaker(
+                speaker,
+                warn=False,
+            )
+            if resolved_speaker is None or spk_id is None:
+                return None
+            key_parts.append(f"custom_spk:{spk_id}")
         elif task_type == TaskType.VOICE_CLONE_XVEC:
             if spk_embedding is None:
                 return None

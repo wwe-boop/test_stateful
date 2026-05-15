@@ -213,6 +213,8 @@ def export_embeddings(
     }
     if hasattr(talker.config, "spk_id") and talker.config.spk_id:
         metadata["spk_id"] = talker.config.spk_id
+    if hasattr(talker.config, "spk_is_dialect") and talker.config.spk_is_dialect:
+        metadata["spk_is_dialect"] = talker.config.spk_is_dialect
     if hasattr(talker.config, "codec_language_id") and talker.config.codec_language_id:
         metadata["codec_language_id"] = talker.config.codec_language_id
 

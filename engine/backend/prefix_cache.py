@@ -94,7 +94,7 @@ class PrefixKVCache:
         object.__setattr__(entry, "hit_count", entry.hit_count + 1)
         logger.debug(
             "Prefix cache HIT: key=%s prefix_len=%d (hits=%d)",
-            key[:40], entry.prefix_len, entry.hit_count,
+            key, entry.prefix_len, entry.hit_count,
         )
         return entry
 
@@ -131,7 +131,7 @@ class PrefixKVCache:
             evicted_key, evicted = self._cache.popitem(last=False)
             logger.debug(
                 "Prefix cache evict: key=%s (hits=%d, age=%.1fs)",
-                evicted_key[:40], evicted.hit_count,
+                evicted_key, evicted.hit_count,
                 time.monotonic() - evicted.created_at,
             )
 
@@ -144,7 +144,7 @@ class PrefixKVCache:
         self._cache[key] = entry
         logger.info(
             "Prefix cache PUT: key=%s prefix_len=%d (size=%d/%d)",
-            key[:40], prefix_len, len(self._cache), self._max_entries,
+            key, prefix_len, len(self._cache), self._max_entries,
         )
 
     def invalidate(self, key: str) -> bool:

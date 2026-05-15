@@ -59,7 +59,7 @@ spliter:
   l3_split_cap_ratio: 0.90
 
 sampling:
-  do_sample: false
+  do_sample: true
   temperature: 0.9
   repetition_penalty: 1.05
   top_k: 50
@@ -67,8 +67,8 @@ sampling:
 
 # Prefill: CustomVoice client speaker missing / invalid (must exist in weights spk_id)
 prefill:
-  default_speaker: vivian
-  fallback_speaker: vivian
+  default_speaker: customer_service_clone_1000
+  fallback_speaker: customer_service_clone_1000
 
 # Optional Base/ICL reference library. When entries is empty, Base/ICL default
 # reference still falls back to ENGINE_DEFAULT_BASE_REF_AUDIO_PATH /
