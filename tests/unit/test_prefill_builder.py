@@ -60,6 +60,85 @@ def test_prefill_language_aliases_normalize_to_manifest_names():
     assert _normalize_language_name("auto") == "auto"
 
 
+class _TinyICLWeights:
+    def __init__(self):
+        self.variant = "tiny"
+        self.hidden_size = 4
+        self.vocab_size = 512
+        self.codec_eos_id = 99
+        self.codec_bos_id = 10
+        self.codec_pad_id = 0
+        self.codec_nothink_id = 11
+        self.codec_think_bos_id = 12
+        self.codec_think_eos_id = 13
+        self.codec_think_id = 14
+        self.codec_language_id = {}
+        self.spk_id_map = {}
+        self.spk_is_dialect = {}
+        self.default_speaker = ""
+        self.fallback_speaker = ""
+        self.device = torch.device("cpu")
+        self.dtype = torch.float32
+        self.codec_embeddings_3d = None
+        self.tts_pad_embed = torch.full((1, 1, self.hidden_size), -1.0)
+        self.tts_bos_embed = torch.full((1, 1, self.hidden_size), -2.0)
+        self.tts_eos_embed = torch.full((1, 1, self.hidden_size), -3.0)
+
+    def text_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return token_ids.to(torch.float32).unsqueeze(-1).expand(
+            *token_ids.shape,
+            self.hidden_size,
+        )
+
+    def codec_embed(self, codec_ids: torch.Tensor) -> torch.Tensor:
+        return (codec_ids.to(torch.float32) * 0.01).unsqueeze(-1).expand(
+            *codec_ids.shape,
+            self.hidden_size,
+        )
+
+
+class _TinyTokenizer:
+    def encode_ids(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return list(range(1, max(4, len(text) + 1)))
+
+
+def test_voice_clone_icl_streaming_prefill_does_not_append_eos_or_pad_before_done():
+    from engine.backend.prefill import PrefillBuilder, TaskType
+
+    weights = _TinyICLWeights()
+    builder = PrefillBuilder(weights, _TinyTokenizer())
+    plan = builder.build_plan_from_ids(
+        task_type=TaskType.VOICE_CLONE_ICL,
+        token_ids=[101],
+        spk_embedding=torch.zeros(1, weights.hidden_size),
+        ref_text_token_ids=[201, 202],
+        ref_codec_sum_vec=torch.zeros(1, 8, weights.hidden_size),
+        include_eos=False,
+    )
+
+    assert plan.trailing == []
+
+
+def test_voice_clone_icl_streaming_eos_is_added_only_when_segment_is_complete():
+    from engine.backend.prefill import PrefillBuilder, TaskType
+
+    weights = _TinyICLWeights()
+    builder = PrefillBuilder(weights, _TinyTokenizer())
+    kwargs = dict(
+        task_type=TaskType.VOICE_CLONE_ICL,
+        token_ids=[101, 102, 103],
+        spk_embedding=torch.zeros(1, weights.hidden_size),
+        ref_text_token_ids=[201],
+        ref_codec_sum_vec=torch.zeros(1, 1, weights.hidden_size),
+    )
+
+    streaming_plan = builder.build_plan_from_ids(**kwargs, include_eos=False)
+    complete_plan = builder.build_plan_from_ids(**kwargs, include_eos=True)
+
+    assert len(complete_plan.trailing) == len(streaming_plan.trailing) + 1
+
+
 def test_voice_clone_icl_does_not_prepend_streaming_first_text_token():
     from engine.backend.prefill import EmbeddingWeights, PrefillBuilder, TaskType
 

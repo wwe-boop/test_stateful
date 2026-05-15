@@ -514,6 +514,7 @@ class PrefillBuilder:
             prefill, trailing = self._build_icl_path(
                 w, device, text_ids, talker_input_embed,
                 ref_codec_sum_vec, ref_ids,
+                include_eos=include_eos,
             )
             char_offsets = []
             icl_handled = True
@@ -526,6 +527,7 @@ class PrefillBuilder:
             prefill, trailing = self._build_icl_path(
                 w, device, text_ids, talker_input_embed,
                 codec_sum_vec, ref_ids,
+                include_eos=include_eos,
             )
             char_offsets = []
             icl_handled = True
@@ -608,7 +610,8 @@ class PrefillBuilder:
         )
 
     def _build_icl_path(self, w, device, text_ids, talker_input_embed,
-                         ref_codec_sum_vec, ref_text_token_ids):
+                         ref_codec_sum_vec, ref_text_token_ids, *,
+                         include_eos: bool = True):
         codec_sum_vec = ref_codec_sum_vec.to(device=device, dtype=torch.bfloat16)
         if codec_sum_vec.dim() == 2:
             codec_sum_vec = codec_sum_vec.unsqueeze(0)
@@ -650,7 +653,7 @@ class PrefillBuilder:
                 text_embed_icl = torch.cat(
                     [text_embed_icl] + [w.tts_pad_embed] * pad_len, dim=1)
             icl_embed = text_embed_icl + codec_embed_icl
-            trailing = [w.tts_pad_embed]
+            trailing = [w.tts_pad_embed] if include_eos else []
 
         prefill = torch.cat([talker_input_embed, icl_embed], dim=1)
         return prefill, trailing

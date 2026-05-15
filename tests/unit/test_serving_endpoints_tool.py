@@ -3,6 +3,8 @@ from __future__ import annotations
 import socket
 import time
 
+import pytest
+
 from tests.tools import serving_endpoints
 
 
@@ -114,3 +116,51 @@ def test_websocket_oneshot_replies_to_ping_and_keeps_waiting(monkeypatch):
     assert sent_frames == [(0xA, b"heartbeat")]
     assert result.error is None
     assert result.events == ["done"]
+
+
+def test_decode_audio_bytes_rejects_partial_float32_frame():
+    with pytest.raises(ValueError, match="not a multiple of 4"):
+        serving_endpoints._decode_audio_bytes(b"\x00\x00\x00", "pcm_f32")
+
+
+def test_websocket_text_opcode_can_recover_audio_payload():
+    transport = serving_endpoints.EngineWebSocketTransport("ws://example.test/v1/ws")
+    result = serving_endpoints.SynthesisResult("engine-websocket", "sid", "text")
+    chunks = []
+    timestamps = []
+
+    terminal = transport._consume_frame(
+        result,
+        chunks,
+        timestamps,
+        {"first_ts": None, "encoding": "pcm_f32"},
+        0x1,
+        b"\x00\x00\x00\x00",
+    )
+
+    assert terminal is False
+    assert len(chunks) == 1
+    assert chunks[0].tolist() == [0.0]
+    assert result.warnings == [
+        "received websocket audio payload in a text frame; decoded as audio"
+    ]
+
+
+def test_websocket_binary_opcode_can_recover_event_payload():
+    transport = serving_endpoints.EngineWebSocketTransport("ws://example.test/v1/ws")
+    result = serving_endpoints.SynthesisResult("engine-websocket", "sid", "text")
+
+    terminal = transport._consume_frame(
+        result,
+        [],
+        [],
+        {"first_ts": None, "encoding": "pcm_f32"},
+        0x2,
+        b'{"type":"event","event":{"type":"done","meta":{}}}',
+    )
+
+    assert terminal is True
+    assert result.events == ["done"]
+    assert result.warnings == [
+        "received websocket event payload in a binary frame; decoded as event"
+    ]

@@ -37,6 +37,11 @@ for import_path in (REPO_ROOT, REPO_ROOT / "scripts" / "python"):
 
 import numpy as np
 import requests
+from tests.token_streaming import (
+    DEFAULT_TOKEN_STREAM_TEXT,
+    TokenChunkingUnavailable,
+    build_token_text_chunks,
+)
 from raw_websocket import (
     RawWebSocketError,
     ws_close,
@@ -449,9 +454,24 @@ def _save_wav(audio: np.ndarray, path: Path, sample_rate: int) -> None:
 
 
 def _decode_audio_bytes(raw: bytes, encoding: str) -> np.ndarray:
+    width = 2 if encoding == "pcm_s16le" else 4
+    if len(raw) % width:
+        raise ValueError(
+            f"{encoding} audio frame has {len(raw)} bytes, "
+            f"which is not a multiple of {width}"
+        )
     if encoding == "pcm_s16le":
         return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32767.0
     return np.frombuffer(raw, dtype=np.float32)
+
+
+def _audio_payload_size_is_valid(raw: bytes, encoding: str) -> bool:
+    width = 2 if encoding == "pcm_s16le" else 4
+    return bool(raw) and len(raw) % width == 0
+
+
+def _payload_preview(raw: bytes, limit: int = 16) -> str:
+    return raw[:limit].hex()
 
 
 def _load_ref_audio(path: str) -> bytes:
@@ -765,8 +785,16 @@ class EngineGrpcTransport:
         finally:
             channel.close()
 
-    def _make_session_config(self, spec: RequestSpec, *, input_mode: int) -> tts_pb2.SessionConfig:
+    def _make_session_config(
+        self,
+        spec: RequestSpec,
+        *,
+        input_mode: int,
+        group_policy: int | None = None,
+    ) -> tts_pb2.SessionConfig:
         pb2, _ = _require_engine_gateway()
+        if group_policy is None:
+            group_policy = pb2.GROUP_POLICY_AUTO
         return pb2.SessionConfig(
             task_type=spec.task_type,
             language=spec.language,
@@ -776,7 +804,7 @@ class EngineGrpcTransport:
             ref_text=spec.ref_text or "",
             x_vector_only=bool(spec.x_vector_only),
             input_mode=input_mode,
-            group_policy=pb2.GROUP_POLICY_AUTO,
+            group_policy=group_policy,
             audio=pb2.AudioFormat(
                 encoding=_engine_audio_encoding_to_proto(spec.encoding),
                 sample_rate=spec.sample_rate,
@@ -877,19 +905,30 @@ class EngineGrpcTransport:
         session_id: str | None = None,
         chunk_delay_ms: float = 200.0,
         input_mode: int | None = None,
+        group_policy: int | None = None,
     ) -> SynthesisResult:
         pb2, pb2_grpc = _require_engine_gateway()
         if input_mode is None:
             input_mode = pb2.INPUT_MODE_CLAUSE
+        if group_policy is None:
+            group_policy = pb2.GROUP_POLICY_AUTO
         import grpc
 
         sid = session_id or uuid.uuid4().hex[:12]
         result = SynthesisResult(
             self.name,
             sid,
-            " ".join(text_chunks),
+            "".join(text_chunks),
             sample_rate=spec.sample_rate,
             encoding=spec.encoding,
+        )
+        result.details.update(
+            {
+                "input_mode": int(input_mode),
+                "group_policy": int(group_policy),
+                "text_chunk_count": len(text_chunks),
+                "text_chunks": list(text_chunks),
+            }
         )
         channel = grpc.insecure_channel(f"{self.host}:{self.port}")
         stub = pb2_grpc.TTSServiceStub(channel)
@@ -903,7 +942,11 @@ class EngineGrpcTransport:
             yield pb2.SynthesizeRequest(
                 start=pb2.StartRequest(
                     session_id=sid,
-                    config=self._make_session_config(spec, input_mode=input_mode),
+                    config=self._make_session_config(
+                        spec,
+                        input_mode=input_mode,
+                        group_policy=group_policy,
+                    ),
                 )
             )
             for chunk in text_chunks:
@@ -1031,7 +1074,13 @@ class EngineWebSocketTransport:
         finally:
             ws_close(conn)
 
-    def _config_payload(self, spec: RequestSpec, *, input_mode: str) -> dict[str, Any]:
+    def _config_payload(
+        self,
+        spec: RequestSpec,
+        *,
+        input_mode: str,
+        group_policy: str = "auto",
+    ) -> dict[str, Any]:
         payload = {
             "task_type": spec.task_type,
             "language": spec.language,
@@ -1041,7 +1090,7 @@ class EngineWebSocketTransport:
             "ref_text": spec.ref_text or "",
             "x_vector_only": bool(spec.x_vector_only),
             "input_mode": input_mode,
-            "group_policy": "auto",
+            "group_policy": group_policy,
             "audio": {
                 "encoding": spec.encoding,
                 "sample_rate": spec.sample_rate,
@@ -1061,15 +1110,25 @@ class EngineWebSocketTransport:
         *,
         treat_close_as_ok: bool = False,
     ) -> bool:
-        if opcode == 0x2:
+        def consume_audio_payload(payload: bytes, *, warning: str = "") -> bool:
+            try:
+                audio = _decode_audio_bytes(payload, state["encoding"])
+            except ValueError as exc:
+                raise RawWebSocketError(
+                    f"invalid websocket audio frame for {state['encoding']}: {exc}; "
+                    f"opcode=0x{opcode:x} length={len(payload)} "
+                    f"prefix={_payload_preview(payload)}"
+                ) from exc
             now = time.perf_counter()
             if state["first_ts"] is None:
                 state["first_ts"] = now
             timestamps.append(now)
-            chunks.append(_decode_audio_bytes(payload, state["encoding"]))
+            chunks.append(audio)
+            if warning:
+                result.warnings.append(warning)
             return False
-        if opcode == 0x1:
-            message = json.loads(payload.decode("utf-8"))
+
+        def consume_event_message(message: dict[str, Any]) -> bool:
             if message.get("type") != "event":
                 return False
             event = message.get("event", {})
@@ -1089,9 +1148,42 @@ class EngineWebSocketTransport:
             if event_type in {"done", "end"}:
                 return True
             return False
+
+        if opcode == 0x2:
+            if payload[:1] in {b"{", b"["} or not _audio_payload_size_is_valid(payload, state["encoding"]):
+                try:
+                    message = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    pass
+                else:
+                    result.warnings.append(
+                        "received websocket event payload in a binary frame; decoded as event"
+                    )
+                    return consume_event_message(message)
+            return consume_audio_payload(payload)
+        if opcode == 0x1:
+            try:
+                message = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                if _audio_payload_size_is_valid(payload, state["encoding"]):
+                    return consume_audio_payload(
+                        payload,
+                        warning=(
+                            "received websocket audio payload in a text frame; "
+                            "decoded as audio"
+                        ),
+                    )
+                raise RawWebSocketError(
+                    f"invalid websocket text frame: {exc}; "
+                    f"length={len(payload)} prefix={_payload_preview(payload)}"
+                ) from exc
+            return consume_event_message(message)
         if opcode == 0x8:
             return True if treat_close_as_ok else result.error is not None
         if opcode == 0x9:
+            return False
+        if opcode == 0x0:
+            result.warnings.append("ignored websocket continuation frame")
             return False
         return False
 
@@ -1197,14 +1289,23 @@ class EngineWebSocketTransport:
         session_id: str | None = None,
         chunk_delay_ms: float = 200.0,
         input_mode: str = "clause",
+        group_policy: str = "auto",
     ) -> SynthesisResult:
         sid = session_id or uuid.uuid4().hex[:12]
         result = SynthesisResult(
             self.name,
             sid,
-            " ".join(text_chunks),
+            "".join(text_chunks),
             sample_rate=spec.sample_rate,
             encoding=spec.encoding,
+        )
+        result.details.update(
+            {
+                "input_mode": input_mode,
+                "group_policy": group_policy,
+                "text_chunk_count": len(text_chunks),
+                "text_chunks": list(text_chunks),
+            }
         )
         conn = ws_connect(self.url, timeout=timeout)
         chunks: list[np.ndarray] = []
@@ -1219,7 +1320,11 @@ class EngineWebSocketTransport:
                 {
                     "type": "start",
                     "session_id": sid,
-                    "config": self._config_payload(spec, input_mode=input_mode),
+                    "config": self._config_payload(
+                        spec,
+                        input_mode=input_mode,
+                        group_policy=group_policy,
+                    ),
                 },
             )
             deadline = started + timeout
@@ -2079,6 +2184,63 @@ def _run_engine_reference_suite(
     return results
 
 
+def _run_token_streaming_case(
+    transport,
+    spec: RequestSpec,
+    args: argparse.Namespace,
+    *,
+    target: str,
+    output_dir: Path,
+) -> CaseResult:
+    try:
+        tokenized = build_token_text_chunks(
+            args.token_stream_text,
+            tokenizer_dir=args.tokenizer_dir or None,
+        )
+    except TokenChunkingUnavailable as exc:
+        return _make_case(
+            target,
+            "streaming-token",
+            ok=True,
+            skipped=True,
+            summary=f"skipped: {exc}",
+        )
+    except ValueError as exc:
+        return _make_case(
+            target,
+            "streaming-token",
+            ok=False,
+            error=f"invalid token-stream chunks: {_error_text(exc)}",
+        )
+
+    if target == "engine-grpc":
+        pb2, _ = _require_engine_gateway()
+        input_mode = pb2.INPUT_MODE_TOKEN
+        group_policy = pb2.GROUP_POLICY_NONE
+    else:
+        input_mode = "token"
+        group_policy = "none"
+
+    synth = transport.synthesize_streaming(
+        spec,
+        tokenized.chunks,
+        timeout=args.timeout,
+        session_id=f"{target}-stream-token",
+        chunk_delay_ms=args.token_chunk_delay_ms,
+        input_mode=input_mode,
+        group_policy=group_policy,
+    )
+    synth.details["token_stream"] = tokenized.to_details()
+    case = _case_from_synth(
+        target,
+        "streaming-token",
+        synth,
+        save_path=output_dir / f"{target}_streaming_token.wav",
+    )
+    case.details["token_stream"] = tokenized.to_details()
+    return case
+
+
 def _run_engine_suite(
     transport,
     args: argparse.Namespace,
@@ -2148,6 +2310,16 @@ def _run_engine_suite(
                 save_path=output_dir / f"{target}_streaming_text.wav",
             )
         )
+        if not args.skip_token_streaming:
+            results.append(
+                _run_token_streaming_case(
+                    transport,
+                    spec,
+                    args,
+                    target=target,
+                    output_dir=output_dir,
+                )
+            )
 
     if not args.skip_custom_instruct:
         if _custom_voice_instruct_supported(caps):
@@ -2641,6 +2813,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--story-timeout", type=float, default=600.0)
     parser.add_argument("--story-path", default="")
     parser.add_argument("--chunk-delay-ms", type=float, default=200.0)
+    parser.add_argument(
+        "--token-stream-text",
+        default=DEFAULT_TOKEN_STREAM_TEXT,
+        help="Text split into re-encodable tokenizer chunks for the standalone TOKEN-mode streaming case",
+    )
+    parser.add_argument(
+        "--tokenizer-dir",
+        default="",
+        help=(
+            "Tokenizer directory for strict TOKEN-mode streaming. "
+            "Default: resolve the tokenizer from engine.yaml / model package paths."
+        ),
+    )
+    parser.add_argument(
+        "--token-chunk-delay-ms",
+        type=float,
+        default=30.0,
+        help="Delay between tokenizer-derived TOKEN-mode text chunks",
+    )
     parser.add_argument("--concurrency", default="1,2,4")
     parser.add_argument(
         "--concurrency-samples",
@@ -2691,6 +2882,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-single", action="store_true")
     parser.add_argument("--skip-streaming", action="store_true")
+    parser.add_argument("--skip-token-streaming", action="store_true")
     parser.add_argument("--skip-custom-instruct", action="store_true")
     parser.add_argument("--skip-concurrent", action="store_true")
     parser.add_argument("--skip-long", action="store_true")

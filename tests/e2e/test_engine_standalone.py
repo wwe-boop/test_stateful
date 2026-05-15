@@ -5,6 +5,7 @@ E2E test & benchmark for the standalone TTS engine (gRPC on port 50051).
 Tests the engine with:
   1. Single-request smoke test
   2. Streaming text input (init -> text chunks -> text_complete)
+  2a. Strict token-scale streaming input
   2b. CustomVoice + instruct (preset speaker + style instruction; skipped on 0.6b)
   3. Multi-session concurrent requests (1, 2, 4 sessions)
   4. Long text rollover (medium / very long / streaming long)
@@ -35,6 +36,12 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import pytest
+
+from tests.token_streaming import (
+    DEFAULT_TOKEN_STREAM_TEXT,
+    TokenChunkingUnavailable,
+    build_token_text_chunks,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
@@ -374,6 +381,7 @@ async def _synthesize_streaming(
     text_chunks: list[str],
     init_instruct: str = "",
     input_mode=None,
+    group_policy=None,
     chunk_delay_ms: float = 50.0,
     session_id: str = "",
     timeout: float = 120.0,
@@ -382,8 +390,10 @@ async def _synthesize_streaming(
     pb2, pb2_grpc = _require_gateway()
     if input_mode is None:
         input_mode = pb2.INPUT_MODE_LONG_SEGMENT
+    if group_policy is None:
+        group_policy = pb2.GROUP_POLICY_AUTO
     sid = session_id or uuid.uuid4().hex[:12]
-    result = TTSResult(session_id=sid, text=" ".join(text_chunks))
+    result = TTSResult(session_id=sid, text="".join(text_chunks))
 
     import grpc.aio as grpc_aio
     channel = grpc_aio.insecure_channel(f"{host}:{port}")
@@ -407,6 +417,7 @@ async def _synthesize_streaming(
                     speaker=init_speaker,
                     instruct=init_instruct,
                     input_mode=input_mode,
+                    group_policy=group_policy,
                 ),
             )
         )
@@ -610,6 +621,47 @@ def run_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
     _print_result(result, "stream")
     if result.audio is not None and result.audio.size > 0:
         out_path = str(output_dir / "test2_streaming_text.wav")
+        _save_wav(result.audio, out_path)
+        print(f"  Saved: {out_path}")
+
+    return result
+
+
+def _build_token_stream_chunks_or_skip() -> list[str]:
+    try:
+        tokenized = build_token_text_chunks(DEFAULT_TOKEN_STREAM_TEXT)
+    except TokenChunkingUnavailable as exc:
+        pytest.skip(str(exc))
+    except ValueError as exc:
+        pytest.fail(f"Invalid TOKEN-mode test chunks: {exc}")
+    return tokenized.chunks
+
+
+def run_token_streaming_text(host: str, port: int, output_dir: Path) -> TTSResult:
+    print("\n" + "=" * 60)
+    print("  Test 2a: Token-Scale Streaming Text Input")
+    print("=" * 60)
+
+    tokenized = build_token_text_chunks(DEFAULT_TOKEN_STREAM_TEXT)
+    print(
+        "  Token chunks: "
+        f"count={tokenized.chunk_count} max_chars={tokenized.max_chunk_chars} "
+        f"tokenizer={tokenized.tokenizer_dir}"
+    )
+
+    result = asyncio.run(_synthesize_streaming(
+        host, port,
+        init_speaker="Serena",
+        init_task_type="custom_voice",
+        input_mode=tts_pb2.INPUT_MODE_TOKEN,
+        group_policy=tts_pb2.GROUP_POLICY_NONE,
+        text_chunks=tokenized.chunks,
+        chunk_delay_ms=30,
+        session_id="stream-token",
+    ))
+    _print_result(result, "stream-token")
+    if result.audio is not None and result.audio.size > 0:
+        out_path = str(output_dir / "test2a_streaming_token.wav")
         _save_wav(result.audio, out_path)
         print(f"  Saved: {out_path}")
 
@@ -1123,6 +1175,22 @@ class TestEngineSmokeAndStreaming:
             chunk_delay_ms=100,
         ))
         assert r.error is None, f"Streaming synthesis failed: {r.error}"
+        assert r.total_samples >= SAMPLE_RATE * 0.1
+
+    def test_streaming_token_text(self, engine_addr):
+        host, port = engine_addr
+        token_chunks = _build_token_stream_chunks_or_skip()
+        r = asyncio.run(_synthesize_streaming(
+            host, port,
+            init_speaker="Serena", init_task_type="custom_voice",
+            input_mode=tts_pb2.INPUT_MODE_TOKEN,
+            group_policy=tts_pb2.GROUP_POLICY_NONE,
+            text_chunks=token_chunks,
+            chunk_delay_ms=30,
+            session_id="pytest-stream-token",
+        ))
+        assert r.error is None, f"TOKEN-mode streaming synthesis failed: {r.error}"
+        assert r.text == DEFAULT_TOKEN_STREAM_TEXT
         assert r.total_samples >= SAMPLE_RATE * 0.1
 
 
