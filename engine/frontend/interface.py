@@ -26,6 +26,7 @@ from ..core.types import (
     SessionState,
     TokenizedText,
 )
+from ..text_normalization import strip_emoji
 from .dispatcher import Dispatcher
 from .spliter import Spliter
 from .spliter.driver import ActionType
@@ -46,7 +47,7 @@ _WHITESPACE_TO_STRIP = str.maketrans({
 
 def _normalize_tts_text(text: str) -> str:
     """Remove formatting whitespace that harms tokenization/prosody."""
-    text = (text or "").translate(_WHITESPACE_TO_STRIP)
+    text = strip_emoji((text or "").translate(_WHITESPACE_TO_STRIP))
     while "  " in text:
         text = text.replace("  ", " ")
     return text

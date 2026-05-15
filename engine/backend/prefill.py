@@ -22,6 +22,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from ..text_normalization import strip_emoji
+
 logger = logging.getLogger(__name__)
 
 
@@ -236,6 +238,7 @@ class EmbeddingWeights:
 
 def normalize_tts_text(text: str) -> str:
     """Basic text normalization for TTS input."""
+    text = strip_emoji(text or "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\t", " ")
     import re

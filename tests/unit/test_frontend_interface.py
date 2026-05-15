@@ -10,7 +10,14 @@ from engine.core.types import (
     ResultType,
     SessionConfig,
 )
-from engine.frontend.interface import FrontendInterface
+from engine.frontend.interface import FrontendInterface, _normalize_tts_text
+
+
+def test_tts_text_normalization_strips_emoji_noise():
+    assert _normalize_tts_text("你好😊，世界🌍！") == "你好，世界！"
+    assert _normalize_tts_text("good😊morning") == "good morning"
+    assert _normalize_tts_text("第1️⃣步完成✅。") == "第步完成。"
+    assert _normalize_tts_text("😊🚀") == ""
 
 
 class _CharTokenizer:
