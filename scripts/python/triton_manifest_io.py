@@ -73,11 +73,7 @@ def package_defaults() -> Dict[str, Any]:
             "trt": "runtime/model.plan",
             "onnx": "runtime/model.onnx",
         },
-        "optional_assets": {
-            "speaker_encoder": "runtime/speaker_encoder.onnx",
-            "speech_tokenizer_encoder": "runtime/speech_tokenizer_encoder.onnx",
-            "speech_tokenizer_codec_fused": "runtime/speech_tokenizer_codec_fused.onnx",
-        },
+        "optional_assets": {},
     }
 
 
@@ -136,6 +132,17 @@ def load_manifest(
         manifest["package"]["model_package_dir"] = package_model_package_dir
 
     return manifest
+
+
+def runtime_optional_assets_for_variant(variant: str, engine_mode: str) -> Dict[str, str]:
+    """Return production runtime support assets for a variant."""
+    if not (variant.startswith("base-") or variant.startswith("icl-")):
+        return {}
+    suffix = "engine" if engine_mode == "trt" else "onnx"
+    return {
+        "speaker_encoder": f"runtime/speaker_encoder.{suffix}",
+        "speech_tokenizer_codec_fused": f"runtime/speech_tokenizer_codec_fused.{suffix}",
+    }
 
 
 def build_manifest_for_export(
@@ -199,11 +206,7 @@ def build_manifest_for_export(
                 "trt": "runtime/model.plan",
                 "onnx": "runtime/model.onnx",
             },
-            "optional_assets": {
-                "speaker_encoder": "runtime/speaker_encoder.onnx",
-                "speech_tokenizer_encoder": "runtime/speech_tokenizer_encoder.onnx",
-                "speech_tokenizer_codec_fused": "runtime/speech_tokenizer_codec_fused.onnx",
-            },
+            "optional_assets": runtime_optional_assets_for_variant(variant, engine_mode),
         },
         "engine_profile": {
             "profile_schema_version": 1,

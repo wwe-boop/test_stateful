@@ -483,8 +483,33 @@ engine_build_image() {
     fi
 
     log_step "Building engine Docker image: $image_tag"
-    local base_image="${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:26.02-py3}"
-    local pytorch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-cu130}}"
+    local image_tag_release=""
+    if [[ "$image_tag" =~ :([0-9]{2}\.[0-9]{2})$ ]]; then
+        image_tag_release="${BASH_REMATCH[1]}"
+    fi
+    local base_image="${ENGINE_BASE_IMAGE:-}"
+    if [ -z "$base_image" ]; then
+        if [ -n "$image_tag_release" ]; then
+            base_image="nvcr.io/nvidia/tensorrt:${image_tag_release}-py3"
+        else
+            base_image="nvcr.io/nvidia/tensorrt:26.02-py3"
+        fi
+    fi
+    local pytorch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}"
+    if [ -z "$pytorch_cuda_tag" ]; then
+        if [ -n "$image_tag_release" ] && declare -F resolve_ngc_torch_index_tag >/dev/null; then
+            pytorch_cuda_tag=$(resolve_ngc_torch_index_tag "$image_tag_release" 2>/dev/null || true)
+        fi
+        pytorch_cuda_tag="${pytorch_cuda_tag:-cu130}"
+    fi
+    local base_release=""
+    if [[ "$base_image" =~ :([0-9]{2}\.[0-9]{2})-py3$ ]]; then
+        base_release="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$image_tag_release" ] && [ -n "$base_release" ] && [ "$image_tag_release" != "$base_release" ]; then
+        log_error "Engine image tag/base image mismatch: image=$image_tag implies $image_tag_release but BASE_IMAGE=$base_image"
+        return 1
+    fi
     # BuildKit: enables RUN --mount cache for pip (faster rebuilds; see Dockerfile.engine).
     DOCKER_BUILDKIT=1 docker build \
         --build-arg "BASE_IMAGE=$base_image" \
@@ -493,6 +518,21 @@ engine_build_image() {
         -f "$dockerfile" \
         "$repo_root" \
         || { log_error "Docker build failed"; return 1; }
+
+    local expected_release="${image_tag_release:-$base_release}"
+    if [ -n "$expected_release" ] && ! engine_docker_image_matches_release "$image_tag" "$expected_release"; then
+        local actual_release
+        actual_release=$(engine_docker_image_tensorrt_release "$image_tag" || true)
+        log_error "Built image TensorRT release mismatch: image=$image_tag expected=$expected_release actual=${actual_release:-unknown}"
+        log_error "Base image was: $base_image"
+        return 1
+    fi
+    if [ -n "$pytorch_cuda_tag" ] && ! engine_docker_image_matches_torch_cuda "$image_tag" "$pytorch_cuda_tag"; then
+        local actual_torch_cuda_tag
+        actual_torch_cuda_tag=$(engine_docker_image_torch_cuda_tag "$image_tag" || true)
+        log_error "Built image PyTorch CUDA wheel mismatch: image=$image_tag expected=$pytorch_cuda_tag actual=${actual_torch_cuda_tag:-unknown}"
+        return 1
+    fi
     log_info "Image built: $image_tag"
 }
 

@@ -228,7 +228,8 @@ assemble_model_repo() {
         "$repo_dir/code2wav" \
         "$repo_dir/tts_orchestrator" \
         "$repo_dir/tts_orchestrator_http" \
-        "$repo_dir/triton_manifest.json"
+        "$repo_dir/triton_manifest.json" \
+        "$repo_dir/artifact_manifest.json"
 
     # Helper: copy engine/onnx only; config.pbtxt comes from generate_triton_configs.py
     _place_model() {
@@ -344,15 +345,6 @@ assemble_model_repo() {
         log_warn "  runtime/speech_tokenizer_codec_fused: SKIPPED (not required for non-base / non-ICL)"
     fi
 
-    if [ -f "$tokenizer_dir/speech_tokenizer_encoder.onnx" ]; then
-        _link_or_copy "$tokenizer_dir/speech_tokenizer_encoder.onnx" "$runtime_dir/speech_tokenizer_encoder.onnx"
-        [ -f "$tokenizer_dir/speech_tokenizer_encoder.onnx.data" ] \
-            && _link_or_copy "$tokenizer_dir/speech_tokenizer_encoder.onnx.data" "$runtime_dir/speech_tokenizer_encoder.onnx.data"
-        log_info "  runtime/speech_tokenizer_encoder.onnx: OK"
-    else
-        log_warn "  runtime/speech_tokenizer_encoder.onnx: SKIPPED (only needed for base / voice clone)"
-    fi
-
     # ── 2. Talker + Code2Wav fused (required — production single runtime engine) ──
     local fused_src
     if fused_src="$(_resolve_model_src "$variant_dir/talker_code2wav_fused")"; then
@@ -446,11 +438,15 @@ assemble_model_repo() {
             [ -f "$tok_dir/$tf" ] && \
                 _link_or_copy "$tok_dir/$tf" "$orch_model_dir/tokenizer/$tf"
         done
-        if [ "$engine_mode" = "trt" ] && [ -f "$tokenizer_dir/code2wav_decoder.engine" ]; then
+        if [[ "$variant" == base-* || "$variant" == icl-* ]] \
+            && [ "$engine_mode" = "trt" ] \
+            && [ -f "$tokenizer_dir/code2wav_decoder.engine" ]; then
             _link_or_copy "$tokenizer_dir/code2wav_decoder.engine" \
                 "$orch_model_dir/tokenizer/code2wav_decoder.engine"
             log_info "  tts_orchestrator/tokenizer/code2wav_decoder.engine: OK (ICL warm state)"
-        elif [ "$engine_mode" = "trt" ] && [ -f "$tokenizer_dir/code2wav_decoder.onnx" ]; then
+        elif [[ "$variant" == base-* || "$variant" == icl-* ]] \
+            && [ "$engine_mode" = "trt" ] \
+            && [ -f "$tokenizer_dir/code2wav_decoder.onnx" ]; then
             log_warn "  tts_orchestrator/tokenizer/code2wav_decoder.engine: SKIPPED (run Phase B to enable ICL warm state)"
         fi
         log_info "  tts_orchestrator/tokenizer: OK"
@@ -474,7 +470,6 @@ assemble_model_repo() {
         "$engine_mode" \
         "$model_version" \
         "$repo_dir" \
-        "$repo_dir/triton_manifest.json" \
         "$orch_model_dir/triton_manifest.json" \
         "$runtime_dir/triton_manifest.json" <<'PY'; then
 import json
@@ -494,6 +489,21 @@ manifest = load_manifest(src, output_repo=output_repo, model_package_dir=model_p
 manifest["engine_mode"] = engine_mode
 manifest.setdefault("package", {})["model_package_dir"] = model_package_dir
 manifest.setdefault("orchestrator", {})["model_package_dir"] = model_package_dir
+optional_assets = manifest.setdefault("package", {}).setdefault("optional_assets", {})
+if isinstance(optional_assets, dict):
+    # speech_tokenizer_encoder is verification-only. Production runtime uses
+    # speech_tokenizer_codec_fused for ICL preprocessing.
+    optional_assets.pop("speech_tokenizer_encoder", None)
+    if str(manifest.get("variant", "")).startswith(("base-", "icl-")):
+        if engine_mode == "trt":
+            optional_assets["speaker_encoder"] = "runtime/speaker_encoder.engine"
+            optional_assets["speech_tokenizer_codec_fused"] = "runtime/speech_tokenizer_codec_fused.engine"
+        else:
+            optional_assets["speaker_encoder"] = "runtime/speaker_encoder.onnx"
+            optional_assets["speech_tokenizer_codec_fused"] = "runtime/speech_tokenizer_codec_fused.onnx"
+    else:
+        optional_assets.pop("speaker_encoder", None)
+        optional_assets.pop("speech_tokenizer_codec_fused", None)
 
 for target in targets:
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -502,19 +512,16 @@ PY
         log_error "  failed to write package triton_manifest.json"
         return 1
     fi
-    log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/$model_version + runtime)"
+    log_info "  triton_manifest.json: copied (tts_orchestrator/$model_version + runtime)"
 
     # Propagate artifact_manifest.json (written by build_pipeline.sh) into
-    # the same three locations so the runtime fingerprint guard
-    # (engine/runtime/fingerprint.py) can locate it from any deploy mode:
-    #   - repo root          → engine-docker image / Triton root
-    #   - tts_orchestrator/  → standalone --model-package-dir target
-    #   - runtime/           → per-engine sibling (handy for sha256 verify)
+    # the model package so the runtime fingerprint guard can locate it from
+    # standalone and Triton deployments. Keep runtime/ as a sibling copy for
+    # sha256 verification tools.
     if [ -f "$exported_dir/artifact_manifest.json" ]; then
-        cp -f "$exported_dir/artifact_manifest.json" "$repo_dir/artifact_manifest.json"
         cp -f "$exported_dir/artifact_manifest.json" "$orch_model_dir/artifact_manifest.json"
         cp -f "$exported_dir/artifact_manifest.json" "$runtime_dir/artifact_manifest.json"
-        log_info "  artifact_manifest.json: copied (3 locations; runtime fingerprint guard ready)"
+        log_info "  artifact_manifest.json: copied (tts_orchestrator/$model_version + runtime)"
     else
         log_warn "  artifact_manifest.json: NOT FOUND in $exported_dir"
         log_warn "    Runtime fingerprint guard will fail-stop unless QWEN3_ALLOW_FINGERPRINT_MISMATCH=1"
@@ -537,9 +544,9 @@ PY
     find "$orch_model_dir" -type d -name "__pycache__" -prune -exec rm -rf {} +
     log_info "  tts_orchestrator/python: pruned legacy payload"
 
-    if ! python3 "$repo_root/scripts/python/generate_triton_configs.py" \
-        --manifest "$repo_dir/triton_manifest.json" \
-        --output-repo "$repo_dir" \
+	    if ! python3 "$repo_root/scripts/python/generate_triton_configs.py" \
+	        --manifest "$runtime_dir/triton_manifest.json" \
+	        --output-repo "$repo_dir" \
         --engine-mode "$engine_mode" \
         --engine-dtype "$engine_dtype"; then
         log_error "  generate_triton_configs.py failed"
@@ -550,6 +557,71 @@ PY
     echo ""
     log_info "Model repository assembled: $repo_dir"
     return 0
+}
+
+# ---------------------------------------------------------------------------
+#  _resolve_repo_manifest <repo_dir> [model_version]
+#  Finds the manifest that describes an assembled model package.  The package
+#  copies are authoritative; the repo-root manifest is kept only as a backward
+#  compatibility fallback for older repositories.
+# ---------------------------------------------------------------------------
+_resolve_repo_manifest() {
+    local repo_dir="$1"
+    local model_version="${2:-}"
+    local candidate
+
+    if [ -n "$model_version" ]; then
+        candidate="$repo_dir/tts_orchestrator/$model_version/runtime/triton_manifest.json"
+        [ -f "$candidate" ] && { echo "$candidate"; return 0; }
+        candidate="$repo_dir/tts_orchestrator/$model_version/triton_manifest.json"
+        [ -f "$candidate" ] && { echo "$candidate"; return 0; }
+    fi
+
+    if [ -d "$repo_dir/tts_orchestrator" ]; then
+        candidate=$(find "$repo_dir/tts_orchestrator" \
+            -path "*/runtime/triton_manifest.json" -type f 2>/dev/null | sort | head -n 1)
+        [ -n "$candidate" ] && { echo "$candidate"; return 0; }
+        candidate=$(find "$repo_dir/tts_orchestrator" \
+            -mindepth 2 -maxdepth 2 -name "triton_manifest.json" -type f 2>/dev/null | sort | head -n 1)
+        [ -n "$candidate" ] && { echo "$candidate"; return 0; }
+    fi
+
+    candidate="$repo_dir/triton_manifest.json"
+    [ -f "$candidate" ] && { echo "$candidate"; return 0; }
+    return 1
+}
+
+_infer_model_version_from_repo() {
+    local repo_dir="$1"
+    local manifest
+    manifest=$(_resolve_repo_manifest "$repo_dir" "" 2>/dev/null || true)
+    [ -n "$manifest" ] || return 1
+    python3 - "$manifest" <<'PY' 2>/dev/null
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    manifest = {}
+
+package = manifest.get("package") or {}
+package_dir = ""
+if isinstance(package, dict):
+    package_dir = str(package.get("model_package_dir") or "")
+if not package_dir:
+    orch = manifest.get("orchestrator") or {}
+    if isinstance(orch, dict):
+        package_dir = str(orch.get("model_package_dir") or "")
+if package_dir:
+    print(Path(package_dir).name)
+elif path.parent.name == "runtime":
+    print(path.parent.parent.name)
+else:
+    print(path.parent.name)
+PY
 }
 
 # ---------------------------------------------------------------------------
@@ -571,18 +643,20 @@ sync_trt_configs() {
     fi
     engine_dtype="${engine_dtype:-bf16}"
 
-    if [ ! -f "$repo_dir/triton_manifest.json" ]; then
-        log_warn "  sync_trt_configs: no triton_manifest.json in repo (skip)"
+    local manifest_path
+    manifest_path=$(_resolve_repo_manifest "$repo_dir" "${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-}}" 2>/dev/null || true)
+    if [ -z "$manifest_path" ]; then
+        log_warn "  sync_trt_configs: no triton_manifest.json in model package (skip)"
         return 0
     fi
     local repo_root
     repo_root="$(cd "${_LIB_DIR}/../../.." && pwd)"
     if python3 "$repo_root/scripts/python/generate_triton_configs.py" \
-        --manifest "$repo_dir/triton_manifest.json" \
+        --manifest "$manifest_path" \
         --output-repo "$repo_dir" \
         --engine-mode "$engine_mode" \
         --engine-dtype "$engine_dtype"; then
-        log_info "  Triton configs: regenerated from triton_manifest.json (sync_trt_configs)"
+        log_info "  Triton configs: regenerated from $manifest_path (sync_trt_configs)"
         return 0
     fi
     log_error "  generate_triton_configs.py failed"
@@ -600,27 +674,8 @@ validate_model_repo() {
     local missing=0
     local warned=0
 
-    if [ -z "$model_version" ] && [ -f "$repo_dir/triton_manifest.json" ]; then
-        model_version=$(python3 - "$repo_dir/triton_manifest.json" <<'PY' 2>/dev/null || true
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-with path.open(encoding="utf-8") as f:
-    manifest = json.load(f)
-package = manifest.get("package") or {}
-package_dir = ""
-if isinstance(package, dict):
-    package_dir = str(package.get("model_package_dir") or "")
-if not package_dir:
-    orch = manifest.get("orchestrator") or {}
-    if isinstance(orch, dict):
-        package_dir = str(orch.get("model_package_dir") or "")
-if package_dir:
-    print(Path(package_dir).name)
-PY
-        )
+    if [ -z "$model_version" ]; then
+        model_version=$(_infer_model_version_from_repo "$repo_dir" 2>/dev/null || true)
     fi
     model_version=$(resolve_model_version "${model_version:-}") || return 1
 
@@ -754,27 +809,10 @@ build_triton_image() {
 
     local model_repo="$repo_root/workspace/model_repository"
     local model_version="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
-    if [ -f "$model_repo/triton_manifest.json" ]; then
-        model_version=$(python3 - "$model_repo/triton_manifest.json" <<'PY' 2>/dev/null || true
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-with path.open(encoding="utf-8") as f:
-    manifest = json.load(f)
-package = manifest.get("package") or {}
-package_dir = ""
-if isinstance(package, dict):
-    package_dir = str(package.get("model_package_dir") or "")
-if not package_dir:
-    orch = manifest.get("orchestrator") or {}
-    if isinstance(orch, dict):
-        package_dir = str(orch.get("model_package_dir") or "")
-if package_dir:
-    print(Path(package_dir).name)
-PY
-        )
+    local inferred_version
+    inferred_version=$(_infer_model_version_from_repo "$model_repo" 2>/dev/null || true)
+    if [ -n "$inferred_version" ]; then
+        model_version="$inferred_version"
     fi
     model_version=$(resolve_model_version "${model_version:-}") || return 1
     local model_dir="$model_repo/tts_orchestrator/$model_version"

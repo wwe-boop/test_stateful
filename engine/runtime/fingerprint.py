@@ -203,6 +203,37 @@ def _probe_gpu_via_torch(device_index: int) -> tuple[str, str]:
         return "", ""
 
 
+def _probe_gpu_via_nvidia_smi(device_index: int) -> tuple[str, str]:
+    """Returns (sm_string, name) using nvidia-smi. Empty strings on failure."""
+    if not shutil.which("nvidia-smi"):
+        return "", ""
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                f"--id={device_index}",
+                "--query-gpu=compute_cap,name",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5,
+        ).strip().splitlines()
+    except Exception as exc:  # pragma: no cover
+        logger.debug("nvidia-smi GPU probe failed: %s", exc)
+        return "", ""
+    if not out:
+        return "", ""
+    row = out[0].strip()
+    if not row:
+        return "", ""
+    parts = [part.strip() for part in row.split(",", 1)]
+    compute_cap = parts[0] if parts else ""
+    name = parts[1] if len(parts) > 1 else ""
+    match = re.search(r"(\d+)\s*\.\s*(\d+)", compute_cap)
+    sm = f"sm_{match.group(1)}{match.group(2)}" if match else ""
+    return sm, name
+
+
 def _probe_tensorrt_version() -> str:
     """Returns the TensorRT version string, or empty string."""
     try:
@@ -252,7 +283,11 @@ def _probe_driver_via_nvml() -> str:
 
 def probe_current_environment(device_index: int = 0) -> RuntimeEnvironment:
     """Snapshot what this Python process sees on the GPU host."""
-    sm, name = _probe_gpu_via_torch(device_index)
+    sm, name = _probe_gpu_via_nvidia_smi(device_index)
+    if not sm or not name:
+        torch_sm, torch_name = _probe_gpu_via_torch(device_index)
+        sm = sm or torch_sm
+        name = name or torch_name
     return RuntimeEnvironment(
         gpu_sm=sm,
         gpu_name=name,

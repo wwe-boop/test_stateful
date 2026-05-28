@@ -211,38 +211,82 @@ _compose_manifest_ngc_tag() {
     printf '%s\n' "$tag"
 }
 
+_compose_ngc_tag_from_image() {
+    local image="${1:-}"
+    local tag="${image##*:}"
+    if [[ "$tag" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+        printf '%s\n' "$tag"
+    fi
+}
+
+_compose_apply_engine_ngc_defaults() {
+    local ngc_tag="$1"
+    export ENGINE_BASE_IMAGE="${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:${ngc_tag}-py3}"
+    if [[ -z "${ENGINE_PYTORCH_CUDA_TAG:-}" ]]; then
+        if [[ -n "${PYTORCH_CUDA_TAG:-}" ]]; then
+            export ENGINE_PYTORCH_CUDA_TAG="$PYTORCH_CUDA_TAG"
+        else
+            local torch_cuda_tag
+            torch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag" 2>/dev/null || true)
+            [[ -n "$torch_cuda_tag" ]] && export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
+        fi
+    fi
+}
+
+_compose_apply_triton_ngc_defaults() {
+    local ngc_tag="$1"
+    export TRITON_BASE_IMAGE="${TRITON_BASE_IMAGE:-nvcr.io/nvidia/tritonserver:${ngc_tag}-py3}"
+    if [[ -z "${TRITON_PYTORCH_CUDA_TAG:-}" ]]; then
+        if [[ -n "${PYTORCH_CUDA_TAG:-}" ]]; then
+            export TRITON_PYTORCH_CUDA_TAG="$PYTORCH_CUDA_TAG"
+        else
+            local torch_cuda_tag
+            torch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag" 2>/dev/null || true)
+            [[ -n "$torch_cuda_tag" ]] && export TRITON_PYTORCH_CUDA_TAG="$torch_cuda_tag"
+        fi
+    fi
+}
+
 resolve_compose_image_defaults() {
-    local ngc_tag=""
+    local manifest_ngc_tag=""
 
     if [[ "$GATEWAY" == "engine" || "$GATEWAY" == "all" ]]; then
+        local engine_ngc_tag=""
         if [[ -z "${IMAGE_OVERRIDE:-}" && ( -z "${ENGINE_IMAGE:-}" || "${ENGINE_IMAGE:-}" == "qwen3-engine:26.02" ) ]]; then
-            ngc_tag="$(_compose_manifest_ngc_tag)"
-            if [[ -n "$ngc_tag" ]]; then
-                export ENGINE_IMAGE="qwen3-engine:${ngc_tag}"
-                export ENGINE_BASE_IMAGE="${ENGINE_BASE_IMAGE:-nvcr.io/nvidia/tensorrt:${ngc_tag}-py3}"
-                if [[ -z "${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]]; then
-                    local torch_cuda_tag
-                    torch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag" 2>/dev/null || true)
-                    [[ -n "$torch_cuda_tag" ]] && export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
-                fi
+            manifest_ngc_tag="$(_compose_manifest_ngc_tag)"
+            engine_ngc_tag="$manifest_ngc_tag"
+            if [[ -n "$engine_ngc_tag" ]]; then
+                export ENGINE_IMAGE="qwen3-engine:${engine_ngc_tag}"
                 log_info "Using engine image from Phase B manifest: $ENGINE_IMAGE"
             fi
+        elif [[ -n "${ENGINE_IMAGE:-}" ]]; then
+            engine_ngc_tag="$(_compose_ngc_tag_from_image "$ENGINE_IMAGE")"
+            if [[ -n "$engine_ngc_tag" ]]; then
+                log_info "Using engine build base from image tag: $ENGINE_IMAGE -> NGC $engine_ngc_tag"
+            fi
+        fi
+        if [[ -n "$engine_ngc_tag" ]]; then
+            _compose_apply_engine_ngc_defaults "$engine_ngc_tag"
         fi
     fi
 
     if [[ "$GATEWAY" == "triton" || "$GATEWAY" == "all" ]]; then
+        local triton_ngc_tag=""
         if [[ -z "${IMAGE_OVERRIDE:-}" && ( -z "${TRITON_IMAGE:-}" || "${TRITON_IMAGE:-}" == "qwen3-tts-triton:26.02" ) ]]; then
-            ngc_tag="${ngc_tag:-$(_compose_manifest_ngc_tag)}"
-            if [[ -n "$ngc_tag" ]]; then
-                export TRITON_IMAGE="qwen3-tts-triton:${ngc_tag}"
-                export TRITON_BASE_IMAGE="${TRITON_BASE_IMAGE:-nvcr.io/nvidia/tritonserver:${ngc_tag}-py3}"
-                if [[ -z "${TRITON_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]]; then
-                    local torch_cuda_tag
-                    torch_cuda_tag=$(resolve_ngc_torch_index_tag "$ngc_tag" 2>/dev/null || true)
-                    [[ -n "$torch_cuda_tag" ]] && export TRITON_PYTORCH_CUDA_TAG="$torch_cuda_tag"
-                fi
+            manifest_ngc_tag="${manifest_ngc_tag:-$(_compose_manifest_ngc_tag)}"
+            triton_ngc_tag="$manifest_ngc_tag"
+            if [[ -n "$triton_ngc_tag" ]]; then
+                export TRITON_IMAGE="qwen3-tts-triton:${triton_ngc_tag}"
                 log_info "Using Triton image from Phase B manifest: $TRITON_IMAGE"
             fi
+        elif [[ -n "${TRITON_IMAGE:-}" ]]; then
+            triton_ngc_tag="$(_compose_ngc_tag_from_image "$TRITON_IMAGE")"
+            if [[ -n "$triton_ngc_tag" ]]; then
+                log_info "Using Triton build base from image tag: $TRITON_IMAGE -> NGC $triton_ngc_tag"
+            fi
+        fi
+        if [[ -n "$triton_ngc_tag" ]]; then
+            _compose_apply_triton_ngc_defaults "$triton_ngc_tag"
         fi
     fi
 }
@@ -261,6 +305,39 @@ log_compose_runtime_summary() {
     log_info "  Triton device:    $TRITON_GPU_DEVICE"
     log_info "  Triton max batch: $TRITON_MAX_BATCH"
     log_info "  Triton max seq:   $TRITON_MAX_SEQ_LEN"
+}
+
+verify_compose_engine_image() {
+    $DRY_RUN && return 0
+
+    local image="${ENGINE_IMAGE:-qwen3-engine:26.02}"
+    local image_tag_release=""
+    image_tag_release="$(_compose_ngc_tag_from_image "$image")"
+    local base_release=""
+    if [[ -n "${ENGINE_BASE_IMAGE:-}" && "$ENGINE_BASE_IMAGE" =~ :([0-9]{2}\.[0-9]{2})-py3$ ]]; then
+        base_release="${BASH_REMATCH[1]}"
+    fi
+    if [[ -n "$image_tag_release" && -n "$base_release" && "$image_tag_release" != "$base_release" ]]; then
+        log_error "Engine image tag/base image mismatch: image=$image implies $image_tag_release but ENGINE_BASE_IMAGE=$ENGINE_BASE_IMAGE"
+        return 1
+    fi
+    local expected_release="${image_tag_release:-$base_release}"
+
+    if [[ -n "$expected_release" ]] && ! engine_docker_image_matches_release "$image" "$expected_release"; then
+        local actual_release
+        actual_release=$(engine_docker_image_tensorrt_release "$image" || true)
+        log_error "Built engine image TensorRT release mismatch: image=$image expected=$expected_release actual=${actual_release:-unknown}"
+        log_error "Check ENGINE_BASE_IMAGE / --image; Docker tags do not guarantee image contents."
+        return 1
+    fi
+
+    local expected_torch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-}"
+    if [[ -n "$expected_torch_cuda_tag" ]] && ! engine_docker_image_matches_torch_cuda "$image" "$expected_torch_cuda_tag"; then
+        local actual_torch_cuda_tag
+        actual_torch_cuda_tag=$(engine_docker_image_torch_cuda_tag "$image" || true)
+        log_error "Built engine image PyTorch CUDA wheel mismatch: image=$image expected=$expected_torch_cuda_tag actual=${actual_torch_cuda_tag:-unknown}"
+        return 1
+    fi
 }
 
 compose_manifest_profile_value() {
@@ -648,9 +725,15 @@ cmd_build() {
     export_compose_env
     resolve_compose_image_defaults
     case "$GATEWAY" in
-        engine) compose_cmd build engine ;;
+        engine)
+            compose_cmd build engine
+            verify_compose_engine_image
+            ;;
         triton) compose_cmd build triton ;;
-        all) compose_cmd build engine triton ;;
+        all)
+            compose_cmd build engine triton
+            verify_compose_engine_image
+            ;;
     esac
 }
 

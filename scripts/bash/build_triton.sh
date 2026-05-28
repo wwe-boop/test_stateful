@@ -405,7 +405,7 @@ cmd_run() {
             || { log_error "Assembly failed"; exit 1; }
     fi
 
-    # Sync TRT configs for optional models (speaker_encoder, speech_tokenizer_encoder)
+    # Sync TRT configs for runtime support models (speaker_encoder, speech_tokenizer_codec_fused)
     # when they exist from a prior run but current variant didn't place them.
     sync_trt_configs "$MODEL_REPO_DIR" "$ENGINE_MODE" "$EXPORTED_DIR"
 
@@ -522,28 +522,7 @@ cmd_build() {
             || { log_error "Assembly failed"; exit 1; }
     else
         local repo_version=""
-        if [ -f "$MODEL_REPO_DIR/triton_manifest.json" ]; then
-            repo_version=$(python3 - "$MODEL_REPO_DIR/triton_manifest.json" <<'PY' 2>/dev/null || true
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-with path.open(encoding="utf-8") as f:
-    manifest = json.load(f)
-package = manifest.get("package") or {}
-package_dir = ""
-if isinstance(package, dict):
-    package_dir = str(package.get("model_package_dir") or "")
-if not package_dir:
-    orch = manifest.get("orchestrator") or {}
-    if isinstance(orch, dict):
-        package_dir = str(orch.get("model_package_dir") or "")
-if package_dir:
-    print(Path(package_dir).name)
-PY
-            )
-        fi
+        repo_version=$(_infer_model_version_from_repo "$MODEL_REPO_DIR" 2>/dev/null || true)
         if [ -n "$repo_version" ] && [ "$repo_version" != "$MODEL_VERSION" ]; then
             log_warn "Model repository version mismatch: repo=$repo_version requested=$MODEL_VERSION, re-assembling ..."
             assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \

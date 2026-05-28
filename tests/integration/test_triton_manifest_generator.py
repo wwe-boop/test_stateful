@@ -126,6 +126,7 @@ def test_build_manifest_for_export_roundtrip():
     assert m.get("triton_io_float_dtype") == "bf16"
     assert m["package"]["layout"] == "triton_model_version"
     assert m["package"]["runtime_artifacts"]["trt"] == "runtime/model.plan"
+    assert m["package"]["optional_assets"] == {}
     assert m["code2wav_fused"]["packed_kv"] is True
     assert m["code2wav_fused"]["c2w_kv_heads"] == 16
     assert m["code2wav_fused"]["c2w_head_dim"] == 64

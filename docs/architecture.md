@@ -707,7 +707,7 @@ Talker Backbone 保留 KV Cache（与 Code Predictor 不同），因为：
 | ONNX Runtime | `model.onnx` | `onnxruntime` | `generate_triton_configs.py` |
 | TensorRT | `model.plan` | `tensorrt` | `generate_triton_configs.py`（显式 I/O 与 minimal） |
 
-**`triton_manifest.json`**（`export_09` 必填）：合并 `weights/config.json` 中的 Talker 维度与融合图 Code2Wav 状态（`code2wav_fused`）。Phase C `assemble` **要求**该文件存在，将其复制到 `model_repository/` 根与 `tts_orchestrator/1/`，并仅通过 [`scripts/python/generate_triton_configs.py`](../scripts/python/generate_triton_configs.py) 生成全部 `config.pbtxt`。Schema 见 [`scripts/python/schemas/triton_manifest.schema.json`](../scripts/python/schemas/triton_manifest.schema.json)。
+**`triton_manifest.json`**（`export_09` 必填）：合并 `weights/config.json` 中的 Talker 维度与融合图 Code2Wav 状态（`code2wav_fused`）。Phase C `assemble` **要求**该文件存在，将其复制到 `tts_orchestrator/<version>/` 与 `tts_orchestrator/<version>/runtime/`，并通过 [`scripts/python/generate_triton_configs.py`](../scripts/python/generate_triton_configs.py) 生成全部 `config.pbtxt`。Schema 见 [`scripts/python/schemas/triton_manifest.schema.json`](../scripts/python/schemas/triton_manifest.schema.json)。
 
 **精度与 manifest（单一来源）**：
 
