@@ -57,6 +57,10 @@ from engine.config import (
     resolve_model_package_paths,
 )
 from engine.core.types import AudioConfig, AudioEncoding, GroupPolicy, InputMode, SessionConfig
+from engine.runtime.fingerprint import (
+    FingerprintCheckError,
+    enforce_engine_fingerprint,
+)
 from engine.server import TTSEngine
 
 logger = logging.getLogger("tts_orchestrator")
@@ -243,6 +247,20 @@ class TritonPythonModel:
         self._engine_dir = Path(package_paths.engine_dir)
         self._weights_dir = Path(package_paths.weights_dir)
         self._tokenizer_dir = Path(package_paths.tokenizer_dir)
+
+        # Strict runtime fingerprint guard.  Same check as standalone
+        # engine/server.py; failures here surface in Triton's model_repository
+        # load status as a TritonModelException with the full report attached.
+        try:
+            enforce_engine_fingerprint(
+                str(self._model_package_dir),
+                device_index=self.device_id,
+                runtime_dir=str(self._engine_dir),
+            )
+        except FingerprintCheckError as exc:
+            raise pb_utils.TritonModelException(
+                f"Engine fingerprint check failed for variant '{self.variant}':\n{exc}"
+            ) from exc
 
         cfg = EngineConfig()
         apply_model_package_paths(cfg, package_paths)

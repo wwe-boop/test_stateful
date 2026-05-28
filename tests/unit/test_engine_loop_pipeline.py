@@ -197,6 +197,139 @@ class TestSessionCancel:
         assert result.metrics == {"cancelled": True}
         assert "cancel-me" not in engine_loop._groups
 
+    def test_new_session_replacement_releases_existing_slot(self, model_config):
+        inbox = queue.Queue()
+        loop = _ImmediateLoop()
+
+        class StubExecutor:
+            kv_pool = KVCachePool(
+                max_slots=4, config=model_config,
+                device=torch.device("cpu"), preallocate=False,
+            )
+            _device = torch.device("cpu")
+            _config = model_config
+
+        engine_loop = EngineLoop(
+            engine_inbox=inbox,
+            async_loop=loop,
+            executor=StubExecutor(),
+            max_batch_size=4,
+        )
+
+        engine_loop._handle_request(
+            EngineRequest(type=RequestType.NEW_SESSION, session_id="s1")
+        )
+        slot = StubExecutor.kv_pool.allocate("s1:0")
+        seg = EngineSegment("s1", 0)
+        seg.slot = slot
+        seg.state = "active"
+        engine_loop._groups["s1"].segments[0] = seg
+        engine_loop._seg_by_slot[slot.slot_id] = seg
+
+        engine_loop._handle_request(
+            EngineRequest(type=RequestType.NEW_SESSION, session_id="s1")
+        )
+
+        assert slot.is_free is True
+        assert slot.slot_id not in engine_loop._seg_by_slot
+        assert engine_loop._groups["s1"].segments == {}
+        assert StubExecutor.kv_pool.free_count == 4
+
+    def test_duplicate_start_tokens_releases_replaced_segment_slot(self, model_config):
+        inbox = queue.Queue()
+        loop = _ImmediateLoop()
+
+        class StubExecutor:
+            kv_pool = KVCachePool(
+                max_slots=4, config=model_config,
+                device=torch.device("cpu"), preallocate=False,
+            )
+            _device = torch.device("cpu")
+            _config = model_config
+
+        engine_loop = EngineLoop(
+            engine_inbox=inbox,
+            async_loop=loop,
+            executor=StubExecutor(),
+            max_batch_size=4,
+        )
+
+        engine_loop._handle_request(
+            EngineRequest(type=RequestType.NEW_SESSION, session_id="s1")
+        )
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.START_TOKENS,
+                session_id="s1",
+                segment_idx=0,
+                token_ids=[1],
+            )
+        )
+        old_seg = engine_loop._groups["s1"].segments[0]
+        slot = StubExecutor.kv_pool.allocate("s1:0")
+        old_seg.slot = slot
+        old_seg.state = "active"
+        engine_loop._seg_by_slot[slot.slot_id] = old_seg
+
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.START_TOKENS,
+                session_id="s1",
+                segment_idx=0,
+                token_ids=[2],
+            )
+        )
+
+        new_seg = engine_loop._groups["s1"].segments[0]
+        assert slot.is_free is True
+        assert old_seg.slot is None
+        assert new_seg is not old_seg
+        assert new_seg.pending_token_ids == [2]
+        assert new_seg.slot is None
+        assert slot.slot_id not in engine_loop._seg_by_slot
+        assert StubExecutor.kv_pool.free_count == 4
+
+    def test_failed_prefill_cleanup_releases_slot_and_removes_session(self, model_config):
+        inbox = queue.Queue()
+        loop = _ImmediateLoop()
+
+        class StubExecutor:
+            kv_pool = KVCachePool(
+                max_slots=4, config=model_config,
+                device=torch.device("cpu"), preallocate=False,
+            )
+            _device = torch.device("cpu")
+            _config = model_config
+
+        engine_loop = EngineLoop(
+            engine_inbox=inbox,
+            async_loop=loop,
+            executor=StubExecutor(),
+            max_batch_size=4,
+        )
+
+        result_queue = queue.Queue()
+        engine_loop._handle_request(
+            EngineRequest(
+                type=RequestType.NEW_SESSION,
+                session_id="s1",
+                result_queue=result_queue,
+            )
+        )
+        seg = EngineSegment("s1", 0)
+        seg.state = "pending_prefill"
+        seg.slot = StubExecutor.kv_pool.allocate("s1:0")
+        engine_loop._groups["s1"].segments[0] = seg
+        engine_loop._seg_by_slot[seg.slot.slot_id] = seg
+
+        engine_loop._cleanup_failed_prefills()
+
+        result = result_queue.get_nowait()
+        assert result.type == ResultType.ERROR
+        assert result.session_id == "s1"
+        assert "s1" not in engine_loop._groups
+        assert StubExecutor.kv_pool.free_count == 4
+
 
 class TestProcessStepOutput:
     def test_process_updates_slot_state(self, model_config):

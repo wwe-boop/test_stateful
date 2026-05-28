@@ -17,6 +17,7 @@ Key optimisations:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -38,6 +39,30 @@ logger = logging.getLogger(__name__)
 
 FUSED_CHUNK_T = 1
 _FUSED_DUMMY_PAST_LEN = 1
+_MAX_TORCH_SEED = (1 << 63) - 1
+
+
+def _stable_sampling_seed(base_seed: int, *parts: object) -> int:
+    """Derive a deterministic torch seed from stable logical identifiers."""
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(int(base_seed)).encode("utf-8"))
+    for part in parts:
+        h.update(b"\0")
+        h.update(str(part).encode("utf-8"))
+    return int.from_bytes(h.digest()[:8], "little") & _MAX_TORCH_SEED
+
+
+def _wait_stream_for_current(stream: Any, device: torch.device) -> None:
+    """Make a custom CUDA stream wait for tensors built on the current stream."""
+    if stream is None or not hasattr(stream, "wait_stream"):
+        return
+    try:
+        current = torch.cuda.current_stream(device)
+    except Exception:
+        return
+    if getattr(current, "cuda_stream", None) == getattr(stream, "cuda_stream", None):
+        return
+    stream.wait_stream(current)
 
 
 def _append_c2w_delta(
@@ -238,6 +263,7 @@ class TRTEngine:
             if valid_input_names and name not in valid_input_names:
                 continue
             tensor = tensor.contiguous()
+            inputs[name] = tensor
             shape = tuple(tensor.shape)
             input_shapes[name] = shape
             if use_cache:
@@ -249,6 +275,15 @@ class TRTEngine:
                 ctx.set_input_shape(name, shape)
                 shape_changed = True
             ctx.set_tensor_address(name, tensor.data_ptr())
+            if tensor.is_cuda:
+                try:
+                    tensor.record_stream(stream)
+                except Exception:
+                    logger.debug(
+                        "Could not record input tensor stream: %s",
+                        name,
+                        exc_info=True,
+                    )
 
         if shape_changed and hasattr(ctx, "infer_shapes"):
             unresolved = ctx.infer_shapes()
@@ -286,6 +321,15 @@ class TRTEngine:
                 )
 
             ctx.set_tensor_address(name, out_tensor.data_ptr())
+            if out_tensor.is_cuda:
+                try:
+                    out_tensor.record_stream(stream)
+                except Exception:
+                    logger.debug(
+                        "Could not record output tensor stream: %s",
+                        name,
+                        exc_info=True,
+                    )
             outputs[name] = out_tensor
 
         ctx.execute_async_v3(stream.cuda_stream)
@@ -316,6 +360,8 @@ class GPUFuture:
     _compute_stream: Any = None
     _raw: Dict[str, torch.Tensor] = field(default_factory=dict)
     _slots: List[SlotKVState] = field(default_factory=list)
+    # Keeps async TensorRT input buffers alive until the compute stream syncs.
+    _input_refs: Dict[str, Any] = field(default_factory=dict)
     _original_past_lens: List[int] = field(default_factory=list)
     _padded_past_len: int = 0
     _seq: int = 1
@@ -335,6 +381,7 @@ class GPUFuture:
         """
         if self._compute_stream is not None:
             self._compute_stream.synchronize()
+        self._input_refs.clear()
 
         batch_size = len(self._slots)
         raw = self._raw
@@ -463,11 +510,9 @@ class Executor:
         self._do_sample = do_sample
         self._temperature = temperature
         self._repetition_penalty = repetition_penalty
+        self._random_seed = int(random_seed)
 
         self._compute_stream = torch.cuda.Stream(device=self._device)
-
-        self._sampling_gen = torch.Generator(device=self._device)
-        self._sampling_gen.manual_seed(random_seed)
 
         self._fused_engine: Optional[TRTEngine] = None
         self._embedding_weights = None
@@ -754,6 +799,7 @@ class Executor:
             input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
 
         stream = self._compute_stream
+        _wait_stream_for_current(stream, self._device)
         with torch.cuda.stream(stream):
             raw = self._fused_engine.infer(
                 inputs, out_names, stream,
@@ -861,6 +907,7 @@ class Executor:
             input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
 
         stream = self._compute_stream
+        _wait_stream_for_current(stream, self._device)
         with torch.cuda.stream(stream):
             raw = self._fused_engine.infer(
                 inputs, out_names, stream,
@@ -942,6 +989,7 @@ class Executor:
             input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
 
         stream = self._compute_stream
+        _wait_stream_for_current(stream, self._device)
         with torch.cuda.stream(stream):
             raw = self._fused_engine.infer(
                 inputs, out_names, stream,
@@ -1087,6 +1135,7 @@ class Executor:
         ):
             input_snapshot = self._debug_dumper.capture(inputs, root_name="inputs")
 
+        _wait_stream_for_current(self._compute_stream, self._device)
         with torch.cuda.stream(self._compute_stream):
             raw = self._fused_engine.infer(
                 inputs, out_names, self._compute_stream,
@@ -1107,6 +1156,7 @@ class Executor:
             _compute_stream=self._compute_stream,
             _raw=raw,
             _slots=slots,
+            _input_refs=inputs,
             _original_past_lens=original_past_lens,
             _padded_past_len=padded_past_len,
             _seq=1,
@@ -1145,6 +1195,49 @@ class Executor:
         for idx, name in enumerate(self._c2w_transconv_output_names):
             overrides[name] = slot._c2w_transconv_write[idx]
         return overrides
+
+    def _slot_sampling_generator(self, slot: SlotKVState) -> torch.Generator:
+        """Return the deterministic sampling generator owned by one slot."""
+        if slot.sampling_generator is not None:
+            return slot.sampling_generator
+
+        identity = slot.session_id if slot.session_id is not None else f"slot:{slot.slot_id}"
+        seed = _stable_sampling_seed(
+            self._random_seed,
+            identity,
+            slot.segment_idx,
+        )
+        gen = torch.Generator(device=self._device)
+        gen.manual_seed(seed)
+        slot.sampling_seed = seed
+        slot.sampling_generator = gen
+        return gen
+
+    def _build_sampling_noise(
+        self,
+        slots: List[SlotKVState],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build per-lane Gumbel noise without cross-lane RNG coupling."""
+        cfg = self._config
+        gumbel_rows: list[torch.Tensor] = []
+        cp_gumbel_rows: list[torch.Tensor] = []
+
+        for slot in slots:
+            gen = self._slot_sampling_generator(slot)
+            gumbel_u = torch.rand(
+                1, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+                generator=gen,
+            ).clamp(1e-8, 1.0)
+            cp_gumbel_u = torch.rand(
+                1, cfg.cp_num_stages, cfg.logits_topk,
+                device=self._device, dtype=torch.float32,
+                generator=gen,
+            ).clamp(1e-8, 1.0)
+            gumbel_rows.append(-torch.log(-torch.log(gumbel_u)))
+            cp_gumbel_rows.append(-torch.log(-torch.log(cp_gumbel_u)))
+
+        return torch.cat(gumbel_rows, dim=0), torch.cat(cp_gumbel_rows, dim=0)
 
     # ------------------------------------------------------------------
     # Input / output name builders
@@ -1216,18 +1309,7 @@ class Executor:
                 batch, 1, device=self._device, dtype=torch.float32,
             )
         elif self._do_sample:
-            gumbel = torch.rand(
-                batch, cfg.logits_topk,
-                device=self._device, dtype=torch.float32,
-                generator=self._sampling_gen,
-            ).clamp(1e-8, 1.0)
-            gumbel = -torch.log(-torch.log(gumbel))
-            cp_gumbel = torch.rand(
-                batch, cfg.cp_num_stages, cfg.logits_topk,
-                device=self._device, dtype=torch.float32,
-                generator=self._sampling_gen,
-            ).clamp(1e-8, 1.0)
-            cp_gumbel = -torch.log(-torch.log(cp_gumbel))
+            gumbel, cp_gumbel = self._build_sampling_noise(slots)
             temperature = torch.full(
                 (batch, 1), self._temperature,
                 device=self._device, dtype=torch.float32,

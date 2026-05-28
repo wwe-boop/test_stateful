@@ -273,6 +273,7 @@ class EngineLoop:
                 self._try_prefill_pending()
             except Exception:
                 logger.exception("Prefill failed unexpectedly")
+                self._cleanup_failed_prefills()
 
             # --- Phase 3: Launch decode for active slots. ---
             active_slots = self._get_active_slots_mlfq()
@@ -312,7 +313,8 @@ class EngineLoop:
 
     def _handle_request(self, req: EngineRequest) -> None:
         if req.type == RequestType.NEW_SESSION:
-            if len(self._groups) >= self._max_queue_size:
+            replacing_existing = req.session_id in self._groups
+            if not replacing_existing and len(self._groups) >= self._max_queue_size:
                 logger.warning(
                     "Backpressure: rejecting session %s (active=%d >= limit=%d)",
                     req.session_id, len(self._groups), self._max_queue_size,
@@ -327,6 +329,12 @@ class EngineLoop:
                         ),
                     )
                 return
+            if replacing_existing:
+                logger.warning(
+                    "NEW_SESSION replacing existing backend session: %s",
+                    req.session_id,
+                )
+                self._remove_session(req.session_id)
             group = EngineSessionGroup(req.session_id, req)
             self._groups[req.session_id] = group
             self._total_sessions += 1
@@ -352,6 +360,15 @@ class EngineLoop:
             if req.token_ids:
                 seg.pending_token_ids.extend(req.token_ids)
                 seg.text_tokens_consumed += len(req.token_ids)
+            old_seg = group.segments.get(req.segment_idx)
+            if old_seg is not None:
+                logger.warning(
+                    "START_TOKENS replacing existing segment: %s seg=%d state=%s",
+                    req.session_id,
+                    req.segment_idx,
+                    old_seg.state,
+                )
+                self._release_segment_slot(old_seg)
             group.segments[req.segment_idx] = seg
             if req.result_queue is not None:
                 group.result_queue = req.result_queue
@@ -510,6 +527,7 @@ class EngineLoop:
                     segment_idx=best.segment_idx,
                     error_msg=str(exc),
                 ))
+                self._remove_session(best.session_id)
                 return False
             prefill_metrics = self._prefill_metrics(task_type, req_cfg)
             # Non-ICL tasks can check cache before building the full plan. ICL
@@ -985,6 +1003,7 @@ class EngineLoop:
                 "Evicted segment %s:%d due to idle timeout",
                 seg.session_id, seg.segment_idx,
             )
+            self._remove_session(seg.session_id)
 
     # ------------------------------------------------------------------
     # Result processing (runs while GPU does next step)
@@ -1190,11 +1209,7 @@ class EngineLoop:
         }
 
         seg.state = "done"
-        if seg.slot:
-            slot_id = seg.slot.slot_id
-            self._executor.kv_pool.release(slot_id)
-            self._seg_by_slot.pop(slot_id, None)
-            seg.slot = None
+        self._release_segment_slot(seg)
 
         self._send_result(group, EngineResult(
             type=ResultType.SEGMENT_END,
@@ -1244,9 +1259,40 @@ class EngineLoop:
         if group is None:
             return
         for seg in group.segments.values():
-            if seg.slot:
-                self._executor.kv_pool.release(seg.slot.slot_id)
-                self._seg_by_slot.pop(seg.slot.slot_id, None)
+            self._release_segment_slot(seg)
+
+    def _release_segment_slot(self, seg: EngineSegment) -> None:
+        slot = seg.slot
+        if slot is None:
+            return
+        slot_id = slot.slot_id
+        kv_pool = self._executor.kv_pool
+        if kv_pool is not None:
+            kv_pool.release(slot_id)
+        self._seg_by_slot.pop(slot_id, None)
+        seg.slot = None
+
+    def _cleanup_failed_prefills(self) -> None:
+        failed_sessions: list[str] = []
+        for group in list(self._groups.values()):
+            for seg in group.segments.values():
+                if seg.state == "pending_prefill" and seg.slot is not None:
+                    failed_sessions.append(group.session_id)
+                    self._send_result(group, EngineResult(
+                        type=ResultType.ERROR,
+                        session_id=seg.session_id,
+                        segment_idx=seg.segment_idx,
+                        error_msg="Prefill failed unexpectedly",
+                    ))
+                    logger.warning(
+                        "Cleaning failed prefill session %s seg=%d slot=%d",
+                        seg.session_id,
+                        seg.segment_idx,
+                        seg.slot.slot_id,
+                    )
+                    break
+        for session_id in failed_sessions:
+            self._remove_session(session_id)
 
     # ------------------------------------------------------------------
     # Result delivery (cross-thread)

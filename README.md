@@ -48,7 +48,7 @@ cd Qwen3-TTS-Triton
 # 推荐先跑 custom-1.7b；不带参数时会进入交互模式
 bash scripts/bash/autorun.sh
 
-# 一次性跑完整流程
+# 一次性跑本机完整流程
 bash scripts/bash/autorun.sh all -m custom-1.7b
 ```
 
@@ -61,8 +61,11 @@ Phase A: setup_env.sh
 Phase B: build_engines.sh
   在 NGC 容器里用 trtexec 编译 TensorRT engine，并把 engine profile 写回 triton_manifest.json
 
-Phase C: deploy.sh / compose.sh
-  以 standalone engine、engine Docker 或 Triton gateway 启动服务
+Phase C1: deploy.sh package / compose.sh prepare
+  组装模型包；engine-docker 会用当前代码构建运行镜像
+
+Phase C2: deploy.sh run / compose.sh up
+  只在当前机器启动 standalone engine、engine Docker 或 Triton 服务
 ```
 
 ## 部署流程
@@ -91,13 +94,13 @@ workspace/models/
 
 如果只部署推荐路径，至少准备 `Qwen3-TTS-Tokenizer-12Hz` 和 `Qwen3-TTS-12Hz-1.7B-CustomVoice`。如果部署 `base-1.7b`，还需要 `Qwen3-TTS-12Hz-1.7B-Base`。
 
-3. 一键执行导出、构建和部署：
+3. 一键执行导出、构建、打包和本机启动：
 
 ```bash
 bash scripts/bash/autorun.sh all -m custom-1.7b --gateway standalone --engine-mode trt
 ```
 
-这会按顺序执行 Phase A 环境/导出、Phase B TensorRT engine 编译、Phase C 模型包组装和服务启动。默认使用 `bf16`，并根据 GPU 显存选择保守的 TensorRT profile。
+这会按顺序执行 Phase A 环境/导出、Phase B TensorRT engine 编译、Phase C1 模型包/镜像产物组装、Phase C2 当前机器服务启动。默认使用 `bf16`，并根据目标 GPU 指纹和导出产物估算 TensorRT profile；如果显式传 `--max-batch-size` 等参数，则命令行优先。
 
 4. 也可以分阶段执行，适合排查问题或复用已导出的产物：
 
@@ -112,20 +115,27 @@ bash scripts/bash/autorun.sh build -m custom-1.7b \
   --max-seq-len 512 \
   --dtype bf16
 
-# Phase C: 启动 standalone engine
+# Phase C1: 组装模型包/镜像，不启动服务
+bash scripts/bash/autorun.sh package -m custom-1.7b \
+  --gateway standalone \
+  --engine-mode trt
+
+# Phase C2: 只在当前机器启动 standalone engine
 bash scripts/bash/autorun.sh deploy -m custom-1.7b \
   --gateway standalone \
   --engine-mode trt
 ```
 
-5. 如需 Triton 或 engine Docker，把 Phase C 的 gateway 换掉：
+5. 如需 Triton 或 engine Docker，把 Phase C 的 gateway 换掉。`package` 只生成产物，不启动服务；`deploy` 只在当前机器运行服务：
 
 ```bash
-# Triton Python backend / model repository
-bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway triton --engine-mode trt
+# Triton Python backend / model repository；package 会构建自包含 Triton 镜像
+bash scripts/bash/autorun.sh package -m custom-1.7b --gateway triton --engine-mode trt
+bash scripts/bash/autorun.sh deploy  -m custom-1.7b --gateway triton --engine-mode trt
 
-# 独立 engine 容器
-bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker --engine-mode trt
+# 独立 engine 容器；package 会按当前 checkout 重建 engine 镜像
+bash scripts/bash/autorun.sh package -m custom-1.7b --gateway engine-docker --engine-mode trt --build
+bash scripts/bash/autorun.sh deploy  -m custom-1.7b --gateway engine-docker --engine-mode trt
 ```
 
 6. 部署 `base-1.7b` / `icl` 实验路径时，建议先准备默认参考音频和 reference registry：
@@ -205,6 +215,18 @@ mamba run -n qwen3-tts python tests/tools/serving_endpoints.py \
 
 底层的 `setup_env.sh`、`build_engines.sh`、`deploy.sh`、`compose.sh` 仍可单独使用，但 README 默认只展示 `autorun.sh`。所有关键控制项都可以从 `autorun.sh` 进入：导出 GPU、TensorRT 编译 GPU、engine profile、runtime 上限、部署方式和端口。
 
+Phase C 被拆成两个显式命令：
+
+```bash
+# 只组装部署产物，不启动服务；跨机/打包机场景用这个
+bash scripts/bash/autorun.sh package -m custom-1.7b --gateway engine-docker
+
+# 只在当前机器启动服务；当前机器不是生产服务机时不要执行这个
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
+```
+
+`autorun.sh all` 是“本机完整流程”，会执行 `setup → build → package → deploy`。如果你是在导图/打包机上为云端生产容器准备产物，通常应在导入云端返回的 engine artifact 后执行 `package`，然后把镜像和模型包交给生产部署系统；不要在打包机上执行 `deploy`。
+
 配置优先级是：命令行参数 > 已导出的环境变量 > manifest/default。常用环境变量包括 `MODEL_VERSION`、`EXPORT_DEVICE`、`BUILD_GPU_DEVICE`、`RUNTIME_GPU_DEVICE`、`MAX_BATCH_SIZE`、`MAX_INPUT_LEN`、`MAX_SEQ_LEN`、`RUNTIME_MAX_BATCH_SIZE`、`RUNTIME_MAX_SEQ_LEN`；但推荐日常都从 `autorun.sh` 参数进入，便于复现。
 
 ### 模型版本号
@@ -259,7 +281,22 @@ bash scripts/bash/autorun.sh build -m custom-1.7b \
   --dtype bf16
 ```
 
-如果不显式传 `--max-batch-size`、`--max-input-len`、`--max-seq-len`，Phase B 会根据选中的构建 GPU 总显存给一个保守建议值：
+如果不显式传 `--max-batch-size`、`--max-input-len`、`--max-seq-len`，Phase B 会优先读取
+`workspace/exported/<variant>/triton_manifest.json` 和导出的权重/engine/ONNX 文件，估算：
+
+- 固定占用：TRT/ONNX 主模型、runtime embedding 权重、必要的 reference preprocessing engine
+- 每路持久状态：Talker KV pool、Code2Wav KV、conv/transconv 双缓冲、token_counts
+- 每步峰值：batched talker KV 输入、C2W KV/state 输入、TRT 输出缓存和少量采样/attention scratch
+
+然后结合目标机器 `target_profile.json` 里的 GPU 总显存，向下取到支持的 profile 档位：
+
+```text
+16 / 32 / 64 / 128
+```
+
+因此跨机编译时 profile 应以生产机 `target_profile.json` 和导出产物估算为准，而不是打包机显存。例如 `custom-1.7b` 在 48G 目标卡上，如果固定占用、TRT 自留和 KV/cache 估算后仍满足余量，默认建议可以落到 `max_batch_size=128`。
+
+如果导出 manifest 不存在，才回退到粗略显存档位：
 
 ```text
 约 24 GB GPU:  max_batch=16   max_input_len=96   max_seq_len=384
@@ -268,7 +305,7 @@ bash scripts/bash/autorun.sh build -m custom-1.7b \
 约 80 GB GPU:  max_batch=128  max_input_len=128  max_seq_len=512
 ```
 
-这只是默认建议，不是限制。比如你可以在 24G 机器上为 48G 部署机尝试构建更大的 profile：
+这只是默认建议，不是限制；显式参数仍然最高优先级。比如你可以在 24G 机器上为 48G 部署机尝试构建更大的 profile：
 
 ```bash
 bash scripts/bash/autorun.sh build -m custom-1.7b \
@@ -359,10 +396,29 @@ bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
 ```
 
 注意：`autorun.sh build` 是 Phase B 的 TensorRT engine 编译，不是重建
-`Dockerfile.engine` 对应的 Docker 镜像。`autorun.sh deploy --gateway engine-docker`
-只会在镜像不存在，或镜像明显不是 engine 镜像时自动构建；如果你更新了
-`engine/`、`engine.yaml` 或 `scripts/compose/engine-entrypoint.sh` 这类会被
-`Dockerfile.engine` `COPY` 进镜像的文件，需要显式重新构建并重建容器：
+`Dockerfile.engine` 对应的 Docker 镜像。现在推荐把镜像构建放在 package 步骤：
+
+```bash
+bash scripts/bash/autorun.sh package -m custom-1.7b --gateway engine-docker --build
+```
+
+`package --gateway engine-docker` 会先组装 `workspace/model_repository`，再按当前
+checkout 重建 engine 镜像。Docker cache 会复用依赖层，但 `engine/`、
+`engine.yaml` 和 `scripts/compose/engine-entrypoint.sh` 这类 `COPY` 进镜像的代码会更新。
+
+如果你只想在当前机器启动服务，使用：
+
+```bash
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
+```
+
+如果跳过了 package，但仍希望 run 前强制刷新当前代码镜像，可以给 deploy 加 `--build`：
+
+```bash
+bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker --build
+```
+
+底层也可以直接使用 compose：
 
 ```bash
 bash scripts/bash/compose.sh down --gateway engine
@@ -373,14 +429,6 @@ DOCKER_BUILDKIT=1 bash scripts/bash/compose.sh up \
   --build
 
 bash scripts/bash/compose.sh logs --gateway engine --follow
-```
-
-如果想继续走 `autorun.sh deploy`，可以先删除旧镜像，让 deploy 阶段重新构建：
-
-```bash
-bash scripts/bash/autorun.sh stop
-docker image rm qwen3-engine:26.02
-bash scripts/bash/autorun.sh deploy -m custom-1.7b --gateway engine-docker
 ```
 
 如果你正在频繁改 engine 代码，不建议反复重建镜像。使用 compose 的开发覆盖层或 watch：

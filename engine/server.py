@@ -51,6 +51,10 @@ from .config import (
     resolve_model_package_paths,
     to_model_config,
 )
+from .runtime.fingerprint import (
+    FingerprintCheckError,
+    enforce_engine_fingerprint,
+)
 from .core.mlfq import MLFQConfig
 from .core.types import SessionConfig
 from .frontend.interface import FrontendInterface
@@ -950,6 +954,21 @@ def main():
             cfg,
             resolve_model_package_paths(cfg.paths.model_package_dir),
         )
+
+    # Strict runtime fingerprint guard.  Refuses to start when the engine
+    # plan in this package was compiled for a GPU / TRT version that
+    # disagrees with what this process can actually use.  Bypass with
+    # QWEN3_ALLOW_FINGERPRINT_MISMATCH=1 (debugging only).  See
+    # engine/runtime/fingerprint.py for details.
+    if cfg.paths.model_package_dir:
+        try:
+            enforce_engine_fingerprint(
+                cfg.paths.model_package_dir,
+                device_index=args.device,
+            )
+        except FingerprintCheckError as exc:
+            logger.error("Engine fingerprint check failed:\n%s", exc)
+            raise SystemExit(2) from exc
 
     engine_dir = cfg.paths.engine_dir
     tokenizer_dir = cfg.paths.tokenizer_dir

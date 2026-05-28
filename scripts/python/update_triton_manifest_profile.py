@@ -70,6 +70,9 @@ def update_manifest(args: argparse.Namespace) -> None:
             "max_seq_len": int(args.max_seq_len),
             "builder_image": args.builder_image or "",
             "target_driver": args.target_driver or "",
+            "ngc_tag": args.ngc_tag or "",
+            "gpu_sm": args.gpu_sm or "",
+            "tensorrt_version": args.tensorrt_version or "",
         }
     )
     if not args.skip_built_at:
@@ -92,8 +95,22 @@ def main() -> None:
     parser.add_argument("--builder", default="trtexec")
     parser.add_argument("--builder-image", default="")
     parser.add_argument("--target-driver", default="")
+    parser.add_argument("--ngc-tag", default="")
+    parser.add_argument("--target-profile", default="", help="target_profile.json for gpu_sm metadata")
+    parser.add_argument("--gpu-sm", default="")
+    parser.add_argument("--tensorrt-version", default="")
     parser.add_argument("--skip-built-at", action="store_true")
     args = parser.parse_args()
+    if args.target_profile and not args.gpu_sm:
+        try:
+            profile = json.loads(Path(args.target_profile).read_text(encoding="utf-8"))
+            args.gpu_sm = str((profile.get("gpus") or [{}])[0].get("sm") or "")
+        except Exception:
+            args.gpu_sm = ""
+    if args.ngc_tag and not args.tensorrt_version:
+        # The shell resolver records exact TRT version in ngc_matrix.conf; callers
+        # can pass it explicitly.  Keep this optional for old local builds.
+        args.tensorrt_version = ""
     update_manifest(args)
 
 

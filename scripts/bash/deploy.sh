@@ -2,7 +2,7 @@
 # ===========================================================================
 #  deploy.sh — Phase C: Deploy TTS service (standalone engine or Triton)
 #
-#  Unified entry point for deploying the TTS service. Supports three gateway modes:
+#  Unified entry point for packaging or deploying the TTS service. Supports three gateway modes:
 #
 #  A) Standalone gRPC Server (--gateway standalone)
 #     Runs `python -m engine.server` on the host (see ENGINE_PYTHON / conda).
@@ -18,6 +18,7 @@
 #     Best for: portable deploy, matching TRT base with Phase B.
 #
 #  Usage:
+#    bash scripts/bash/deploy.sh package --gateway engine-docker    # assemble model repo + build engine image, do not run
 #    bash scripts/bash/deploy.sh run                               # standalone (default)
 #    bash scripts/bash/deploy.sh run --gateway triton               # Triton mode
 #    bash scripts/bash/deploy.sh run --gateway engine-docker      # Engine image + container
@@ -47,7 +48,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/../.." && pwd))"
 source "${SCRIPT_DIR}/tools.sh"
 
 # ── Defaults ──
@@ -57,6 +58,7 @@ GATEWAY_MODE="${GATEWAY_MODE:-standalone}"
 VARIANT=""
 MODEL_VERSION="${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}"
 DRY_RUN=false
+FORCE_IMAGE_BUILD=false
 
 # Standalone options
 ENGINE_PORT="${ENGINE_GRPC_PORT:-50051}"
@@ -81,6 +83,7 @@ usage() {
 Usage: deploy.sh <command> [options]
 
 Commands:
+  package                Assemble deployment artifacts; optionally build image, do not start service
   run                    Start the TTS service
   stop                   Stop the TTS service
   status                 Show service status
@@ -96,6 +99,8 @@ Options:
   --engine-image <tag>   Image tag for engine-docker (default: Phase B NGC tag)
   --variant <name>       Model variant (default: auto-discover)
   --model-version <N>    Triton model version directory (default: 1)
+  --build, --rebuild-image
+                          Rebuild runtime image from current code before use
   --dry-run              Show what would be done
 
   Standalone options:
@@ -116,6 +121,7 @@ Options:
 Examples:
   deploy.sh run                                  # standalone, auto-discover variant
   deploy.sh run --variant custom-1.7b            # standalone, specific variant
+  deploy.sh package --gateway engine-docker --variant custom-1.7b
   deploy.sh run --gateway triton                 # Triton mode
   deploy.sh run --gateway engine-docker          # Engine Dockerfile + container
   deploy.sh run --foreground                     # standalone, foreground
@@ -171,6 +177,7 @@ while [[ $# -gt 0 ]]; do
         --variant)        VARIANT="$2"; shift 2 ;;
         --model-version)  MODEL_VERSION="$2"; shift 2 ;;
         --dry-run)        DRY_RUN=true; shift ;;
+        --build|--rebuild-image) FORCE_IMAGE_BUILD=true; shift ;;
         --engine-image)   ENGINE_IMAGE="$2"; ENGINE_IMAGE_EXPLICIT=true; shift 2 ;;
         --help|-h)        usage; exit 0 ;;
 
@@ -263,11 +270,195 @@ resolve_runtime_controls() {
     export RUNTIME_MAX_SEQ_LEN="$MAX_SEQ_LEN"
 }
 
+check_engine_artifact_ready() {
+    local _amf="${REPO_ROOT}/workspace/exported/artifact_manifest.json"
+    local _exp="${REPO_ROOT}/workspace/exported"
+    local _tp="${TARGET_PROFILE:-${REPO_ROOT}/workspace/target_profile.json}"
+    local _tp_arg=""
+    [ -f "$_tp" ] && _tp_arg="$_tp"
+    if [ ! -f "$_amf" ]; then
+        if [ "${ALLOW_FINGERPRINT_MISMATCH:-}" = "1" ]; then
+            log_warn "Missing artifact_manifest.json — ignored (ALLOW_FINGERPRINT_MISMATCH=1)"
+            return 0
+        fi
+        log_error "未发现 artifact_manifest.json: $_amf"
+        log_error "  Strict 模式要求 package/run 前必须有 build 写入的 artifact_manifest。"
+        log_error "  请先执行:"
+        log_error "    bash scripts/bash/autorun.sh build"
+        log_error "    或 bash scripts/bash/autorun.sh import-artifact <bundle>"
+        log_error "  调试可临时使用: ALLOW_FINGERPRINT_MISMATCH=1"
+        return 1
+    fi
+    if engine_fingerprint_check "$_amf" "$_exp" "$_tp_arg"; then
+        return 0
+    fi
+    if [ "${ALLOW_FINGERPRINT_MISMATCH:-}" = "1" ]; then
+        log_warn "Fingerprint mismatch — ignored (ALLOW_FINGERPRINT_MISMATCH=1)"
+        return 0
+    fi
+    log_error "  请重新 build 或 import-artifact 以更新 engines。"
+    return 1
+}
+
+EXPECTED_ENGINE_RELEASE=""
+EXPECTED_ENGINE_TORCH_CUDA_TAG=""
+
+resolve_engine_docker_image() {
+    local img="${ENGINE_IMAGE:-qwen3-engine:26.02}"
+    local expected_release=""
+    local manifest_tag=""
+    if ! $ENGINE_IMAGE_EXPLICIT && [[ "$img" == qwen3-engine:* ]]; then
+        if [[ "$img" =~ ^qwen3-engine:([0-9]+\.[0-9]+)$ ]]; then
+            expected_release="${BASH_REMATCH[1]}"
+        fi
+        if [ -z "$expected_release" ] || [ "$expected_release" = "26.02" ]; then
+            manifest_tag="${NGC_TAG:-}"
+            local tag_source="manifest"
+            if [ -n "$manifest_tag" ]; then
+                tag_source="ngc_tag"
+            fi
+            if [ -z "$manifest_tag" ]; then
+                manifest_tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" 2>/dev/null || true)
+            fi
+            if [ -z "$manifest_tag" ]; then
+                manifest_tag=$(resolve_manifest_ngc_tag "$MODEL_REPO_DIR" "$MODEL_VERSION" 2>/dev/null || true)
+            fi
+            if [ -n "$manifest_tag" ]; then
+                img="qwen3-engine:${manifest_tag}"
+                expected_release="$manifest_tag"
+                if [ "$tag_source" = "manifest" ]; then
+                    log_info "Using engine Docker image from Phase B manifest: $img"
+                elif [ "$tag_source" = "ngc_tag" ]; then
+                    log_info "Using engine Docker image from NGC_TAG: $img"
+                fi
+            else
+                log_error "Cannot determine engine Docker image from Phase B manifest."
+                log_error "Run Phase B with a target profile first, or pass --engine-image explicitly."
+                log_error "Typical flow: probe_target.sh on production GPU -> build_engines.sh make-bundle/remote-build -> import-artifact."
+                return 1
+            fi
+        fi
+    fi
+
+    if [ -n "$expected_release" ] && [ -z "${ENGINE_BASE_IMAGE:-}" ]; then
+        export ENGINE_BASE_IMAGE="nvcr.io/nvidia/tensorrt:${expected_release}-py3"
+    fi
+    if [ -n "$expected_release" ] && [ -z "${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]; then
+        local torch_cuda_tag
+        torch_cuda_tag=$(resolve_ngc_torch_index_tag "$expected_release" 2>/dev/null || true)
+        if [ -n "$torch_cuda_tag" ]; then
+            export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
+        fi
+    fi
+
+    EXPECTED_ENGINE_RELEASE="$expected_release"
+    EXPECTED_ENGINE_TORCH_CUDA_TAG="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}"
+    echo "$img"
+}
+
+ensure_engine_docker_image_current() {
+    local img="$1"
+    local need_build=false
+    if $FORCE_IMAGE_BUILD; then
+        log_info "Rebuilding engine image from current code (--build/--rebuild-image)."
+        need_build=true
+    elif ! docker image inspect "$img" &>/dev/null; then
+        need_build=true
+    elif ! engine_docker_image_has_app "$img"; then
+        log_warn "镜像 $img 存在但未包含 /app 下的 engine 包（常见于把 TensorRT 基础镜像误打成同名 tag）。"
+        log_info "将按 Dockerfile.engine 重新构建..."
+        need_build=true
+    elif ! engine_docker_image_supports_model_package_engine "$img"; then
+        log_warn "镜像 $img 的 engine 代码或启动脚本较旧，无法优先使用模型包内的 engine/。"
+        log_info "将按 Dockerfile.engine 重新构建..."
+        need_build=true
+    elif [ -n "$EXPECTED_ENGINE_RELEASE" ] && ! engine_docker_image_matches_release "$img" "$EXPECTED_ENGINE_RELEASE"; then
+        local actual_release
+        actual_release=$(engine_docker_image_tensorrt_release "$img" || true)
+        log_warn "镜像 $img 的 TensorRT 版本是 ${actual_release:-unknown}，但 Phase B manifest 对应 $EXPECTED_ENGINE_RELEASE。"
+        log_info "将按 Dockerfile.engine 使用 ENGINE_BASE_IMAGE=$ENGINE_BASE_IMAGE 重新构建..."
+        need_build=true
+    elif [ -n "$EXPECTED_ENGINE_TORCH_CUDA_TAG" ] && ! engine_docker_image_matches_torch_cuda "$img" "$EXPECTED_ENGINE_TORCH_CUDA_TAG"; then
+        local actual_torch_cuda_tag
+        actual_torch_cuda_tag=$(engine_docker_image_torch_cuda_tag "$img" || true)
+        log_warn "镜像 $img 的 PyTorch CUDA wheel 是 ${actual_torch_cuda_tag:-unknown}，但目标应为 $EXPECTED_ENGINE_TORCH_CUDA_TAG。"
+        log_info "将按 Dockerfile.engine 使用 ENGINE_PYTORCH_CUDA_TAG=$EXPECTED_ENGINE_TORCH_CUDA_TAG 重新构建..."
+        need_build=true
+    fi
+    if $need_build; then
+        bash "${SCRIPT_DIR}/compose.sh" build --gateway engine --image "$img" || return 1
+    fi
+}
+
 # ── Commands ──
+
+cmd_package() {
+    resolve_variant
+    $DRY_RUN || check_engine_artifact_ready || return 1
+
+    case "$GATEWAY_MODE" in
+        standalone)
+            local prepare_args=(
+                prepare
+                --gateway engine
+                --variant "$VARIANT"
+                --engine-mode trt
+                --repo-dir "$MODEL_REPO_DIR"
+                --model-version "$MODEL_VERSION"
+            )
+            $DRY_RUN && prepare_args+=(--dry-run)
+            MODEL_REPO_DIR="$MODEL_REPO_DIR" bash "${SCRIPT_DIR}/compose.sh" "${prepare_args[@]}"
+            log_info "Model package ready: $MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
+            ;;
+        engine-docker)
+            local prepare_args=(
+                prepare
+                --gateway engine
+                --variant "$VARIANT"
+                --engine-mode trt
+                --repo-dir "$MODEL_REPO_DIR"
+                --model-version "$MODEL_VERSION"
+            )
+            $DRY_RUN && prepare_args+=(--dry-run)
+            MODEL_REPO_DIR="$MODEL_REPO_DIR" bash "${SCRIPT_DIR}/compose.sh" "${prepare_args[@]}"
+            local img
+            img=$(resolve_engine_docker_image) || return 1
+            if ! $DRY_RUN; then
+                # Packaging should always refresh image code. Docker cache keeps
+                # dependency layers, but COPY engine/ and scripts/compose reflect
+                # the current checkout.
+                FORCE_IMAGE_BUILD=true
+                ensure_engine_docker_image_current "$img" || return 1
+            else
+                log_info "[DRY RUN] Would build engine Docker image from current code: $img"
+            fi
+            log_step "Engine package ready"
+            log_info "  Engine image:  $img"
+            log_info "  Model package: $MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
+            log_info "  Production run mounts the model package under /models."
+            ;;
+        triton)
+            local build_args=(
+                --variant "$VARIANT"
+                --model-version "$MODEL_VERSION"
+                --engine-mode trt
+            )
+            $DRY_RUN && build_args+=(--dry-run)
+            build_args+=("${TRITON_ARGS[@]}")
+            bash "${SCRIPT_DIR}/build_triton.sh" build "${build_args[@]}"
+            ;;
+    esac
+}
 
 cmd_run() {
     resolve_variant
     resolve_runtime_controls
+
+    # Strict pre-flight: refuse to deploy engines without a valid
+    # artifact_manifest.json from the unified build pipeline.  Mirrors the
+    # check in autorun.sh::run_phase_c so direct `deploy.sh run` callers
+    # are protected too.  Bypass via ALLOW_FINGERPRINT_MISMATCH=1.
+    $DRY_RUN || check_engine_artifact_ready || return 1
 
     case "$GATEWAY_MODE" in
         standalone)
@@ -398,54 +589,8 @@ cmd_run_engine_docker() {
         exit 1
     fi
 
-    local img="${ENGINE_IMAGE:-qwen3-engine:26.02}"
-    local expected_release=""
-    local manifest_tag=""
-    if ! $ENGINE_IMAGE_EXPLICIT && [[ "$img" == qwen3-engine:* ]]; then
-        if [[ "$img" =~ ^qwen3-engine:([0-9]+\.[0-9]+)$ ]]; then
-            expected_release="${BASH_REMATCH[1]}"
-        fi
-        if [ -z "$expected_release" ] || [ "$expected_release" = "26.02" ]; then
-            manifest_tag="${NGC_TAG:-}"
-            local tag_source="manifest"
-            if [ -n "$manifest_tag" ]; then
-                tag_source="ngc_tag"
-            fi
-            if [ -z "$manifest_tag" ]; then
-                manifest_tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" 2>/dev/null || true)
-            fi
-            if [ -z "$manifest_tag" ]; then
-                manifest_tag=$(resolve_manifest_ngc_tag "$MODEL_REPO_DIR" "$MODEL_VERSION" 2>/dev/null || true)
-            fi
-            if [ -z "$manifest_tag" ]; then
-                tag_source="driver"
-                manifest_tag=$(resolve_ngc_tag 2>/dev/null || true)
-            fi
-            if [ -n "$manifest_tag" ]; then
-                img="qwen3-engine:${manifest_tag}"
-                expected_release="$manifest_tag"
-                if [ "$tag_source" = "manifest" ]; then
-                    log_info "Using engine Docker image from Phase B manifest: $img"
-                elif [ "$tag_source" = "ngc_tag" ]; then
-                    log_info "Using engine Docker image from NGC_TAG: $img"
-                else
-                    log_info "Using engine Docker image from driver-compatible NGC tag: $img"
-                fi
-            fi
-        fi
-    fi
-
-    if [ -n "$expected_release" ] && [ -z "${ENGINE_BASE_IMAGE:-}" ]; then
-        export ENGINE_BASE_IMAGE="nvcr.io/nvidia/tensorrt:${expected_release}-py3"
-    fi
-    if [ -n "$expected_release" ] && [ -z "${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}" ]; then
-        local torch_cuda_tag
-        torch_cuda_tag=$(resolve_ngc_torch_index_tag "$expected_release" 2>/dev/null || true)
-        if [ -n "$torch_cuda_tag" ]; then
-            export ENGINE_PYTORCH_CUDA_TAG="$torch_cuda_tag"
-        fi
-    fi
-    local expected_torch_cuda_tag="${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-}}"
+    local img
+    img=$(resolve_engine_docker_image) || exit 1
 
     if $DRY_RUN; then
         log_info "[DRY RUN] Would start engine Docker container (Dockerfile.engine)"
@@ -457,36 +602,11 @@ cmd_run_engine_docker() {
         log_info "  Max batch:   $MAX_BATCH"
         log_info "  Max seq len: ${MAX_SEQ_LEN:-auto}"
         log_info "  Max sess:    $MAX_SESSIONS"
+        $FORCE_IMAGE_BUILD && log_info "  Rebuild:     yes (--build/--rebuild-image)"
         return 0
     fi
 
-    local need_build=false
-    if ! docker image inspect "$img" &>/dev/null; then
-        need_build=true
-    elif ! engine_docker_image_has_app "$img"; then
-        log_warn "镜像 $img 存在但未包含 /app 下的 engine 包（常见于把 TensorRT 基础镜像误打成同名 tag）。"
-        log_info "将按 Dockerfile.engine 重新构建..."
-        need_build=true
-    elif ! engine_docker_image_supports_model_package_engine "$img"; then
-        log_warn "镜像 $img 的 engine 代码或启动脚本较旧，无法优先使用模型包内的 engine/。"
-        log_info "将按 Dockerfile.engine 重新构建..."
-        need_build=true
-    elif [ -n "$expected_release" ] && ! engine_docker_image_matches_release "$img" "$expected_release"; then
-        local actual_release
-        actual_release=$(engine_docker_image_tensorrt_release "$img" || true)
-        log_warn "镜像 $img 的 TensorRT 版本是 ${actual_release:-unknown}，但 Phase B manifest 对应 $expected_release。"
-        log_info "将按 Dockerfile.engine 使用 ENGINE_BASE_IMAGE=$ENGINE_BASE_IMAGE 重新构建..."
-        need_build=true
-    elif [ -n "$expected_torch_cuda_tag" ] && ! engine_docker_image_matches_torch_cuda "$img" "$expected_torch_cuda_tag"; then
-        local actual_torch_cuda_tag
-        actual_torch_cuda_tag=$(engine_docker_image_torch_cuda_tag "$img" || true)
-        log_warn "镜像 $img 的 PyTorch CUDA wheel 是 ${actual_torch_cuda_tag:-unknown}，但目标应为 $expected_torch_cuda_tag。"
-        log_info "将按 Dockerfile.engine 使用 ENGINE_PYTORCH_CUDA_TAG=$expected_torch_cuda_tag 重新构建..."
-        need_build=true
-    fi
-    if $need_build; then
-        bash "${SCRIPT_DIR}/compose.sh" build --gateway engine --image "$img" || exit 1
-    fi
+    ensure_engine_docker_image_current "$img" || exit 1
 
     local compose_args=(
         up
@@ -575,6 +695,7 @@ cmd_forward_triton() {
 # ── Main dispatch ──
 
 case "$COMMAND" in
+    package)     cmd_package ;;
     run)         cmd_run ;;
     stop)        cmd_stop ;;
     status)      cmd_status ;;

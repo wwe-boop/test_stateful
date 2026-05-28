@@ -504,6 +504,24 @@ PY
     fi
     log_info "  triton_manifest.json: copied (repo root + tts_orchestrator/$model_version + runtime)"
 
+    # Propagate artifact_manifest.json (written by build_pipeline.sh) into
+    # the same three locations so the runtime fingerprint guard
+    # (engine/runtime/fingerprint.py) can locate it from any deploy mode:
+    #   - repo root          → engine-docker image / Triton root
+    #   - tts_orchestrator/  → standalone --model-package-dir target
+    #   - runtime/           → per-engine sibling (handy for sha256 verify)
+    if [ -f "$exported_dir/artifact_manifest.json" ]; then
+        cp -f "$exported_dir/artifact_manifest.json" "$repo_dir/artifact_manifest.json"
+        cp -f "$exported_dir/artifact_manifest.json" "$orch_model_dir/artifact_manifest.json"
+        cp -f "$exported_dir/artifact_manifest.json" "$runtime_dir/artifact_manifest.json"
+        log_info "  artifact_manifest.json: copied (3 locations; runtime fingerprint guard ready)"
+    else
+        log_warn "  artifact_manifest.json: NOT FOUND in $exported_dir"
+        log_warn "    Runtime fingerprint guard will fail-stop unless QWEN3_ALLOW_FINGERPRINT_MISMATCH=1"
+        log_warn "    Run: bash scripts/bash/autorun.sh build"
+        log_warn "      or: bash scripts/bash/autorun.sh import-artifact <bundle>"
+    fi
+
     # Keep the Triton Python backend payload minimal.  Only the new adapter,
     # engine package, tokenizer / weights, and manifest should enter the container.
     find "$orch_model_dir" -mindepth 1 -maxdepth 1 \
@@ -514,6 +532,7 @@ PY
         ! -name "runtime" \
         ! -name "resources" \
         ! -name "triton_manifest.json" \
+        ! -name "artifact_manifest.json" \
         -exec rm -rf {} +
     find "$orch_model_dir" -type d -name "__pycache__" -prune -exec rm -rf {} +
     log_info "  tts_orchestrator/python: pruned legacy payload"
@@ -666,6 +685,13 @@ PY
     else
         log_info "  tts_orchestrator/$model_version/triton_manifest.json: OK"
     fi
+    if [ ! -f "$orch_dir/artifact_manifest.json" ]; then
+        log_warn "  tts_orchestrator/$model_version/artifact_manifest.json: missing"
+        log_warn "    Runtime fingerprint guard will fail-stop unless QWEN3_ALLOW_FINGERPRINT_MISMATCH=1"
+        warned=$((warned + 1))
+    else
+        log_info "  tts_orchestrator/$model_version/artifact_manifest.json: OK"
+    fi
     if [ -d "$orch_dir/resources" ]; then
         log_info "  tts_orchestrator/$model_version/resources/: OK"
     elif [ -d "$repo_root/resources" ]; then
@@ -776,6 +802,12 @@ PY
     local build_dir
     build_dir=$(mktemp -d)
     local dockerfile="$build_dir/Dockerfile"
+    mkdir -p "$build_dir/model_repository"
+    if command -v rsync &>/dev/null; then
+        rsync -a "$model_repo/" "$build_dir/model_repository/"
+    else
+        cp -a "$model_repo/." "$build_dir/model_repository/"
+    fi
     cat > "$dockerfile" <<DOCKERFILE
 ARG BASE_IMAGE=${base_image}
 ARG TENSORRT_PYTHON_VERSION=${trt_python_version}
@@ -803,7 +835,7 @@ RUN python3 -m pip install --no-cache-dir \
     --index-url https://download.pytorch.org/whl/\${PYTORCH_CUDA_TAG} \
     torch
 
-COPY workspace/model_repository /models
+COPY model_repository /models
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=6 \
     CMD curl -f http://localhost:8000/v2/health/ready || exit 1
@@ -824,7 +856,7 @@ DOCKERFILE
         --build-arg "PYTORCH_CUDA_TAG=$pytorch_cuda_tag" \
         -t "$image_tag" \
         -f "$dockerfile" \
-        "$repo_root" \
+        "$build_dir" \
         || { rm -rf "$build_dir"; log_error "Docker build failed"; return 1; }
 
     rm -rf "$build_dir"

@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-import torch
 import pytest
+import torch
 
-from engine.backend.executor import TRTEngine
+from engine.backend.executor import (
+    Executor,
+    GPUFuture,
+    TRTEngine,
+    _stable_sampling_seed,
+)
+from engine.backend.kv_cache_pool import ModelConfig, SlotKVState
 
 
 class _FakeContext:
@@ -49,6 +55,14 @@ class _FakeStream:
     cuda_stream = 123
 
 
+class _FakeComputeStream:
+    def __init__(self):
+        self.synchronize_calls = 0
+
+    def synchronize(self):
+        self.synchronize_calls += 1
+
+
 def _make_engine(
     ctx: _FakeContext,
     *,
@@ -65,6 +79,26 @@ def _make_engine(
     engine._prev_input_shapes = {}
     engine._output_buffers = {}
     return engine
+
+
+def _make_sampling_executor(*, seed: int = 1234) -> Executor:
+    executor = Executor.__new__(Executor)
+    executor._device = torch.device("cpu")
+    executor._config = ModelConfig(
+        logits_topk=4,
+        cp_num_stages=3,
+    )
+    executor._random_seed = seed
+    return executor
+
+
+def _make_sampling_slot(slot_id: int, session_id: str) -> SlotKVState:
+    return SlotKVState(
+        slot_id=slot_id,
+        session_id=session_id,
+        segment_idx=0,
+        is_free=False,
+    )
 
 
 def test_infer_skips_unknown_inputs_and_resolves_dynamic_outputs():
@@ -88,6 +122,66 @@ def test_infer_skips_unknown_inputs_and_resolves_dynamic_outputs():
     assert ctx.infer_shapes_calls == 1
     assert ctx.execute_calls == 1
     assert tuple(outputs["wav"].shape) == (1, 1920)
+
+
+def test_stable_sampling_seed_is_repeatable_and_lane_specific():
+    assert _stable_sampling_seed(7, "session-a", 0) == _stable_sampling_seed(
+        7, "session-a", 0
+    )
+    assert _stable_sampling_seed(7, "session-a", 0) != _stable_sampling_seed(
+        7, "session-b", 0
+    )
+
+
+def test_sampling_noise_is_independent_of_batch_membership():
+    batched = _make_sampling_executor(seed=99)
+    slot_a = _make_sampling_slot(0, "session-a:0")
+    slot_b = _make_sampling_slot(1, "session-b:0")
+
+    batch_gumbel, batch_cp_gumbel = batched._build_sampling_noise([slot_a, slot_b])
+
+    separate = _make_sampling_executor(seed=99)
+    single_a = _make_sampling_slot(0, "session-a:0")
+    single_b = _make_sampling_slot(1, "session-b:0")
+    a_gumbel, a_cp_gumbel = separate._build_sampling_noise([single_a])
+    b_gumbel, b_cp_gumbel = separate._build_sampling_noise([single_b])
+
+    assert torch.equal(batch_gumbel[0:1], a_gumbel)
+    assert torch.equal(batch_cp_gumbel[0:1], a_cp_gumbel)
+    assert torch.equal(batch_gumbel[1:2], b_gumbel)
+    assert torch.equal(batch_cp_gumbel[1:2], b_cp_gumbel)
+    assert slot_a.sampling_seed != slot_b.sampling_seed
+
+
+def test_infer_retains_contiguous_bound_inputs():
+    ctx = _FakeContext(output_shapes_before={"wav": (1, 1920)})
+    engine = _make_engine(ctx, input_names={"input_embeds"})
+    original = torch.randn(4, 2).t()
+    assert not original.is_contiguous()
+    inputs = {"input_embeds": original}
+
+    engine.infer(
+        inputs=inputs,
+        output_names=["wav"],
+        stream=_FakeStream(),
+    )
+
+    assert inputs["input_embeds"].is_contiguous()
+    assert ctx.tensor_addresses["input_embeds"] == inputs["input_embeds"].data_ptr()
+    assert inputs["input_embeds"].data_ptr() != original.data_ptr()
+
+
+def test_gpu_future_keeps_input_refs_until_synchronize():
+    stream = _FakeComputeStream()
+    future = GPUFuture(
+        _compute_stream=stream,
+        _input_refs={"input_embeds": torch.ones(1)},
+    )
+
+    assert future._input_refs
+    future.wait()
+    assert stream.synchronize_calls == 1
+    assert future._input_refs == {}
 
 
 def test_infer_raises_for_missing_required_inputs():

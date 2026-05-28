@@ -172,7 +172,7 @@ detect_driver_version() {
             --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
     fi
 
-    if [ -z "$driver_ver" ]; then
+    if [ -z "$driver_ver" ] || ! [[ "$driver_ver" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
         return 1
     fi
     echo "$driver_ver"
@@ -197,6 +197,10 @@ detect_gpu_compute_cap() {
 _driver_ge() {
     local installed="$1"
     local required="$2"
+
+    if ! [[ "$installed" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || ! [[ "$required" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+        return 1
+    fi
 
     local inst_major inst_minor req_major req_minor
     inst_major=$(echo "$installed" | cut -d. -f1)

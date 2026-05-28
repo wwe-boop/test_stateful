@@ -30,12 +30,12 @@ alwaysApply: true
 
 ```
 Phase A — export (host): PyTorch + qwen_tts → ONNX（步骤 01–09）+ .pt 权重
-Phase B — build_engines.sh (可选): trtexec 默认 3 引擎（spk、speech_codec_fused、talker_code2wav_fused）
+Phase B — build_engines.sh (可选): trtexec 默认 3 引擎（spk、speech_codec_fused、talker_code2wav_fused）；支持跨机 bundle / remote-ssh，在目标生产同构 GPU 上编译 engine
 Phase C — build_triton.sh: assemble（--engine-mode trt|onnx）+ run；若存在 `triton_manifest.json`（export_09 产出），`generate_triton_configs.py` 生成各模型 `config.pbtxt`
 ```
 
 - Phase A：`export_all.py` 按 01→09 顺序；`--skip-verification` 跳过 05–08
-- Phase B + C 共用 `tritonserver:xx.yy-py3`（trtexec 在 `/usr/src/tensorrt/bin/trtexec`）
+- Phase B + C 共用 `tritonserver:xx.yy-py3`（trtexec 在 `/usr/src/tensorrt/bin/trtexec`）；跨机场景以生产机 `target_profile.json` 为 NGC tag 单一事实来源
 - 单独运行导出脚本前需激活环境：`conda activate qwen3-tts`（或 venv）
 
 ## 目录结构

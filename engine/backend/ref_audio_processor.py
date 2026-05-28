@@ -421,6 +421,25 @@ class ReferenceAudioProcessor:
         except Exception:
             logger.debug("Could not empty CUDA cache", exc_info=True)
 
+    def _wait_stream_for_current(self) -> None:
+        try:
+            import torch
+
+            if self._stream is None or not hasattr(self._stream, "wait_stream"):
+                return
+            device = torch.device("cuda", self._device_id)
+            current = torch.cuda.current_stream(device)
+            if getattr(current, "cuda_stream", None) == getattr(
+                self._stream, "cuda_stream", None,
+            ):
+                return
+            self._stream.wait_stream(current)
+        except Exception:
+            logger.debug(
+                "Could not sync reference stream with current stream",
+                exc_info=True,
+            )
+
     def _resolve_ref_audio_max_duration_sec(self) -> float:
         if self._support.ref_audio_max_duration_sec > 0:
             return float(self._support.ref_audio_max_duration_sec)
@@ -454,13 +473,16 @@ class ReferenceAudioProcessor:
         input_dtype = self._speaker_engine.get_tensor_dtype("mel") or mel.dtype
         if mel.dtype != input_dtype:
             mel = mel.to(dtype=input_dtype).contiguous()
+        inputs = {"mel": mel}
+        self._wait_stream_for_current()
         with torch.cuda.stream(self._stream):
             out = self._speaker_engine.infer(
-                {"mel": mel},
+                inputs,
                 ["speaker_embedding"],
                 self._stream,
             )
         self._stream.synchronize()
+        inputs.clear()
         embedding = out["speaker_embedding"].detach().float().cpu().contiguous()
         if not torch.isfinite(embedding).all():
             raise RuntimeError(
@@ -479,13 +501,16 @@ class ReferenceAudioProcessor:
         output_names = ["ref_codec_sum_vec"]
         if "ref_audio_codes" in available_outputs:
             output_names.append("ref_audio_codes")
+        inputs = {"waveform": waveform}
+        self._wait_stream_for_current()
         with torch.cuda.stream(self._stream):
             out = self._codec_engine.infer(
-                {"waveform": waveform},
+                inputs,
                 output_names,
                 self._stream,
             )
         self._stream.synchronize()
+        inputs.clear()
         ref = out["ref_codec_sum_vec"].detach().float().cpu().contiguous()
         if ref.dim() == 4 and ref.shape[2] == 1:
             ref = ref.squeeze(2).contiguous()
@@ -640,6 +665,7 @@ class ReferenceAudioProcessor:
             for i, name in enumerate(trans_names):
                 inputs[name] = trans_states[i].contiguous()
 
+            self._wait_stream_for_current()
             with torch.cuda.stream(self._stream):
                 out = self._c2w_engine.infer(
                     inputs,

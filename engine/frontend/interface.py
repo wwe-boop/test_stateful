@@ -111,10 +111,7 @@ class FrontendInterface:
         on_event: Optional[Callable] = None,
     ) -> Session:
         if session_id in self._sessions:
-            old_task = self._consumer_tasks.pop(session_id, None)
-            if old_task and not old_task.done():
-                old_task.cancel()
-            self._cleanup_session(session_id)
+            await self.cancel_session(session_id)
 
         if len(self._sessions) >= self._max_sessions:
             raise RuntimeError(f"Max sessions ({self._max_sessions}) reached")

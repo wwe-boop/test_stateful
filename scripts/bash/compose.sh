@@ -655,6 +655,19 @@ cmd_build() {
 }
 
 cmd_prepare() {
+    resolve_variant_if_needed
+    if $DRY_RUN; then
+        local model_version
+        model_version=$(resolve_model_version "$MODEL_VERSION") || exit 1
+        log_info "[DRY RUN] Would assemble shared model_repository:"
+        log_info "  Gateway:     $GATEWAY"
+        log_info "  Variant:     $VARIANT"
+        log_info "  Engine mode: $ENGINE_MODE"
+        log_info "  Source:      $EXPORTED_DIR/$VARIANT"
+        log_info "  Target:      $MODEL_REPO_DIR"
+        log_info "  Version:     $model_version"
+        return 0
+    fi
     prepare_model_repo
 }
 

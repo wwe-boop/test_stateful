@@ -25,9 +25,9 @@
 #
 #  Environment variables:
 #    NGC_IMAGE        Docker image override (default: auto-detect from driver)
-#    MAX_BATCH_SIZE   Max batch (default: auto by selected build GPU memory)
-#    MAX_INPUT_LEN    Prefill len (default: auto by selected build GPU memory)
-#    MAX_SEQ_LEN      Total seq len (default: auto by selected build GPU memory)
+#    MAX_BATCH_SIZE   Max batch (default: auto by exported model + target GPU memory)
+#    MAX_INPUT_LEN    Prefill len (default: auto by exported model + target GPU memory)
+#    MAX_SEQ_LEN      Total seq len (default: auto by exported model + target GPU memory)
 #    ENGINE_DTYPE     bfloat16|float16|float32|fp8 (default: bfloat16)
 #    BUILD_GPU_DEVICE GPU for TRT build (auto | all | N | cuda:N; default: auto)
 #
@@ -37,12 +37,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/../.." && pwd))"
 source "${SCRIPT_DIR}/tools.sh"
 
-# trtexec path inside NGC tritonserver image
+# trtexec path inside NGC tritonserver image; exported so trtexec_runner
+# uses the same constant when constructing docker run commands.
 TRTEXEC="/usr/src/tensorrt/bin/trtexec"
+export TRTEXEC
 DOCKER_GPU_ARGS=(--gpus all)
+# QWEN3_IN_BUNDLE_ROOT lets compile_engines_in_bundle (build_pipeline.sh)
+# redirect EXPORTED_DIR onto a bundle workspace so the same compile code
+# runs unmodified for local / cross-host / SSH paths.
 
 # ── Engine build defaults are resolved after GPU selection. ──
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-}"
@@ -53,13 +58,25 @@ TRITON_IO_FLOAT_DTYPE="${TRITON_IO_FLOAT_DTYPE:-}"
 BUILD_GPU_DEVICE="${BUILD_GPU_DEVICE:-auto}"
 RESOLVED_BUILD_GPU_DEVICE=""
 
-EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
+if [ -n "${QWEN3_IN_BUNDLE_ROOT:-}" ]; then
+    EXPORTED_DIR="${QWEN3_IN_BUNDLE_ROOT}/workspace/exported"
+else
+    EXPORTED_DIR="${REPO_ROOT}/workspace/exported"
+fi
 TOKENIZER_DIR="${EXPORTED_DIR}/tokenizer"
 VARIANT=""
 DRY_RUN=false
 PULL_ONLY=false
 USER_IMAGE="${NGC_IMAGE:-}"
 TARGET_DRIVER="${TARGET_DRIVER:-}"
+COMMAND="build"
+BUILD_MODE="${BUILD_MODE:-local}"
+TARGET_PROFILE="${TARGET_PROFILE:-}"
+BUNDLE_OUT="${BUNDLE_OUT:-${REPO_ROOT}/workspace/engine_build_bundle.tar.zst}"
+ARTIFACT_IN=""
+REMOTE_HOST=""
+REMOTE_WORKDIR="/tmp/qwen3-tts-engine-build"
+ALLOW_FINGERPRINT_MISMATCH=false
 
 _normalize_dtype_value() {
     local value="${1,,}"
@@ -137,11 +154,14 @@ _resolve_build_gpu_device() {
 
 _suggest_build_profile_for_memory() {
     local mem_mb="${1:-0}"
+    # nvidia-smi reports usable MiB, not marketing GB.  Some 48 GB class
+    # cards report around 46,000 MiB, so keep tier cutoffs below the nominal
+    # decimal values used in docs.
     if [ "$mem_mb" -ge 76000 ]; then
         echo "128 128 512"
-    elif [ "$mem_mb" -ge 47000 ]; then
+    elif [ "$mem_mb" -ge 45000 ]; then
         echo "64 128 512"
-    elif [ "$mem_mb" -ge 30000 ]; then
+    elif [ "$mem_mb" -ge 29000 ]; then
         echo "32 128 512"
     else
         echo "16 96 384"
@@ -149,16 +169,38 @@ _suggest_build_profile_for_memory() {
 }
 
 _resolve_build_profile_defaults() {
+    local variant_csv="${1:-}"
     local mem_mb=0
     local mem_label="unknown"
-    if [ "$RESOLVED_BUILD_GPU_DEVICE" != "all" ]; then
+    if [ -n "$TARGET_PROFILE" ]; then
+        local profile_gpu=0
+        if [[ "$RESOLVED_BUILD_GPU_DEVICE" =~ ^[0-9]+$ ]]; then
+            profile_gpu="$RESOLVED_BUILD_GPU_DEVICE"
+        fi
+        mem_mb=$(target_profile_memory_mb "$TARGET_PROFILE" "$profile_gpu")
+        [ -n "$mem_mb" ] || mem_mb=0
+        mem_label="${mem_mb} MiB from target profile GPU ${profile_gpu}"
+    elif [ "$RESOLVED_BUILD_GPU_DEVICE" != "all" ]; then
         mem_mb=$(gpu_total_memory_mb "$RESOLVED_BUILD_GPU_DEVICE")
         [ -n "$mem_mb" ] || mem_mb=0
         mem_label="${mem_mb} MiB on GPU ${RESOLVED_BUILD_GPU_DEVICE}"
     fi
 
     local suggested
-    suggested=($(_suggest_build_profile_for_memory "$mem_mb"))
+    if [ -n "$variant_csv" ] && [ -d "$EXPORTED_DIR" ]; then
+        local profile_input="${MAX_INPUT_LEN:-128}"
+        local profile_seq="${MAX_SEQ_LEN:-512}"
+        suggested=($(suggest_build_profile_from_exports \
+            "$mem_mb" "$EXPORTED_DIR" "$variant_csv" \
+            "$ENGINE_DTYPE" "$profile_input" "$profile_seq"))
+        local profile_summary
+        profile_summary=$(summarize_build_profile_from_exports \
+            "$mem_mb" "$EXPORTED_DIR" "$variant_csv" \
+            "$ENGINE_DTYPE" "$profile_input" "$profile_seq")
+        [ -n "$profile_summary" ] && log_info "  Export-aware sizing: $profile_summary"
+    else
+        suggested=($(_suggest_build_profile_for_memory "$mem_mb"))
+    fi
     [ -n "$MAX_BATCH_SIZE" ] || MAX_BATCH_SIZE="${suggested[0]}"
     [ -n "$MAX_INPUT_LEN" ] || MAX_INPUT_LEN="${suggested[1]}"
     [ -n "$MAX_SEQ_LEN" ] || MAX_SEQ_LEN="${suggested[2]}"
@@ -168,7 +210,7 @@ _resolve_build_profile_defaults() {
     _validate_positive_int "MAX_SEQ_LEN" "$MAX_SEQ_LEN"
 
     log_info "Build profile: max_batch=${MAX_BATCH_SIZE}, max_input=${MAX_INPUT_LEN}, max_seq=${MAX_SEQ_LEN}"
-    log_info "  Default profile source: selected build GPU memory (${mem_label}); override with --max-batch-size/--max-input-len/--max-seq-len"
+    log_info "  Default profile source: selected build GPU memory (${mem_label}) + exported model sizing; override with --max-batch-size/--max-input-len/--max-seq-len"
 }
 
 _detect_docker_gpu_args() {
@@ -303,21 +345,14 @@ build_talker_unified_trt() {
     local prec_flag
     prec_flag=$(_trtexec_precision_flags)
     log_info "Building talker_unified.engine (trtexec, ${ENGINE_DTYPE^^} I/O) ..."
-    local unif_cmd=(
-        docker run --rm "${DOCKER_GPU_ARGS[@]}"
-        -v "$variant_dir:/mnt/model"
-        "$NGC_IMAGE"
-        $TRTEXEC --onnx=/mnt/model/talker_unified.onnx
-        --saveEngine=/mnt/model/talker_unified.engine
-        $prec_flag
-        --memPoolSize=workspace:8192
-        --minShapes="$unif_min"
-        --optShapes="$unif_opt"
-        --maxShapes="$unif_max"
-        --inputIOFormats="$io_in"
-        --outputIOFormats="$io_out"
-    )
-    if ! "${unif_cmd[@]}"; then
+    if ! _trtexec_run "$variant_dir" talker_unified.onnx talker_unified.engine -- \
+            $prec_flag \
+            --memPoolSize=workspace:8192 \
+            --minShapes="$unif_min" \
+            --optShapes="$unif_opt" \
+            --maxShapes="$unif_max" \
+            --inputIOFormats="$io_in" \
+            --outputIOFormats="$io_out"; then
         log_error "trtexec talker_unified engine failed for $variant"
         return 1
     fi
@@ -378,9 +413,7 @@ build_talker_code2wav_fused_trt() {
         prec_flag=$(_trtexec_precision_flags)
     fi
     if [ -n "$fused_io_in" ] && [ -n "$fused_io_out" ]; then
-        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
-            $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
-            --saveEngine=/mnt/model/talker_code2wav_fused.engine \
+        if ! _trtexec_run "$variant_dir" talker_code2wav_fused.onnx talker_code2wav_fused.engine -- \
             $prec_flag \
             --inputIOFormats="$fused_io_in" \
             --outputIOFormats="$fused_io_out" \
@@ -392,9 +425,7 @@ build_talker_code2wav_fused_trt() {
             return 1
         fi
     else
-        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
-            $TRTEXEC --onnx=/mnt/model/talker_code2wav_fused.onnx \
-            --saveEngine=/mnt/model/talker_code2wav_fused.engine \
+        if ! _trtexec_run "$variant_dir" talker_code2wav_fused.onnx talker_code2wav_fused.engine -- \
             $prec_flag \
             --memPoolSize=workspace:8192 \
             --minShapes="$fused_min" \
@@ -419,9 +450,7 @@ build_speech_tokenizer_codec_fused_trt() {
         log_info "[DRY RUN] trtexec speech_tokenizer_codec_fused"
         return 0
     fi
-    if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$variant_dir:/mnt/model" "$NGC_IMAGE" \
-        $TRTEXEC --onnx=/mnt/model/speech_tokenizer_codec_fused.onnx \
-        --saveEngine=/mnt/model/speech_tokenizer_codec_fused.engine \
+    if ! _trtexec_run "$variant_dir" speech_tokenizer_codec_fused.onnx speech_tokenizer_codec_fused.engine -- \
         --minShapes=waveform:1x1x960 \
         --optShapes=waveform:1x1x48000 \
         --maxShapes=waveform:1x1x192000 \
@@ -450,9 +479,7 @@ build_peripheral_engines() {
     # maxShapes 192000 = 8s @24kHz. With 8s cap, workspace ~1.7GB; 6GB leaves margin.
     if [ -f "$TOKENIZER_DIR/speech_tokenizer_encoder.onnx" ]; then
         log_info "Building speech_tokenizer_encoder.engine ..."
-        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$TOKENIZER_DIR:/mnt/model" "$image" \
-            $TRTEXEC --onnx=/mnt/model/speech_tokenizer_encoder.onnx \
-            --saveEngine=/mnt/model/speech_tokenizer_encoder.engine \
+        if ! _trtexec_run "$TOKENIZER_DIR" speech_tokenizer_encoder.onnx speech_tokenizer_encoder.engine -- \
             --minShapes=waveform:1x1x960 \
             --optShapes=waveform:1x1x48000 \
             --maxShapes=waveform:1x1x192000 \
@@ -505,9 +532,7 @@ build_peripheral_engines() {
             i=$((i+1))
         done
         # Force I/O type to match engine precision; Triton config must match.
-        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$TOKENIZER_DIR:/mnt/model" "$image" \
-            $TRTEXEC --onnx=/mnt/model/code2wav_decoder.onnx \
-            --saveEngine=/mnt/model/code2wav_decoder.engine \
+        if ! _trtexec_run "$TOKENIZER_DIR" code2wav_decoder.onnx code2wav_decoder.engine -- \
             $(_trtexec_precision_flags) \
             --inputIOFormats="$c2w_io_in" \
             --outputIOFormats="$c2w_io_out" \
@@ -563,6 +588,15 @@ update_variant_manifest_profile() {
         --builder-image "$NGC_IMAGE"
         --target-driver "$TARGET_DRIVER"
     )
+    if [ -n "${NGC_TAG:-}" ]; then
+        args+=(--ngc-tag "$NGC_TAG")
+        local _trt_ver
+        _trt_ver=$(resolve_ngc_tag_tensorrt_version "$NGC_TAG" 2>/dev/null || true)
+        [ -n "$_trt_ver" ] && args+=(--tensorrt-version "$_trt_ver")
+    fi
+    if [ -n "$TARGET_PROFILE" ]; then
+        args+=(--target-profile "$TARGET_PROFILE")
+    fi
     if [ "$mark_built" != "true" ]; then
         args+=(--skip-built-at)
     fi
@@ -585,9 +619,7 @@ build_speaker_encoders_all() {
         local variant_name
         variant_name=$(basename "$vdir")
         log_info "Building speaker_encoder.engine for $variant_name ..."
-        if ! docker run --rm "${DOCKER_GPU_ARGS[@]}" -v "$vdir:/mnt/model" "$image" \
-            $TRTEXEC --onnx=/mnt/model/speaker_encoder.onnx \
-            --saveEngine=/mnt/model/speaker_encoder.engine \
+        if ! _trtexec_run "$vdir" speaker_encoder.onnx speaker_encoder.engine -- \
             $(_trtexec_precision_flags) \
             --inputIOFormats=$(_trtexec_io_format) \
             --outputIOFormats=$(_trtexec_io_format) \
@@ -603,30 +635,50 @@ build_speaker_encoders_all() {
 }
 
 # ── Argument parsing ──
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        make-bundle|import-artifact|remote-build|build)
+            COMMAND="$1"
+            shift
+            ;;
+    esac
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant)        VARIANT="$2"; shift 2 ;;
+        --mode)           BUILD_MODE="$2"; shift 2 ;;
         --image)          USER_IMAGE="$2"; shift 2 ;;
         --device|--build-device) BUILD_GPU_DEVICE="$2"; shift 2 ;;
+        --target-profile) TARGET_PROFILE="$2"; shift 2 ;;
+        --out)            BUNDLE_OUT="$2"; shift 2 ;;
+        --remote-host)    REMOTE_HOST="$2"; shift 2 ;;
+        --remote-workdir) REMOTE_WORKDIR="$2"; shift 2 ;;
         --max-batch-size) MAX_BATCH_SIZE="$2"; shift 2 ;;
         --max-input-len)  MAX_INPUT_LEN="$2"; shift 2 ;;
         --max-seq-len)    MAX_SEQ_LEN="$2"; shift 2 ;;
         --dtype)          ENGINE_DTYPE="$2"; shift 2 ;;
         --triton-io-float-dtype) TRITON_IO_FLOAT_DTYPE="$2"; shift 2 ;;
         --target-driver)  TARGET_DRIVER="$2"; export TARGET_DRIVER; shift 2 ;;
+        --allow-fingerprint-mismatch) ALLOW_FINGERPRINT_MISMATCH=true; shift ;;
         --dry-run)        DRY_RUN=true; shift ;;
         --pull-only)      PULL_ONLY=true; shift ;;
         --help|-h)
-            echo "Usage: $0 [options]"
+            echo "Usage: $0 [build|make-bundle|remote-build|import-artifact] [options]"
             echo ""
             echo "Options:"
             echo "  --variant <name>       Build for a specific model variant"
+            echo "  --mode local|bundle|remote-ssh  Cross-host mode (default: local)"
+            echo "  --target-profile <json> Target machine profile from probe_target.sh"
+            echo "  --out <bundle>         Output build bundle for make-bundle"
+            echo "  --remote-host <host>   SSH host for remote-build / --mode remote-ssh"
+            echo "  --remote-workdir <dir> Remote work dir (default: /tmp/qwen3-tts-engine-build)"
             echo "  --image <uri>          Override NGC container image (default: auto-detect)"
             echo "  --target-driver <ver>  Target NVIDIA driver for NGC container selection"
             echo "  --device N|auto|all    Build GPU device (default: auto; aliases: --build-device)"
-            echo "  --max-batch-size N     Max batch size (default: auto by build GPU memory)"
-            echo "  --max-input-len N      Max input length for prefill (default: auto by build GPU memory)"
-            echo "  --max-seq-len N        Max sequence length incl. KV cache (default: auto by build GPU memory)"
+            echo "  --max-batch-size N     Max batch size (default: auto by exported model + target GPU memory)"
+            echo "  --max-input-len N      Max input length for prefill (default: auto by exported model + target GPU memory)"
+            echo "  --max-seq-len N        Max sequence length incl. KV cache (default: auto by exported model + target GPU memory)"
             echo "  --dtype bf16|fp16|fp32|fp8  Engine precision (default: bfloat16)"
             echo "  --triton-io-float-dtype T   Float I/O dtype (default: same as --dtype)"
             echo "  --dry-run              Show docker commands without executing"
@@ -634,11 +686,27 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help             Show this help"
             exit 0
             ;;
-        *) log_error "Unknown argument: $1"; exit 1 ;;
+        *)
+            if [ "$COMMAND" = "import-artifact" ] && [ -z "$ARTIFACT_IN" ]; then
+                ARTIFACT_IN="$1"; shift
+            else
+                log_error "Unknown argument: $1"; exit 1
+            fi
+            ;;
     esac
 done
 
 normalize_build_dtypes
+
+case "$BUILD_MODE" in
+    local|bundle|remote-ssh) ;;
+    *) log_error "Unknown build mode: $BUILD_MODE"; exit 1 ;;
+esac
+if [ "$BUILD_MODE" = "bundle" ]; then
+    COMMAND="make-bundle"
+elif [ "$BUILD_MODE" = "remote-ssh" ]; then
+    COMMAND="remote-build"
+fi
 
 # ===========================================================================
 #  Phase B: TRT engine build (trtexec from ONNX)
@@ -646,10 +714,44 @@ normalize_build_dtypes
 
 log_step "Phase B: TensorRT Engine Build (trtexec)"
 
-check_docker_gpu_ready || exit 1
-_resolve_build_gpu_device
+if [ "$COMMAND" = "import-artifact" ]; then
+    [ -n "$ARTIFACT_IN" ] || { log_error "Missing artifact bundle path"; exit 1; }
+    strict=true
+    $ALLOW_FINGERPRINT_MISMATCH && strict=false
+    extract_engine_artifact_bundle "$REPO_ROOT" "$EXPORTED_DIR" "$ARTIFACT_IN" "$strict"
+    exit 0
+fi
 
-if [ -n "$USER_IMAGE" ]; then
+if [ -n "$TARGET_PROFILE" ] && [ -z "$TARGET_DRIVER" ]; then
+    TARGET_DRIVER=$(cross_host_json_value "$TARGET_PROFILE" driver_version || true)
+    [ -n "$TARGET_DRIVER" ] && export TARGET_DRIVER
+fi
+
+if [ "$COMMAND" = "make-bundle" ] || [ "$COMMAND" = "remote-build" ]; then
+    [ -n "$TARGET_PROFILE" ] || { log_error "--target-profile is required for $COMMAND"; exit 1; }
+    norm_device=$(normalize_gpu_device "$BUILD_GPU_DEVICE") || exit 1
+    if [ "$norm_device" = "auto" ] || [ "$norm_device" = "all" ]; then
+        RESOLVED_BUILD_GPU_DEVICE="0"
+    else
+        RESOLVED_BUILD_GPU_DEVICE="$norm_device"
+    fi
+    log_info "Target build GPU from profile: ${RESOLVED_BUILD_GPU_DEVICE}"
+else
+    # Build mode: resolve runner first so we know whether to expect docker.
+    _resolved_runner=$(resolve_trtexec_runner) || exit 1
+    log_info "Engine build runner: $_resolved_runner"
+    if [ "$_resolved_runner" = "docker" ]; then
+        check_docker_gpu_ready || exit 1
+    fi
+    _resolve_build_gpu_device
+fi
+
+if [ -n "$TARGET_PROFILE" ] && [ -z "$USER_IMAGE" ]; then
+    NGC_TAG="$(resolve_ngc_tag_from_profile "$TARGET_PROFILE")" || exit 1
+    export NGC_TAG
+    NGC_IMAGE=$(resolve_ngc_image_from_tag "$NGC_TAG") || exit 1
+    log_info "Using NGC image from target profile: $NGC_IMAGE"
+elif [ -n "$USER_IMAGE" ]; then
     NGC_IMAGE="$USER_IMAGE"
     log_info "Using user-specified image: $NGC_IMAGE"
 else
@@ -660,19 +762,27 @@ else
         source "${SCRIPT_DIR}/lib/ngc_updater.sh" 2>/dev/null || true
         update_ngc_matrix "${SCRIPT_DIR}/ngc_matrix.conf" 2>/dev/null || true
     fi
-    _NGC_VERIFY_MANIFEST=1
+    # docker manifest probing only makes sense when docker is the runner.
+    if [ "${_resolved_runner:-docker}" = "docker" ]; then
+        _NGC_VERIFY_MANIFEST=1
+    fi
     NGC_IMAGE=$(resolve_ngc_image_info) \
         || { log_error "Cannot determine NGC container. Use --image."; exit 1; }
 fi
-ensure_ngc_image "$NGC_IMAGE" || exit 1
-_detect_docker_gpu_args "$NGC_IMAGE" || exit 1
+export NGC_IMAGE
+if [ "$COMMAND" != "make-bundle" ] && [ "$COMMAND" != "remote-build" ]; then
+    if [ "${_resolved_runner:-docker}" = "docker" ]; then
+        ensure_ngc_image "$NGC_IMAGE" || exit 1
+        _detect_docker_gpu_args "$NGC_IMAGE" || exit 1
+    else
+        log_info "Skipping docker image pull (runner=$_resolved_runner; using host trtexec)"
+    fi
+fi
 
 if $PULL_ONLY; then
     log_info "Image ready. Re-run without --pull-only to build engines."
     exit 0
 fi
-
-_resolve_build_profile_defaults
 
 if [ ! -d "$EXPORTED_DIR" ]; then
     log_error "No exported models at: $EXPORTED_DIR"
@@ -693,6 +803,47 @@ else
         exit 1
     fi
     log_info "Discovered variants: ${VARIANTS[*]}"
+fi
+
+variant_csv=$(IFS=,; echo "${VARIANTS[*]}")
+_resolve_build_profile_defaults "$variant_csv"
+
+if [ "$COMMAND" = "make-bundle" ]; then
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would create build bundle: $BUNDLE_OUT"
+        log_info "  Variants: $variant_csv"
+        log_info "  Target profile: $TARGET_PROFILE"
+        exit 0
+    fi
+    for variant in "${VARIANTS[@]}"; do
+        update_variant_manifest_profile "$variant" false
+    done
+    make_engine_build_bundle "$REPO_ROOT" "$EXPORTED_DIR" "$BUNDLE_OUT" "$TARGET_PROFILE" \
+        "$variant_csv" "$ENGINE_DTYPE" "$TRITON_IO_FLOAT_DTYPE" \
+        "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$RESOLVED_BUILD_GPU_DEVICE"
+    exit 0
+fi
+
+if [ "$COMMAND" = "remote-build" ]; then
+    [ -n "$REMOTE_HOST" ] || { log_error "--remote-host is required for remote-build"; exit 1; }
+    tmp_bundle="${REPO_ROOT}/workspace/engine_build_bundle.remote.tar.zst"
+    artifact_local="${REPO_ROOT}/workspace/engine_artifact_bundle.remote.tar.zst"
+    for variant in "${VARIANTS[@]}"; do
+        update_variant_manifest_profile "$variant" false
+    done
+    make_engine_build_bundle "$REPO_ROOT" "$EXPORTED_DIR" "$tmp_bundle" "$TARGET_PROFILE" \
+        "$variant_csv" "$ENGINE_DTYPE" "$TRITON_IO_FLOAT_DTYPE" \
+        "$MAX_BATCH_SIZE" "$MAX_INPUT_LEN" "$MAX_SEQ_LEN" "$RESOLVED_BUILD_GPU_DEVICE"
+    if $DRY_RUN; then
+        log_info "[DRY RUN] Would upload/run/download via SSH host: $REMOTE_HOST"
+        exit 0
+    fi
+    ssh "$REMOTE_HOST" "rm -rf '$REMOTE_WORKDIR' && mkdir -p '$REMOTE_WORKDIR'"
+    scp "$tmp_bundle" "$REMOTE_HOST:$REMOTE_WORKDIR/engine_build_bundle.tar.zst"
+    ssh "$REMOTE_HOST" "cd '$REMOTE_WORKDIR' && (tar --zstd -xf engine_build_bundle.tar.zst 2>/dev/null || tar -z -xf engine_build_bundle.tar.zst) && bash build_on_target.sh"
+    scp "$REMOTE_HOST:$REMOTE_WORKDIR/engine_artifact_bundle.tar.zst" "$artifact_local"
+    extract_engine_artifact_bundle "$REPO_ROOT" "$EXPORTED_DIR" "$artifact_local" "true"
+    exit 0
 fi
 
 FAILED=0

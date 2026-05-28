@@ -38,7 +38,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/../.." && pwd))"
 source "${SCRIPT_DIR}/tools.sh"
 
 _NGC_VERIFY_MANIFEST=1
@@ -56,6 +56,7 @@ HEALTH_TIMEOUT=120
 TRITON_GPU_DEVICE="${TRITON_GPU_DEVICE:-${RUNTIME_GPU_DEVICE:-auto}}"
 TRITON_MAX_BATCH_SLOTS="${TRITON_MAX_BATCH_SLOTS:-${RUNTIME_MAX_BATCH_SIZE:-}}"
 TRITON_MAX_SEQ_LEN="${TRITON_MAX_SEQ_LEN:-${RUNTIME_MAX_SEQ_LEN:-}}"
+ALLOW_FINGERPRINT_MISMATCH=false
 
 # ── Subcommand functions ──
 
@@ -84,6 +85,8 @@ Options:
   --max-seq-len <N>      Runtime max sequence length
   --tag <image:tag>      Docker image tag (for 'build' command)
   --no-health-check      Skip health check after 'run'
+  --allow-fingerprint-mismatch
+                         Warn instead of failing when TRT artifact fingerprint is absent/mismatched
   --generate-dockerfile  Generate Dockerfile.triton and exit
   --dry-run              Show what would be done
   -h, --help             Show this help
@@ -168,6 +171,7 @@ while [[ $# -gt 0 ]]; do
         --max-seq-len|--runtime-max-seq-len|--runtime-max-seq) TRITON_MAX_SEQ_LEN="$2"; shift 2 ;;
         --tag)            BUILD_TAG="$2"; shift 2 ;;
         --no-health-check) NO_HEALTH_CHECK=true; shift ;;
+        --allow-fingerprint-mismatch) ALLOW_FINGERPRINT_MISMATCH=true; shift ;;
         --dry-run)        DRY_RUN=true; shift ;;
         --generate-dockerfile) shift ;;  # already handled
         --help|-h)        usage; exit 0 ;;
@@ -207,10 +211,36 @@ resolve_variant() {
     log_info "Auto-discovered variant: $VARIANT"
 }
 
+check_engine_artifact_fingerprint_for_variant() {
+    local variant="$1"
+    if [ "$ENGINE_MODE" != "trt" ]; then
+        return 0
+    fi
+    local artifact_manifest="$EXPORTED_DIR/artifact_manifest.json"
+    if [ ! -f "$artifact_manifest" ]; then
+        if $ALLOW_FINGERPRINT_MISMATCH; then
+            log_warn "No engine artifact manifest found; skipping fingerprint check"
+            return 0
+        fi
+        log_warn "No engine artifact manifest found; legacy local Phase B output will be accepted"
+        log_warn "For strict cross-host builds, import engines with: build_engines.sh import-artifact <bundle>"
+        return 0
+    fi
+    if engine_fingerprint_check "$artifact_manifest" "$EXPORTED_DIR/$variant/triton_manifest.json"; then
+        return 0
+    fi
+    if $ALLOW_FINGERPRINT_MISMATCH; then
+        log_warn "Engine fingerprint mismatch ignored by --allow-fingerprint-mismatch"
+        return 0
+    fi
+    return 1
+}
+
 # ── Commands ──
 
 cmd_assemble() {
     resolve_variant
+    check_engine_artifact_fingerprint_for_variant "$VARIANT" || exit 1
 
     if $DRY_RUN; then
         log_info "[DRY RUN] Would assemble model repo:"
@@ -268,6 +298,7 @@ cmd_pull() {
 
 cmd_run() {
     resolve_variant
+    check_engine_artifact_fingerprint_for_variant "$VARIANT" || exit 1
 
     # Assemble if needed, or re-assemble if source engines are newer than assembled files
     local need_assemble=false
@@ -452,6 +483,28 @@ cmd_build() {
         log_info "Using default image tag: $BUILD_TAG"
     fi
 
+    if $DRY_RUN; then
+        resolve_variant
+        check_engine_artifact_fingerprint_for_variant "$VARIANT" || exit 1
+        local dry_base="$USER_IMAGE"
+        if [ -z "$dry_base" ]; then
+            local manifest_tag
+            manifest_tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" 2>/dev/null || true)
+            if [ -n "$manifest_tag" ]; then
+                dry_base="nvcr.io/nvidia/tritonserver:${manifest_tag}-py3"
+            else
+                dry_base="${TRITON_IMAGE:-auto}"
+            fi
+        fi
+        log_info "[DRY RUN] Would assemble model repo:"
+        log_info "  Source:  $EXPORTED_DIR/$VARIANT"
+        log_info "  Target:  $MODEL_REPO_DIR"
+        log_info "  Engine:  $ENGINE_MODE"
+        log_info "  Version: $MODEL_VERSION"
+        log_info "[DRY RUN] Would build: $BUILD_TAG (base: $dry_base)"
+        return 0
+    fi
+
     check_docker_gpu_ready || exit 1
 
     if [ -z "$USER_IMAGE" ]; then
@@ -461,8 +514,10 @@ cmd_build() {
         TRITON_IMAGE="$USER_IMAGE"
     fi
 
+    resolve_variant
+    check_engine_artifact_fingerprint_for_variant "$VARIANT" || exit 1
+
     if [ ! -d "$MODEL_REPO_DIR" ] || [ -z "$(ls -A "$MODEL_REPO_DIR" 2>/dev/null)" ]; then
-        resolve_variant
         assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \
             || { log_error "Assembly failed"; exit 1; }
     else
@@ -491,7 +546,6 @@ PY
         fi
         if [ -n "$repo_version" ] && [ "$repo_version" != "$MODEL_VERSION" ]; then
             log_warn "Model repository version mismatch: repo=$repo_version requested=$MODEL_VERSION, re-assembling ..."
-            resolve_variant
             assemble_model_repo "$EXPORTED_DIR" "$VARIANT" "$MODEL_REPO_DIR" "$ENGINE_MODE" "$MODEL_VERSION" \
                 || { log_error "Assembly failed"; exit 1; }
         fi
@@ -501,11 +555,6 @@ PY
     # Generate Dockerfile if missing
     if [ ! -f "$REPO_ROOT/Dockerfile.triton" ]; then
         generate_dockerfile
-    fi
-
-    if $DRY_RUN; then
-        log_info "[DRY RUN] Would build: $BUILD_TAG (base: $TRITON_IMAGE)"
-        return 0
     fi
 
     build_triton_image "$REPO_ROOT" "$BUILD_TAG" "$TRITON_IMAGE" || exit 1

@@ -3,7 +3,8 @@
 #  status.sh — Pipeline status detection for all three phases
 #
 #  Functions: detect_phase_a_status, detect_phase_b_status,
-#             detect_phase_c_status, detect_available_variants,
+#             detect_phase_c_package_status, detect_phase_c_status,
+#             detect_available_variants,
 #             print_status_summary, detect_resume_point
 #  Depends:   lib/logging.sh, lib/utils.sh
 #
@@ -119,12 +120,71 @@ detect_phase_b_status() {
 }
 
 # ---------------------------------------------------------------------------
+#  detect_phase_c_package_status <repo_root> [variant] [model_version]
+#
+#  Checks whether the shared deployment model package exists. This is the
+#  Phase C package artifact consumed by standalone, engine-docker, and Triton.
+#  Outputs: none | partial | complete
+# ---------------------------------------------------------------------------
+detect_phase_c_package_status() {
+    local repo_root="$1"
+    local variant="${2:-}"
+    local model_version
+    model_version=$(resolve_model_version "${3:-${MODEL_VERSION:-${ENGINE_MODEL_VERSION:-1}}}" 2>/dev/null || echo "1")
+    local package_dir="$repo_root/workspace/model_repository/tts_orchestrator/$model_version"
+    local runtime_dir="$package_dir/runtime"
+
+    if [ ! -d "$package_dir" ]; then
+        echo "none"
+        return 0
+    fi
+
+    local has_runtime=false
+    local has_python=false
+    local has_manifest=false
+    local has_payload=false
+    [ -f "$runtime_dir/model.plan" ] || [ -f "$runtime_dir/model.onnx" ] && has_runtime=true
+    [ -f "$package_dir/model.py" ] && [ -d "$package_dir/engine" ] && has_python=true
+    [ -f "$runtime_dir/triton_manifest.json" ] || [ -f "$package_dir/triton_manifest.json" ] && has_manifest=true
+
+    if [ -n "$variant" ]; then
+        local exported_manifest="$repo_root/workspace/exported/$variant/triton_manifest.json"
+        if [ -f "$exported_manifest" ] && [ -f "$runtime_dir/triton_manifest.json" ]; then
+            local repo_variant
+            repo_variant=$(python3 - "$runtime_dir/triton_manifest.json" <<'PY' 2>/dev/null || true
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    data = json.load(f)
+print(data.get("model_variant") or data.get("variant") or "")
+PY
+)
+            if [ -z "$repo_variant" ] || [ "$repo_variant" = "$variant" ]; then
+                has_payload=true
+            fi
+        else
+            has_payload=true
+        fi
+    else
+        has_payload=true
+    fi
+
+    if $has_runtime && $has_python && $has_manifest && $has_payload; then
+        echo "complete"
+    else
+        echo "partial"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 #  detect_phase_c_status [repo_root] [container_name]
 #
-#  Checks if TTS service is running (standalone engine OR Triton container).
+#  Checks if TTS service is running (standalone engine, engine container, or Triton container).
 #  Outputs: none | running | healthy
 #
-#  Checks standalone engine first (PID file), then Triton container.
+#  Checks standalone engine first (PID file), then engine/Triton containers.
 # ---------------------------------------------------------------------------
 detect_phase_c_status() {
     local repo_root="${1:-$(git rev-parse --show-toplevel 2>/dev/null || echo ".")}"
@@ -138,8 +198,19 @@ detect_phase_c_status() {
         return 0
     fi
 
-    # Check Triton container
+    # Check engine Docker container
     if command -v docker &>/dev/null; then
+        local engine_container="${ENGINE_CONTAINER_NAME:-qwen3-engine}"
+        if docker ps -q --filter "name=$engine_container" 2>/dev/null | grep -q .; then
+            local health_port="${ENGINE_HEALTH_PORT:-8080}"
+            if curl -sf "http://localhost:${health_port}/health" &>/dev/null; then
+                echo "healthy"
+            else
+                echo "running"
+            fi
+            return 0
+        fi
+
         if docker ps -q --filter "name=$container_name" 2>/dev/null | grep -q .; then
             local http_port="${TRITON_HTTP_PORT:-8000}"
             if curl -sf "http://localhost:${http_port}/v2/health/ready" &>/dev/null; then
@@ -236,14 +307,16 @@ print_status_summary() {
     local models_dir="$repo_root/workspace/models"
 
     # Detect phase status
-    local phase_a phase_b phase_c
+    local phase_a phase_b phase_c_package phase_c
     phase_a=$(detect_phase_a_status "$exported_dir" "$variant")
     phase_b=$(detect_phase_b_status "$exported_dir" "$variant")
+    phase_c_package=$(detect_phase_c_package_status "$repo_root" "$variant")
     phase_c=$(detect_phase_c_status "$repo_root")
 
-    local pa_icon pb_icon pc_icon
+    local pa_icon pb_icon pcp_icon pc_icon
     pa_icon=$(_status_icon "$phase_a")
     pb_icon=$(_status_icon "$phase_b")
+    pcp_icon=$(_status_icon "$phase_c_package")
     pc_icon=$(_status_icon "$phase_c")
 
     # Detect GPU (best effort)
@@ -272,7 +345,8 @@ print_status_summary() {
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase A (setup + export):     $pa_icon"
     echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase B (TRT engines):        $pb_icon"
-    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C (deploy):             $pc_icon"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C1 (package):           $pcp_icon"
+    echo -e "${_CLR_BLUE}║${_CLR_RESET}  Phase C2 (current run):       $pc_icon"
     echo -e "${_CLR_BLUE}╠══════════════════════════════════════════════════════════╣${_CLR_RESET}"
 
     # List available variants
@@ -298,22 +372,25 @@ print_status_summary() {
 #  detect_resume_point <repo_root> [variant]
 #
 #  Determines which phase to resume from based on current state.
-#  Outputs: setup | build | deploy | done
+#  Outputs: setup | build | package | deploy | done
 # ---------------------------------------------------------------------------
 detect_resume_point() {
     local repo_root="$1"
     local variant="${2:-}"
     local exported_dir="$repo_root/workspace/exported"
 
-    local phase_a phase_b phase_c
+    local phase_a phase_b phase_c_package phase_c
     phase_a=$(detect_phase_a_status "$exported_dir" "$variant")
     phase_b=$(detect_phase_b_status "$exported_dir" "$variant")
+    phase_c_package=$(detect_phase_c_package_status "$repo_root" "$variant")
     phase_c=$(detect_phase_c_status "$repo_root")
 
     if [ "$phase_c" = "healthy" ]; then
         echo "done"
-    elif [ "$phase_b" = "complete" ]; then
+    elif [ "$phase_c_package" = "complete" ]; then
         echo "deploy"
+    elif [ "$phase_b" = "complete" ]; then
+        echo "package"
     elif [ "$phase_a" = "complete" ]; then
         echo "build"
     else

@@ -110,6 +110,11 @@ class SlotKVState:
     pad_start_frame: int = -1
     pad_consecutive_silence: int = 0
 
+    # Per-slot sampling RNG.  Kept with the logical segment so batched
+    # scheduling cannot change a lane's random sequence.
+    sampling_seed: Optional[int] = None
+    sampling_generator: Optional[torch.Generator] = None
+
     # Activity tracking for eviction
     last_active_time: float = field(default_factory=time.monotonic)
 
@@ -261,8 +266,19 @@ class KVCachePool:
         slot.text_idx = 0
         slot.trailing = []
         slot.token_queue = []
+        slot.pad_start_frame = -1
+        slot.pad_consecutive_silence = 0
+        slot.sampling_seed = None
+        slot.sampling_generator = None
         slot.next_embed = None
         slot.last_codec_sum = None
+        slot.token_counts = None
+        slot.talker_kv = None
+        slot.c2w_kv = None
+        slot.c2w_conv_states = None
+        slot.c2w_transconv_states = None
+        slot._c2w_conv_write = None
+        slot._c2w_transconv_write = None
         slot.last_active_time = time.monotonic()
         if self._preallocate and self._talker_kv_pool is not None:
             self._talker_kv_pool[slot_id].zero_()
@@ -273,6 +289,9 @@ class KVCachePool:
     def release(self, slot_id: int) -> None:
         """Return a slot to the pool."""
         slot = self._slots[slot_id]
+        if slot.is_free:
+            logger.debug("Ignoring duplicate release for free slot %d", slot_id)
+            return
         slot.session_id = None
         slot.segment_idx = -1
         slot.is_free = True
@@ -281,6 +300,11 @@ class KVCachePool:
         slot.frame_idx = 0
         slot.text_idx = 0
         slot.trailing = []
+        slot.token_queue = []
+        slot.pad_start_frame = -1
+        slot.pad_consecutive_silence = 0
+        slot.sampling_seed = None
+        slot.sampling_generator = None
         slot.next_embed = None
         slot.last_codec_sum = None
         slot.token_counts = None
@@ -324,6 +348,11 @@ class KVCachePool:
         slot.trailing = []
         slot.next_embed = None
         slot.last_codec_sum = None
+        slot.token_queue = []
+        slot.pad_start_frame = -1
+        slot.pad_consecutive_silence = 0
+        slot.sampling_seed = None
+        slot.sampling_generator = None
 
     def scatter_prefill_kv(
         self, slot_id: int, kv: torch.Tensor, seq_len: int,

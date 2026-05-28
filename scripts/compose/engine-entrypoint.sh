@@ -97,6 +97,70 @@ cmd=(
     --port "${ENGINE_GRPC_PORT:-50051}"
 )
 
+# Lightweight fingerprint precheck.  Runs *before* Python startup so a
+# wrong-GPU container fails in milliseconds with a clear error rather than
+# 20-30s into engine init with a cryptic TRT log.  Only checks gpu_sm;
+# full check (TRT version + driver) happens inside engine/server.py
+# via engine.runtime.fingerprint.enforce_engine_fingerprint.
+#
+# Bypass: ENGINE_SKIP_FINGERPRINT_PRECHECK=1 (the Python guard inside
+# engine/server.py still runs and is the authoritative check).
+artifact_manifest=""
+for candidate in \
+    "$model_package_dir/artifact_manifest.json" \
+    "${model_package_dir}/../artifact_manifest.json" \
+    "${model_repo}/artifact_manifest.json"; do
+    if [[ -f "$candidate" ]]; then
+        artifact_manifest="$candidate"
+        break
+    fi
+done
+
+if [[ "${ENGINE_SKIP_FINGERPRINT_PRECHECK:-0}" != "1" ]] && [[ -n "$artifact_manifest" ]]; then
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "[WARN] entrypoint: nvidia-smi unavailable; skipping SM precheck (Python guard will still run)" >&2
+    else
+        device_index="${ENGINE_DEVICE:-0}"
+        actual_cc=$(nvidia-smi --id="$device_index" \
+            --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+            | head -1 | tr -d ' ' || true)
+        if [[ -z "$actual_cc" ]]; then
+            echo "[WARN] entrypoint: cannot read compute_cap for device $device_index; deferring to Python guard" >&2
+        else
+            actual_sm="sm_${actual_cc//./}"
+            expected_sm=$(python3 -c "
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get('gpu_sm','') or '')
+except Exception:
+    print('')
+" "$artifact_manifest")
+            if [[ -n "$expected_sm" ]] && [[ "$expected_sm" != "$actual_sm" ]]; then
+                if [[ "${QWEN3_ALLOW_FINGERPRINT_MISMATCH:-0}" = "1" ]]; then
+                    echo "[WARN] entrypoint: SM mismatch (expected=$expected_sm actual=$actual_sm) — bypassed via QWEN3_ALLOW_FINGERPRINT_MISMATCH=1" >&2
+                else
+                    echo "[ERROR] entrypoint: GPU SM mismatch — refusing to start" >&2
+                    echo "        expected: $expected_sm (from $artifact_manifest)" >&2
+                    echo "        actual:   $actual_sm (device $device_index)" >&2
+                    echo "        The engine was compiled for a different GPU architecture." >&2
+                    echo "        Either:" >&2
+                    echo "          1. Run this image on a host with $expected_sm GPUs" >&2
+                    echo "          2. Re-build the engine on the target hardware via autorun.sh build" >&2
+                    echo "          3. Set QWEN3_ALLOW_FINGERPRINT_MISMATCH=1 (debugging only)" >&2
+                    exit 1
+                fi
+            else
+                echo "[INFO] entrypoint: SM precheck OK (sm=$actual_sm)" >&2
+            fi
+        fi
+    fi
+elif [[ -z "$artifact_manifest" ]]; then
+    if [[ "${QWEN3_ALLOW_FINGERPRINT_MISMATCH:-0}" != "1" ]]; then
+        echo "[WARN] entrypoint: no artifact_manifest.json found near $model_package_dir" >&2
+        echo "        Python guard will fail-stop unless QWEN3_ALLOW_FINGERPRINT_MISMATCH=1" >&2
+    fi
+fi
+
 echo "Starting engine from shared model package" >&2
 echo "  config=${config_path}" >&2
 echo "  model_repo=${model_repo}" >&2
@@ -105,6 +169,7 @@ echo "  tokenizer=${tokenizer_dir}" >&2
 echo "  weights=${weights_dir}" >&2
 echo "  engine_dir=${engine_dir}" >&2
 echo "  manifest=${manifest_path}" >&2
+echo "  artifact_manifest=${artifact_manifest:-<not found>}" >&2
 echo "  runtime_artifact=${runtime_artifact}" >&2
 echo "  engine_mode=${engine_mode}" >&2
 echo "  pythonpath=${PYTHONPATH}" >&2

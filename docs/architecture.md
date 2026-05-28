@@ -2314,3 +2314,20 @@ build_triton.sh (deploy)   →  workspace/model_repository/ → Triton Server
 **问题**: TRT-LLM 内部插件维护有状态对象，通过 raw TRT API 调用时 segfault，无法实现 O(1) decode step。
 
 **解决方案**: 通过 ONNX 导出 + `trtexec` 编译，完全绕过 TRT-LLM。KV Cache 在 BLS Python 层通过 `dlpack` 零拷贝管理。Talker Context 和 Talker Decode Fused 均融合 Code Predictor + Codec Embedding Sum，注册为独立 Triton 子模型。
+
+---
+
+## 附录 B: 跨机 Engine 编译流水线
+
+生产部署时，导图机、engine 编译机、镜像打包机可以不是同一台机器。TensorRT `.engine` 绑定目标 GPU SM 架构、TensorRT 版本和构建 profile，因此 Phase B 应在目标生产同构 GPU 上执行。
+
+推荐流程:
+
+1. 生产同构机器执行 `scripts/bash/probe_target.sh --out target_profile.json`。
+2. 导图/打包机执行 `autorun.sh make-bundle --target-profile target_profile.json`，生成 `engine_build_bundle.tar.zst`。
+3. 目标机器解包后执行 `build_on_target.sh`，生成 `engine_artifact_bundle.tar.zst`。
+4. 打包机执行 `autorun.sh import-artifact engine_artifact_bundle.tar.zst`。
+5. 打包机继续 `autorun.sh package` / `build_triton.sh assemble` / `build_triton.sh build`，只组装模型包和运行镜像，不启动服务。
+6. 只有当前机器就是服务机或本机验证机时，才执行 `autorun.sh deploy` 启动服务。
+
+`target_profile.json` 是跨机场景下 NGC tag 的唯一事实来源。Phase C package/run 使用 Phase B manifest 中记录的 NGC tag 推导运行镜像，不再从打包机本机 driver 回退猜测。详细命令见 `docs/cross_host_build.md`。
