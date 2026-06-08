@@ -512,6 +512,14 @@ class TTSEngine:
 
         self._validate_model_specific_fields(model_type, config)
         config.task_type = self._internal_task_type_for_model(model_type)
+        self._log_session_config_debug(
+            "session_config_resolved",
+            loaded_model_type=loaded_model_type,
+            requested_task_type=requested,
+            resolved_model_type=model_type,
+            internal_task_type=config.task_type,
+            config=config,
+        )
 
         task_type = (config.task_type or "").strip()
         if task_type == "voice_clone":
@@ -767,6 +775,14 @@ class TTSEngine:
                 (config.ref_text or "").strip().encode("utf-8"),
             ).hexdigest()
         config.ref_preprocess_runtime = "trt"
+        self._log_session_config_debug(
+            "reference_metadata_resolved",
+            loaded_model_type=self._loaded_model_type(),
+            requested_task_type=config.task_type,
+            resolved_model_type=self._loaded_model_type(),
+            internal_task_type=config.task_type,
+            config=config,
+        )
 
     def _resolve_voice_clone_reference(self, model_type: str, config: SessionConfig) -> None:
         normalized = (model_type or "").strip()
@@ -888,6 +904,65 @@ class TTSEngine:
             config.ref_c2w_conv_states = features.ref_c2w_conv_states
             config.ref_c2w_transconv_states = features.ref_c2w_transconv_states
             config.ref_c2w_frame_idx = features.ref_c2w_frame_idx
+        self._log_reference_feature_debug(config)
+
+    def _log_session_config_debug(
+        self,
+        stage: str,
+        *,
+        loaded_model_type: str,
+        requested_task_type: str,
+        resolved_model_type: str,
+        internal_task_type: str,
+        config: SessionConfig,
+    ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        logger.debug(
+            "Session config observability: %s",
+            {
+                "stage": stage,
+                "loaded_model_type": loaded_model_type,
+                "requested_task_type": requested_task_type,
+                "resolved_model_type": resolved_model_type,
+                "internal_task_type": internal_task_type,
+                "speaker": config.speaker,
+                "language": config.language,
+                "input_mode": config.input_mode.value if config.input_mode else "",
+                "group_policy": config.group_policy.value if config.group_policy else "",
+                "has_ref_audio": bool(config.ref_audio),
+                "has_ref_text": bool((config.ref_text or "").strip()),
+                "has_instruct": bool((config.instruct or "").strip()),
+                "x_vector_only": bool(config.x_vector_only),
+                "ref_source": config.ref_source,
+                "ref_id": config.ref_id,
+                "ref_audio_sha256_prefix": config.ref_audio_sha256[:12],
+                "ref_text_hash_prefix": config.ref_text_hash[:12],
+                "ref_preprocess_runtime": config.ref_preprocess_runtime,
+            },
+        )
+
+    def _log_reference_feature_debug(self, config: SessionConfig) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        logger.debug(
+            "Reference codec observability: %s",
+            {
+                "task_type": config.task_type,
+                "ref_source": config.ref_source,
+                "ref_id": config.ref_id,
+                "x_vector_only": bool(config.x_vector_only),
+                "ref_feature_cache_key": config.ref_feature_cache_key,
+                "spk_embedding_ready": config.spk_embedding is not None,
+                "ref_codec_sum_vec_ready": config.ref_codec_sum_vec is not None,
+                "ref_audio_codes_ready": config.ref_audio_codes is not None,
+                "ref_c2w_kv_ready": config.ref_c2w_kv is not None,
+                "ref_c2w_conv_states_ready": bool(config.ref_c2w_conv_states),
+                "ref_c2w_transconv_states_ready": bool(config.ref_c2w_transconv_states),
+                "ref_c2w_frame_idx": int(config.ref_c2w_frame_idx),
+                "warnings": list(config.ref_warnings),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Internal: relay asyncio.Queue → stdlib queue.Queue

@@ -633,15 +633,23 @@ def torch_dtype(dtype_str: str) -> torch.dtype:
 
 
 def to_model_config(arch: ModelArchConfig, cfg: EngineConfig):
-    """Convert ModelArchConfig + EngineConfig → backend.kv_cache_pool.ModelConfig."""
+    """Convert ModelArchConfig + EngineConfig → backend.kv_cache_pool.ModelConfig.
+
+    I/O dtype uses triton_io_float_dtype (actual TRT tensor format) when set,
+    falling back to arch.dtype (engine_dtype).  This matters when engine_dtype
+    differs from triton_io_float_dtype, e.g. engine_dtype=fp32 with
+    triton_io_float_dtype=bf16: TRT computes in fp32 but the I/O tensors are
+    bf16, so the executor must pass bf16 tensors.
+    """
     from .backend.kv_cache_pool import ModelConfig
+    io_dtype_str = arch.engine_profile.triton_io_float_dtype or arch.dtype
     return ModelConfig(
         num_layers=arch.num_layers,
         kv_heads=arch.kv_heads,
         head_dim=arch.head_dim,
         max_seq_len=cfg.scheduler.max_seq_len,
         hidden_size=arch.hidden_size,
-        dtype=torch_dtype(arch.dtype),
+        dtype=torch_dtype(io_dtype_str),
         codec_vocab_size=arch.codec_vocab_size,
         logits_topk=arch.logits_topk,
         cp_num_stages=arch.cp_num_stages,

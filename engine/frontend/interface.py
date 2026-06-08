@@ -12,6 +12,7 @@ It delegates backend request emission to ``frontend.dispatcher.Dispatcher``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Callable, Dict, Optional, TYPE_CHECKING
 
@@ -449,13 +450,19 @@ class FrontendInterface:
 
     def _prepare_session_config(self, config: SessionConfig) -> None:
         """Canonicalize session-level prompt text once at session creation."""
-        config.instruct_spec = self._tokenize_prompt_text(config.instruct)
+        config.instruct_spec = self._tokenize_prompt_text(config.instruct, field_name="instruct")
         config.instruct = config.instruct_spec.text if config.instruct_spec else None
-        config.ref_text_spec = self._tokenize_prompt_text(config.ref_text)
+        config.ref_text_spec = self._tokenize_prompt_text(config.ref_text, field_name="ref_text")
         config.ref_text = config.ref_text_spec.text if config.ref_text_spec else None
 
-    def _tokenize_prompt_text(self, text: Optional[str]) -> Optional[TokenizedText]:
-        normalized = _normalize_tts_text(text or "").strip()
+    def _tokenize_prompt_text(self, text: Optional[str], *, field_name: str) -> Optional[TokenizedText]:
+        raw_text = text or ""
+        normalized = _normalize_tts_text(raw_text).strip()
+        self._log_tokenization_debug(
+            field_name,
+            raw_text=raw_text,
+            normalized_text=normalized,
+        )
         if not normalized:
             return None
         return TokenizedText(
@@ -464,6 +471,11 @@ class FrontendInterface:
         )
 
     def _tokenize_segment_text(self, text: str) -> list[SegmentToken]:
+        self._log_tokenization_debug(
+            "segment_text",
+            raw_text=text,
+            normalized_text=text,
+        )
         ids, texts = self._tokenizer.encode_with_text(text, add_special_tokens=False)
         return [
             SegmentToken(
@@ -479,3 +491,50 @@ class FrontendInterface:
             return list(self._tokenizer.encode_ids(text, add_special_tokens=False))
         ids, _ = self._tokenizer.encode_with_text(text, add_special_tokens=False)
         return list(ids)
+
+    def _log_tokenization_debug(
+        self,
+        field_name: str,
+        *,
+        raw_text: str,
+        normalized_text: str,
+    ) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        payload = {
+            "field": field_name,
+            "raw_text": raw_text,
+            "raw_text_repr": repr(raw_text),
+            "normalized_text": normalized_text,
+            "normalized_text_repr": repr(normalized_text),
+        }
+        if normalized_text:
+            snapshot_fn = getattr(self._tokenizer, "debug_snapshot", None)
+            if callable(snapshot_fn):
+                payload["tokenizer"] = snapshot_fn(
+                    normalized_text,
+                    add_special_tokens=False,
+                )
+            else:
+                ids, pieces = self._tokenizer.encode_with_text(
+                    normalized_text,
+                    add_special_tokens=False,
+                )
+                payload["tokenizer"] = {
+                    "ids": [int(token_id) for token_id in ids],
+                    "pieces": [
+                        {
+                            "index": idx,
+                            "id": int(token_id),
+                            "span": token_text,
+                            "span_repr": repr(token_text),
+                        }
+                        for idx, (token_id, token_text) in enumerate(zip(ids, pieces))
+                    ],
+                }
+
+        logger.debug(
+            "Tokenizer observability: %s",
+            json.dumps(payload, ensure_ascii=False),
+        )

@@ -188,9 +188,22 @@ install_dependencies() {
     # NOT needed in the final Triton image.
     install_qwen3_tts "${REPO_ROOT}/${SUBMODULE_PATH}"
 
-    # Standalone TTS engine (python -m engine.server) loads .engine from Phase B;
-    # TensorRT plan format is tied to the trtexec version in the NGC build image.
-    install_tensorrt_for_standalone_engine
+    # Standalone TensorRT is needed for host-side debugging via
+    # `python -m engine.server`.  Install it during Phase A by default so the
+    # environment is debug-ready after autorun/setup, while still allowing
+    # advanced users to opt out explicitly.
+    local _standalone_trt_mode="${INSTALL_STANDALONE_TENSORRT:-auto}"
+    case "$_standalone_trt_mode" in
+        1|true|yes|always)
+            install_tensorrt_for_standalone_engine
+            ;;
+        0|false|no|never)
+            log_info "Skipping standalone TensorRT install (INSTALL_STANDALONE_TENSORRT=$_standalone_trt_mode)"
+            ;;
+        *)
+            install_tensorrt_for_standalone_engine
+            ;;
+    esac
 
     # Serving / protocol test deps used by the standalone engine gateway and
     # the unified endpoint test tools.

@@ -303,6 +303,31 @@ check_engine_artifact_ready() {
 EXPECTED_ENGINE_RELEASE=""
 EXPECTED_ENGINE_TORCH_CUDA_TAG=""
 
+resolve_standalone_tensorrt_version() {
+    if [ -n "${STANDALONE_ENGINE_TENSORRT_PIP_VERSION:-}" ]; then
+        printf '%s\n' "$STANDALONE_ENGINE_TENSORRT_PIP_VERSION"
+        return 0
+    fi
+
+    local manifest_tag="${NGC_TAG:-}"
+    if [ -z "$manifest_tag" ]; then
+        manifest_tag=$(resolve_manifest_ngc_tag "$EXPORTED_DIR/$VARIANT/triton_manifest.json" 2>/dev/null || true)
+    fi
+    if [ -z "$manifest_tag" ]; then
+        manifest_tag=$(resolve_manifest_ngc_tag "$MODEL_REPO_DIR" "$MODEL_VERSION" 2>/dev/null || true)
+    fi
+    if [ -n "$manifest_tag" ]; then
+        local trt_version
+        trt_version=$(resolve_ngc_tag_tensorrt_version "$manifest_tag" 2>/dev/null || true)
+        if [ -n "$trt_version" ]; then
+            printf '%s\n' "$trt_version"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "10.15.1.29"
+}
+
 resolve_engine_docker_image() {
     local img="${ENGINE_IMAGE:-qwen3-engine:26.02}"
     local expected_release=""
@@ -498,6 +523,14 @@ cmd_run_standalone() {
         --model-version "$MODEL_VERSION"
 
     ENGINE_MODEL_PACKAGE_DIR="$MODEL_REPO_DIR/tts_orchestrator/$MODEL_VERSION"
+
+    local pybin
+    pybin=$(resolve_engine_python_bin "$REPO_ROOT") || exit 1
+
+    local standalone_trt_version
+    standalone_trt_version=$(resolve_standalone_tensorrt_version)
+    export STANDALONE_ENGINE_TENSORRT_PIP_VERSION="$standalone_trt_version"
+    install_tensorrt_for_python "$pybin" "$standalone_trt_version" || exit 1
 
     local start_args=(
         --port "$ENGINE_PORT"

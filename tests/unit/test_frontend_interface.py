@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 
 from engine.core.types import (
     EngineResult,
@@ -18,6 +20,8 @@ def test_tts_text_normalization_strips_emoji_noise():
     assert _normalize_tts_text("good😊morning") == "good morning"
     assert _normalize_tts_text("第1️⃣步完成✅。") == "第步完成。"
     assert _normalize_tts_text("😊🚀") == ""
+    assert _normalize_tts_text("湿度19%，气温为23℃。") == "湿度19%，气温为23℃。"
+    assert _normalize_tts_text("湿度19%.") == "湿度19%."
 
 
 class _CharTokenizer:
@@ -27,6 +31,23 @@ class _CharTokenizer:
     def encode_with_text(self, text, add_special_tokens=False):
         ids = self.encode_ids(text, add_special_tokens=add_special_tokens)
         return ids, list(text)
+
+    def debug_snapshot(self, text, add_special_tokens=False):
+        ids = self.encode_ids(text, add_special_tokens=add_special_tokens)
+        return {
+            "text": text,
+            "ids": ids,
+            "pieces": [
+                {
+                    "index": idx,
+                    "id": token_id,
+                    "token": ch,
+                    "span": ch,
+                    "offset": [idx, idx + 1],
+                }
+                for idx, (token_id, ch) in enumerate(zip(ids, text))
+            ],
+        }
 
 
 async def _drain_requests(inbox: asyncio.Queue) -> list:
@@ -214,3 +235,26 @@ def test_prefill_done_event_exposes_reference_metadata():
         await asyncio.sleep(0)
 
     asyncio.run(run())
+
+
+def test_tokenizer_observability_logs_raw_and_normalized_text(caplog):
+    interface = FrontendInterface(
+        engine_inbox=asyncio.Queue(maxsize=16),
+        tokenizer=_CharTokenizer(),
+        max_sessions=2,
+        engine_max_decode_len=64,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="engine.frontend.interface"):
+        interface._tokenize_segment_text("湿度19%，气温为23℃。")
+
+    observability_logs = [
+        record.message for record in caplog.records
+        if "Tokenizer observability:" in record.message
+    ]
+    assert observability_logs, "expected tokenizer observability logs"
+    payload = json.loads(observability_logs[-1].split("Tokenizer observability: ", 1)[1])
+    assert payload["field"] == "segment_text"
+    assert payload["normalized_text"] == "湿度19%，气温为23℃。"
+    assert payload["tokenizer"]["ids"]
+    assert payload["tokenizer"]["pieces"]

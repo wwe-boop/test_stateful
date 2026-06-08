@@ -366,6 +366,8 @@ build_forward_args() {
         _torch_tag=$(resolve_ngc_torch_index_tag "$NGC_TAG") || exit 1
         local _trt_python_version
         _trt_python_version=$(resolve_ngc_tag_tensorrt_version "$NGC_TAG") || exit 1
+        local _trt_cuda_version
+        _trt_cuda_version=$(resolve_ngc_tag_cuda_version "$NGC_TAG") || exit 1
         if ! $BUILD_IMAGE_EXPLICIT; then
             BUILD_IMAGE="$_ngc_image"
         fi
@@ -382,6 +384,11 @@ build_forward_args() {
         export TRITON_TENSORRT_PYTHON_VERSION="${TRITON_TENSORRT_PYTHON_VERSION:-$_trt_python_version}"
         export TRITON_TENSORRT_PIP_VERSION="${TRITON_TENSORRT_PIP_VERSION:-$_trt_python_version}"
         export STANDALONE_ENGINE_TENSORRT_PIP_VERSION="${STANDALONE_ENGINE_TENSORRT_PIP_VERSION:-$_trt_python_version}"
+        case "${_trt_cuda_version%%.*}" in
+            13) export STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE="${STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE:-tensorrt-cu13}" ;;
+            12) export STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE="${STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE:-tensorrt-cu12}" ;;
+            *)  export STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE="${STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE:-tensorrt}" ;;
+        esac
     fi
     if [ -z "$ENGINE_DOCKER_IMAGE" ]; then
         ENGINE_DOCKER_IMAGE="$(_env_or_empty ENGINE_IMAGE)"
@@ -392,6 +399,10 @@ build_forward_args() {
     if [ -n "$VARIANT" ]; then
         # Pass variant via env var (setup_env.sh reads MODEL_VARIANT)
         export MODEL_VARIANT="$VARIANT"
+    fi
+    export AUTHORUN_COMMAND="${COMMAND:-}"
+    if [ -n "$GATEWAY_MODE" ]; then
+        export GATEWAY_MODE
     fi
     export MODEL_VERSION
     export ENGINE_MODEL_VERSION="$MODEL_VERSION"

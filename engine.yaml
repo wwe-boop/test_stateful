@@ -67,8 +67,8 @@ sampling:
 
 # Prefill: CustomVoice client speaker missing / invalid (must exist in weights spk_id)
 prefill:
-  default_speaker: 001
-  fallback_speaker: 001
+  default_speaker: "001"
+  fallback_speaker: "001"
 
 # Optional Base/ICL reference library. When entries is empty, Base/ICL default
 # reference still falls back to ENGINE_DEFAULT_BASE_REF_AUDIO_PATH /

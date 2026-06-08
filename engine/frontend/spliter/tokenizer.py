@@ -14,10 +14,10 @@ class LightQwen3TTSTokenizer:
         self.tokenizer_dir = Path(tokenizer_dir)
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logger_level)
-        
+
         if not self.tokenizer_dir.is_dir():
             raise ValueError(f"Tokenizer directory {self.tokenizer_dir} does not exist")
-        
+
         self.tokenizer_json_path = self.tokenizer_dir / "tokenizer.json"
         # 先看看有没有tokenizer.json文件如果有，那么直接加载就好了
         if self.tokenizer_json_path.is_file():
@@ -27,16 +27,16 @@ class LightQwen3TTSTokenizer:
                 return
             except Exception as e:
                 self.logger.error(f"Failed to load tokenizer from {self.tokenizer_json_path}: {e}")
-        
+
         # 没有tokenizer_config.json文件，那么需要从vocab.json和merges.txt文件中构建tokenizer
         vocab_path = self.tokenizer_dir / "vocab.json"
         merges_path = self.tokenizer_dir / "merges.txt"
-        
+
         if not vocab_path.is_file():
             raise ValueError(f"Vocab file {vocab_path} does not exist")
         with open(vocab_path, "r", encoding="utf-8") as f:
             vocab = json.load(f)
-        
+
         if not merges_path.is_file():
             raise ValueError(f"Merges file {merges_path} does not exist")
         merges = self._parse_merges(merges_path)
@@ -52,6 +52,16 @@ class LightQwen3TTSTokenizer:
 
         self.logger.info(f"Loaded tokenizer from {self.tokenizer_dir}")
 
+    @staticmethod
+    def _display_token_text(token: str) -> str:
+        """Make whitespace-bearing tokens readable in single-line debug logs."""
+        return (
+            str(token)
+            .replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
 
     @staticmethod
     def _parse_merges(merges_path: Path) -> list:
@@ -66,7 +76,7 @@ class LightQwen3TTSTokenizer:
                 if len(parts) >= 2:
                     merges.append((parts[0], parts[1]))
         return merges
-    
+
     @staticmethod
     def _load_added_tokens(root: Path) -> List[Any]:
         """
@@ -103,7 +113,7 @@ class LightQwen3TTSTokenizer:
                 )
             )
         return tokens
-    
+
     def encode(self, text: str, add_special_tokens: bool = True, **kwargs: Any):
         """Return the raw tokenizers.Encoding object."""
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
@@ -121,7 +131,7 @@ class LightQwen3TTSTokenizer:
         """Return token ids and the corresponding original token."""
         enc = self.encode(text, add_special_tokens=add_special_tokens, **kwargs)
         return enc.ids, enc.tokens
-    
+
     def encode_with_text(self, text: str, add_special_tokens: bool = True, **kwargs: Any) -> Tuple[List[int], List[str]]:
         """Return token ids and stable original-text spans derived from offsets.
 
@@ -141,7 +151,56 @@ class LightQwen3TTSTokenizer:
             spans.append(text[start:end])
             prev_end = end
         return enc.ids, spans
-    
+
+    def debug_snapshot(
+        self,
+        text: str,
+        add_special_tokens: bool = True,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """Return a structured tokenization snapshot for observability."""
+        enc = self.encode(text, add_special_tokens=add_special_tokens, **kwargs)
+        spans: List[str] = []
+        prev_end = 0
+        text_len = len(text)
+        for start, end in enc.offsets:
+            start = max(int(start), prev_end)
+            end = max(int(end), start)
+            if end > text_len:
+                end = text_len
+            spans.append(text[start:end])
+            prev_end = end
+
+        pieces = []
+        for idx, token_id in enumerate(enc.ids):
+            token = enc.tokens[idx] if idx < len(enc.tokens) else ""
+            offset = enc.offsets[idx] if idx < len(enc.offsets) else (0, 0)
+            span = spans[idx] if idx < len(spans) else ""
+            pieces.append(
+                {
+                    "index": idx,
+                    "id": int(token_id),
+                    "token": token,
+                    "token_display": self._display_token_text(token),
+                    "offset": [int(offset[0]), int(offset[1])],
+                    "span": span,
+                    "span_display": self._display_token_text(span),
+                }
+            )
+
+        return {
+            "text": text,
+            "text_display": self._display_token_text(text),
+            "add_special_tokens": bool(add_special_tokens),
+            "ids": [int(token_id) for token_id in enc.ids],
+            "tokens": list(enc.tokens),
+            "tokens_display": [self._display_token_text(token) for token in enc.tokens],
+            "offsets": [[int(start), int(end)] for start, end in enc.offsets],
+            "spans": spans,
+            "spans_display": [self._display_token_text(span) for span in spans],
+            "pieces": pieces,
+        }
+
     def __call__(self, text: str, return_tensors: str | None = None, **kwargs: Any) -> Dict[str, Any]:
         """HuggingFace-compatible __call__ for drop-in use in PrefillBuilder."""
         ids = self.encode_ids(text, add_special_tokens=kwargs.get("add_special_tokens", True))

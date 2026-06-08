@@ -46,6 +46,91 @@ pip_install_requirements() {
 }
 
 # ---------------------------------------------------------------------------
+#  _resolve_tensorrt_pip_package [explicit_package]
+#  Chooses the CUDA-specific TensorRT pip package name when we already know
+#  the target CUDA tag from the NGC / PyTorch compatibility plan.
+# ---------------------------------------------------------------------------
+_resolve_tensorrt_pip_package() {
+    local explicit="${1:-${STANDALONE_ENGINE_TENSORRT_PIP_PACKAGE:-}}"
+    if [ -n "$explicit" ]; then
+        printf '%s\n' "$explicit"
+        return 0
+    fi
+
+    local cuda_tag="${STANDALONE_ENGINE_TENSORRT_CUDA_TAG:-${ENGINE_PYTORCH_CUDA_TAG:-${PYTORCH_CUDA_TAG:-${TRITON_PYTORCH_CUDA_TAG:-}}}}"
+    case "$cuda_tag" in
+        cu13*) printf '%s\n' 'tensorrt-cu13' ;;
+        cu12*) printf '%s\n' 'tensorrt-cu12' ;;
+        *)     printf '%s\n' 'tensorrt' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+#  install_tensorrt_for_python <python_bin> [version]
+#  Installs/pins the TensorRT Python package for a specific interpreter.
+#  Prefers CUDA-specific package names from the official TensorRT pip docs and
+#  forces the public PyPI index so mirror overrides do not redirect us to a
+#  stale university mirror. NVIDIA's package index stays configured as the
+#  extra source used by TensorRT's Python packaging flow.
+# ---------------------------------------------------------------------------
+install_tensorrt_for_python() {
+    local pybin="${1:-python3}"
+    local want="${2:-${STANDALONE_ENGINE_TENSORRT_PIP_VERSION:-10.15.1.29}}"
+    local pyexe=""
+    local package=""
+
+    if [[ "$pybin" == */* ]]; then
+        if [ -x "$pybin" ]; then
+            pyexe="$pybin"
+        fi
+    else
+        pyexe=$(command -v "$pybin" 2>/dev/null || true)
+    fi
+
+    if [ -z "$pyexe" ] || [ ! -x "$pyexe" ]; then
+        log_error "Python interpreter not found or not executable: $pybin"
+        return 1
+    fi
+
+    package=$(_resolve_tensorrt_pip_package)
+
+    local have=""
+    have=$("$pyexe" -c "import tensorrt as trt; print(trt.__version__)" 2>/dev/null || echo "")
+    if [ -n "$have" ] && [ "$have" = "$want" ]; then
+        log_info "TensorRT $want already installed for $pybin, skipping"
+        return 0
+    fi
+
+    local timeout="${TENSORRT_PIP_TIMEOUT:-15}"
+    local retries="${TENSORRT_PIP_RETRIES:-1}"
+    local common_args=(
+        -m pip install --upgrade
+        --disable-pip-version-check
+        --no-cache-dir
+        --timeout "$timeout"
+        --retries "$retries"
+    )
+
+    log_step "Installing TensorRT $want for $pyexe ..."
+    log_info "Using TensorRT package ${package}==${want} from official PyPI with NVIDIA index enabled"
+
+    if NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP=0 \
+        "$pyexe" "${common_args[@]}" \
+        --index-url "https://pypi.org/simple" \
+        --extra-index-url "https://pypi.nvidia.com" \
+        --trusted-host "pypi.org" \
+        --trusted-host "pypi.nvidia.com" \
+        "${package}==${want}"; then
+        log_info "TensorRT $want installed for $pyexe"
+        return 0
+    fi
+
+    log_error "TensorRT install failed for $pyexe (${package}==${want})"
+    log_error "If the required TensorRT Python package is no longer published for this NGC tag, use --gateway engine-docker or --gateway triton."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 #  install_torch_cuda [cuda_tag_or_version]
 #  Installs PyTorch + torchaudio with the correct CUDA build.
 #
@@ -272,18 +357,7 @@ install_onnx_export_deps() {
 # ---------------------------------------------------------------------------
 install_tensorrt_for_standalone_engine() {
     local want="${STANDALONE_ENGINE_TENSORRT_PIP_VERSION:-10.15.1.29}"
-    local have=""
-    have=$(python3 -c "import tensorrt as trt; print(trt.__version__)" 2>/dev/null || echo "")
-
-    if [ -n "$have" ] && [ "$have" = "$want" ]; then
-        log_info "TensorRT $want (standalone engine) already installed, skipping"
-        return 0
-    fi
-
-    log_step "Installing TensorRT $want for standalone engine (match Phase B NGC trtexec)..."
-    python3 -m pip install --upgrade "tensorrt==${want}" \
-        || { log_error "TensorRT install failed"; return 1; }
-    log_info "TensorRT $want installed"
+    install_tensorrt_for_python python3 "$want"
 }
 
 # ---------------------------------------------------------------------------
