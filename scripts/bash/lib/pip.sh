@@ -66,6 +66,76 @@ _resolve_tensorrt_pip_package() {
 }
 
 # ---------------------------------------------------------------------------
+#  _resolve_tensorrt_runtime_package
+#  Maps CUDA-specific TensorRT package families to the CUDA runtime package
+#  actually published on PyPI.  CUDA 13 currently ships a deprecated
+#  nvidia-cuda-runtime-cu13 placeholder, so we must install nvidia-cuda-runtime
+#  directly and then install TRT packages with --no-deps.
+# ---------------------------------------------------------------------------
+_resolve_tensorrt_runtime_package() {
+    local package="${1:-}"
+    case "$package" in
+        tensorrt-cu13) printf '%s\n' 'nvidia-cuda-runtime' ;;
+        *)             printf '%s\n' '' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+#  _resolve_tensorrt_runtime_version
+#  Returns a compatible CUDA runtime wheel version for the selected TRT family.
+# ---------------------------------------------------------------------------
+_resolve_tensorrt_runtime_version() {
+    local package="${1:-}"
+    case "$package" in
+        tensorrt-cu13) printf '%s\n' '13.0.96' ;;
+        *)             printf '%s\n' '' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+#  _install_tensorrt_cu13_fallback <python_exe> <version> <common_args...>
+#  Recovery path for TensorRT CUDA 13 packaging on PyPI.  Current 10.13.3.9
+#  metadata pulls the deprecated nvidia-cuda-runtime-cu13 source package, so
+#  we install the supported runtime wheel first and then install the TRT meta /
+#  libs / bindings packages without dependency resolution.
+# ---------------------------------------------------------------------------
+_install_tensorrt_cu13_fallback() {
+    local pyexe="$1"
+    local want="$2"
+    shift 2
+    local common_args=("$@")
+    local runtime_pkg runtime_ver
+    runtime_pkg=$(_resolve_tensorrt_runtime_package "tensorrt-cu13")
+    runtime_ver=$(_resolve_tensorrt_runtime_version "tensorrt-cu13")
+    [ -n "$runtime_pkg" ] || return 1
+    [ -n "$runtime_ver" ] || return 1
+
+    log_warn "Detected deprecated nvidia-cuda-runtime-cu13 dependency; using CUDA 13 fallback install path"
+
+    "$pyexe" "${common_args[@]}" \
+        --index-url "https://pypi.org/simple" \
+        --extra-index-url "https://pypi.nvidia.com" \
+        --trusted-host "pypi.org" \
+        --trusted-host "pypi.nvidia.com" \
+        "${runtime_pkg}==${runtime_ver}" \
+        || return 1
+
+    "$pyexe" "${common_args[@]}" \
+        --no-deps \
+        --index-url "https://pypi.org/simple" \
+        --extra-index-url "https://pypi.nvidia.com" \
+        --trusted-host "pypi.org" \
+        --trusted-host "pypi.nvidia.com" \
+        "tensorrt==${want}" \
+        "tensorrt_cu13_bindings==${want}" \
+        "tensorrt_cu13_libs==${want}" \
+        "tensorrt-cu13==${want}" \
+        || return 1
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 #  install_tensorrt_for_python <python_bin> [version]
 #  Installs/pins the TensorRT Python package for a specific interpreter.
 #  Prefers CUDA-specific package names from the official TensorRT pip docs and
@@ -114,16 +184,26 @@ install_tensorrt_for_python() {
     log_step "Installing TensorRT $want for $pyexe ..."
     log_info "Using TensorRT package ${package}==${want} from official PyPI with NVIDIA index enabled"
 
-    if NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP=0 \
+    if [ "$package" = "tensorrt-cu13" ]; then
+        if _install_tensorrt_cu13_fallback "$pyexe" "$want" "${common_args[@]}"; then
+            log_info "TensorRT $want installed for $pyexe via CUDA 13 fallback path"
+            return 0
+        fi
+    fi
+
+    local install_output=""
+    if install_output=$(NVIDIA_TENSORRT_DISABLE_INTERNAL_PIP=0 \
         "$pyexe" "${common_args[@]}" \
         --index-url "https://pypi.org/simple" \
         --extra-index-url "https://pypi.nvidia.com" \
         --trusted-host "pypi.org" \
         --trusted-host "pypi.nvidia.com" \
-        "${package}==${want}"; then
+        "${package}==${want}" 2>&1); then
+        printf '%s\n' "$install_output"
         log_info "TensorRT $want installed for $pyexe"
         return 0
     fi
+    printf '%s\n' "$install_output"
 
     log_error "TensorRT install failed for $pyexe (${package}==${want})"
     log_error "If the required TensorRT Python package is no longer published for this NGC tag, use --gateway engine-docker or --gateway triton."
