@@ -203,6 +203,34 @@ def _trace_cp_pytorch(
     }
 
 
+def _sample_cp_pytorch(
+    cp: CodePredictorUnrolled,
+    past_hidden: torch.Tensor,
+    codec_token_0: torch.Tensor,
+    cp_gumbel_noise: torch.Tensor,
+    temperature: torch.Tensor,
+    *,
+    use_autocast_bf16: bool,
+) -> List[int]:
+    hidden_in = past_hidden.to(dtype=torch.bfloat16 if use_autocast_bf16 else torch.float32)
+    noise_in = cp_gumbel_noise.to(device=past_hidden.device, dtype=torch.float32)
+    temp_in = temperature.to(device=past_hidden.device, dtype=torch.float32)
+
+    ctx = torch.autocast(
+        device_type=past_hidden.device.type,
+        dtype=torch.bfloat16,
+        enabled=use_autocast_bf16,
+    )
+    with torch.no_grad(), ctx:
+        out = cp(
+            hidden_in,
+            codec_token_0.to(device=past_hidden.device),
+            cp_gumbel_noise=noise_in,
+            temperature=temp_in,
+        )
+    return out.detach().cpu().reshape(-1).to(torch.int64).tolist()
+
+
 def _trace_cp_cached(
     cp_model: torch.nn.Module,
     talker_codec_embedding: torch.nn.Module,
@@ -312,6 +340,8 @@ def _print_trace(
     bf16_trace: Dict[str, Any],
     cached_fp32_trace: Dict[str, Any],
     cached_bf16_trace: Dict[str, Any],
+    sampled_fp32_tail: List[int],
+    sampled_bf16_tail: List[int],
     onnx_tail: List[int],
     trt_tail: List[int],
 ) -> None:
@@ -321,6 +351,8 @@ def _print_trace(
     print(f"Unrolled BF16 tail : {bf16_trace['tail_tokens']}")
     print(f"Cached FP32 tail   : {cached_fp32_trace['tail_tokens']}")
     print(f"Cached BF16 tail   : {cached_bf16_trace['tail_tokens']}")
+    print(f"Sampled FP32 tail  : {sampled_fp32_tail}")
+    print(f"Sampled BF16 tail  : {sampled_bf16_tail}")
     print(f"Standalone ONNX    : {onnx_tail}")
     print(f"Fused TRT tail     : {trt_tail}")
     print()
@@ -332,6 +364,15 @@ def _print_trace(
             "unrolled_bf16": _first_diff(cached_fp32_trace["tail_tokens"], bf16_trace["tail_tokens"]),
             "onnx": _first_diff(cached_fp32_trace["tail_tokens"], onnx_tail),
             "trt": _first_diff(cached_fp32_trace["tail_tokens"], trt_tail),
+        },
+    )
+    print(
+        "first_diff_vs_fused_trt:",
+        {
+            "sampled_fp32": _first_diff(trt_tail, sampled_fp32_tail),
+            "sampled_bf16": _first_diff(trt_tail, sampled_bf16_tail),
+            "onnx_argmax": _first_diff(trt_tail, onnx_tail),
+            "cached_fp32_argmax": _first_diff(trt_tail, cached_fp32_trace["tail_tokens"]),
         },
     )
     print()
@@ -432,6 +473,22 @@ def main() -> None:
         trt_token_0,
         use_autocast_bf16=True,
     )
+    sampled_fp32_tail = _sample_cp_pytorch(
+        cp_unrolled_fp32,
+        trt_hidden.float(),
+        trt_token_0,
+        dump_payload["inputs"]["cp_gumbel_noise"].to(device=device),
+        dump_payload["inputs"]["temperature"].to(device=device),
+        use_autocast_bf16=False,
+    )
+    sampled_bf16_tail = _sample_cp_pytorch(
+        cp_unrolled_bf16,
+        trt_hidden.to(dtype=torch.bfloat16),
+        trt_token_0,
+        dump_payload["inputs"]["cp_gumbel_noise"].to(device=device),
+        dump_payload["inputs"]["temperature"].to(device=device),
+        use_autocast_bf16=True,
+    )
     onnx_tail = _run_cp_onnx(onnx_path, trt_hidden, trt_token_0)
 
     title = f"CP Dump Analysis: {dump_path.name}"
@@ -452,6 +509,8 @@ def main() -> None:
         bf16_trace=bf16_trace,
         cached_fp32_trace=cached_fp32_trace,
         cached_bf16_trace=cached_bf16_trace,
+        sampled_fp32_tail=sampled_fp32_tail,
+        sampled_bf16_tail=sampled_bf16_tail,
         onnx_tail=onnx_tail,
         trt_tail=trt_tail,
     )
@@ -468,6 +527,8 @@ def main() -> None:
         "unrolled_pytorch_bf16": bf16_trace,
         "cached_pytorch_fp32": cached_fp32_trace,
         "cached_pytorch_bf16": cached_bf16_trace,
+        "sampled_pytorch_fp32": sampled_fp32_tail,
+        "sampled_pytorch_bf16": sampled_bf16_tail,
         "onnx_tail": onnx_tail,
         "first_diff_vs_cached_fp32": {
             "cached_bf16": _first_diff(cached_fp32_trace["tail_tokens"], cached_bf16_trace["tail_tokens"]),
@@ -475,6 +536,12 @@ def main() -> None:
             "unrolled_bf16": _first_diff(cached_fp32_trace["tail_tokens"], bf16_trace["tail_tokens"]),
             "onnx": _first_diff(cached_fp32_trace["tail_tokens"], onnx_tail),
             "trt": _first_diff(cached_fp32_trace["tail_tokens"], trt_tail),
+        },
+        "first_diff_vs_fused_trt": {
+            "sampled_fp32": _first_diff(trt_tail, sampled_fp32_tail),
+            "sampled_bf16": _first_diff(trt_tail, sampled_bf16_tail),
+            "onnx_argmax": _first_diff(trt_tail, onnx_tail),
+            "cached_fp32_argmax": _first_diff(trt_tail, cached_fp32_trace["tail_tokens"]),
         },
     }
     if args.report_json:

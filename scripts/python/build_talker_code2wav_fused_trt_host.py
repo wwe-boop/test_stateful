@@ -44,6 +44,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-input-len", type=int, default=4096)
     p.add_argument("--max-seq-len", type=int, default=4096)
     p.add_argument("--workspace-mib", type=int, default=8192)
+    p.add_argument(
+        "--builder-optimization-level",
+        type=int,
+        default=None,
+        help="Optional TensorRT builder_optimization_level override (0-5).",
+    )
     p.add_argument("--verbose", action="store_true")
     return p.parse_args()
 
@@ -168,6 +174,8 @@ def main() -> None:
 
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, args.workspace_mib << 20)
+    if args.builder_optimization_level is not None:
+        config.builder_optimization_level = int(args.builder_optimization_level)
     _apply_precision_flags(config, str(manifest.get("engine_dtype", "bf16")))
 
     profile = builder.create_optimization_profile()

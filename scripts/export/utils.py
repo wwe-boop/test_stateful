@@ -879,6 +879,86 @@ class CodePredictorUnrolled(nn.Module):
         self.hidden_size = code_predictor.config.hidden_size
         self.logits_topk = int(logits_topk)
 
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    @staticmethod
+    def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        if n_rep == 1:
+            return hidden_states
+        batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+        hidden_states = hidden_states.reshape(batch, num_kv_heads, 1, seq_len, head_dim)
+        hidden_states = hidden_states.expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+        return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+
+    def _apply_rotary_pos_emb(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        query_states = (query_states * cos) + (self._rotate_half(query_states) * sin)
+        key_states = (key_states * cos) + (self._rotate_half(key_states) * sin)
+        return query_states, key_states
+
+    def _run_attention(
+        self,
+        attn_module: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        batch, seq_len = hidden_states.shape[:2]
+        hidden_shape = (batch, seq_len, -1, attn_module.head_dim)
+
+        query_states = attn_module.q_norm(attn_module.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = attn_module.k_norm(attn_module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = attn_module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = self._apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        key_states = self._repeat_kv(key_states, attn_module.num_key_value_groups)
+        value_states = self._repeat_kv(value_states, attn_module.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * attn_module.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(value_states.dtype)
+
+        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, attn_module.o_proj.in_features)
+        return attn_module.o_proj(attn_output)
+
+    def _run_layer(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = layer.input_layernorm(hidden_states)
+        hidden_states = self._run_attention(
+            layer.self_attn,
+            hidden_states,
+            attention_mask,
+            position_embeddings,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = layer.post_attention_layernorm(hidden_states)
+        hidden_states = layer.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
     def _transformer_forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, D = x.shape
         device = x.device
@@ -894,17 +974,12 @@ class CodePredictorUnrolled(nn.Module):
 
         hidden = x
         for layer in self.transformer_layers:
-            layer_out = layer(
+            hidden = self._run_layer(
+                layer,
                 hidden,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_values=None,
-                output_attentions=False,
-                use_cache=False,
-                cache_position=torch.arange(S, device=device),
-                position_embeddings=position_embeddings,
+                causal_mask,
+                position_embeddings,
             )
-            hidden = layer_out[0]
 
         return self.norm(hidden)
 
