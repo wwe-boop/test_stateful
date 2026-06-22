@@ -31,10 +31,10 @@ DATA_LOG = REPO_ROOT / "data.log"
 OUTPUT_DIR = REPO_ROOT / "workspace" / "repeat_case"
 SAMPLE_RATE = 24000
 
-# WS_HOST = "8.160.176.148"
-WS_HOST = "localhost"
-# WS_PORT = 1182
-WS_PORT = 50052
+WS_HOST = "8.160.176.148"
+# WS_HOST = "localhost"
+WS_PORT = 1182
+# WS_PORT = 50052
 WS_PATH = "/v1/ws"
 
 
