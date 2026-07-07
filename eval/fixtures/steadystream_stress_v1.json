@@ -1,0 +1,21 @@
+{
+  "trace_id": "steadystream_stress_v1",
+  "description": "Representative LLM streaming trace with mixed pause lengths for Table 4 stress replay.",
+  "speaker": "Serena",
+  "language": "Chinese",
+  "instruct": "用平静温和的叙述语气说",
+  "task_type": "custom_voice",
+  "stream_input_mode": "clause",
+  "expected_session_duration_sec": 45.0,
+  "chunks": [
+    {"text": "其实我真的有发现，", "pause_after_ms": 180},
+    {"text": "你是不是也有过这种感觉？", "pause_after_ms": 220},
+    {"text": "明明刚才还很平静，", "pause_after_ms": 150},
+    {"text": "下一秒却突然紧张起来！", "pause_after_ms": 320},
+    {"text": "比如看到一串数字 2026 和英文缩写 AI 时，", "pause_after_ms": 1400},
+    {"text": "大脑会先停顿半秒，", "pause_after_ms": 200},
+    {"text": "然后才继续往下读。", "pause_after_ms": 280},
+    {"text": "这种边界处的韵律变化，", "pause_after_ms": 160},
+    {"text": "正是流式合成最需要保持稳定的地方。", "pause_after_ms": 0}
+  ]
+}

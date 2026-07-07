@@ -1,14 +1,7 @@
 """SteadyStream Evaluation Package - Frozen API v1.0
 
-This package implements all metrics defined in steadystream_plan_v2.md §4.
-
-Core modules:
-- boundary_metrics: F0 and energy jump measurement with VAD gating
-- excess_metrics: Excess jumps beyond natural baseline (§4.3)
-- pause_metrics: Pause deviation measurement (§4.3)
-- sim_delta: Speaker similarity loss (§4.4)
-- latency_metrics: FASL and RTF (§4.5)
-- text_metrics: CER computation (§4.6)
+This package implements metrics from steadystream_plan_v2.md §4 (E0) and
+Table 4 concurrency stress helpers (E9).
 
 Status: PROVISIONAL until §4.7 acceptance criteria pass.
 """
@@ -16,44 +9,40 @@ Status: PROVISIONAL until §4.7 acceptance criteria pass.
 __version__ = "1.0.0-alpha"
 
 from .boundary_metrics import (
-    measure_boundary_metrics,
-    summarize_boundary_metrics,
     boundary_positions_from_concat,
     boundary_positions_proportional,
-    vad_gate,
+    measure_boundary_metrics,
     side_f0_mean,
+    summarize_boundary_metrics,
+    vad_gate,
 )
-
+from .boundary_match import forced_segmentation_rate, match_boundaries
 from .excess_metrics import (
     NaturalBoundaryReference,
     compute_excess_metrics,
     summarize_excess_metrics,
 )
-
+from .fasl_vad import (
+    first_speech_sample_index,
+    measure_fasl_vad_from_concat,
+    measure_fasl_vad_from_packets,
+    vad_speech_mask,
+)
+from .jitter_metrics import intervals_from_packet_timestamps, measure_jitter_ms
+from .latency_metrics import measure_first_audio_streaming_latency, measure_rtf
 from .pause_metrics import (
-    detect_boundary_pause,
     compute_pause_deviation,
+    detect_boundary_pause,
     measure_pause_metrics,
     summarize_pause_metrics,
 )
-
-from .sim_delta import (
-    compute_sim_delta,
-    summarize_sim_delta,
-)
-
-from .latency_metrics import (
-    measure_first_audio_streaming_latency,
-    measure_rtf,
-)
-
-from .text_metrics import (
-    compute_cer,
-    measure_cer_batch,
-)
+from .sim_delta import compute_sim_delta, summarize_sim_delta
+from .stress_metrics import aggregate_stress_runs, summarize_session_stress
+from .stutter_metrics import pause_resume_stutter_delta, simulate_playout_underflows
+from .text_metrics import compute_cer, measure_cer_batch
 
 __all__ = [
-    # boundary
+    # boundary (E0)
     "measure_boundary_metrics",
     "summarize_boundary_metrics",
     "boundary_positions_from_concat",
@@ -78,4 +67,17 @@ __all__ = [
     # text
     "compute_cer",
     "measure_cer_batch",
+    # Table 4 stress
+    "match_boundaries",
+    "forced_segmentation_rate",
+    "measure_fasl_vad_from_packets",
+    "measure_fasl_vad_from_concat",
+    "first_speech_sample_index",
+    "vad_speech_mask",
+    "measure_jitter_ms",
+    "intervals_from_packet_timestamps",
+    "simulate_playout_underflows",
+    "pause_resume_stutter_delta",
+    "summarize_session_stress",
+    "aggregate_stress_runs",
 ]
