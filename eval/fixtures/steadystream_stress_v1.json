@@ -1,7 +1,7 @@
 {
   "trace_id": "steadystream_stress_v1",
   "description": "Representative LLM streaming trace with mixed pause lengths for Table 4 stress replay.",
-  "speaker": "Serena",
+  "speaker": "serena",
   "language": "Chinese",
   "instruct": "用平静温和的叙述语气说",
   "task_type": "custom_voice",

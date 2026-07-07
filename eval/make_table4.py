@@ -24,13 +24,6 @@ VARIANT_LABELS = {
     "full_steadystream": "完整 SteadyStream",
 }
 
-MAIN_COLUMNS = [
-    ("fasl_vad_ms", "FASL↓ (ms)"),
-    ("jitter_p95_ms", "Jitter↓ (ms)"),
-    ("stutter_rate_pct", "卡顿率↓ (%)"),
-    ("ttft_ms", "TTFT P50/P95 (ms)"),
-]
-
 
 def _load_run_summaries(results_dir: Path, variant: str, concurrency: int) -> list[dict[str, Any]]:
     runs = []
@@ -68,10 +61,10 @@ def _format_cell(mean: float | None, std: float | None) -> str:
     return f"{mean:.1f}±{std:.1f}"
 
 
-def _ttft_cell(runs: list[dict[str, Any]]) -> str:
+def _p50_p95_cell(runs: list[dict[str, Any]], metric: str) -> str:
     p50_vals, p95_vals = [], []
     for run in runs:
-        block = run.get("ttft_ms") or {}
+        block = run.get(metric) or {}
         if block.get("p50") is not None:
             p50_vals.append(block["p50"])
         if block.get("p95") is not None:
@@ -83,43 +76,55 @@ def _ttft_cell(runs: list[dict[str, Any]]) -> str:
     return f"{p50:.0f}/{p95:.0f}"
 
 
+def _batch_xrt_cell(runs: list[dict[str, Any]]) -> str:
+    vals = [r.get("batch_x_rt") for r in runs if r.get("batch_x_rt") is not None]
+    if not vals:
+        xrt_m, xrt_s = _mean_std_across_seeds(runs, "x_rt")
+        return _format_cell(xrt_m, xrt_s)
+    return f"{np.mean(vals):.2f}"
+
+
 def generate_table4_markdown(results_dir: Path, variant: str = "stateful_triton") -> str:
     lines = [
         "# 表 4：SteadyStream 并发下用户感知稳定性",
         "",
         f"变体：**{VARIANT_LABELS.get(variant, variant)}** ｜ 数据来源：`{results_dir}`",
         "",
-        "| 并发路数 | FASL↓ (ms) | Jitter↓ (ms) | 卡顿率↓ (%) | TTFT P50/P95 (ms) | 成功路数 |",
-        "|---|---|---|---|---|---|",
+        "口径：FASL = 首段上游文本 → VAD 首有声；TTFT/首包 = session init → 首 PCM（客户端）；"
+        "RTF = 单路墙钟/音频时长；×RT = 批次总音频/批次墙钟。",
+        "",
+        "| 并发 | FASL↓ | Jitter↓ | 卡顿↓(%) | TTFT P50/P95 | RTF↓ | ×RT↑ | 成功 |",
+        "|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
 
     for c in CONCURRENCY_ORDER:
         runs = _load_run_summaries(results_dir, variant, c)
         if not runs:
-            lines.append(f"| {c} | – | – | – | – | – |")
+            lines.append(f"| {c} | – | – | – | – | – | – | – |")
             continue
         fasl_m, fasl_s = _mean_std_across_seeds(runs, "fasl_vad_ms")
         jit_m, jit_s = _mean_std_across_seeds(runs, "jitter_p95_ms")
         stu_m, stu_s = _mean_std_across_seeds(runs, "stutter_rate_pct")
-        ttft = _ttft_cell(runs)
+        ttft = _p50_p95_cell(runs, "ttft_ms")
+        rtf_m, rtf_s = _mean_std_across_seeds(runs, "rtf")
+        xrt = _batch_xrt_cell(runs)
         n_ok = int(np.mean([r.get("n_ok", 0) for r in runs]))
         lines.append(
             f"| {c} | {_format_cell(fasl_m, fasl_s)} | {_format_cell(jit_m, jit_s)} | "
-            f"{_format_cell(stu_m, stu_s)} | {ttft} | {n_ok}/{c} |"
+            f"{_format_cell(stu_m, stu_s)} | {ttft} | {_format_cell(rtf_m, rtf_s)} | {xrt} | {n_ok}/{c} |"
         )
 
     lines.extend(["", "## 表 4b：上游停顿时长分层", ""])
-    lines.append("| 分层 | 并发 | FASL (ms) | 卡顿率 (%) | vs PAD 卡顿差 (pp) |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| 分层 | 并发 | FASL | 卡顿(%) | vs PAD(pp) |")
+    lines.append("|---|---:|---:|---:|---:|")
 
     for strat in ("normal", "long_pause"):
-        label = "全量" if strat == "normal" else "停顿 > 1 s"
+        label = "全量" if strat == "normal" else "停顿>1s"
         for c in [1, 8, 128]:
             pad_runs = _load_run_summaries(results_dir, "pad_baseline", c)
             cand_runs = _load_run_summaries(results_dir, variant, c)
             if not cand_runs:
                 continue
-            # Session-level stratification requires per-session JSON; placeholder from aggregate
             fasl_m, _ = _mean_std_across_seeds(cand_runs, "fasl_vad_ms")
             stu_m, _ = _mean_std_across_seeds(cand_runs, "stutter_rate_pct")
             pad_stu, _ = _mean_std_across_seeds(pad_runs, "stutter_rate_pct")
@@ -130,7 +135,7 @@ def generate_table4_markdown(results_dir: Path, variant: str = "stateful_triton"
             )
 
     lines.append("")
-    lines.append("> 完整并发梯度曲线与 3-seed 原始数据见补充材料。")
+    lines.append("> 3 seeds/档；完整曲线见补充材料。server_ttft_ms 写入 run_summary 供附录对照。")
     return "\n".join(lines) + "\n"
 
 

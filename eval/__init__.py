@@ -36,8 +36,12 @@ from .pause_metrics import (
     measure_pause_metrics,
     summarize_pause_metrics,
 )
-from .sim_delta import compute_sim_delta, summarize_sim_delta
-from .stress_metrics import aggregate_stress_runs, summarize_session_stress
+try:
+    from .sim_delta import compute_sim_delta, summarize_sim_delta
+except ImportError:  # torch optional for stress-only workflows
+    compute_sim_delta = None  # type: ignore[misc, assignment]
+    summarize_sim_delta = None  # type: ignore[misc, assignment]
+from .stress_metrics import aggregate_stress_runs, compute_session_metrics, summarize_session_stress
 from .stutter_metrics import pause_resume_stutter_delta, simulate_playout_underflows
 from .text_metrics import compute_cer, measure_cer_batch
 
@@ -79,5 +83,6 @@ __all__ = [
     "simulate_playout_underflows",
     "pause_resume_stutter_delta",
     "summarize_session_stress",
+    "compute_session_metrics",
     "aggregate_stress_runs",
 ]

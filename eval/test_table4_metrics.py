@@ -11,7 +11,7 @@ import numpy as np
 from eval.boundary_match import forced_segmentation_rate, match_boundaries
 from eval.fasl_vad import measure_fasl_vad_from_packets
 from eval.jitter_metrics import intervals_from_packet_timestamps, measure_jitter_ms
-from eval.stress_metrics import aggregate_stress_runs, summarize_session_stress
+from eval.stress_metrics import aggregate_stress_runs, compute_session_metrics, summarize_session_stress
 from eval.stutter_metrics import simulate_playout_underflows
 
 
@@ -61,6 +61,31 @@ def test_boundary_match() -> None:
     print("  ✓ Boundary match")
 
 
+def test_rtf_xrt() -> None:
+    m = compute_session_metrics(
+        {"total_ms": 1600.0, "total_samples": 24000 * 10, "session_id": "x"}
+    )
+    assert m["rtf"] == 0.16
+    assert m["x_rt"] == 6.25
+    print("  ✓ RTF / ×RT")
+
+
+def test_ttft_anchor() -> None:
+    t0 = 1000.0
+    m = compute_session_metrics(
+        {
+            "session_start_ts": t0,
+            "first_pcm_ts": t0 + 0.05,
+            "first_text_ts": t0 + 0.02,
+            "total_ms": 500.0,
+            "total_samples": 24000,
+        }
+    )
+    assert m["ttft_ms"] == 50.0
+    assert m["ttfb_ms"] == 50.0
+    print("  ✓ TTFT = init→首包")
+
+
 def test_aggregate() -> None:
     sessions = [
         {"fasl_vad_ms": 100, "ttft_ms": 80, "jitter_p95_ms": 5, "stutter_rate_pct": 0.5},
@@ -76,6 +101,8 @@ def main() -> int:
     test_fasl_vad()
     test_jitter_stutter()
     test_boundary_match()
+    test_rtf_xrt()
+    test_ttft_anchor()
     test_aggregate()
     rec = summarize_session_stress(
         {

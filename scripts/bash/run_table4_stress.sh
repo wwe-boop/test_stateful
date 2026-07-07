@@ -16,6 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 TRITON="${TRITON:-localhost:8001}"
+BACKEND="${BACKEND:-engine}"
+ENDPOINT="${ENDPOINT:-127.0.0.1:50051}"
 TRACE="${TRACE:-${REPO_ROOT}/eval/fixtures/steadystream_stress_v1.json}"
 VARIANT="${VARIANT:-stateful_triton}"
 OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/workspace/table4_runs}"
@@ -44,6 +46,8 @@ fi
 IFS=',' read -r -a SEED_ARR <<< "${SEEDS}"
 
 echo "=== Table 4 stress sweep ==="
+echo "Backend:     ${BACKEND}"
+echo "Endpoint:    ${ENDPOINT}"
 echo "Triton:      ${TRITON}"
 echo "Trace:       ${TRACE}"
 echo "Variant:     ${VARIANT}"
@@ -59,6 +63,8 @@ for seed in "${SEED_ARR[@]}"; do
     echo ""
     echo "--- ${VARIANT}  concurrency=${c}  seed=${seed} ---"
     python3 "${REPO_ROOT}/scripts/python/steadystream_stress_client.py" \
+      --backend "${BACKEND}" \
+      --endpoint "${ENDPOINT}" \
       --triton "${TRITON}" \
       --trace "${TRACE}" \
       --concurrency "${c}" \

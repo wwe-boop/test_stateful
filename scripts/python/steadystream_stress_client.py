@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from eval.stress_metrics import aggregate_stress_runs, summarize_session_stress
+from eval.stress_metrics import aggregate_stress_runs, compute_session_metrics
 
 SAMPLE_RATE = 24000
 DEFAULT_CONCURRENCY = [1, 8, 16, 32, 64, 128]
@@ -48,9 +48,10 @@ class SessionRecord:
     seed: int
     trace_id: str
     session_start_ts: float = 0.0
-    first_token_ts: float | None = None
+    first_text_ts: float | None = None
     first_pcm_ts: float | None = None
-    ttft_ms: float | None = None
+    ttfb_ms: float | None = None
+    server_ttft_ms: float | None = None
     trace_pause_after_total_ms: float = 0.0
     audio_packets: list[dict[str, Any]] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -75,9 +76,12 @@ class SessionRecord:
             "seed": self.seed,
             "trace_id": self.trace_id,
             "session_start_ts": self.session_start_ts,
-            "first_token_ts": self.first_token_ts,
+            "first_text_ts": self.first_text_ts,
+            "first_token_ts": self.first_text_ts,
             "first_pcm_ts": self.first_pcm_ts,
-            "ttft_ms": self.ttft_ms,
+            "ttfb_ms": self.ttfb_ms,
+            "ttft_ms": self.ttfb_ms,
+            "server_ttft_ms": self.server_ttft_ms,
             "trace_pause_after_total_ms": self.trace_pause_after_total_ms,
             "audio_packets": packets,
             "events": self.events,
@@ -129,6 +133,125 @@ def poisson_session_starts(
     while len(offsets) < n_sessions:
         offsets.append(offsets[-1] + 1.0 / lam)
     return sorted(offsets[:n_sessions])
+
+
+def _run_engine_streaming_session(
+    endpoint: str,
+    trace: dict[str, Any],
+    *,
+    session_id: str,
+    variant: str,
+    concurrency: int,
+    seed: int,
+    start_delay_sec: float,
+    timeout: float,
+) -> SessionRecord:
+    import grpc
+    from engine.gateway import tts_pb2, tts_pb2_grpc
+
+    rec = SessionRecord(
+        session_id=session_id,
+        variant=variant,
+        concurrency=concurrency,
+        seed=seed,
+        trace_id=trace.get("trace_id", "unknown"),
+        trace_pause_after_total_ms=sum(c.get("pause_after_ms", 0) for c in trace["chunks"]),
+    )
+    if start_delay_sec > 0:
+        time.sleep(start_delay_sec)
+
+    mode_map = {
+        "token": tts_pb2.INPUT_MODE_TOKEN,
+        "clause": tts_pb2.INPUT_MODE_CLAUSE,
+        "long_segment": tts_pb2.INPUT_MODE_LONG_SEGMENT,
+        "full_text": tts_pb2.INPUT_MODE_FULL_TEXT,
+    }
+    input_mode = mode_map.get(trace.get("stream_input_mode", "clause"), tts_pb2.INPUT_MODE_CLAUSE)
+    chunks = trace["chunks"]
+
+    def request_gen():
+        yield tts_pb2.SynthesizeRequest(
+            start=tts_pb2.StartRequest(
+                session_id=session_id,
+                config=tts_pb2.SessionConfig(
+                    task_type=trace.get("task_type", "custom_voice"),
+                    speaker=str(trace.get("speaker", "serena")).lower(),
+                    language=trace.get("language", "Chinese"),
+                    instruct=trace.get("instruct", ""),
+                    input_mode=input_mode,
+                    group_policy=tts_pb2.GROUP_POLICY_NONE,
+                    audio=tts_pb2.AudioFormat(
+                        encoding=tts_pb2.AUDIO_ENCODING_PCM_F32,
+                        sample_rate=SAMPLE_RATE,
+                        channels=1,
+                    ),
+                ),
+            )
+        )
+        for chunk in chunks:
+            pause_ms = float(chunk.get("pause_after_ms", 0))
+            if pause_ms > 0:
+                time.sleep(pause_ms / 1000.0)
+            if rec.first_text_ts is None:
+                rec.first_text_ts = time.perf_counter()
+            yield tts_pb2.SynthesizeRequest(text=tts_pb2.TextChunk(text=chunk["text"]))
+        yield tts_pb2.SynthesizeRequest(end=tts_pb2.EndRequest())
+
+    t0 = time.perf_counter()
+    rec.session_start_ts = t0
+    channel = grpc.insecure_channel(endpoint)
+    stub = tts_pb2_grpc.TTSServiceStub(channel)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=10.0)
+        for response in stub.SynthesizeStream(request_gen(), timeout=timeout):
+            now = time.perf_counter()
+            which = response.WhichOneof("response")
+            if which == "audio":
+                samples = np.frombuffer(response.audio.pcm_data, dtype=np.float32)
+                if rec.first_pcm_ts is None:
+                    rec.first_pcm_ts = now
+                    rec.ttfb_ms = (now - t0) * 1000.0
+                rec.audio_packets.append({"client_ts": now, "samples": samples})
+                rec.events.append({"ts": now, "type": "audio", "n_samples": len(samples)})
+            elif which == "event":
+                payload = {"type": response.event.type, "message": response.event.message}
+                rec.events.append({"ts": now, "type": "event", "payload": payload})
+                if response.event.type == "error":
+                    rec.error = response.event.message or "engine stream error"
+                    break
+    except grpc.RpcError as exc:
+        rec.error = str(exc)
+    finally:
+        channel.close()
+
+    rec.total_ms = (time.perf_counter() - t0) * 1000.0
+    rec.total_samples = int(sum(len(p["samples"]) for p in rec.audio_packets))
+    return rec
+
+
+def run_streaming_session(
+    backend: str,
+    endpoint: str,
+    trace: dict[str, Any],
+    *,
+    session_id: str,
+    variant: str,
+    concurrency: int,
+    seed: int,
+    start_delay_sec: float,
+    timeout: float,
+) -> SessionRecord:
+    if backend == "engine":
+        return _run_engine_streaming_session(
+            endpoint, trace,
+            session_id=session_id, variant=variant, concurrency=concurrency,
+            seed=seed, start_delay_sec=start_delay_sec, timeout=timeout,
+        )
+    return _run_streaming_session(
+        endpoint, trace,
+        session_id=session_id, variant=variant, concurrency=concurrency,
+        seed=seed, start_delay_sec=start_delay_sec, timeout=timeout,
+    )
 
 
 def _run_streaming_session(
@@ -197,11 +320,18 @@ def _run_streaming_session(
             samples = _decode_audio_bytes(audio.flatten()[0], audio_format)
             if rec.first_pcm_ts is None:
                 rec.first_pcm_ts = now
-                if rec.first_token_ts is not None:
-                    rec.ttft_ms = (now - rec.first_token_ts) * 1000.0
+                if rec.session_start_ts:
+                    rec.ttfb_ms = (now - rec.session_start_ts) * 1000.0
+                if rec.server_ttft_ms is None:
+                    raw = payload.get("triton_adapter_ttft_ms") or payload.get("server_ttft_ms")
+                    if raw is not None:
+                        try:
+                            rec.server_ttft_ms = float(raw)
+                        except (TypeError, ValueError):
+                            pass
             rec.audio_packets.append({"client_ts": now, "samples": samples})
             all_samples.append(samples)
-            rec.events.append({"ts": now, "type": "audio", "n_samples": len(samples)})
+            rec.events.append({"ts": now, "type": "audio", "n_samples": len(samples), "payload": payload})
         elif et == "error":
             errors.append(payload.get("message", "unknown error"))
             done.set()
@@ -246,8 +376,8 @@ def _run_streaming_session(
         pause_ms = float(chunk.get("pause_after_ms", 0))
         if pause_ms > 0:
             time.sleep(pause_ms / 1000.0)
-        if rec.first_token_ts is None:
-            rec.first_token_ts = time.perf_counter()
+        if rec.first_text_ts is None:
+            rec.first_text_ts = time.perf_counter()
         _send_one({"action": "append_text", "session_id": session_id, "text": chunk["text"]})
 
     _send_one({"action": "text_complete", "session_id": session_id})
@@ -263,9 +393,10 @@ def _run_streaming_session(
 
 
 def run_stress(
-    triton_url: str,
+    endpoint: str,
     trace: dict[str, Any],
     *,
+    backend: str = "engine",
     concurrency: int,
     seed: int,
     variant: str,
@@ -282,8 +413,8 @@ def run_stress(
     for i in range(warmup):
         sid = f"warmup-{i}-{uuid.uuid4().hex[:8]}"
         try:
-            _run_streaming_session(
-                triton_url,
+            run_streaming_session(
+                backend, endpoint,
                 trace,
                 session_id=sid,
                 variant=variant,
@@ -296,12 +427,12 @@ def run_stress(
             pass
 
     wall_t0 = time.perf_counter()
-    records: list[SessionRecord] = []
+    by_idx: dict[int, SessionRecord] = {}
 
     def _worker(idx: int) -> SessionRecord:
         sid = f"stress-c{concurrency}-s{seed}-{idx}-{uuid.uuid4().hex[:8]}"
-        return _run_streaming_session(
-            triton_url,
+        return run_streaming_session(
+            backend, endpoint,
             trace,
             session_id=sid,
             variant=variant,
@@ -326,39 +457,31 @@ def run_stress(
                     trace_id=trace.get("trace_id", "unknown"),
                     error=str(exc),
                 )
-            records.append(rec)
-            session_path = out_dir / f"session_{idx:03d}.json"
-            with open(session_path, "w", encoding="utf-8") as f:
-                json.dump(rec.to_dict(), f, ensure_ascii=False, indent=2)
-            if save_wav and rec.audio_packets:
-                wav_path = out_dir / f"session_{idx:03d}.wav"
-                _save_wav(np.concatenate([p["samples"] for p in rec.audio_packets]), wav_path)
+            by_idx[idx] = rec
 
     wall_sec = time.perf_counter() - wall_t0
-    summaries = [summarize_session_stress(r.to_dict()) for r in records]
-    # Re-run with in-memory packets for accurate FASL (JSON strips samples)
-    for rec, summary in zip(records, summaries):
-        if rec.audio_packets and rec.first_token_ts is not None:
-            from eval.fasl_vad import measure_fasl_vad_from_packets
-            from eval.jitter_metrics import intervals_from_packet_timestamps, measure_jitter_ms
-            from eval.stutter_metrics import simulate_playout_underflows
+    summaries: list[dict[str, Any]] = []
+    for idx in sorted(by_idx):
+        rec = by_idx[idx]
+        metrics = compute_session_metrics(
+            {
+                **rec.to_dict(),
+                "audio_packets": rec.audio_packets,
+                "events": rec.events,
+                "total_ms": rec.total_ms,
+                "total_samples": rec.total_samples,
+            }
+        )
+        rec._metrics = metrics
+        summaries.append(metrics)
+        session_path = out_dir / f"session_{idx:03d}.json"
+        with open(session_path, "w", encoding="utf-8") as f:
+            json.dump(rec.to_dict(), f, ensure_ascii=False, indent=2)
+        if save_wav and rec.audio_packets:
+            wav_path = out_dir / f"session_{idx:03d}.wav"
+            _save_wav(np.concatenate([p["samples"] for p in rec.audio_packets]), wav_path)
 
-            fasl = measure_fasl_vad_from_packets(
-                rec.audio_packets, first_token_ts=rec.first_token_ts
-            )
-            summary["fasl_vad_ms"] = fasl.get("fasl_vad_ms")
-            summary["first_packet_ms"] = fasl.get("first_packet_ms")
-            ts_list = [p["client_ts"] for p in rec.audio_packets]
-            dur_list = [len(p["samples"]) / SAMPLE_RATE for p in rec.audio_packets]
-            jitter = measure_jitter_ms(
-                intervals_from_packet_timestamps(ts_list), expected_interval_ms=40.0
-            )
-            stutter = simulate_playout_underflows(ts_list, dur_list, prebuffer_ms=200.0)
-            summary["jitter_p95_ms"] = jitter.get("jitter_p95_ms")
-            summary["stutter_rate_pct"] = stutter.get("stutter_rate_pct")
-            rec._metrics = summary
-
-    aggregate = aggregate_stress_runs(summaries)
+    aggregate = aggregate_stress_runs(summaries, wall_sec=wall_sec)
     aggregate["concurrency"] = concurrency
     aggregate["seed"] = seed
     aggregate["variant"] = variant
@@ -390,13 +513,20 @@ def postprocess_run_dir(run_dir: Path) -> dict[str, Any]:
     for path in sorted(run_dir.glob("session_*.json")):
         with open(path, encoding="utf-8") as f:
             sessions.append(json.load(f))
-    summaries = [summarize_session_stress(s) for s in sessions]
-    return {"aggregate": aggregate_stress_runs(summaries), "sessions": summaries}
+    summaries = [compute_session_metrics(s) for s in sessions]
+    wall_sec = None
+    summary_path = run_dir / "run_summary.json"
+    if summary_path.exists():
+        with open(summary_path, encoding="utf-8") as f:
+            wall_sec = (json.load(f).get("aggregate") or {}).get("wall_sec")
+    return {"aggregate": aggregate_stress_runs(summaries, wall_sec=wall_sec), "sessions": summaries}
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--triton", default="localhost:8001")
+    p.add_argument("--backend", default="engine", choices=["engine", "triton"])
+    p.add_argument("--endpoint", default="", help="engine gRPC or triton gRPC host:port")
+    p.add_argument("--triton", default="localhost:8001", help="Alias when --backend triton")
     p.add_argument("--trace", default=str(REPO_ROOT / "eval/fixtures/steadystream_stress_v1.json"))
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
@@ -421,10 +551,15 @@ def main() -> int:
         return 0
 
     trace = load_trace(Path(args.trace))
-    print(f"Trace: {trace.get('trace_id')}  chunks={len(trace['chunks'])}  concurrency={args.concurrency}  seed={args.seed}")
+    endpoint = args.endpoint or (args.triton if args.backend == "triton" else "127.0.0.1:50051")
+    print(
+        f"Trace: {trace.get('trace_id')}  backend={args.backend}  endpoint={endpoint}  "
+        f"concurrency={args.concurrency}  seed={args.seed}"
+    )
     summary = run_stress(
-        args.triton,
+        endpoint,
         trace,
+        backend=args.backend,
         concurrency=args.concurrency,
         seed=args.seed,
         variant=args.variant,
