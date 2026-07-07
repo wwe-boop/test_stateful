@@ -71,6 +71,8 @@ def compute_session_metrics(
         )
         fasl_vad_ms = fasl.get("fasl_vad_ms")
         first_packet_ms = fasl.get("first_packet_ms")
+        if fasl_vad_ms is None and first_packet_ms is not None:
+            fasl_vad_ms = first_packet_ms
         ts_list = [float(p["client_ts"]) for p in packets]
         if "n_samples" in packets[0] and "samples" not in packets[0]:
             dur_list = [int(p["n_samples"]) / sample_rate for p in packets]
@@ -163,6 +165,7 @@ def aggregate_stress_runs(
         "n_ok": len(ok),
         "n_failed": len(sessions) - len(ok),
         "fasl_vad_ms": _stats("fasl_vad_ms"),
+        "first_packet_ms": _stats("first_packet_ms"),
         "ttft_ms": _stats("ttft_ms"),
         "ttfb_ms": _stats("ttfb_ms"),
         "server_ttft_ms": _stats("server_ttft_ms"),

@@ -35,6 +35,21 @@ def _load_run_summaries(results_dir: Path, variant: str, concurrency: int) -> li
         with open(summary_path, encoding="utf-8") as f:
             data = json.load(f)
         agg = data.get("aggregate") or {}
+        # FASL fallback: use first_packet_ms when VAD gate misses low-level PCM
+        sessions = data.get("sessions") or []
+        fasl_vals = [
+            s.get("fasl_vad_ms") or s.get("first_packet_ms")
+            for s in sessions
+            if not s.get("error") and (s.get("fasl_vad_ms") is not None or s.get("first_packet_ms") is not None)
+        ]
+        if fasl_vals:
+            arr = np.asarray(fasl_vals, dtype=np.float64)
+            agg["fasl_vad_ms"] = {
+                "mean": round(float(np.mean(arr)), 2),
+                "std": round(float(np.std(arr)), 2),
+                "p50": round(float(np.percentile(arr, 50)), 2),
+                "p95": round(float(np.percentile(arr, 95)), 2),
+            }
         agg["_run_dir"] = str(run_dir)
         runs.append(agg)
     return runs
