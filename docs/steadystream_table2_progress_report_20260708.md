@@ -6,7 +6,7 @@
 
 ## 1. 一句话结论
 
-表 2 当前已完成前 5 行的可运行实现、三种子音频生成、指标后处理和 CER 合并；新增的“完整可运行 SteadyStream 组合行”也已经完成 150/150 条音频生成和非 CER 指标后处理，下一步只差 ASR/CER 合并后即可生成新版交付表。
+表 2 当前已完成前 5 行的可运行实现、三种子音频生成、指标后处理和 CER 合并；新增的“完整可运行 SteadyStream 组合行”也已经完成 150/150 条音频生成、ASR/CER 合并和新版交付表生成。
 
 需要特别说明：计划中真正的“完整 SteadyStream”定义为 C1+C2+C3+C4，其中 C4 是 continuation 后训练 checkpoint。当前没有找到真实 C4 continuation 训练 checkpoint，因此我没有把基座引擎或 smoke adapter 冒充成最终 C4 行；当前补测行标注为“C1+C2+C3，C4 未训练”。
 
@@ -20,11 +20,11 @@
 | 4 | 仅 KV/token 尾 C2 prototype | 已完成，3 seeds x 50 | 27.01% +/- 0.55% | 边界指标好看，但文本完整性失败，不能作为最终方案。 |
 | 5 | 尾 + KV + 暂停恢复 C1+C2+C3 prototype | 已完成，3 seeds x 50 | 28.24% +/- 0.23% | 暂停指标被修好，但继承了 C2 的 CER 问题。 |
 | 6 | 完整 SteadyStream C1+C2+C3+C4 | C4 未训练，最终行未完成 | - | 不能造数；需要真实 continuation checkpoint。 |
-| 6a | 当前可运行全开补测 C1+C2+C3，C4 未训练 | 音频 150/150 完成，非 CER 指标完成，CER 待 ASR | 待补 | 用来交付“现有引擎能跑到什么程度”，不冒充训练后 C4。 |
+| 6a | 当前可运行全开补测 C1+C2+C3，C4 未训练 | 音频 150/150 完成，ASR/CER 完成，delivery 已生成 | 24.36% +/- 0.47% | 用来交付“现有引擎能跑到什么程度”，不冒充训练后 C4。 |
 
-## 3. 最新非 CER 指标
+## 3. 最新表 2 指标
 
-产物位置：`workspace/table2_runs_impl_20260708/table2_full_no_cer.md`
+产物位置：`workspace/table2_runs_impl_20260708/table2_current_full.md`
 
 | 变体 | F0 raw↓ | 能量 raw↓ | 停顿↓ | SIM Δ↓ | FASL↓ | CER↓ |
 |---|---:|---:|---:|---:|---:|---:|
@@ -33,7 +33,7 @@
 | C1 prototype | 3.57 +/- 0.42 st | 3.35 +/- 0.25 dB | 200.54 +/- 15.04 ms | 0.10 +/- 0.01 | 27.03 +/- 0.24 ms | 11.40% +/- 0.85% |
 | C2 prototype | 3.07 +/- 0.12 st | 3.12 +/- 0.12 dB | 205.10 +/- 2.19 ms | 0.13 +/- 0.01 | 27.78 +/- 0.31 ms | 27.01% +/- 0.55% |
 | C1+C2+C3 prototype | 4.00 +/- 0.93 st | 4.50 +/- 0.34 dB | 11.53 +/- 3.31 ms | 0.13 +/- 0.01 | 28.09 +/- 0.13 ms | 28.24% +/- 0.23% |
-| 当前可运行全开 C1+C2+C3，C4 未训练 | 4.14 +/- 0.63 st | 4.80 +/- 0.14 dB | 9.80 +/- 3.33 ms | 0.14 +/- 0.00 | 28.38 +/- 1.65 ms | 待 ASR |
+| 当前可运行全开 C1+C2+C3，C4 未训练 | 4.14 +/- 0.63 st | 4.80 +/- 0.14 dB | 9.80 +/- 3.33 ms | 0.14 +/- 0.00 | 28.38 +/- 1.65 ms | 24.36% +/- 0.47% |
 
 ## 4. 当前主要问题
 
@@ -54,16 +54,16 @@
 | 评测 runner | 扩展 `workspace/table2_timed_runner.py` 和相关脚本，支持 resume、三种子、变体标识和暂停恢复输出 | 已完成 750 行基础评测和 150 行全开补测。 |
 | 后处理 | 增加/扩展 Table 2 postprocess、ASR manifest、CER merge、delivery generator | 已能生成当前表、诊断文档和交付 markdown。 |
 | C4 准备 | 增加 continuation manifest validator、API synthetic smoke dataset、prepare_data codes attach、continuation batch dry-run、0.6B smoke train 脚本 | 已证明 C4 数据/训练 plumbing 能跑，但还不是最终 C4 模型。 |
-| 完整行补测 | 新增 `scripts/python/run_table2_full_steadystream.py` | 150/150 条音频已完成，非 CER 指标已完成。 |
-| 版本管理 | 已配置 GitHub remote `github-test-stateful` 和专用 deploy key | 当前代码提交已推送，最新已推提交为 `0ceed1b`；本文档会作为后续进度提交。 |
+| 完整行补测 | 新增 `scripts/python/run_table2_full_steadystream.py` | 150/150 条音频、ASR/CER 合并和 delivery 生成均已完成。 |
+| 版本管理 | 已配置 GitHub remote `github-test-stateful` 和专用 deploy key | 当前代码和本文档已持续推送到 GitHub 目标分支。 |
 
-## 6. 下一步交付路径
+## 6. 当前交付与下一步
 
-| 优先级 | 动作 | 预期产物 |
+| 优先级 | 动作 | 当前结果 |
 |---:|---|---|
-| P0 | 为 6a 全开补测行生成 ASR manifest，复用已有 750 条 CER，只新增 150 条全开音频 ASR | `table2_cer_full.json` |
-| P0 | 合并 full-row CER 并重新生成交付表 | `table2_current_full.md` 和 `table2_current_delivery_full_20260708.md` |
-| P0 | 拉回本地 outputs，并提交/推送新增汇报与必要代码变更 | GitHub 分支同步，用户可直接查看。 |
+| P0 | 为 6a 全开补测行生成 ASR manifest，复用已有 750 条 CER，只新增 150 条全开音频 ASR | 已完成，产物为 `table2_cer_full.json`。 |
+| P0 | 合并 full-row CER 并重新生成交付表 | 已完成，产物为 `table2_current_full.md` 和 `table2_current_delivery_full_20260708.md`。 |
+| P0 | 拉回本地 outputs，并提交/推送新增汇报与必要代码变更 | 已完成，本地目录为 `outputs/table2_current_delivery_full/`。 |
 | P1 | 若要把第 6 行从“C4 未训练”变成真正完整 SteadyStream，需要提供或训练 continuation checkpoint | 真实 C1+C2+C3+C4 表 2 末行。 |
 | P1 | 训练路径复用父目录官方 finetuning，但要改成多片段 continuation collate 和 loss mask | LoRA 或全参 C4 checkpoint。 |
 
@@ -75,6 +75,8 @@
 
 完整行音频输出：`workspace/table2_runs_impl_20260708`
 
+完整交付表：`workspace/table2_runs_impl_20260708/table2_current_delivery_full_20260708.md`
+
 完整行日志：`workspace/logs/table2_full_steadystream_20260708.log`
 
-截至本文档写入时，完整行音频生成已经完成 150/150，后台进程正常退出。
+截至本文档更新时，完整行音频生成、ASR/CER 合并和 delivery 生成均已完成。
