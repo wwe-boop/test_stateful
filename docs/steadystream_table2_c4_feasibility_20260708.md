@@ -202,6 +202,43 @@ Training status:
   1.7B full-parameter C4 run is not safe without freeing/moving services or
   adding LoRA support.
 
+The 0.6B Base model can be downloaded through the same mirror for a
+no-backward compatibility smoke:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    local_dir="workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base",
+)
+PY
+
+CUDA_VISIBLE_DEVICES=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+python scripts/python/run_c4_forward_smoke.py \
+  --model-dir workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base \
+  --manifest-jsonl workspace/c4_synthetic_smoke_20260708_api1/c4_synthetic_smoke_manifest_with_codes.jsonl \
+  --output-summary workspace/c4_synthetic_smoke_20260708_api1/c4_forward_smoke_0p6b_summary.json
+```
+
+This is not a training run. It only verifies that the continuation batch is
+accepted by a real Qwen3-TTS forward pass before adding LoRA or freeing GPUs
+for an actual C4 update.
+
+The forward smoke uses `talker.text_projection` when text and codec embedding
+dimensions differ. This matters for 0.6B, where text embeddings are 2048-D and
+codec embeddings are 1024-D; direct addition, as in the current official SFT
+snippet, is not shape-compatible for this smoke path.
+
+Observed 0.6B smoke result on the one-sample synthetic manifest:
+
+- batch shape: `[1, 339, 2]`
+- codec/loss positions: `247`
+- talker loss: `13.598655`
+- sub-talker loss: `11.102696`
+- combined no-backward loss: `16.929464`
+- CUDA reserved memory during smoke: about `2.56 GB`
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.
