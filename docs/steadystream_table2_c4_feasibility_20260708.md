@@ -110,6 +110,40 @@ This script does not invent data and does not launch training. It only
 answers whether the manifest is shaped enough to justify modifying the
 fine-tuning collate and starting a C4 LoRA run.
 
+## API-Synthetic Smoke Data
+
+API synthesis can be used to create a diagnostic C4 smoke dataset, but it
+must not be treated as the final C4 training source for Table 2. If the API
+is the same base Qwen3-TTS engine under test, synthetic training becomes
+self-distillation and can reinforce the same early-EOS and KV-contract
+failure that caused the C2 CER regression.
+
+The supported smoke path is:
+
+```bash
+python scripts/python/synthesize_c4_smoke_dataset.py \
+  --input-jsonl workspace/datasets/test-prosody-mini-smoke.jsonl \
+  --out-dir workspace/c4_synthetic_smoke_20260708_api1 \
+  --endpoint 127.0.0.1:50051 \
+  --limit 1
+```
+
+This writes:
+
+- `c4_synthetic_smoke_manifest.jsonl`: no-code continuation manifest.
+- `prepare_data_input.jsonl`: flat segment rows for official `prepare_data.py`.
+- `wav/<sample_id>/segment_*.wav`: per-segment synthetic audio with boundary
+  silence appended to the previous segment.
+- `wav/<sample_id>/full.wav`: concatenated listening copy.
+- `summary.json`: synthesis trace and audio durations.
+
+The generated manifest passes schema validation without `--require-codes`.
+Generating a training-ready manifest still requires audio tokenizer codes.
+The attempted official extraction command failed because the remote host
+cannot reach HuggingFace for `Qwen/Qwen3-TTS-Tokenizer-12Hz` and the local
+model package only contains the text tokenizer files, not the audio tokenizer
+`preprocessor_config.json` stack.
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.
