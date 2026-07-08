@@ -139,10 +139,42 @@ This writes:
 
 The generated manifest passes schema validation without `--require-codes`.
 Generating a training-ready manifest still requires audio tokenizer codes.
-The attempted official extraction command failed because the remote host
-cannot reach HuggingFace for `Qwen/Qwen3-TTS-Tokenizer-12Hz` and the local
-model package only contains the text tokenizer files, not the audio tokenizer
-`preprocessor_config.json` stack.
+The remote host cannot reach HuggingFace directly, but the tokenizer can be
+downloaded via the mirror:
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    local_dir="workspace/hf_models/Qwen3-TTS-Tokenizer-12Hz",
+)
+PY
+```
+
+Then extract codes with the parent official script:
+
+```bash
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+python /home/zehan/workspace/Qwen3-TTS/finetuning/prepare_data.py \
+  --device cuda:1 \
+  --tokenizer_model_path /home/zehan/workspace/Qwen3-TTS-Triton/workspace/hf_models/Qwen3-TTS-Tokenizer-12Hz \
+  --input_jsonl workspace/c4_synthetic_smoke_20260708_api1/prepare_data_input_abs.jsonl \
+  --output_jsonl workspace/c4_synthetic_smoke_20260708_api1/prepare_data_with_codes.jsonl
+```
+
+Attach the flat `audio_codes` back to the continuation manifest:
+
+```bash
+python scripts/python/attach_c4_codes_from_prepare.py \
+  --manifest-jsonl workspace/c4_synthetic_smoke_20260708_api1/c4_synthetic_smoke_manifest.jsonl \
+  --prepared-jsonl workspace/c4_synthetic_smoke_20260708_api1/prepare_data_with_codes.jsonl \
+  --output-jsonl workspace/c4_synthetic_smoke_20260708_api1/c4_synthetic_smoke_manifest_with_codes.jsonl
+```
+
+The one-sample API smoke run now validates with `--require-codes`:
+8 coded segments, 247 code frames, and 0 schema issues. This is still smoke
+data only, not final C4 evidence.
 
 ## Next Training Step Once Data Exists
 
