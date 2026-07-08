@@ -997,11 +997,12 @@ class EngineLoop:
         slot: SlotKVState,
         *,
         max_tokens: int,
-        drop_last_token: bool = False,
+        drop_tail_tokens: int = 0,
     ) -> tuple[Optional[torch.Tensor], int, int]:
         past_len = int(slot.past_len)
-        if drop_last_token and past_len > 0:
-            past_len -= 1
+        drop_tail_tokens = max(0, int(drop_tail_tokens))
+        if drop_tail_tokens > 0:
+            past_len = max(0, past_len - drop_tail_tokens)
         if past_len <= 0:
             return None, 0, 0
         keep = min(past_len, int(max_tokens))
@@ -1018,6 +1019,13 @@ class EngineLoop:
             return None, 0, 0
         logical_past_len = int(slot.position_offset) + past_len
         return kv.contiguous(), keep, logical_past_len
+
+    @staticmethod
+    def _steadystream_terminal_drop_tokens(slot: SlotKVState) -> int:
+        """Drop pad/stop-phase Talker inputs before carrying KV to a new segment."""
+        if slot.pad_start_frame >= 0 and slot.frame_idx >= slot.pad_start_frame:
+            return max(1, int(slot.frame_idx) - int(slot.pad_start_frame) + 1)
+        return 1
 
     def _restore_talker_kv_tail(
         self,
@@ -1095,7 +1103,7 @@ class EngineLoop:
         group: EngineSessionGroup,
         seg: EngineSegment,
         *,
-        drop_last_talker_token: bool = False,
+        drop_talker_tail_tokens: int = 0,
     ) -> None:
         if not group.steadystream_variant or seg.slot is None:
             return
@@ -1106,13 +1114,14 @@ class EngineLoop:
             talker_kv, compact_len, logical_past_len = self._snapshot_talker_kv_tail(
                 slot,
                 max_tokens=self._steadystream_kv_tail_tokens(group),
-                drop_last_token=drop_last_talker_token,
+                drop_tail_tokens=drop_talker_tail_tokens,
             )
             if talker_kv is not None and compact_len > 0:
                 carry["talker_kv"] = talker_kv
                 carry["talker_past_len"] = compact_len
                 carry["talker_logical_past_len"] = logical_past_len
-                carry["talker_dropped_last_token"] = bool(drop_last_talker_token)
+                carry["talker_dropped_last_token"] = drop_talker_tail_tokens > 0
+                carry["talker_dropped_tail_tokens"] = int(drop_talker_tail_tokens)
                 carry["talker_position_offset"] = max(
                     0,
                     int(logical_past_len) - int(compact_len),
@@ -1241,6 +1250,9 @@ class EngineLoop:
         metrics["steadystream_kv_dropped_last_token"] = str(
             bool(carry.get("talker_dropped_last_token"))
         ).lower()
+        metrics["steadystream_kv_dropped_tail_tokens"] = str(
+            int(carry.get("talker_dropped_tail_tokens") or 0)
+        )
         metrics["steadystream_carry_from_segment"] = str(
             carry.get("from_segment_idx", "")
         )
@@ -1560,7 +1572,11 @@ class EngineLoop:
         self._store_steadystream_carry(
             group,
             seg,
-            drop_last_talker_token=not overflow,
+            drop_talker_tail_tokens=(
+                0
+                if overflow or seg.slot is None
+                else self._steadystream_terminal_drop_tokens(seg.slot)
+            ),
         )
         seg.state = "done"
         self._release_segment_slot(seg)

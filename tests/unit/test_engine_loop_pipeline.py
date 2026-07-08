@@ -691,7 +691,7 @@ class TestSteadyStreamCarry:
         engine_loop._store_steadystream_carry(
             group,
             seg0,
-            drop_last_talker_token=True,
+            drop_talker_tail_tokens=1,
         )
 
         carry = group.steadystream_carry
@@ -699,7 +699,18 @@ class TestSteadyStreamCarry:
         assert carry["talker_logical_past_len"] == 26
         assert carry["talker_position_offset"] == 10
         assert carry["talker_dropped_last_token"] is True
+        assert carry["talker_dropped_tail_tokens"] == 1
         assert int(carry["talker_kv"][0, 0, 0, -1, 0].item()) == 18
+
+    def test_terminal_drop_tokens_cover_pad_phase(self):
+        slot = SlotKVState(slot_id=0)
+        slot.frame_idx = 35
+        slot.pad_start_frame = 30
+
+        assert EngineLoop._steadystream_terminal_drop_tokens(slot) == 6
+
+        slot.pad_start_frame = -1
+        assert EngineLoop._steadystream_terminal_drop_tokens(slot) == 1
 
     def test_restore_reports_reset_or_inherited_token_counts(self, model_config):
         hidden = model_config.hidden_size
@@ -741,6 +752,7 @@ class TestSteadyStreamCarry:
         assert torch.count_nonzero(slot.token_counts) == 0
         assert metrics["steadystream_kv_position_offset"] == "0"
         assert metrics["steadystream_kv_dropped_last_token"] == "false"
+        assert metrics["steadystream_kv_dropped_tail_tokens"] == "0"
 
         inherited_counts = torch.ones(
             1,
