@@ -1,0 +1,122 @@
+# SteadyStream Table 2 C4 Training Feasibility Note
+
+Date: 2026-07-08
+
+Scope: Table 2 only, remote repo `/home/zehan/workspace/Qwen3-TTS-Triton`.
+
+## Current Table 2 State
+
+The first five Table 2 rows have been measured on `test-prosody-mini`
+with three seeds:
+
+| Variant | CER |
+|---|---:|
+| Stateless | 11.13% +/- 0.09% |
+| Existing stateful Triton stream | 10.86% +/- 0.12% |
+| C1 acoustic tail prototype | 11.40% +/- 0.85% |
+| C2 KV/token tail prototype | 27.01% +/- 0.55% |
+| C1+C2+C3 prototype | 28.24% +/- 0.23% |
+| Full SteadyStream C4 | Not measured |
+
+The C2 and C1+C2+C3 rows are diagnostic prototypes, not acceptable final
+systems. The full SteadyStream row must remain blank until a continuation
+trained checkpoint exists. Using the base engine for that row would hide
+the train-test mismatch that C4 is supposed to solve.
+
+## Why CER Regressed
+
+The CER jump is a real generation failure rather than an ASR or aggregation
+artifact. Smoke audio for `seed_42/prosody_mini_001` shows that stateful
+streaming and C1 include the final sentence, while the C2 prototype often
+stops before the final sentence:
+
+`听起来很费时间，但香气层次反而更干净。`
+
+The likely root cause is that the current C2 path restores a cropped Talker
+KV tail without a verified sink, CustomVoice prefix, position-id, and EOS
+contract. This can preserve some boundary prosody, which explains better
+F0 and energy numbers, but it destabilizes semantic continuation. C3 then
+inherits the C2 failure: pause correction can improve pause deviation, but
+it cannot repair early EOS or missing text.
+
+## What The Plan Requires For C4
+
+`steadystream_plan_v2.md` section 3 defines C4 as continuation SFT, not as
+a direct invocation of the official single-sentence fine-tuning command.
+The required training shape is:
+
+- 50-300h long continuous recordings for 2-3 target speakers.
+- Strict source isolation between training and `test-prosody`.
+- Real boundary silence retained at the end of the previous segment codes,
+  capped at 600 ms.
+- Per-boundary `pause_ms` and `punct_class`.
+- Multi-segment sequence assembly:
+  `[CustomVoice prefix] + sum(text_k + codes_k + boundary_token)`.
+- Loss only on speech codec tokens.
+- Bounded-history dropout and optional lookahead to match the C2 inference
+  format.
+
+The parent repo `/home/zehan/workspace/Qwen3-TTS/finetuning` currently
+contains the official single-speaker, single-utterance path:
+
+`audio + text + ref_audio -> prepare_data.py -> audio_codes -> sft_12hz.py`
+
+That path is useful as a base, but its current dataset/collate builds one
+text segment followed by one audio-code segment and EOS. It does not yet
+build the multi-segment continuation sequence needed for C4.
+
+## Current Blocker
+
+No ready C4 continuation dataset or trained C4 checkpoint was found under
+the checked remote paths:
+
+- `/home/zehan/workspace/Qwen3-TTS-Triton`
+- `/home/zehan/workspace/Qwen3-TTS`
+- `/x2robot_v2/zehan/Qwen3-TTS-EasyFinetuning`
+- `/mnt/nas/zbl-nas-1/zehan`
+
+GPU state also argues against starting an unverified training run:
+
+- GPU0 is occupied by the vLLM Qwen3-30B service.
+- GPU1 is occupied by the Qwen3-TTS engine service.
+
+Therefore the responsible Table 2 action is to keep the C4 row blank, record
+the blocker, and prepare validation tooling for the moment a real long-audio
+manifest is provided.
+
+## Added Readiness Check
+
+`scripts/python/build_c4_continuation_manifest.py` validates the expected
+C4 continuation JSONL schema. It checks:
+
+- Top-level `sample_id`, `speaker_name`, `language`, and `segments`.
+- At least two segments per sample by default.
+- Per-segment non-empty `text`.
+- Per-segment `pause_ms` in `[0, 600]` ms by default.
+- Per-segment known `punct_class`.
+- Optional training-ready `codes` validation with `--require-codes`.
+- Optional exact source-overlap guard with `--eval-source-list`.
+
+Example for a training-ready manifest:
+
+```bash
+python scripts/python/build_c4_continuation_manifest.py \
+  --input-jsonl /path/to/c4_continuation_with_codes.jsonl \
+  --require-codes \
+  --output-summary workspace/c4_manifest_summary.json
+```
+
+This script does not invent data and does not launch training. It only
+answers whether the manifest is shaped enough to justify modifying the
+fine-tuning collate and starting a C4 LoRA run.
+
+## Next Training Step Once Data Exists
+
+1. Run the readiness check on the real continuation JSONL.
+2. Reject the dataset if it has missing codes, missing pause fields, source
+   overlap with evaluation data, or too little total speech duration.
+3. Implement a continuation dataset/collate in the parent fine-tuning repo
+   that shares the CustomVoice prefix builder with the Triton inference path.
+4. Add single-sample token-layout assertions before any long training run.
+5. Start a small LoRA smoke run first. Only after CER/WER, SIM, and audio
+   spot checks pass should the checkpoint be used to fill the Table 2 C4 row.
