@@ -78,7 +78,28 @@ def test_render_delivery_keeps_full_steadystream_unmeasured():
     )
 
     assert "| 完整 SteadyStream | — | — | — | — | — | — | 未测" in rendered
-    assert "synthetic C4 smoke validates plumbing only" in rendered
+    assert "API-synthetic C4 smoke validates plumbing only" in rendered
     assert "| codec frames | 1831 |" in rendered
     assert "| loaded adapter tensors | 132 |" in rendered
     assert "`14.618859 -> 14.419856`" in rendered
+
+
+def test_render_delivery_reports_full_inference_row_when_present():
+    table2 = {
+        "summary": {
+            "stateless_once": minimal_row("无状态", 0.111),
+            "full_steadystream": minimal_row("完整 SteadyStream（C1+C2+C3, C4未训练）", 0.222),
+        }
+    }
+
+    rendered = table2_delivery.render_delivery(
+        table2=table2,
+        c4_validation=None,
+        c4_lora=None,
+    )
+
+    assert "Current measured inference rows: `2/6`" in rendered
+    assert "Full-row guardrail" in rendered
+    assert "| 完整 SteadyStream（C1+C2+C3, C4未训练） |" in rendered
+    assert "22.20±0.20%" in rendered
+    assert "未测：没有真实 C4 checkpoint" not in rendered

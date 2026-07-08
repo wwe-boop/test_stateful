@@ -20,6 +20,7 @@ VARIANT_ORDER = [
     "acoustic_tail_only",
     "kv_tail_only",
     "tail_kv_pause_recovery",
+    "full_steadystream",
 ]
 
 METRICS = [
@@ -91,7 +92,8 @@ def render_table2(table2: dict[str, Any]) -> list[str]:
         )
         cells.append(coverage_note(row))
         lines.append("| " + " | ".join(cells) + " |")
-    lines.append("| 完整 SteadyStream | — | — | — | — | — | — | 未测：没有真实 C4 checkpoint，synthetic smoke 不进正式行 |")
+    if "full_steadystream" not in summary:
+        lines.append("| 完整 SteadyStream | — | — | — | — | — | — | 未测：没有真实 C4 checkpoint，synthetic smoke 不进正式行 |")
     return lines
 
 
@@ -110,10 +112,10 @@ def render_delivery(
         "",
         "## Delivery Verdict",
         "",
-        "- Current measured rows: `5/6`.",
-        "- Full SteadyStream C4 row: `not measured`.",
-        "- Reason: no real continuation-trained C4 checkpoint has been found or deployed.",
-        "- Guardrail: API-synthetic C4 smoke validates plumbing only; it is not final Table 2 evidence.",
+        f"- Current measured inference rows: `{sum(1 for v in VARIANT_ORDER if v in (table2.get('summary') or {}))}/6`.",
+        "- C4-trained checkpoint status: `not present` unless explicitly supplied in the source JSON.",
+        "- Full-row guardrail: if present, `full_steadystream` is the C1+C2+C3 inference combination with untrained C4, not the final trained C4 result.",
+        "- API-synthetic C4 smoke validates plumbing only; it is not final Table 2 evidence.",
         "",
         "## Current Table 2",
         "",
