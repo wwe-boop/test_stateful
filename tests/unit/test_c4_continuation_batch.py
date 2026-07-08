@@ -42,7 +42,7 @@ def _special_ids():
     )
 
 
-def test_continuation_batch_masks_loss_to_speech_codes_only():
+def test_continuation_batch_trains_speech_codes_and_boundary_eos():
     rows = [
         {
             "sample_id": "s1",
@@ -72,14 +72,15 @@ def test_continuation_batch_masks_loss_to_speech_codes_only():
 
     assert summary["batch_size"] == 1
     assert summary["codec_mask_true"] == 3
-    assert summary["loss_positions"] == 3
+    assert summary["loss_positions"] == 5
     assert layouts[0]["total_codec_frames"] == 3
-    assert layouts[0]["total_loss_positions"] == 3
+    assert layouts[0]["total_loss_positions"] == 5
 
     first = layouts[0]["segments"][0]
     boundary_pos = first["boundary_codec_eos"]
     assert int(batch["input_ids"][0, boundary_pos, 1]) == 2150
-    assert int(batch["codec_0_labels"][0, boundary_pos]) == -100
+    assert int(batch["codec_0_labels"][0, boundary_pos]) == 2150
+    assert first["loss_positions"] == 3
 
 
 def test_continuation_batch_rejects_bad_code_shape():

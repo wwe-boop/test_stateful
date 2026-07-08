@@ -4,7 +4,7 @@
 This is the bridge between the validated continuation JSONL and the future C4
 training loop. It builds the same tensor families as the official single-
 sentence collate path, but lays multiple text/code segments into one sequence
-and masks loss to speech codec tokens only.
+and masks loss to speech codec tokens plus segment boundary/EOS tokens.
 """
 
 from __future__ import annotations
@@ -192,7 +192,11 @@ def build_continuation_batch(
 
             batch["codec_ids"][batch_index, codec_start:codec_end, :] = codes
             batch["codec_mask"][batch_index, codec_start:codec_end] = True
+            # Match the official collate: train codec_0 speech frames and the
+            # codec EOS/boundary position. codec_mask stays speech-only because
+            # sub-talker residual-code loss has no target at EOS.
             batch["codec_0_labels"][batch_index, codec_start:codec_end] = codec0
+            batch["codec_0_labels"][batch_index, boundary] = special_ids.codec_eos_token_id
 
             spans.append(
                 {
@@ -206,7 +210,7 @@ def build_continuation_batch(
                     "codec_span": [codec_start, codec_end],
                     "boundary_codec_eos": boundary,
                     "codec_frames": int(codec0.numel()),
-                    "loss_positions": int(codec0.numel()),
+                    "loss_positions": int(codec0.numel()) + 1,
                 }
             )
 
