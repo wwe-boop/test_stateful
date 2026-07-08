@@ -204,10 +204,10 @@ def generate_table2(results_dir: Path) -> str:
 
     # Footer notes
     lines.append("")
-    lines.append("† v2.1 新增行：Triton 服务现有的 stateful clause stream 路径作为"服务端现状"对照。")
+    lines.append("† v2.1 新增行：Triton 服务现有的 stateful clause stream 路径作为“服务端现状”对照。")
     lines.append("")
     lines.append("单位：F0 跳变（semitone）、能量（dB）、停顿（ms 偏差）、SIM Δ（相似度损失，×100）、FASL（ms）、CER（%）。")
-    lines.append("所有格 = 3 种子均值±std；每列最优加粗；对"无状态"行做 Wilcoxon 显著性标记（* p<0.05, ** p<0.01）。")
+    lines.append("所有格 = 3 种子均值±std；每列最优加粗；对“无状态”行做 Wilcoxon 显著性标记（* p<0.05, ** p<0.01）。")
 
     return "\n".join(lines)
 

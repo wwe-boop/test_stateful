@@ -506,6 +506,10 @@ def _session_config_from_proto(proto_cfg, *, default_mode: InputMode) -> Session
         input_mode=_input_mode_from_proto(proto_cfg.input_mode, default_mode=default_mode),
         group_policy=_group_policy_from_proto(proto_cfg.group_policy),
         audio=_audio_config_from_proto(proto_cfg.audio if proto_cfg.HasField("audio") else None),
+        experimental={
+            str(k): str(v)
+            for k, v in getattr(proto_cfg, "experimental", {}).items()
+        },
     )
     _validate_audio_config(cfg.audio)
     return cfg

@@ -136,6 +136,26 @@ pause_summary = summarize_pause_metrics(pause_metrics)
 print(f"Pause deviation mean: {pause_summary['pause_deviation_mean_ms']} ms")
 ```
 
+## 数据合成（test-prosody-mini）
+
+LLM 生成评测文本脚本位于 `eval/data_synth/`，默认走 DashScope 兼容 OpenAI API，也可切换 Volcengine Ark。
+
+```bash
+# 1) 凭证模板 -> 本地文件（已在 .gitignore 中）
+cp eval/data_synth/env.example .env.data_synth
+
+# 2) 加载环境变量
+source scripts/bash/setup_data_synth_env.sh
+
+# 3) 生成 50 条 mini 集
+bash scripts/bash/generate_test_prosody.sh --count 50
+
+# 切换 Ark（需填写 ARK_MODEL 接入点）
+DATA_SYNTH_PROVIDER=ark bash scripts/bash/generate_test_prosody.sh --count 10 --provider ark
+```
+
+输出默认写入 `workspace/datasets/test-prosody-mini.jsonl`，每条样本含 `segments`、`boundary_punct_classes`、`speaker`、`instruct`，供 E0.3 / E1 复测使用。
+
 ## E0 待办清单
 
 - [x] E0.1: 修复 boundary_metrics.py 加入 VAD 门控和浊音帧过滤

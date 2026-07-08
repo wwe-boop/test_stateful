@@ -95,6 +95,7 @@ class SessionConfig:
     input_mode: InputMode = InputMode.LONG_SEGMENT
     group_policy: GroupPolicy = GroupPolicy.AUTO
     audio: AudioConfig = field(default_factory=AudioConfig)
+    experimental: dict[str, str] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -82,6 +82,20 @@ from .prefix_cache import PrefixKVCache
 from .prefill import PrefillBuilder, PrefillPlan, TaskType, parse_task_type
 
 logger = logging.getLogger(__name__)
+
+
+_SS_ACOUSTIC_VARIANTS = {
+    "acoustic_tail_only",
+    "tail_kv_pause_recovery",
+    "full_steadystream",
+}
+_SS_KV_VARIANTS = {
+    "kv_tail_only",
+    "tail_kv_pause_recovery",
+    "full_steadystream",
+}
+_SS_VALID_VARIANTS = _SS_ACOUSTIC_VARIANTS | _SS_KV_VARIANTS
+_SS_DEFAULT_KV_TAIL_TOKENS = 384
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +137,8 @@ class EngineSessionGroup:
     __slots__ = (
         "session_id", "request", "result_queue",
         "segments", "input_complete_all", "created_at",
-        "overflow_token_ids",
+        "overflow_token_ids", "steadystream_variant",
+        "steadystream_experimental", "steadystream_carry",
     )
 
     def __init__(self, session_id: str, request: EngineRequest):
@@ -134,6 +149,18 @@ class EngineSessionGroup:
         self.input_complete_all: bool = False
         self.created_at: float = time.monotonic()
         self.overflow_token_ids: list[int] = []
+        self.steadystream_experimental: dict[str, str] = {}
+        if request.session_config is not None:
+            self.steadystream_experimental = dict(
+                request.session_config.experimental or {}
+            )
+        self.steadystream_variant: str = str(
+            self.steadystream_experimental.get("steadystream_variant", "")
+            or ""
+        ).strip()
+        if self.steadystream_variant not in _SS_VALID_VARIANTS:
+            self.steadystream_variant = ""
+        self.steadystream_carry: dict[str, Any] = {}
 
     @property
     def active_slot_count(self) -> int:
@@ -481,7 +508,10 @@ class EngineLoop:
         best_group: Optional[EngineSessionGroup] = None
 
         for group in self._groups.values():
-            if group.active_slot_count >= self._max_slots_per_session:
+            max_slots_for_group = (
+                1 if group.steadystream_variant else self._max_slots_per_session
+            )
+            if group.active_slot_count >= max_slots_for_group:
                 continue
             for seg in group.segments.values():
                 if seg.state != "pending_prefill":
@@ -554,7 +584,26 @@ class EngineLoop:
                 )
                 cached = self._prefix_cache.get(cache_key)
 
-            if task_type != TaskType.VOICE_CLONE_ICL and cached is not None and best.pending_token_ids:
+            if (
+                self._steadystream_uses_acoustic(best_group)
+                and not self._steadystream_uses_kv(best_group)
+            ):
+                self._restore_steadystream_c2w_carry(
+                    best_group, slot, prefill_metrics,
+                )
+                cached = None
+            force_full_prefill = (
+                self._steadystream_uses_acoustic(best_group)
+                and not self._steadystream_uses_kv(best_group)
+            )
+
+            steadystream_prefill = self._try_prefill_from_steadystream_carry(
+                best_group, best, slot, task_type, prefill_metrics,
+            )
+            if steadystream_prefill is not None:
+                prefill_audio, prefill_eos = steadystream_prefill
+                best.eos_trailing_added = best.input_complete
+            elif task_type != TaskType.VOICE_CLONE_ICL and cached is not None and best.pending_token_ids:
                 # ── Cache HIT: restore prefix KV and let decode consume first text token ──
                 req_embeds, trailing = (
                     self._prefill_builder.build_suffix_from_ids(
@@ -639,7 +688,8 @@ class EngineLoop:
                 # changes the fused Talker/C2W state boundary and can corrupt
                 # generation quality.
                 split_prefix_prefill = (
-                    task_type != TaskType.VOICE_CLONE_ICL
+                    not force_full_prefill
+                    and task_type != TaskType.VOICE_CLONE_ICL
                     and plan.cacheable_prefix_embeds is not None
                     and plan.request_prefill_embeds is not None
                     and int(plan.request_prefill_embeds.shape[1]) == 1
@@ -906,6 +956,188 @@ class EngineLoop:
         if slot.talker_kv is not None:
             return slot.talker_kv[:, :, :, :prefix_len, :].clone()
         return None
+
+    @staticmethod
+    def _steadystream_uses_acoustic(group: EngineSessionGroup) -> bool:
+        return group.steadystream_variant in _SS_ACOUSTIC_VARIANTS
+
+    @staticmethod
+    def _steadystream_uses_kv(group: EngineSessionGroup) -> bool:
+        return group.steadystream_variant in _SS_KV_VARIANTS
+
+    def _steadystream_kv_tail_tokens(self, group: EngineSessionGroup) -> int:
+        raw = group.steadystream_experimental.get("kv_tail_tokens", "")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = _SS_DEFAULT_KV_TAIL_TOKENS
+        return max(16, min(value, self._executor.kv_pool.max_seq_len))
+
+    def _snapshot_talker_kv_tail(
+        self,
+        slot: SlotKVState,
+        *,
+        max_tokens: int,
+    ) -> tuple[Optional[torch.Tensor], int]:
+        past_len = int(slot.past_len)
+        if past_len <= 0:
+            return None, 0
+        keep = min(past_len, int(max_tokens))
+        start = past_len - keep
+        kv_pool = self._executor.kv_pool
+        if kv_pool._preallocate and kv_pool._talker_kv_pool is not None:
+            kv = kv_pool._talker_kv_pool[
+                slot.slot_id : slot.slot_id + 1,
+                :, :, start:past_len, :,
+            ].clone()
+        elif slot.talker_kv is not None:
+            kv = slot.talker_kv[:, :, :, start:past_len, :].clone()
+        else:
+            return None, 0
+        return kv.contiguous(), keep
+
+    def _restore_talker_kv_tail(
+        self,
+        slot: SlotKVState,
+        talker_kv: torch.Tensor,
+        past_len: int,
+    ) -> None:
+        kv_pool = self._executor.kv_pool
+        past_len = int(past_len)
+        if kv_pool._preallocate and kv_pool._talker_kv_pool is not None:
+            kv_pool._talker_kv_pool[
+                slot.slot_id, :, :, :past_len, :
+            ] = talker_kv[0, :, :, :past_len, :].to(
+                device=self._embed_device,
+                dtype=self._embed_dtype,
+            )
+        else:
+            slot.talker_kv = talker_kv.to(
+                device=self._embed_device,
+                dtype=self._embed_dtype,
+            ).contiguous()
+        slot.past_len = past_len
+
+    def _store_steadystream_carry(
+        self,
+        group: EngineSessionGroup,
+        seg: EngineSegment,
+    ) -> None:
+        if not group.steadystream_variant or seg.slot is None:
+            return
+        slot = seg.slot
+        carry: dict[str, Any] = {"from_segment_idx": int(seg.segment_idx)}
+
+        if self._steadystream_uses_kv(group):
+            talker_kv, past_len = self._snapshot_talker_kv_tail(
+                slot,
+                max_tokens=self._steadystream_kv_tail_tokens(group),
+            )
+            if talker_kv is not None and past_len > 0:
+                carry["talker_kv"] = talker_kv
+                carry["talker_past_len"] = past_len
+                if slot.token_counts is not None:
+                    carry["token_counts"] = slot.token_counts.clone()
+
+        if self._steadystream_uses_acoustic(group):
+            if slot.c2w_kv is not None:
+                carry["c2w_kv"] = slot.c2w_kv.clone().contiguous()
+            if slot.c2w_conv_states:
+                carry["c2w_conv_states"] = [
+                    t.clone().contiguous() for t in slot.c2w_conv_states
+                ]
+            if slot.c2w_transconv_states:
+                carry["c2w_transconv_states"] = [
+                    t.clone().contiguous() for t in slot.c2w_transconv_states
+                ]
+            carry["c2w_frame_idx"] = int(slot.frame_idx)
+
+        if len(carry) > 1:
+            group.steadystream_carry = carry
+            logger.info(
+                "Stored SteadyStream carry: session=%s variant=%s seg=%d keys=%s",
+                group.session_id,
+                group.steadystream_variant,
+                seg.segment_idx,
+                sorted(k for k in carry.keys() if k != "from_segment_idx"),
+            )
+
+    def _restore_steadystream_c2w_carry(
+        self,
+        group: EngineSessionGroup,
+        slot: SlotKVState,
+        metrics: dict,
+    ) -> bool:
+        carry = group.steadystream_carry or {}
+        c2w_kv = carry.get("c2w_kv")
+        conv_states = carry.get("c2w_conv_states")
+        transconv_states = carry.get("c2w_transconv_states")
+        if c2w_kv is None or conv_states is None or transconv_states is None:
+            return False
+        warmed = self._executor.apply_c2w_warm_state(
+            slot,
+            c2w_kv,
+            conv_states,
+            transconv_states,
+            int(carry.get("c2w_frame_idx") or 0),
+        )
+        if warmed:
+            metrics["steadystream_acoustic_tail"] = "true"
+            metrics["steadystream_carry_from_segment"] = str(
+                carry.get("from_segment_idx", "")
+            )
+        return warmed
+
+    def _try_prefill_from_steadystream_carry(
+        self,
+        group: EngineSessionGroup,
+        seg: EngineSegment,
+        slot: SlotKVState,
+        task_type: TaskType,
+        metrics: dict,
+    ) -> Optional[tuple[Optional[bytes], bool]]:
+        if not self._steadystream_uses_kv(group):
+            return None
+        if task_type == TaskType.VOICE_CLONE_ICL:
+            return None
+        carry = group.steadystream_carry or {}
+        talker_kv = carry.get("talker_kv")
+        past_len = int(carry.get("talker_past_len") or 0)
+        if talker_kv is None or past_len <= 0 or not seg.pending_token_ids:
+            return None
+
+        self._restore_talker_kv_tail(slot, talker_kv, past_len)
+        req_embeds, trailing = self._prefill_builder.build_suffix_from_ids(
+            seg.pending_token_ids,
+            include_eos=seg.input_complete,
+        )
+        self._prime_decode_after_prefix_prefill(
+            slot,
+            req_embeds,
+            trailing,
+            source=f"steadystream_{group.steadystream_variant}",
+        )
+        if carry.get("token_counts") is not None:
+            slot.token_counts = carry["token_counts"].clone().to(
+                device=self._embed_device,
+                dtype=torch.int64,
+            )
+        if self._steadystream_uses_acoustic(group):
+            self._restore_steadystream_c2w_carry(group, slot, metrics)
+        metrics["steadystream_variant"] = group.steadystream_variant
+        metrics["steadystream_kv_tail"] = "true"
+        metrics["steadystream_kv_past_len"] = str(past_len)
+        metrics["steadystream_carry_from_segment"] = str(
+            carry.get("from_segment_idx", "")
+        )
+        logger.info(
+            "Applied SteadyStream KV carry: session=%s variant=%s seg=%d past=%d",
+            group.session_id,
+            group.steadystream_variant,
+            seg.segment_idx,
+            past_len,
+        )
+        return None, False
 
     # ------------------------------------------------------------------
     # Decode batch (MLFQ-ordered)
@@ -1208,6 +1440,7 @@ class EngineLoop:
             "overflow": overflow,
         }
 
+        self._store_steadystream_carry(group, seg)
         seg.state = "done"
         self._release_segment_slot(seg)
 

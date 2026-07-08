@@ -79,6 +79,7 @@ message SessionConfig {
   GroupPolicy group_policy = 9;
   AudioFormat audio = 10;
   SamplingParams sampling = 11;
+  map<string, string> experimental = 12;
 }
 
 message SynthesizeOnceRequest {
