@@ -831,6 +831,7 @@ class EngineLoop:
         else:
             slot.talker_kv = cached.talker_kv.clone()
         slot.past_len = prefix_len
+        slot.position_offset = 0
 
     def _apply_ref_c2w_warm_state(
         self,
@@ -978,11 +979,11 @@ class EngineLoop:
         raw = str(
             group.steadystream_experimental.get("kv_inherit_token_counts", "")
         ).strip().lower()
-        if raw in {"", "1", "true", "yes", "on"}:
+        if raw in {"1", "true", "yes", "on"}:
             return True
-        if raw in {"0", "false", "no", "off"}:
+        if raw in {"", "0", "false", "no", "off"}:
             return False
-        return True
+        return False
 
     @staticmethod
     def _steadystream_prepends_prefix_to_kv_tail(group: EngineSessionGroup) -> bool:
@@ -996,10 +997,10 @@ class EngineLoop:
         slot: SlotKVState,
         *,
         max_tokens: int,
-    ) -> tuple[Optional[torch.Tensor], int]:
+    ) -> tuple[Optional[torch.Tensor], int, int]:
         past_len = int(slot.past_len)
         if past_len <= 0:
-            return None, 0
+            return None, 0, 0
         keep = min(past_len, int(max_tokens))
         start = past_len - keep
         kv_pool = self._executor.kv_pool
@@ -1011,21 +1012,23 @@ class EngineLoop:
         elif slot.talker_kv is not None:
             kv = slot.talker_kv[:, :, :, start:past_len, :].clone()
         else:
-            return None, 0
-        return kv.contiguous(), keep
+            return None, 0, 0
+        logical_past_len = int(slot.position_offset) + past_len
+        return kv.contiguous(), keep, logical_past_len
 
     def _restore_talker_kv_tail(
         self,
         slot: SlotKVState,
         talker_kv: torch.Tensor,
-        past_len: int,
+        compact_len: int,
+        logical_past_len: Optional[int] = None,
     ) -> None:
         kv_pool = self._executor.kv_pool
-        past_len = int(past_len)
+        compact_len = int(compact_len)
         if kv_pool._preallocate and kv_pool._talker_kv_pool is not None:
             kv_pool._talker_kv_pool[
-                slot.slot_id, :, :, :past_len, :
-            ] = talker_kv[0, :, :, :past_len, :].to(
+                slot.slot_id, :, :, :compact_len, :
+            ] = talker_kv[0, :, :, :compact_len, :].to(
                 device=self._embed_device,
                 dtype=self._embed_dtype,
             )
@@ -1034,21 +1037,25 @@ class EngineLoop:
                 device=self._embed_device,
                 dtype=self._embed_dtype,
             ).contiguous()
-        slot.past_len = past_len
+        slot.past_len = compact_len
+        if logical_past_len is None:
+            logical_past_len = compact_len
+        slot.position_offset = max(0, int(logical_past_len) - compact_len)
 
     def _restore_prefix_plus_talker_kv_tail(
         self,
         slot: SlotKVState,
         cached_prefix: Any,
         talker_kv: torch.Tensor,
-        past_len: int,
+        compact_len: int,
+        logical_past_len: Optional[int] = None,
     ) -> tuple[int, int]:
         """Restore CustomVoice sink prefix followed by a bounded Talker KV tail."""
         self._restore_prefix_cache(slot, cached_prefix)
         prefix_len = int(cached_prefix.prefix_len)
         max_seq = int(self._executor.kv_pool.max_seq_len)
         tail_len = min(
-            int(past_len),
+            int(compact_len),
             int(talker_kv.shape[3]),
             max(0, max_seq - prefix_len),
         )
@@ -1075,6 +1082,9 @@ class EngineLoop:
                 dim=3,
             ).contiguous()
         slot.past_len = prefix_len + tail_len
+        if logical_past_len is None:
+            logical_past_len = slot.past_len
+        slot.position_offset = max(0, int(logical_past_len) - slot.past_len)
         return prefix_len, tail_len
 
     def _store_steadystream_carry(
@@ -1088,13 +1098,18 @@ class EngineLoop:
         carry: dict[str, Any] = {"from_segment_idx": int(seg.segment_idx)}
 
         if self._steadystream_uses_kv(group):
-            talker_kv, past_len = self._snapshot_talker_kv_tail(
+            talker_kv, compact_len, logical_past_len = self._snapshot_talker_kv_tail(
                 slot,
                 max_tokens=self._steadystream_kv_tail_tokens(group),
             )
-            if talker_kv is not None and past_len > 0:
+            if talker_kv is not None and compact_len > 0:
                 carry["talker_kv"] = talker_kv
-                carry["talker_past_len"] = past_len
+                carry["talker_past_len"] = compact_len
+                carry["talker_logical_past_len"] = logical_past_len
+                carry["talker_position_offset"] = max(
+                    0,
+                    int(logical_past_len) - int(compact_len),
+                )
                 if (
                     self._steadystream_inherits_token_counts(group)
                     and slot.token_counts is not None
@@ -1165,8 +1180,12 @@ class EngineLoop:
             return None
         carry = group.steadystream_carry or {}
         talker_kv = carry.get("talker_kv")
-        past_len = int(carry.get("talker_past_len") or 0)
-        if talker_kv is None or past_len <= 0 or not seg.pending_token_ids:
+        compact_len = int(carry.get("talker_past_len") or 0)
+        logical_past_len = int(
+            carry.get("talker_logical_past_len")
+            or (compact_len + int(carry.get("talker_position_offset") or 0))
+        )
+        if talker_kv is None or compact_len <= 0 or not seg.pending_token_ids:
             return None
 
         if (
@@ -1177,15 +1196,16 @@ class EngineLoop:
                 slot,
                 cached_prefix,
                 talker_kv,
-                past_len,
+                compact_len,
+                logical_past_len,
             )
             metrics["steadystream_kv_prefix"] = "cached"
             metrics["steadystream_kv_prefix_len"] = str(prefix_len)
             metrics["steadystream_kv_tail_effective_len"] = str(tail_len)
         else:
-            self._restore_talker_kv_tail(slot, talker_kv, past_len)
+            self._restore_talker_kv_tail(slot, talker_kv, compact_len, logical_past_len)
             metrics["steadystream_kv_prefix"] = "none"
-            metrics["steadystream_kv_tail_effective_len"] = str(past_len)
+            metrics["steadystream_kv_tail_effective_len"] = str(compact_len)
         req_embeds, trailing = self._prefill_builder.build_suffix_from_ids(
             seg.pending_token_ids,
             include_eos=seg.input_complete,
@@ -1208,16 +1228,21 @@ class EngineLoop:
             self._restore_steadystream_c2w_carry(group, slot, metrics)
         metrics["steadystream_variant"] = group.steadystream_variant
         metrics["steadystream_kv_tail"] = "true"
-        metrics["steadystream_kv_past_len"] = str(past_len)
+        metrics["steadystream_kv_past_len"] = str(compact_len)
+        metrics["steadystream_kv_logical_past_len"] = str(logical_past_len)
+        metrics["steadystream_kv_position_offset"] = str(slot.position_offset)
         metrics["steadystream_carry_from_segment"] = str(
             carry.get("from_segment_idx", "")
         )
         logger.info(
-            "Applied SteadyStream KV carry: session=%s variant=%s seg=%d past=%d",
+            "Applied SteadyStream KV carry: session=%s variant=%s seg=%d "
+            "compact_past=%d logical_past=%d position_offset=%d",
             group.session_id,
             group.steadystream_variant,
             seg.segment_idx,
-            past_len,
+            compact_len,
+            logical_past_len,
+            slot.position_offset,
         )
         return None, False
 

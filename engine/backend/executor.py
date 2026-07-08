@@ -777,6 +777,7 @@ class Executor:
 
         if self._fused_engine is None:
             slot.past_len = int(prefill_embeds.shape[1])
+            slot.position_offset = 0
             slot.c2w_conv_states = []
             slot.c2w_transconv_states = []
             return None, False
@@ -831,6 +832,7 @@ class Executor:
             else:
                 slot.talker_kv = stripped
         slot.past_len = seq
+        slot.position_offset = 0
 
         c2w_kv = raw.get("c2w_new_kv")
         if c2w_kv is not None:
@@ -887,6 +889,7 @@ class Executor:
 
         if self._fused_engine is None:
             slot.past_len = int(prefill_embeds.shape[1])
+            slot.position_offset = 0
             return
 
         seq = int(prefill_embeds.shape[1])
@@ -939,6 +942,7 @@ class Executor:
             else:
                 slot.talker_kv = stripped
         slot.past_len = seq
+        slot.position_offset = 0
 
     def prefill_from_prefix(
         self,
@@ -1275,7 +1279,8 @@ class Executor:
             )
 
         position_ids = torch.stack([
-            torch.arange(s.past_len, s.past_len + seq,
+            torch.arange(s.position_offset + s.past_len,
+                         s.position_offset + s.past_len + seq,
                          device=self._device, dtype=torch.int64)
             .unsqueeze(0).expand(3, seq)
             for s in slots
@@ -1485,6 +1490,9 @@ class Executor:
             "slot_segment_indices": [int(s.segment_idx) for s in slots],
             "slot_prefill_sources": [str(s.prefill_source or "") for s in slots],
             "slot_past_len_before": [int(s.past_len) for s in slots],
+            "slot_position_offset_before": [
+                int(s.position_offset) for s in slots
+            ],
             "slot_frame_idx_before": [int(s.frame_idx) for s in slots],
             "slot_text_idx_before": [int(s.text_idx) for s in slots],
             "slot_trailing_len": [len(s.trailing) for s in slots],

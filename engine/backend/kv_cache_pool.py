@@ -82,6 +82,10 @@ class SlotKVState:
     # Talker KV: [1, num_layers*2, kv_heads, cur_len, head_dim]
     talker_kv: Optional[torch.Tensor] = None
     past_len: int = 0
+    # Logical RoPE offset for compacted caches.  When a KV tail is stored at
+    # slot positions [0, tail_len), its keys still carry their original RoPE
+    # phase, so new query positions must continue from the uncropped timeline.
+    position_offset: int = 0
 
     # Code2Wav KV: [1, n_c2w*2, c2w_kv_heads, cur_len, c2w_head_dim]
     c2w_kv: Optional[torch.Tensor] = None
@@ -262,6 +266,7 @@ class KVCachePool:
         slot.is_free = False
         slot.prefill_source = ""
         slot.past_len = 0
+        slot.position_offset = 0
         slot.frame_idx = 0
         slot.text_idx = 0
         slot.trailing = []
@@ -297,6 +302,7 @@ class KVCachePool:
         slot.is_free = True
         slot.prefill_source = ""
         slot.past_len = 0
+        slot.position_offset = 0
         slot.frame_idx = 0
         slot.text_idx = 0
         slot.trailing = []

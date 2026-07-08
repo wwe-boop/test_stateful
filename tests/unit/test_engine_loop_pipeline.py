@@ -11,7 +11,7 @@ import pytest
 
 from engine.backend.kv_cache_pool import KVCachePool, ModelConfig, SlotKVState
 from engine.backend.prefill import PrefillPlan, TaskType
-from engine.backend.executor import StepOutput
+from engine.backend.executor import Executor, StepOutput
 from engine.backend.engine_loop import (
     EngineLoop,
     EngineSegment,
@@ -492,6 +492,7 @@ class _StubExecutorForPrefill:
             self._config.head_dim,
         )
         slot.past_len = seq
+        slot.position_offset = 0
         slot.frame_idx = 1
         slot.next_embed = torch.full(
             (1, 1, self._config.hidden_size),
@@ -518,6 +519,7 @@ class _StubExecutorForPrefill:
             self._config.head_dim,
         )
         slot.past_len = seq
+        slot.position_offset = 0
 
     def prefill_from_prefix(self, slot, embeds):
         self.prefill_from_prefix_inputs.append(embeds.clone())
@@ -565,7 +567,7 @@ def _make_talker_kv(model_config, seq: int) -> torch.Tensor:
 
 
 class TestSteadyStreamCarry:
-    def test_token_counts_are_inherited_by_default(self, model_config):
+    def test_token_counts_reset_by_default(self, model_config):
         executor = _StubExecutorForPrefill(model_config)
         engine_loop = EngineLoop(
             engine_inbox=queue.Queue(),
@@ -590,12 +592,9 @@ class TestSteadyStreamCarry:
         engine_loop._store_steadystream_carry(group, seg)
 
         assert "talker_kv" in group.steadystream_carry
-        torch.testing.assert_close(
-            group.steadystream_carry["token_counts"],
-            seg.slot.token_counts,
-        )
+        assert "token_counts" not in group.steadystream_carry
 
-    def test_token_counts_can_be_reset_explicitly(self, model_config):
+    def test_token_counts_can_be_inherited_explicitly(self, model_config):
         executor = _StubExecutorForPrefill(model_config)
         engine_loop = EngineLoop(
             engine_inbox=queue.Queue(),
@@ -608,7 +607,7 @@ class TestSteadyStreamCarry:
             {
                 "steadystream_variant": "kv_tail_only",
                 "kv_tail_tokens": "16",
-                "kv_inherit_token_counts": "false",
+                "kv_inherit_token_counts": "true",
             },
         )
         seg = EngineSegment("s1", 0)
@@ -624,7 +623,45 @@ class TestSteadyStreamCarry:
         engine_loop._store_steadystream_carry(group, seg)
 
         assert "talker_kv" in group.steadystream_carry
-        assert "token_counts" not in group.steadystream_carry
+        torch.testing.assert_close(
+            group.steadystream_carry["token_counts"],
+            seg.slot.token_counts,
+        )
+
+    def test_kv_tail_restore_preserves_logical_position_offset(self, model_config):
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(hidden_size=model_config.hidden_size),
+        )
+        group = _make_steadystream_group(
+            "s1",
+            {"steadystream_variant": "kv_tail_only", "kv_tail_tokens": "16"},
+        )
+        seg0 = EngineSegment("s1", 0)
+        seg0.slot = SlotKVState(slot_id=0)
+        seg0.slot.talker_kv = _make_talker_kv(model_config, seq=20)
+        seg0.slot.past_len = 20
+        seg0.slot.position_offset = 7
+
+        engine_loop._store_steadystream_carry(group, seg0)
+
+        assert group.steadystream_carry["talker_past_len"] == 16
+        assert group.steadystream_carry["talker_logical_past_len"] == 27
+        assert group.steadystream_carry["talker_position_offset"] == 11
+
+        slot = SlotKVState(slot_id=1)
+        engine_loop._restore_talker_kv_tail(
+            slot,
+            group.steadystream_carry["talker_kv"],
+            group.steadystream_carry["talker_past_len"],
+            group.steadystream_carry["talker_logical_past_len"],
+        )
+
+        assert slot.past_len == 16
+        assert slot.position_offset == 11
 
     def test_restore_reports_reset_or_inherited_token_counts(self, model_config):
         hidden = model_config.hidden_size
@@ -664,6 +701,7 @@ class TestSteadyStreamCarry:
         ) == (None, False)
         assert metrics["steadystream_token_counts"] == "reset"
         assert torch.count_nonzero(slot.token_counts) == 0
+        assert metrics["steadystream_kv_position_offset"] == "0"
 
         inherited_counts = torch.ones(
             1,
@@ -732,9 +770,52 @@ class TestSteadyStreamCarry:
         ) == (None, False)
 
         assert slot.past_len == 6
+        assert slot.position_offset == 0
         assert metrics["steadystream_kv_prefix"] == "cached"
         assert metrics["steadystream_kv_prefix_len"] == "2"
         assert metrics["steadystream_kv_tail_effective_len"] == "4"
+
+
+class TestExecutorPositionIds:
+    def test_position_ids_include_compacted_cache_offset(self, model_config):
+        executor = Executor.__new__(Executor)
+        executor._config = model_config
+        executor._device = torch.device("cpu")
+        executor._do_sample = False
+        executor._temperature = 1.0
+        executor._repetition_penalty = 1.0
+        executor._c2w_conv_input_names = []
+        executor._c2w_transconv_input_names = []
+
+        slot = SlotKVState(slot_id=0)
+        slot.past_len = 4
+        slot.position_offset = 13
+        slot.c2w_kv = None
+        slot.c2w_conv_states = []
+        slot.c2w_transconv_states = []
+        slot.token_counts = torch.zeros(
+            1,
+            model_config.codec_vocab_size,
+            dtype=torch.int64,
+        )
+
+        inputs = executor._build_fused_inputs(
+            input_embeds=torch.zeros(1, 2, model_config.hidden_size),
+            slots=[slot],
+            batched_talker_kv=torch.zeros(
+                1,
+                model_config.num_layers * 2,
+                model_config.kv_heads,
+                slot.past_len,
+                model_config.head_dim,
+            ),
+            past_seq_lens=torch.tensor([slot.past_len], dtype=torch.long),
+            use_dummy_kv=False,
+            sampling_mode="disabled",
+        )
+
+        assert inputs["position_ids"].shape == (1, 3, 2, 1)
+        assert inputs["position_ids"][0, 0, :, 0].tolist() == [17, 18]
 
 
 class TestPrefillBoundary:
