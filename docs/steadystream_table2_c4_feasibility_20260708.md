@@ -176,6 +176,32 @@ The one-sample API smoke run now validates with `--require-codes`:
 8 coded segments, 247 code frames, and 0 schema issues. This is still smoke
 data only, not final C4 evidence.
 
+## Continuation Batch Dry-Run
+
+Before modifying the training loop, run a layout dry-run:
+
+```bash
+python scripts/python/build_c4_continuation_batch.py \
+  --manifest-jsonl workspace/c4_synthetic_smoke_20260708_api1/c4_synthetic_smoke_manifest_with_codes.jsonl \
+  --output-summary workspace/c4_synthetic_smoke_20260708_api1/continuation_batch_summary.json
+```
+
+The builder creates the same tensor families as the official collate
+(`input_ids`, `codec_ids`, `codec_mask`, `codec_0_labels`, masks), but lays
+all segments in one sequence and masks loss only on speech codec tokens.
+For now, segment boundaries are represented by `codec_eos_token_id` and are
+not trained as loss targets. A learned `<bnd>` token still requires a model
+vocabulary/config change.
+
+Training status:
+
+- `peft` and `bitsandbytes` are not installed in the current `qwen3-tts`
+  environment, so LoRA/QLoRA is not available yet.
+- The official `finetuning/sft_12hz.py` path is full-parameter training.
+- GPU1 has roughly 11 GB free while the TTS engine is resident, so a direct
+  1.7B full-parameter C4 run is not safe without freeing/moving services or
+  adding LoRA support.
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.
