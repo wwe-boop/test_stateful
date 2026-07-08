@@ -663,6 +663,44 @@ class TestSteadyStreamCarry:
         assert slot.past_len == 16
         assert slot.position_offset == 11
 
+    def test_kv_tail_snapshot_can_drop_terminal_token(self, model_config):
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(hidden_size=model_config.hidden_size),
+        )
+        group = _make_steadystream_group(
+            "s1",
+            {"steadystream_variant": "kv_tail_only", "kv_tail_tokens": "16"},
+        )
+        seg0 = EngineSegment("s1", 0)
+        seg0.slot = SlotKVState(slot_id=0)
+        kv = torch.arange(20, dtype=torch.float32).view(1, 1, 1, 20, 1)
+        seg0.slot.talker_kv = kv.expand(
+            1,
+            model_config.num_layers * 2,
+            model_config.kv_heads,
+            20,
+            model_config.head_dim,
+        ).clone()
+        seg0.slot.past_len = 20
+        seg0.slot.position_offset = 7
+
+        engine_loop._store_steadystream_carry(
+            group,
+            seg0,
+            drop_last_talker_token=True,
+        )
+
+        carry = group.steadystream_carry
+        assert carry["talker_past_len"] == 16
+        assert carry["talker_logical_past_len"] == 26
+        assert carry["talker_position_offset"] == 10
+        assert carry["talker_dropped_last_token"] is True
+        assert int(carry["talker_kv"][0, 0, 0, -1, 0].item()) == 18
+
     def test_restore_reports_reset_or_inherited_token_counts(self, model_config):
         hidden = model_config.hidden_size
         req_embeds = torch.randn(1, 1, hidden)
@@ -702,6 +740,7 @@ class TestSteadyStreamCarry:
         assert metrics["steadystream_token_counts"] == "reset"
         assert torch.count_nonzero(slot.token_counts) == 0
         assert metrics["steadystream_kv_position_offset"] == "0"
+        assert metrics["steadystream_kv_dropped_last_token"] == "false"
 
         inherited_counts = torch.ones(
             1,

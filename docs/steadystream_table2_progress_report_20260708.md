@@ -8,7 +8,7 @@
 
 表 2 当前已完成前 5 行的可运行实现、三种子音频生成、指标后处理和 CER 合并；新增的“完整可运行 SteadyStream 组合行”也已经完成 150/150 条音频生成、ASR/CER 合并和新版交付表生成。
 
-2026-07-08 最新进展：C2 的 CER 劣化已经定位到裁剪 KV tail 后 RoPE 逻辑位置被重置的问题。本轮已落地 P0 修复：紧凑 KV 继续紧凑存放，但 slot 额外携带 `position_offset`，后续 decode 的 `position_ids` 按原始逻辑时间线继续递增；同时 `kv_inherit_token_counts` 默认从继承改为 reset。旧 C2/C3 数字仍保留作“修复前原型”记录，不能当作修复后结果。
+2026-07-08 最新进展：C2 的 CER 劣化已经拆成两层 P0 问题处理。第一层是裁剪 KV tail 后 RoPE 逻辑位置被重置：本轮已落地 `position_offset`，紧凑 KV 继续紧凑存放，但后续 decode 的 `position_ids` 按原始逻辑时间线继续递增。第二层是 smoke 发现未发生裁剪时仍早停：原因更像是段末把触发结束的 terminal EOS/pad-stop token 一起带进下一段；已改为保存 SteadyStream carry 时默认丢掉最后一个 talker token。`kv_inherit_token_counts` 默认也已从继承改为 reset。旧 C2/C3 数字仍保留作“修复前原型”记录，不能当作修复后结果。
 
 需要特别说明：计划中真正的“完整 SteadyStream”定义为 C1+C2+C3+C4，其中 C4 是 continuation 后训练 checkpoint。当前没有找到真实 C4 continuation 训练 checkpoint，因此我没有把基座引擎或 smoke adapter 冒充成最终 C4 行；当前补测行标注为“C1+C2+C3，C4 未训练”。
 
@@ -19,7 +19,7 @@
 | 1 | 无状态 | 已完成，3 seeds x 50 | 11.13% +/- 0.09% | 基线成立，可进当前交付表。 |
 | 2 | 现有 stateful Triton | 已完成，3 seeds x 50 | 10.86% +/- 0.12% | 比无状态 CER 略好，边界 F0/能量明显改善。 |
 | 3 | 仅声学尾 C1 prototype | 已完成，3 seeds x 50 | 11.40% +/- 0.85% | CER 接近基线，是目前最安全的组件原型。 |
-| 4 | 仅 KV/token 尾 C2 prototype | P0 位置修复已落地，待重跑 | 修复前 27.01% +/- 0.55% | 修复前边界指标好看但文本完整性失败；根因是裁剪 KV 的 RoPE 相位和新 query position 不一致。 |
+| 4 | 仅 KV/token 尾 C2 prototype | P0 位置修复 + terminal-token drop 已落地，待重跑 | 修复前 27.01% +/- 0.55% | 修复前边界指标好看但文本完整性失败；已定位到 RoPE position 错位和段末 EOS 进入下一段上下文两个风险。 |
 | 5 | 尾 + KV + 暂停恢复 C1+C2+C3 prototype | 依赖修复后 C2 重跑；C3 口径仍待解耦 | 修复前 28.24% +/- 0.23% | 暂停指标被修好，但旧结果继承了 C2 的 CER 问题；不能作为最终 C3 结论。 |
 | 6 | 完整 SteadyStream C1+C2+C3+C4 | C2 门禁 + C4 训练 checkpoint 均未完成 | - | 不能造数；正确顺序是 C2 修复重跑达标，再训练/部署真实 C4。 |
 | 6a | 当前可运行全开补测 C1+C2+C3，C4 未训练 | 音频 150/150 完成，ASR/CER 完成，delivery 已生成 | 24.36% +/- 0.47% | 用来交付“现有引擎能跑到什么程度”，不冒充训练后 C4。 |
@@ -43,7 +43,7 @@
 
 | 问题 | 现象 | 原因判断 | 处理策略 |
 |---|---|---|---|
-| C2/C3 CER 变差 | C2 到 27.01%，C1+C2+C3 到 28.24% | 已定位 P0 根因：裁剪后的 Talker KV tail 保留的是旧绝对位置 RoPE 相位，但 restore 后 `slot.past_len` 从紧凑尾长重新计数，新 query position 错位，导致提前 EOS/漏读末句；不是单纯 ASR 统计问题 | 已新增 `position_offset` 修复逻辑位置连续性，并把 token_counts 默认 reset；下一步重跑 C2 门禁。 |
+| C2/C3 CER 变差 | C2 到 27.01%，C1+C2+C3 到 28.24% | 已定位两层 P0 根因：裁剪后的 Talker KV tail 保留旧绝对位置 RoPE 相位但新 query position 重置；另外未裁剪 smoke 仍早停，说明上一段 terminal EOS/pad-stop token 也不能直接作为下一段上下文 | 已新增 `position_offset` 修复逻辑位置连续性；保存 carry 时默认丢掉最后一个 talker token；token_counts 默认 reset；下一步重跑 C2 门禁。 |
 | C3 只能修暂停 | 停顿从约 200 ms 降到约 10 ms，但 CER 没恢复 | pause recovery 是后处理/边界修正，不能补回已经缺失的文本 | 继续保留 C3 作为独立模块，但不把它宣传成解决语义完整性的手段。 |
 | C3 停顿口径风险 | C3 停顿列非常好看 | 当前 pause recovery 目标表和指标期望来自同一硬编码表，存在循环论证风险 | 最终表需要把目标 pause 统计和指标测量解耦，并加 crossfade，避免只是在优化指标本身。 |
 | 最终 C4 行未完成 | 没有 C4 checkpoint | `steadystream_plan_v2.md` 要的是多片段 continuation SFT，不是普通单句 speaker finetune；父目录训练代码可作为基础，但还要改 dataset/collate/loss mask | 已补 C4 manifest 校验、codes attach、batch dry-run、smoke train 工具；等真实数据或释放训练资源后推进。 |
@@ -60,8 +60,8 @@
 | 后处理 | 增加/扩展 Table 2 postprocess、ASR manifest、CER merge、delivery generator | 已能生成当前表、诊断文档和交付 markdown。 |
 | C4 准备 | 增加 continuation manifest validator、API synthetic smoke dataset、prepare_data codes attach、continuation batch dry-run、0.6B smoke train 脚本 | 已证明 C4 数据/训练 plumbing 能跑，但还不是最终 C4 模型。 |
 | 完整行补测 | 新增 `scripts/python/run_table2_full_steadystream.py` | 150/150 条音频、ASR/CER 合并和 delivery 生成均已完成。 |
-| C2 P0 修复 | 新增 `SlotKVState.position_offset`；`executor` 的 fused `position_ids` 改为 `position_offset + past_len`；SteadyStream carry 新增 `talker_logical_past_len`/`talker_position_offset`；`kv_inherit_token_counts` 默认改为 reset | 修复裁剪 KV tail 的 RoPE 逻辑位置合约，避免把旧 KV 相位当作从 0 开始的新缓存。 |
-| C2 回归测试 | 更新 `tests/unit/test_engine_loop_pipeline.py`，新增紧凑 KV tail position offset、默认 token_counts reset、显式继承兼容测试 | 目标测试已通过：28 passed, 1 warning。 |
+| C2 P0 修复 | 新增 `SlotKVState.position_offset`；`executor` 的 fused `position_ids` 改为 `position_offset + past_len`；SteadyStream carry 新增 `talker_logical_past_len`/`talker_position_offset`；段末 carry 默认丢掉最后一个 talker token；`kv_inherit_token_counts` 默认改为 reset | 同时修复裁剪 KV tail 的 RoPE 逻辑位置合约，以及上一段 EOS/pad-stop token 污染下一段上下文的问题。 |
+| C2 回归测试 | 更新 `tests/unit/test_engine_loop_pipeline.py`，新增紧凑 KV tail position offset、terminal token drop、默认 token_counts reset、显式继承兼容测试 | 目标测试已通过：22 passed, 1 warning；前一组含 C4 单测为 28 passed, 1 warning。 |
 | C4 真实数据 | 选定 WenetSpeech4TTS Premium 作为 C4 主数据源，完成 Premium_0 pilot 下载、MD5 校验、20 样本 manifest+codes 构建和 batch dry-run | 可用于 C4 扩容训练前置，但训练启动应等 C2 门禁通过。 |
 | 版本管理 | 已配置 GitHub remote `github-test-stateful` 和专用 deploy key | 当前代码和本文档已持续推送到 GitHub 目标分支。 |
 
@@ -72,7 +72,7 @@
 | P0 | 为 6a 全开补测行生成 ASR manifest，复用已有 750 条 CER，只新增 150 条全开音频 ASR | 已完成，产物为 `table2_cer_full.json`。 |
 | P0 | 合并 full-row CER 并重新生成交付表 | 已完成，产物为 `table2_current_full.md` 和 `table2_current_delivery_full_20260708.md`。 |
 | P0 | 拉回本地 outputs，并提交/推送新增汇报与必要代码变更 | 已完成，本地目录为 `outputs/table2_current_delivery_full/`。 |
-| P0 | 用 P0 C2 修复重跑 `kv_tail_only` 和 `tail_kv_pause_recovery` | 待执行；通过标准是 CER 回到无状态/stateful 基线约 1 个百分点范围内，同时保持边界 F0/能量收益。 |
+| P0 | 用 P0 C2 修复重跑 `kv_tail_only` 和 `tail_kv_pause_recovery` | 正在执行 smoke；通过标准是 CER 回到无状态/stateful 基线约 1 个百分点范围内，同时保持边界 F0/能量收益。 |
 | P0 | 如果修复后 C2 仍不达标，继续补 sink/window/token-history re-prefill 或 position-offset KV 细节 | 不启动 C4 训练，避免把 C2 实现 bug 误归因到 C4。 |
 | P1 | C2 门禁通过后，扩大 WenetSpeech4TTS Premium manifest，启动 continuation SFT | 真实 C4 checkpoint。 |
 | P1 | 训练路径复用父目录官方 finetuning，但要改成多片段 continuation collate、history drop、lookahead 和 loss mask | LoRA 或全参 C4 checkpoint。 |

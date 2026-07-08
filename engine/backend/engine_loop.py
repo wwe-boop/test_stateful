@@ -997,8 +997,11 @@ class EngineLoop:
         slot: SlotKVState,
         *,
         max_tokens: int,
+        drop_last_token: bool = False,
     ) -> tuple[Optional[torch.Tensor], int, int]:
         past_len = int(slot.past_len)
+        if drop_last_token and past_len > 0:
+            past_len -= 1
         if past_len <= 0:
             return None, 0, 0
         keep = min(past_len, int(max_tokens))
@@ -1091,6 +1094,8 @@ class EngineLoop:
         self,
         group: EngineSessionGroup,
         seg: EngineSegment,
+        *,
+        drop_last_talker_token: bool = False,
     ) -> None:
         if not group.steadystream_variant or seg.slot is None:
             return
@@ -1101,11 +1106,13 @@ class EngineLoop:
             talker_kv, compact_len, logical_past_len = self._snapshot_talker_kv_tail(
                 slot,
                 max_tokens=self._steadystream_kv_tail_tokens(group),
+                drop_last_token=drop_last_talker_token,
             )
             if talker_kv is not None and compact_len > 0:
                 carry["talker_kv"] = talker_kv
                 carry["talker_past_len"] = compact_len
                 carry["talker_logical_past_len"] = logical_past_len
+                carry["talker_dropped_last_token"] = bool(drop_last_talker_token)
                 carry["talker_position_offset"] = max(
                     0,
                     int(logical_past_len) - int(compact_len),
@@ -1231,6 +1238,9 @@ class EngineLoop:
         metrics["steadystream_kv_past_len"] = str(compact_len)
         metrics["steadystream_kv_logical_past_len"] = str(logical_past_len)
         metrics["steadystream_kv_position_offset"] = str(slot.position_offset)
+        metrics["steadystream_kv_dropped_last_token"] = str(
+            bool(carry.get("talker_dropped_last_token"))
+        ).lower()
         metrics["steadystream_carry_from_segment"] = str(
             carry.get("from_segment_idx", "")
         )
@@ -1547,7 +1557,11 @@ class EngineLoop:
             "overflow": overflow,
         }
 
-        self._store_steadystream_carry(group, seg)
+        self._store_steadystream_carry(
+            group,
+            seg,
+            drop_last_talker_token=not overflow,
+        )
         seg.state = "done"
         self._release_segment_slot(seg)
 
