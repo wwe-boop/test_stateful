@@ -387,6 +387,31 @@ Result:
   `workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_epoch2_shuffle_adapter.pt`
   (`1.4 MB`)
 
+The saved adapter can be restored into a fresh 0.6B base model and continued:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+python scripts/python/run_c4_lora_smoke_train.py \
+  --model-dir workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base \
+  --manifest-jsonl workspace/c4_synthetic_smoke5_20260708/c4_synthetic_smoke_manifest_with_codes.jsonl \
+  --limit 5 --steps 2 --epochs 1 --shuffle --seed 20260709 \
+  --rank 4 --alpha 8 --lr 1e-4 \
+  --load-adapter workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_epoch2_shuffle_adapter.pt \
+  --save-adapter workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_resume2_adapter.pt \
+  --output-summary workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_resume2_summary.json
+```
+
+Resume result:
+
+- loaded tensors: `132`
+- loaded adapter params: `675,840`
+- source adapter metadata: `steps=10`, `manifest_rows=5`
+- resumed samples: `prosody_mini_2001, prosody_mini_2002`
+- resumed loss: `14.618859 -> 14.419856`
+- saved resumed adapter:
+  `workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_resume2_adapter.pt`
+  (`1.4 MB`)
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.

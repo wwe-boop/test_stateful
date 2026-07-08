@@ -131,6 +131,56 @@ def lora_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def load_lora_adapter(model: torch.nn.Module, adapter_path: Path) -> dict[str, Any]:
+    payload = torch.load(adapter_path, map_location="cpu")
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+    state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+    if not isinstance(state_dict, dict) or not state_dict:
+        raise ValueError(f"{adapter_path}: missing non-empty LoRA state_dict")
+
+    expected = lora_state_dict(model)
+    expected_names = set(expected)
+    model_params = dict(model.named_parameters())
+    loaded_names: list[str] = []
+    unexpected_names: list[str] = []
+    shape_mismatches: list[dict[str, Any]] = []
+
+    for name, value in state_dict.items():
+        if name not in expected_names:
+            unexpected_names.append(name)
+            continue
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"{adapter_path}: {name} is not a tensor")
+        target = model_params[name]
+        if tuple(value.shape) != tuple(target.shape):
+            shape_mismatches.append(
+                {
+                    "name": name,
+                    "expected": list(target.shape),
+                    "actual": list(value.shape),
+                }
+            )
+            continue
+        target.data.copy_(value.to(device=target.device, dtype=target.dtype))
+        loaded_names.append(name)
+
+    missing_names = sorted(expected_names - set(loaded_names))
+    if unexpected_names or missing_names or shape_mismatches:
+        raise ValueError(
+            "LoRA adapter is incompatible: "
+            f"unexpected={unexpected_names}, missing={missing_names}, "
+            f"shape_mismatches={shape_mismatches}"
+        )
+
+    loaded_params = sum(model_params[name].numel() for name in loaded_names)
+    return {
+        "loaded_adapter": str(adapter_path),
+        "loaded_tensor_count": len(loaded_names),
+        "loaded_param_count": int(loaded_params),
+        "metadata": metadata,
+    }
+
+
 def build_sample_schedule(
     *,
     num_items: int,
@@ -223,6 +273,11 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         alpha=args.alpha,
         dropout=args.dropout,
     )
+    loaded_adapter_info = (
+        load_lora_adapter(model, args.load_adapter)
+        if args.load_adapter
+        else None
+    )
     model.train()
 
     cycle_items = prepare_cycle_items(
@@ -293,6 +348,7 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     "lr": args.lr,
                     "sample_strategy": "cycle_rows_batch_size_1",
                     "manifest_rows": len(rows),
+                    "loaded_adapter": str(args.load_adapter) if args.load_adapter else None,
                 },
                 "state_dict": lora_state_dict(model),
             },
@@ -327,6 +383,7 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "sample_strategy": "cycle_rows_batch_size_1",
         "manifest_rows": len(rows),
         "scheduled_samples": [cycle_items[item["row_index"]]["sample_id"] for item in schedule],
+        "loaded_adapter": loaded_adapter_info,
         **lora_info,
         "batch_shape": sample_batches[0]["batch_shape"] if len(sample_batches) == 1 else None,
         "sample_batches": sample_batches,
@@ -359,6 +416,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=8.0)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--target-suffixes", default=",".join(DEFAULT_TARGET_SUFFIXES))
+    parser.add_argument("--load-adapter", type=Path)
     parser.add_argument("--save-adapter", type=Path)
     parser.add_argument("--output-summary", type=Path)
     return parser.parse_args()

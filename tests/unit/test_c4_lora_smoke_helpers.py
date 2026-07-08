@@ -75,6 +75,41 @@ def test_lora_state_dict_only_contains_adapter_weights():
     assert all("base" not in key for key in keys)
 
 
+def test_load_lora_adapter_restores_adapter_weights(tmp_path):
+    model = TinyAttention()
+    c4_lora.inject_lora(
+        model,
+        target_suffixes=("self_attn.q_proj",),
+        rank=2,
+        alpha=4,
+        dropout=0.0,
+    )
+    with torch.no_grad():
+        model.self_attn.q_proj.lora_A.fill_(0.25)
+        model.self_attn.q_proj.lora_B.fill_(0.5)
+    saved_state = c4_lora.lora_state_dict(model)
+    adapter_path = tmp_path / "adapter.pt"
+    torch.save(
+        {
+            "metadata": {"source": "unit-test"},
+            "state_dict": saved_state,
+        },
+        adapter_path,
+    )
+
+    with torch.no_grad():
+        model.self_attn.q_proj.lora_A.zero_()
+        model.self_attn.q_proj.lora_B.zero_()
+
+    info = c4_lora.load_lora_adapter(model, adapter_path)
+
+    assert info["loaded_tensor_count"] == 2
+    assert info["loaded_param_count"] == 20
+    assert info["metadata"] == {"source": "unit-test"}
+    assert torch.allclose(model.self_attn.q_proj.lora_A.cpu(), saved_state["self_attn.q_proj.lora_A"])
+    assert torch.allclose(model.self_attn.q_proj.lora_B.cpu(), saved_state["self_attn.q_proj.lora_B"])
+
+
 def test_build_sample_schedule_uses_full_epochs_when_steps_is_zero():
     schedule = c4_lora.build_sample_schedule(
         num_items=3,
