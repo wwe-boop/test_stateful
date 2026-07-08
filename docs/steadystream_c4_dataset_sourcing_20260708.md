@@ -12,6 +12,37 @@ Use **Emilia ZH** as the second source or augmentation pool. It is much larger a
 
 Use **AISHELL-3** only for smoke tests and code-path validation. It is clean and easy to download, but mostly short independent TTS utterances, so it cannot be treated as final C4 evidence.
 
+
+## 2026-07-08 Pilot Status
+
+The first WenetSpeech4TTS pilot has been downloaded and converted on 4090-Host.
+
+Downloaded files:
+
+- `workspace/datasets/raw/WenetSpeech4TTS/Premium/WenetSpeech4TTS_Premium_0.tar.gz` (8.49 GB)
+- `workspace/datasets/raw/WenetSpeech4TTS/filelists/Premium_filelist.lst`
+- `workspace/datasets/raw/WenetSpeech4TTS/DNSMOS_P808Scores/Premium_DNSMOS.lst`
+- `workspace/datasets/raw/WenetSpeech4TTS/Premium/Premium_md5check.txt`
+
+Validation:
+
+- MD5 matched `fc9f29fc98827b0b51aa918c1dff0f21`.
+- Extracted shard contains 40,826 wav files and 40,826 txt files.
+- Wav format sampled in the pilot is 16 kHz mono.
+- Each txt has `utterance_id + transcript` plus timestamp intervals.
+
+Pilot C4 output:
+
+- Builder: `scripts/python/build_c4_manifest_wenetspeech4tts.py`
+- Pilot root: `workspace/c4_wenet_premium0_pilot_20260708`
+- No-code manifest: `c4_wenet_manifest.jsonl`
+- Training-ready manifest with tokenizer codes: `c4_wenet_manifest_with_codes.jsonl`
+- Official tokenizer output: `prepare_data_with_codes.jsonl`
+- Validation summary: 20 valid continuation samples, 95 coded segments, 2,852 code frames, 0 issues.
+- Continuation batch dry-run passed; first sample has 142 speech frames and 146 loss positions, confirming one boundary/EOS loss target per segment.
+
+Implementation note: the useful C4 shape is intra-utterance punctuation splitting, not only adjacent file grouping. Many Premium records already contain multi-clause continuous audio with word/character timestamps. The builder splits those real continuous wavs at punctuation, clips segment wavs, and retains up to 600 ms of natural boundary silence at the tail of the previous segment.
+
 ## Candidate ranking
 
 | Priority | Dataset | Why it fits C4 | Main risk | Decision |
@@ -107,9 +138,7 @@ wget -c https://www.openslr.org/resources/93/data_aishell3.tgz
 
 ## Immediate next engineering task
 
-Add `scripts/python/build_c4_manifest_wenetspeech4tts.py` after the first Premium tar is downloaded. The script should parse WenetSpeech4TTS filelists/txt timestamps, group adjacent source segments, compute boundary `pause_ms`/`punct_class`, and emit the same continuation manifest consumed by the existing C4 validator.
-
-Do not use AISHELL-3 or synthetic API data as the final C4 Table 2 evidence. They are only for proving the training code path.
+Scale the WenetSpeech4TTS pilot beyond 20 samples after the C2 position contract is fixed. The next data step is to generate a larger 50-100h coded continuation manifest from Premium shards, then run a real C4 LoRA schedule. Do not use AISHELL-3 or synthetic API data as the final C4 Table 2 evidence; they are only for proving the training code path.
 
 ## Sources checked
 
