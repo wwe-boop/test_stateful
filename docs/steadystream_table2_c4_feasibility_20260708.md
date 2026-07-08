@@ -239,6 +239,29 @@ Observed 0.6B smoke result on the one-sample synthetic manifest:
 - combined no-backward loss: `16.929464`
 - CUDA reserved memory during smoke: about `2.56 GB`
 
+A one-step frozen-backbone train smoke can be run without PEFT:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+python scripts/python/run_c4_train_step_smoke.py \
+  --model-dir workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base \
+  --manifest-jsonl workspace/c4_synthetic_smoke_20260708_api1/c4_synthetic_smoke_manifest_with_codes.jsonl \
+  --save-trainable-state workspace/c4_synthetic_smoke_20260708_api1/c4_train_step_smoke_state.pt \
+  --output-summary workspace/c4_synthetic_smoke_20260708_api1/c4_train_step_smoke_summary.json
+```
+
+This freezes the backbone and trains only `talker.codec_head` plus
+`talker.code_predictor.lm_head` for one optimizer step. It is only an
+autograd/optimizer smoke test, not a useful C4 checkpoint.
+
+Observed one-step smoke result:
+
+- trainable params: `34,603,008 / 914,643,008` (`3.7832%`)
+- combined loss before step: `16.929464`
+- grad norm before clipping: `14.5625`
+- saved trainable state: `67 MB`
+- CUDA reserved memory during step: about `2.56 GB`
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.
