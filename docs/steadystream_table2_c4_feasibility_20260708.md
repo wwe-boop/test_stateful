@@ -287,6 +287,72 @@ Observed package-free LoRA smoke result:
 - saved adapter: `1.4 MB`
 - CUDA reserved memory during run: about `4.32 GB`
 
+## Five-Sample API-Synthetic C4 Smoke
+
+The one-sample smoke was extended to a five-sample synthetic continuation set
+generated from DashScope text and the local TTS API. One generated text row used
+speaker `Ethan`, which is not supported by the current Triton config, so the
+smoke copy maps it to `ryan` and preserves the original value in
+`metadata.original_speaker`.
+
+Remote paths:
+
+- Text manifest:
+  `workspace/datasets/c4-synthetic-train-smoke5.supported.jsonl`
+- Synthesized audio and C4 artifacts:
+  `workspace/c4_synthetic_smoke5_20260708/`
+- Training-ready continuation manifest:
+  `workspace/c4_synthetic_smoke5_20260708/c4_synthetic_smoke_manifest_with_codes.jsonl`
+
+Validation result:
+
+- samples: `5`
+- segments: `42`
+- coded segments: `42`
+- code frames: `1,831`
+- speech from codes: `146.48 s`
+- speakers: `ryan=1`, `serena=2`, `vivian=2`
+- punct classes: `colon=2`, `comma=14`, `exclamation=3`,
+  `period=19`, `question=1`, `semicolon=3`
+- schema issues: `0`
+
+The five-sample continuation batch dry-run accepts all rows at once:
+
+- batch shape: `[5, 633, 2]`
+- sequence lengths: `[340, 463, 633, 510, 484]`
+- codec/loss positions: `1,831`
+- attention tokens: `2,430`
+
+`run_c4_lora_smoke_train.py` now supports multiple manifest rows by cycling
+rows with batch size 1. This avoids mixing different speaker embeddings inside
+one tensor batch while still validating that the multi-sample manifest, per-row
+reference mel, continuation layout, optimizer, and adapter save path all work.
+
+Observed five-sample package-free LoRA smoke result on the 0.6B base model:
+
+- sample strategy: `cycle_rows_batch_size_1`
+- manifest rows: `5`
+- steps: `10` (each sample seen twice)
+- matched modules: `66`
+- trainable params: `675,840 / 915,318,848` (`0.073837%`)
+- aggregate codec/loss positions: `1,831`
+- loss over 10 steps:
+  `[16.529987, 16.487158, 13.633871, 15.783941, 15.756899,
+  15.764313, 15.568721, 12.864022, 14.712641, 14.752712]`
+- first step: `prosody_mini_2001`, combined loss `16.529987`,
+  grad norm `9.8125`
+- last step: `prosody_mini_2005`, combined loss `14.752712`,
+  grad norm `11.6875`
+- saved adapter:
+  `workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_adapter.pt`
+  (`1.4 MB`)
+
+This closes the C4 plumbing gap from API synthesis to official tokenizer codes
+to continuation collation to LoRA optimization. It still must not be reported as
+the full SteadyStream C4 row, because the data are synthetic self-distillation
+from the same base TTS service and the adapter has not been deployed or measured
+with the Table 2 inference components.
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.

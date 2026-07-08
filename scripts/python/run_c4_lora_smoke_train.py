@@ -130,12 +130,40 @@ def lora_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def prepare_cycle_items(
+    *,
+    rows: list[dict[str, Any]],
+    qwen3tts: Qwen3TTSModel,
+    model: torch.nn.Module,
+    max_segments: int | None,
+    repo_root: Path,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row_index, row in enumerate(rows):
+        batch, layouts = build_continuation_batch(
+            [row],
+            tokenizer=qwen3tts.processor,
+            special_ids=special_ids_from_model_config(model.config),
+            max_segments=max_segments,
+        )
+        items.append(
+            {
+                "row_index": row_index,
+                "sample_id": str(row.get("sample_id") or f"sample_{row_index}"),
+                "batch": batch,
+                "layouts": layouts,
+                "ref_mels": load_ref_mels(first_ref_audio(row, repo_root=repo_root)),
+            }
+        )
+    return items
+
+
 def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
     rows = read_jsonl(args.manifest_jsonl)
     if args.limit:
         rows = rows[: args.limit]
-    if len(rows) != 1:
-        raise ValueError("LoRA smoke currently expects exactly one manifest row")
+    if not rows:
+        raise ValueError("manifest contains no rows after applying --limit")
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         str(args.model_dir),
@@ -152,13 +180,13 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
     )
     model.train()
 
-    batch, layouts = build_continuation_batch(
-        rows,
-        tokenizer=qwen3tts.processor,
-        special_ids=special_ids_from_model_config(model.config),
+    cycle_items = prepare_cycle_items(
+        rows=rows,
+        qwen3tts=qwen3tts,
+        model=model,
         max_segments=args.max_segments,
+        repo_root=args.repo_root,
     )
-    ref_mels = load_ref_mels(first_ref_audio(rows[0], repo_root=args.repo_root))
 
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],
@@ -166,13 +194,14 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         weight_decay=args.weight_decay,
     )
 
-    loss_history: list[dict[str, float]] = []
+    loss_history: list[dict[str, Any]] = []
     for step in range(args.steps):
+        item = cycle_items[step % len(cycle_items)]
         optimizer.zero_grad(set_to_none=True)
         talker_loss, sub_talker_loss, combined_loss = build_embeddings_and_losses(
             model=model,
-            batch=batch,
-            ref_mels=ref_mels,
+            batch=item["batch"],
+            ref_mels=item["ref_mels"],
         )
         combined_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -183,6 +212,8 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         loss_history.append(
             {
                 "step": float(step),
+                "row_index": float(item["row_index"]),
+                "sample_id": item["sample_id"],
                 "talker_loss": round(float(talker_loss.detach().cpu()), 6),
                 "sub_talker_loss": round(float(sub_talker_loss.detach().cpu()), 6),
                 "combined_loss": round(float(combined_loss.detach().cpu()), 6),
@@ -202,6 +233,8 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     "dropout": args.dropout,
                     "steps": args.steps,
                     "lr": args.lr,
+                    "sample_strategy": "cycle_rows_batch_size_1",
+                    "manifest_rows": len(rows),
                 },
                 "state_dict": lora_state_dict(model),
             },
@@ -209,19 +242,36 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         )
 
     device = next(model.parameters()).device
+    all_layouts = [
+        layout
+        for item in cycle_items
+        for layout in item["layouts"]
+    ]
+    sample_batches = [
+        {
+            "sample_id": item["sample_id"],
+            "batch_shape": list(item["batch"]["input_ids"].shape),
+            "codec_frames": int(item["batch"]["codec_mask"].sum().item()),
+            "loss_positions": int((item["batch"]["codec_0_labels"] != -100).sum().item()),
+        }
+        for item in cycle_items
+    ]
     return {
         "model_dir": str(args.model_dir),
         "manifest_jsonl": str(args.manifest_jsonl),
         "device": str(device),
         "steps": args.steps,
         "lr": args.lr,
+        "sample_strategy": "cycle_rows_batch_size_1",
+        "manifest_rows": len(rows),
         **lora_info,
-        "batch_shape": list(batch["input_ids"].shape),
-        "codec_frames": int(batch["codec_mask"].sum().item()),
-        "loss_positions": int((batch["codec_0_labels"] != -100).sum().item()),
+        "batch_shape": sample_batches[0]["batch_shape"] if len(sample_batches) == 1 else None,
+        "sample_batches": sample_batches,
+        "codec_frames": sum(item["codec_frames"] for item in sample_batches),
+        "loss_positions": sum(item["loss_positions"] for item in sample_batches),
         "loss_history": loss_history,
         "saved_adapter": str(args.save_adapter) if args.save_adapter else None,
-        "layouts": layouts,
+        "layouts": all_layouts,
         "cuda_mem_allocated_bytes": int(torch.cuda.memory_allocated(device)) if device.type == "cuda" else None,
         "cuda_mem_reserved_bytes": int(torch.cuda.memory_reserved(device)) if device.type == "cuda" else None,
     }
