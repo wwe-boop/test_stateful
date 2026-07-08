@@ -262,6 +262,31 @@ Observed one-step smoke result:
 - saved trainable state: `67 MB`
 - CUDA reserved memory during step: about `2.56 GB`
 
+A package-free LoRA smoke can be run without installing `peft`:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+python scripts/python/run_c4_lora_smoke_train.py \
+  --model-dir workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base \
+  --manifest-jsonl workspace/c4_synthetic_smoke_20260708_api1/c4_synthetic_smoke_manifest_with_codes.jsonl \
+  --steps 5 --rank 4 --alpha 8 --lr 1e-4 \
+  --save-adapter workspace/c4_synthetic_smoke_20260708_api1/c4_lora_smoke_adapter.pt \
+  --output-summary workspace/c4_synthetic_smoke_20260708_api1/c4_lora_smoke_summary.json
+```
+
+This injects LoRA into matching `self_attn.q_proj` and `self_attn.v_proj`
+modules, freezes the base weights, and saves only adapter tensors. It is a
+closer rehearsal for C4 LoRA than the head-only smoke, but still uses one
+synthetic sample and therefore is not a Table 2 C4 model.
+
+Observed package-free LoRA smoke result:
+
+- matched modules: `66`
+- trainable params: `675,840 / 915,318,848` (`0.073837%`)
+- loss over 5 steps: `16.929464 -> 16.068239`
+- saved adapter: `1.4 MB`
+- CUDA reserved memory during run: about `4.32 GB`
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.
