@@ -10,7 +10,7 @@ import torch
 import pytest
 
 from engine.backend.kv_cache_pool import KVCachePool, ModelConfig, SlotKVState
-from engine.backend.prefill import PrefillPlan
+from engine.backend.prefill import PrefillPlan, TaskType
 from engine.backend.executor import StepOutput
 from engine.backend.engine_loop import (
     EngineLoop,
@@ -541,6 +541,200 @@ class _StubExecutorForPrefill:
             dtype=torch.int64,
         )
         return b"audio", False
+
+
+def _make_steadystream_group(session_id: str, experimental: dict[str, str]):
+    return EngineSessionGroup(
+        session_id,
+        EngineRequest(
+            type=RequestType.NEW_SESSION,
+            session_id=session_id,
+            session_config=SimpleNamespace(experimental=experimental),
+        ),
+    )
+
+
+def _make_talker_kv(model_config, seq: int) -> torch.Tensor:
+    return torch.ones(
+        1,
+        model_config.num_layers * 2,
+        model_config.kv_heads,
+        seq,
+        model_config.head_dim,
+    )
+
+
+class TestSteadyStreamCarry:
+    def test_token_counts_are_inherited_by_default(self, model_config):
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(hidden_size=model_config.hidden_size),
+        )
+        group = _make_steadystream_group(
+            "s1",
+            {"steadystream_variant": "kv_tail_only", "kv_tail_tokens": "16"},
+        )
+        seg = EngineSegment("s1", 0)
+        seg.slot = SlotKVState(slot_id=0)
+        seg.slot.talker_kv = _make_talker_kv(model_config, seq=4)
+        seg.slot.past_len = 4
+        seg.slot.token_counts = torch.ones(
+            1,
+            model_config.codec_vocab_size,
+            dtype=torch.int64,
+        )
+
+        engine_loop._store_steadystream_carry(group, seg)
+
+        assert "talker_kv" in group.steadystream_carry
+        torch.testing.assert_close(
+            group.steadystream_carry["token_counts"],
+            seg.slot.token_counts,
+        )
+
+    def test_token_counts_can_be_reset_explicitly(self, model_config):
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(hidden_size=model_config.hidden_size),
+        )
+        group = _make_steadystream_group(
+            "s1",
+            {
+                "steadystream_variant": "kv_tail_only",
+                "kv_tail_tokens": "16",
+                "kv_inherit_token_counts": "false",
+            },
+        )
+        seg = EngineSegment("s1", 0)
+        seg.slot = SlotKVState(slot_id=0)
+        seg.slot.talker_kv = _make_talker_kv(model_config, seq=4)
+        seg.slot.past_len = 4
+        seg.slot.token_counts = torch.ones(
+            1,
+            model_config.codec_vocab_size,
+            dtype=torch.int64,
+        )
+
+        engine_loop._store_steadystream_carry(group, seg)
+
+        assert "talker_kv" in group.steadystream_carry
+        assert "token_counts" not in group.steadystream_carry
+
+    def test_restore_reports_reset_or_inherited_token_counts(self, model_config):
+        hidden = model_config.hidden_size
+        req_embeds = torch.randn(1, 1, hidden)
+        trailing = [torch.full((1, 1, hidden), 2.0)]
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(
+                suffix=(req_embeds, trailing),
+                hidden_size=hidden,
+            ),
+        )
+        seg = EngineSegment("s1", 1)
+        seg.pending_token_ids = [1, 2]
+        seg.input_complete = True
+
+        group = _make_steadystream_group(
+            "s1",
+            {"steadystream_variant": "kv_tail_only", "kv_prepend_prefix": "true"},
+        )
+        group.steadystream_carry = {
+            "talker_kv": _make_talker_kv(model_config, seq=4),
+            "talker_past_len": 4,
+        }
+        slot = SlotKVState(slot_id=0)
+        metrics: dict[str, str] = {}
+
+        assert engine_loop._try_prefill_from_steadystream_carry(
+            group,
+            seg,
+            slot,
+            TaskType.CUSTOM_VOICE,
+            metrics,
+        ) == (None, False)
+        assert metrics["steadystream_token_counts"] == "reset"
+        assert torch.count_nonzero(slot.token_counts) == 0
+
+        inherited_counts = torch.ones(
+            1,
+            model_config.codec_vocab_size,
+            dtype=torch.int64,
+        )
+        group.steadystream_carry["token_counts"] = inherited_counts
+        slot = SlotKVState(slot_id=0)
+        metrics = {}
+
+        assert engine_loop._try_prefill_from_steadystream_carry(
+            group,
+            seg,
+            slot,
+            TaskType.CUSTOM_VOICE,
+            metrics,
+        ) == (None, False)
+        assert metrics["steadystream_token_counts"] == "inherited"
+        torch.testing.assert_close(slot.token_counts, inherited_counts)
+
+    def test_restore_can_prepend_cached_prefix_before_kv_tail(self, model_config):
+        hidden = model_config.hidden_size
+        req_embeds = torch.randn(1, 1, hidden)
+        trailing = [torch.full((1, 1, hidden), 2.0)]
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(
+                suffix=(req_embeds, trailing),
+                hidden_size=hidden,
+            ),
+        )
+        seg = EngineSegment("s1", 1)
+        seg.pending_token_ids = [1, 2]
+        seg.input_complete = True
+        group = _make_steadystream_group(
+            "s1",
+            {"steadystream_variant": "kv_tail_only", "kv_prepend_prefix": "true"},
+        )
+        group.steadystream_carry = {
+            "talker_kv": _make_talker_kv(model_config, seq=4),
+            "talker_past_len": 4,
+        }
+        cached_prefix = SimpleNamespace(
+            prefix_len=2,
+            talker_kv=torch.zeros(
+                1,
+                model_config.num_layers * 2,
+                model_config.kv_heads,
+                2,
+                model_config.head_dim,
+            ),
+        )
+        slot = SlotKVState(slot_id=0)
+        metrics: dict[str, str] = {}
+
+        assert engine_loop._try_prefill_from_steadystream_carry(
+            group,
+            seg,
+            slot,
+            TaskType.CUSTOM_VOICE,
+            metrics,
+            cached_prefix,
+        ) == (None, False)
+
+        assert slot.past_len == 6
+        assert metrics["steadystream_kv_prefix"] == "cached"
+        assert metrics["steadystream_kv_prefix_len"] == "2"
+        assert metrics["steadystream_kv_tail_effective_len"] == "4"
 
 
 class TestPrefillBoundary:
