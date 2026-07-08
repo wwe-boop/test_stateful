@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,50 @@ def lora_state_dict(model: torch.nn.Module) -> dict[str, torch.Tensor]:
     }
 
 
+def build_sample_schedule(
+    *,
+    num_items: int,
+    steps: int,
+    epochs: int,
+    shuffle: bool,
+    seed: int,
+) -> list[dict[str, int]]:
+    if num_items <= 0:
+        raise ValueError("num_items must be > 0")
+    if epochs <= 0:
+        raise ValueError("epochs must be > 0")
+
+    rng = random.Random(seed)
+    epoch_entries: list[dict[str, int]] = []
+    for epoch in range(epochs):
+        order = list(range(num_items))
+        if shuffle:
+            rng.shuffle(order)
+        for row_index in order:
+            epoch_entries.append(
+                {
+                    "epoch": epoch,
+                    "row_index": row_index,
+                    "cycle": 0,
+                }
+            )
+
+    if steps <= 0:
+        return epoch_entries
+
+    schedule: list[dict[str, int]] = []
+    cycle = 0
+    while len(schedule) < steps:
+        for entry in epoch_entries:
+            if len(schedule) >= steps:
+                break
+            scheduled = dict(entry)
+            scheduled["cycle"] = cycle
+            schedule.append(scheduled)
+        cycle += 1
+    return schedule
+
+
 def prepare_cycle_items(
     *,
     rows: list[dict[str, Any]],
@@ -193,10 +238,17 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    schedule = build_sample_schedule(
+        num_items=len(cycle_items),
+        steps=args.steps,
+        epochs=args.epochs,
+        shuffle=args.shuffle,
+        seed=args.seed,
+    )
 
     loss_history: list[dict[str, Any]] = []
-    for step in range(args.steps):
-        item = cycle_items[step % len(cycle_items)]
+    for step, scheduled in enumerate(schedule):
+        item = cycle_items[scheduled["row_index"]]
         optimizer.zero_grad(set_to_none=True)
         talker_loss, sub_talker_loss, combined_loss = build_embeddings_and_losses(
             model=model,
@@ -213,6 +265,8 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "step": float(step),
                 "row_index": float(item["row_index"]),
+                "epoch": float(scheduled["epoch"]),
+                "cycle": float(scheduled["cycle"]),
                 "sample_id": item["sample_id"],
                 "talker_loss": round(float(talker_loss.detach().cpu()), 6),
                 "sub_talker_loss": round(float(sub_talker_loss.detach().cpu()), 6),
@@ -231,7 +285,11 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     "rank": args.rank,
                     "alpha": args.alpha,
                     "dropout": args.dropout,
-                    "steps": args.steps,
+                    "steps": len(schedule),
+                    "requested_steps": args.steps,
+                    "epochs": args.epochs,
+                    "shuffle": args.shuffle,
+                    "seed": args.seed,
                     "lr": args.lr,
                     "sample_strategy": "cycle_rows_batch_size_1",
                     "manifest_rows": len(rows),
@@ -260,10 +318,15 @@ def run_lora_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "model_dir": str(args.model_dir),
         "manifest_jsonl": str(args.manifest_jsonl),
         "device": str(device),
-        "steps": args.steps,
+        "steps": len(schedule),
+        "requested_steps": args.steps,
+        "epochs": args.epochs,
+        "shuffle": args.shuffle,
+        "seed": args.seed,
         "lr": args.lr,
         "sample_strategy": "cycle_rows_batch_size_1",
         "manifest_rows": len(rows),
+        "scheduled_samples": [cycle_items[item["row_index"]]["sample_id"] for item in schedule],
         **lora_info,
         "batch_shape": sample_batches[0]["batch_shape"] if len(sample_batches) == 1 else None,
         "sample_batches": sample_batches,
@@ -285,7 +348,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="cuda:0")
     parser.add_argument("--limit", type=int, default=1)
     parser.add_argument("--max-segments", type=int)
-    parser.add_argument("--steps", type=int, default=5)
+    parser.add_argument("--steps", type=int, default=5, help="Optimizer steps; use 0 to run epochs * rows.")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)

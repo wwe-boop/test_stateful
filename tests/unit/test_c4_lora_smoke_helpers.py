@@ -73,3 +73,50 @@ def test_lora_state_dict_only_contains_adapter_weights():
     assert "self_attn.q_proj.lora_A" in keys
     assert "self_attn.q_proj.lora_B" in keys
     assert all("base" not in key for key in keys)
+
+
+def test_build_sample_schedule_uses_full_epochs_when_steps_is_zero():
+    schedule = c4_lora.build_sample_schedule(
+        num_items=3,
+        steps=0,
+        epochs=2,
+        shuffle=False,
+        seed=123,
+    )
+
+    assert [item["row_index"] for item in schedule] == [0, 1, 2, 0, 1, 2]
+    assert [item["epoch"] for item in schedule] == [0, 0, 0, 1, 1, 1]
+    assert [item["cycle"] for item in schedule] == [0, 0, 0, 0, 0, 0]
+
+
+def test_build_sample_schedule_repeats_epoch_plan_to_requested_steps():
+    schedule = c4_lora.build_sample_schedule(
+        num_items=3,
+        steps=5,
+        epochs=1,
+        shuffle=False,
+        seed=123,
+    )
+
+    assert [item["row_index"] for item in schedule] == [0, 1, 2, 0, 1]
+    assert [item["cycle"] for item in schedule] == [0, 0, 0, 1, 1]
+
+
+def test_build_sample_schedule_shuffle_is_seeded():
+    first = c4_lora.build_sample_schedule(
+        num_items=5,
+        steps=0,
+        epochs=2,
+        shuffle=True,
+        seed=123,
+    )
+    second = c4_lora.build_sample_schedule(
+        num_items=5,
+        steps=0,
+        epochs=2,
+        shuffle=True,
+        seed=123,
+    )
+
+    assert first == second
+    assert [item["row_index"] for item in first] != [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]

@@ -353,6 +353,40 @@ the full SteadyStream C4 row, because the data are synthetic self-distillation
 from the same base TTS service and the adapter has not been deployed or measured
 with the Table 2 inference components.
 
+The LoRA smoke runner also supports deterministic training schedules:
+
+- `--epochs N` controls row passes.
+- `--steps 0` expands to `epochs * manifest_rows`.
+- `--shuffle --seed <int>` shuffles row order reproducibly.
+
+Observed scheduled smoke:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+python scripts/python/run_c4_lora_smoke_train.py \
+  --model-dir workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base \
+  --manifest-jsonl workspace/c4_synthetic_smoke5_20260708/c4_synthetic_smoke_manifest_with_codes.jsonl \
+  --limit 5 --steps 0 --epochs 2 --shuffle --seed 20260708 \
+  --rank 4 --alpha 8 --lr 1e-4 \
+  --save-adapter workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_epoch2_shuffle_adapter.pt \
+  --output-summary workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_epoch2_shuffle_summary.json
+```
+
+Result:
+
+- effective steps: `10`
+- scheduled samples:
+  `prosody_mini_2003, prosody_mini_2004, prosody_mini_2002,
+  prosody_mini_2005, prosody_mini_2001, prosody_mini_2002,
+  prosody_mini_2004, prosody_mini_2001, prosody_mini_2005,
+  prosody_mini_2003`
+- loss over 10 scheduled steps:
+  `[13.776013, 15.995429, 16.380299, 15.894934, 16.046816,
+  15.827106, 15.093434, 15.397011, 14.917271, 12.520634]`
+- saved scheduled adapter:
+  `workspace/c4_synthetic_smoke5_20260708/c4_lora_smoke5_epoch2_shuffle_adapter.pt`
+  (`1.4 MB`)
+
 ## Next Training Step Once Data Exists
 
 1. Run the readiness check on the real continuation JSONL.
