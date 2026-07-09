@@ -290,3 +290,32 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 需要注意：本次 3 样本里 `trimmed_for_generation_budget` 均为 0，说明 E8 逐子句分段后单段历史通常没有挤满 512；E9 的价值是防止长历史/长子句再次污染实验，而不是解释本轮所有失败。当前失败仍主要是模型行为问题：即使上一段 text+codes 和当前 text 都进入 full-current prefill，未训练基座仍会复读、串词或漏读，C2 门禁继续失败。
 
 下一步顺序不变但更明确：先做 teacher-forcing NLL 对比，判断真值 codes 在 continuation prefill 下的 NLL 是否显著劣于单段 prefill；再按官方采样配置重跑 HF 诊断。若 NLL 也差，C4 LoRA 的必要性才有干净证据；若 NLL 不差，问题更可能在采样/解码策略而非训练需求。
+
+---
+
+## 10. 2026-07-09 Teacher-Forcing NLL Pilot
+
+按 E7 review §2.3-5，新增 `scripts/python/run_c4_teacher_forcing_nll.py`，在官方 PyTorch Qwen3-TTS 上比较同一目标段真值 codec_0 在两种条件下的逐帧 NLL：
+
+| 条件 | 输入排布 | 统计目标 |
+|---|---|---|
+| `single_segment` | `prefix + current_text + current_codec_BOS + current_codes` | 当前段 codec_0 真值帧 + boundary EOS |
+| `continuation_prefill` | `prefix + history_text + history_codes + boundary_EOS + current_text + current_codec_BOS + current_codes` | 同一个当前段 codec_0 真值帧 + boundary EOS |
+
+为避免 sampling/ASR 干扰，本实验不生成音频，只对 teacher-forced logits 做 cross entropy。single 与 continuation 共享同一模型、同一 speaker embedding、同一目标段 codes。
+
+当前先做 Wenet pilot smoke，尚未达到正式门槛 `N>=20` 且目标文本 `>=20` 字，不能替代最终 NLL 结论；但两组 pilot 信号一致：
+
+| pilot | 样本 | single NLL | continuation NLL | ΔNLL | worse count |
+|---|---:|---:|---:|---:|---:|
+| target segment 1, min 12 chars | 6 | 1.3479 | 1.9922 | +0.6443 | 6/6 |
+| target segment 2, min 12 chars | 5 | 1.1111 | 1.8511 | +0.7400 | 5/5 |
+
+初步判断：在不采样、不解码的 teacher-forcing 条件下，continuation prefill 已经让真值 codec_0 概率显著变差；这支持“当前 continuation 排布超出未训练基座分布”的方向性判断，也解释了 E9 full-current 仍复读/串词。但由于 pilot 文本偏短，下一步需要扩充 manifest，按 review 要求做 `N>=20`、目标文本 `>=20` 字的正式 NLL 分布，再把它作为是否启动 C4 LoRA 的硬证据。
+
+产物：
+
+| 文件 | 说明 |
+|---|---|
+| `workspace/c4_wenet_premium0_pilot_20260708/teacher_forcing_nll_pilot_seg2_min12_limit6.json` | target segment 1 pilot，6 条。 |
+| `workspace/c4_wenet_premium0_pilot_20260708/teacher_forcing_nll_pilot_seg3_min12_limit5.json` | target segment 2 pilot，5 条。 |
