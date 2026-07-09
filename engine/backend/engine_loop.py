@@ -1006,6 +1006,30 @@ class EngineLoop:
             max(64, self._executor.kv_pool.max_seq_len * 2),
         )
 
+    @staticmethod
+    def _steadystream_terminal_drop_mode(group: EngineSessionGroup) -> str:
+        raw = str(
+            group.steadystream_experimental.get(
+                "kv_terminal_drop_mode", "pad_phase"
+            )
+        ).strip().lower().replace("-", "_")
+        if raw in {"eos", "eos_only", "last", "last_token"}:
+            return "eos_only"
+        if raw in {"silence", "tail_silence"}:
+            return "silence"
+        return "pad_phase"
+
+    @staticmethod
+    def _steadystream_terminal_drop_max_tokens(group: EngineSessionGroup) -> int:
+        raw = group.steadystream_experimental.get(
+            "kv_terminal_drop_max_tokens", "24"
+        )
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 24
+        return max(1, min(value, 64))
+
     def _snapshot_talker_kv_tail(
         self,
         slot: SlotKVState,
@@ -1035,8 +1059,20 @@ class EngineLoop:
         return kv.contiguous(), keep, logical_past_len
 
     @staticmethod
-    def _steadystream_terminal_drop_tokens(slot: SlotKVState) -> int:
-        """Drop pad/stop-phase Talker inputs before carrying KV to a new segment."""
+    def _steadystream_terminal_drop_tokens(
+        slot: SlotKVState,
+        *,
+        mode: str = "pad_phase",
+        max_tokens: int = 24,
+    ) -> int:
+        """Drop terminal Talker inputs before carrying KV to a new segment."""
+        mode = (mode or "pad_phase").strip().lower().replace("-", "_")
+        max_tokens = max(1, int(max_tokens))
+        if mode in {"eos", "eos_only", "last", "last_token"}:
+            return 1
+        if mode in {"silence", "tail_silence"}:
+            silence = max(0, int(slot.pad_consecutive_silence))
+            return min(max_tokens, max(1, silence + 1))
         if slot.pad_start_frame >= 0 and slot.frame_idx >= slot.pad_start_frame:
             return max(1, int(slot.frame_idx) - int(slot.pad_start_frame) + 1)
         return 1
@@ -1118,6 +1154,8 @@ class EngineLoop:
         seg: EngineSegment,
         *,
         drop_talker_tail_tokens: int = 0,
+        terminal_drop_mode: str = "pad_phase",
+        terminal_source_frames: int = 0,
     ) -> None:
         if not group.steadystream_variant or seg.slot is None:
             return
@@ -1150,6 +1188,17 @@ class EngineLoop:
                 carry["talker_logical_past_len"] = logical_past_len
                 carry["talker_dropped_last_token"] = drop_talker_tail_tokens > 0
                 carry["talker_dropped_tail_tokens"] = int(drop_talker_tail_tokens)
+                carry["talker_terminal_drop_mode"] = str(terminal_drop_mode)
+                carry["talker_tail_source_frames"] = int(terminal_source_frames)
+                carry["talker_dropped_tail_ratio"] = (
+                    round(
+                        float(drop_talker_tail_tokens)
+                        / max(1.0, float(terminal_source_frames)),
+                        6,
+                    )
+                    if int(terminal_source_frames) > 0
+                    else 0.0
+                )
                 carry["talker_position_offset"] = max(
                     0,
                     int(logical_past_len) - int(compact_len),
@@ -1291,6 +1340,15 @@ class EngineLoop:
         metrics["steadystream_kv_dropped_tail_tokens"] = str(
             int(carry.get("talker_dropped_tail_tokens") or 0)
         )
+        metrics["steadystream_kv_terminal_drop_mode"] = str(
+            carry.get("talker_terminal_drop_mode", "")
+        )
+        metrics["steadystream_kv_tail_source_frames"] = str(
+            int(carry.get("talker_tail_source_frames") or 0)
+        )
+        metrics["steadystream_kv_dropped_tail_ratio"] = str(
+            carry.get("talker_dropped_tail_ratio", "")
+        )
         metrics["steadystream_carry_from_segment"] = str(
             carry.get("from_segment_idx", "")
         )
@@ -1384,6 +1442,15 @@ class EngineLoop:
         metrics["steadystream_replay_original_len"] = str(original_replay_len)
         metrics["steadystream_replay_dropped_tail_tokens"] = str(
             int(carry.get("replay_dropped_tail_tokens") or 0)
+        )
+        metrics["steadystream_kv_terminal_drop_mode"] = str(
+            carry.get("talker_terminal_drop_mode", "")
+        )
+        metrics["steadystream_kv_tail_source_frames"] = str(
+            int(carry.get("talker_tail_source_frames") or 0)
+        )
+        metrics["steadystream_kv_dropped_tail_ratio"] = str(
+            carry.get("talker_dropped_tail_ratio", "")
         )
         metrics["steadystream_token_counts"] = "reset"
         metrics["steadystream_carry_from_segment"] = str(
@@ -1711,14 +1778,32 @@ class EngineLoop:
             "overflow": overflow,
         }
 
+        terminal_drop_mode = self._steadystream_terminal_drop_mode(group)
+        terminal_drop_max = self._steadystream_terminal_drop_max_tokens(group)
+        drop_talker_tail_tokens = (
+            0
+            if overflow or seg.slot is None
+            else self._steadystream_terminal_drop_tokens(
+                seg.slot,
+                mode=terminal_drop_mode,
+                max_tokens=terminal_drop_max,
+            )
+        )
+        metrics["steadystream_terminal_drop_mode"] = terminal_drop_mode
+        metrics["steadystream_talker_dropped_tail_tokens"] = drop_talker_tail_tokens
+        metrics["steadystream_talker_tail_source_frames"] = audio_steps
+        metrics["steadystream_talker_dropped_tail_ratio"] = (
+            round(float(drop_talker_tail_tokens) / max(1.0, float(audio_steps)), 6)
+            if audio_steps > 0
+            else 0.0
+        )
+
         self._store_steadystream_carry(
             group,
             seg,
-            drop_talker_tail_tokens=(
-                0
-                if overflow or seg.slot is None
-                else self._steadystream_terminal_drop_tokens(seg.slot)
-            ),
+            drop_talker_tail_tokens=drop_talker_tail_tokens,
+            terminal_drop_mode=terminal_drop_mode,
+            terminal_source_frames=audio_steps,
         )
         seg.state = "done"
         self._release_segment_slot(seg)

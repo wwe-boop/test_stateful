@@ -702,15 +702,49 @@ class TestSteadyStreamCarry:
         assert carry["talker_dropped_tail_tokens"] == 1
         assert int(carry["talker_kv"][0, 0, 0, -1, 0].item()) == 18
 
-    def test_terminal_drop_tokens_cover_pad_phase(self):
+    def test_terminal_drop_tokens_modes(self):
         slot = SlotKVState(slot_id=0)
         slot.frame_idx = 35
         slot.pad_start_frame = 30
+        slot.pad_consecutive_silence = 2
 
         assert EngineLoop._steadystream_terminal_drop_tokens(slot) == 6
+        assert (
+            EngineLoop._steadystream_terminal_drop_tokens(slot, mode="pad_phase")
+            == 6
+        )
+        assert (
+            EngineLoop._steadystream_terminal_drop_tokens(slot, mode="eos_only")
+            == 1
+        )
+        assert (
+            EngineLoop._steadystream_terminal_drop_tokens(slot, mode="silence")
+            == 3
+        )
+        assert (
+            EngineLoop._steadystream_terminal_drop_tokens(
+                slot,
+                mode="silence",
+                max_tokens=2,
+            )
+            == 2
+        )
 
         slot.pad_start_frame = -1
         assert EngineLoop._steadystream_terminal_drop_tokens(slot) == 1
+
+    def test_terminal_drop_mode_config(self):
+        group = _make_steadystream_group(
+            "s1",
+            {
+                "steadystream_variant": "kv_tail_only",
+                "kv_terminal_drop_mode": "tail-silence",
+                "kv_terminal_drop_max_tokens": "12",
+            },
+        )
+
+        assert EngineLoop._steadystream_terminal_drop_mode(group) == "silence"
+        assert EngineLoop._steadystream_terminal_drop_max_tokens(group) == 12
 
     def test_restore_reports_reset_or_inherited_token_counts(self, model_config):
         hidden = model_config.hidden_size
