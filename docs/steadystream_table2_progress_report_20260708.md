@@ -753,3 +753,26 @@ E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 e
 | 对比变体 | `--include-c1-diagnostics` | 新增 `acoustic_tail_smooth`、`acoustic_tail_tdrop`、`acoustic_tail_smooth_tdrop`、`acoustic_tail_pr_smooth_tdrop`；原有 `acoustic_tail_pause_recovery` 保持为 C1+C3 基线。 |
 
 验证：`py_compile` 已覆盖 `engine/backend/engine_loop.py`、`engine/backend/kv_cache_pool.py`、`scripts/python/run_table2_full_steadystream.py`、`scripts/python/table2_boundary_dsp.py`；`tests/unit/test_table2_boundary_dsp.py` 9 项通过。尚未把新版 engine payload 部署到 5090 重跑 smoke，因此当前只代表代码和单测通过，不代表 F1/F2/F3 的音频收益已确认。下一步应在 0701/001 或当前 1.7B custom 服务上跑 `--include-c1-diagnostics --limit 3`，对比 CER、pause、`boundary_artifact` 和抽听音频后再决定 Lite 定型配置。
+
+---
+
+## 30. 2026-07-10 E30 0701/001 C1 artifact diagnostics smoke
+
+将 E29 新版 engine/runner 同步到 5090，并用原 0701 checkpoint、原 TRT plan、`qwen3-engine:25.10` 重启 `qwen3-engine-custom`。运行目录：`workspace/table2_0701_speaker001_c1diag_e30_20260710/`；本地音频已拉回 `outputs/table2_0701_speaker001_c1diag_e30_20260710/`。样本仍为 `prosody_mini_001-003`、seed=42、speaker=`001`、`input_mode=token`、`stream_group_policy=none`、强制 text chunk boundary。所有 C1 诊断变体 exact boundary 均有效：001/002 为 7/7，003 为 9/9。
+
+CER 结果：
+
+| 组合 | variant | CER 均值 | 判读 |
+|---|---|---:|---|
+| C1 | `acoustic_tail_only` | **3.06%** | 仍是强基线。 |
+| C1+C3+F1/F2+F3 | `acoustic_tail_pr_smooth_tdrop` | **3.06%** | 全开 Lite 候选未伤 CER，并带 pause recovery。 |
+| C1+F1/F2+F3 | `acoustic_tail_smooth_tdrop` | 3.34% | 与 stateless 相当，artifact 最低。 |
+| baseline | `stateless_once` | 3.34% | 单段拼接健康。 |
+| C1+F3 | `acoustic_tail_tdrop` | 3.63% | 单独 F3 未优于纯 C1。 |
+| C1+C3 | `acoustic_tail_pause_recovery` | 4.21% | 本轮比 E28 的 3.63% 差，属 3 样本采样波动/重跑差异。 |
+| C1+F1/F2 | `acoustic_tail_smooth` | 4.21% | smoothing 单独对 CER 不占优，但 artifact 改善明显。 |
+| baseline | `stateful_stream` | 4.78% | 普通流式参考。 |
+
+artifact 指标支持 F1/F2：`acoustic_tail_only` 的 `max_sample_delta_mean=0.1418`、`flux_peak_mean=9.796`；`acoustic_tail_smooth` 降到 `0.0238 / 4.832`；`acoustic_tail_smooth_tdrop` 进一步为 `0.0217 / 3.319`。C3 变体因为边界被替换为目标静音，当前 artifact 窗口指标为 0。F3 的 `steadystream_c1_terminal_dropped_frames` 本轮未在事件 metrics 中出现，说明这 3 条没有稳定触发尾部静音快照 carry，或该指标仍需进一步透传核验；因此当前不能把 F3 单独定型。
+
+结论：E30 证明 F1/F2 是低风险的边界 click/瞬态抑制手段，语义没有灾难性回退；全开 `acoustic_tail_pr_smooth_tdrop` 在 3 条 smoke 上 CER=3.06%，与纯 C1 并列最佳，并且具备 C3 停顿恢复。建议下一步扩到 10 条或全量 mini，并抽听重点对比 `acoustic_tail_only`、`acoustic_tail_smooth_tdrop`、`acoustic_tail_pr_smooth_tdrop` 三档，再决定 Lite 行是否采用“C1+C3+F1/F2（F3 待定）”。

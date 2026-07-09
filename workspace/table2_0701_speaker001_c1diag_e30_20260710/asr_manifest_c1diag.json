@@ -1,0 +1,233 @@
+{
+  "runs_root": "workspace/table2_0701_speaker001_c1diag_e30_20260710",
+  "container_runs_root": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710",
+  "variants": [
+    "stateful_stream",
+    "stateless_once",
+    "acoustic_tail_only",
+    "acoustic_tail_smooth",
+    "acoustic_tail_tdrop",
+    "acoustic_tail_smooth_tdrop",
+    "acoustic_tail_pause_recovery",
+    "acoustic_tail_pr_smooth_tdrop"
+  ],
+  "n_rows": 24,
+  "rows": [
+    {
+      "key": "42:prosody_mini_001:stateful_stream",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateful_stream",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/stateful_stream.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:stateless_once",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateless_once",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/stateless_once.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_only",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_only",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/acoustic_tail_only.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_smooth",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_smooth",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/acoustic_tail_smooth.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_tdrop",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_tdrop",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/acoustic_tail_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_smooth_tdrop",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_smooth_tdrop",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/acoustic_tail_smooth_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_pause_recovery",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pause_recovery",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/acoustic_tail_pause_recovery.wav"
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_pr_smooth_tdrop",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pr_smooth_tdrop",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_001/acoustic_tail_pr_smooth_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:stateful_stream",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateful_stream",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/stateful_stream.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:stateless_once",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateless_once",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/stateless_once.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_only",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_only",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/acoustic_tail_only.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_smooth",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_smooth",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/acoustic_tail_smooth.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_tdrop",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_tdrop",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/acoustic_tail_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_smooth_tdrop",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_smooth_tdrop",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/acoustic_tail_smooth_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_pause_recovery",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pause_recovery",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/acoustic_tail_pause_recovery.wav"
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_pr_smooth_tdrop",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pr_smooth_tdrop",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_002/acoustic_tail_pr_smooth_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:stateful_stream",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateful_stream",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/stateful_stream.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:stateless_once",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateless_once",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/stateless_once.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_only",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_only",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/acoustic_tail_only.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_smooth",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_smooth",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/acoustic_tail_smooth.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_tdrop",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_tdrop",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/acoustic_tail_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_smooth_tdrop",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_smooth_tdrop",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/acoustic_tail_smooth_tdrop.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_pause_recovery",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pause_recovery",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/acoustic_tail_pause_recovery.wav"
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_pr_smooth_tdrop",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pr_smooth_tdrop",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1diag_e30_20260710/seed_42/prosody_mini_003/acoustic_tail_pr_smooth_tdrop.wav"
+    }
+  ]
+}
