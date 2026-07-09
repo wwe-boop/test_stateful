@@ -173,6 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loss-scope", choices=["all", "target"], default="target")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--eval-limit", type=int, default=5)
+    parser.add_argument("--eval-offset", type=int, default=0)
     parser.add_argument("--output-summary", type=Path, required=True)
     return parser.parse_args()
 
@@ -182,10 +183,15 @@ def main() -> int:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    rows = read_jsonl(args.manifest_jsonl)[: args.limit]
+    all_rows = read_jsonl(args.manifest_jsonl)
+    rows = all_rows[: args.limit]
     if not rows:
         raise ValueError("empty training manifest")
-    eval_rows_subset = rows[: min(args.eval_limit, len(rows))]
+    eval_start = max(0, args.eval_offset)
+    eval_end = eval_start + args.eval_limit
+    eval_rows_subset = all_rows[eval_start:eval_end]
+    if not eval_rows_subset:
+        raise ValueError("empty eval manifest slice")
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         str(args.model_dir),
@@ -246,6 +252,7 @@ def main() -> int:
         "target_segment_index": args.target_segment_index,
         "train_samples": len(rows),
         "eval_samples": len(eval_rows_subset),
+        "eval_offset": args.eval_offset,
         "epochs": args.epochs,
         "lr": args.lr,
         "loss_scope": args.loss_scope,

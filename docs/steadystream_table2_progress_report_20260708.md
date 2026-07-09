@@ -263,14 +263,14 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 | combined loss | 15.897184 |
 | 显存 | reserved 约 2.35GB |
 
-离线生成产物：`workspace/c4_wenet_premium0_pilot_20260708/hf_06b_continuation_generate_limit1_seg2/`；本地已拉回到 `outputs/c4_wenet_premium0_pilot_20260708_hf_06b_continuation_generate_limit1_seg2/`。生成音频 `hf_continuation.wav` 时长 7.6s，参考文本只有“笑得有些阴森研默，”8 个归一化字符，但 ASR 出现重复“据”字串，说明不经训练的 HF 基座同样不能稳定消费 continuation 排布。这排除了“TRT 临时 profile512 是唯一主因”的解释。
+离线生成产物：`workspace/c4_wenet_premium0_pilot_20260708/hf_06b_continuation_generate_limit1_seg2/`；本地已拉回到 `outputs/c4_wenet_premium0_pilot_20260708_hf_06b_continuation_generate_limit1_seg2/`。生成音频 `hf_continuation.wav` 时长 7.6s，参考文本只有“笑得有些阴森研默，”8 个归一化字符，ASR 出现重复“据”字串。复核后将该单样本 HF 生成降级为旁证：当次脚本使用贪心解码、无单段/官方 API 对照，不能单独证明“基座无法消费续写排布”；真正不受采样污染的硬证据以后续 E10 teacher-forcing NLL 为准。
 
 当前第 0 步结论：
 
 1. C4 continuation batch 的内部顺序是对的：`current_codec_bos` 均与 `text1 + codes1 + text2` 推导位置一致。
 2. 训推仍有一个必须收口的差异：训练 collate 的 prefix 是官方 finetune 8 槽结构，runtime full-current 的 cacheable prefix 是 21 槽结构。进入 LoRA 诊断前，应统一为同一个前缀构造函数或明确证明两者等价。
-3. 离线 HF 生成也崩，且表现为无 EOS、拖长、复读/乱码；因此“基座不经 continuation 训练无法消费续写排布”的判断进一步增强。
-4. 下一步优先级不是继续调 tail，而是先把 C4 collate 和 runtime full-current 共用前缀构造，再做最小 LoRA 训练诊断，看 continuation CER 是否从 29%/225% 方向显著回落。
+3. 离线 HF 生成当次表现为拖长、复读/乱码，但因使用贪心解码且缺少对照组，只能作为问题现象记录；不能作为 C4 必要性的独立证据。
+4. 下一步优先级不是继续调 tail，而是先用 teacher-forcing NLL 建立无采样污染证据，再把 C4 collate 和 runtime full-current 共用前缀构造，最后做最小 LoRA/训练诊断，看 continuation CER 是否相对 E9 的 42%/65% 显著回落。
 
 ---
 
@@ -356,10 +356,26 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 
 | smoke | loss scope | lr | epochs | eval N | before target NLL | after target NLL | Δ after-before | 判断 |
 |---|---|---:|---:|---:|---:|---:|---:|---|
-| 全段 loss | all | 2e-5 | 1 | 5 | 1.825440 | 4.280673 | +2.455233 | 错误/不稳：历史也监督会伤害目标段。 |
+| 全段 loss | all | 2e-5 | 1 | 5 | 1.825440 | 4.280673 | +2.455233 | 高学习率下爆炸；不能据此否定 all-loss。 |
 | target-only | target | 2e-5 | 1 | 5 | 1.825440 | 4.229811 | +2.404371 | 学习率过大，破坏 base 分布。 |
 | target-only | target | 1e-6 | 1 | 5 | 1.825440 | 1.817586 | -0.007854 | 稳但基本不动。 |
 | target-only | target | 5e-6 | 1 | 20 | 1.882413 | 1.669300 | -0.213113 | 当前最佳 smoke：C4 目标可优化。 |
 | target-only | target | 5e-6 | 3 | 5 | 1.825440 | 1.737562 | -0.087878 | 多 epoch 没继续改善，tiny 全参有漂移/过拟合风险。 |
 
 判读：C4 continuation 目标不是不可学，`target-only + 5e-6 + 1 epoch` 已在全 20 条正式 NLL 样本上把 target NLL 拉低约 0.21。但这还不能作为表 2 C4 交付数字，因为它没有保存/评估可生成 checkpoint，也没有跑 CER/音频；同时全参小数据训练对学习率非常敏感，高 LR 会快速破坏原模型分布。下一步应补 LoRA/冻结策略或使用官方训练框架改造后的 C4 collate，在更大 continuation 数据上训练，再回到 E8/E9 的 corrected token-mode runner 测 C2/C4 CER。
+
+
+---
+
+## 13. 2026-07-09 E12 Held-out C4 Teachability 复核
+
+根据最新 review，对 E11 做两项修正：第一，E11 的 `-0.213` 是同 20 条训练集上的 NLL 改善，只能说明可记忆，不能说明泛化；第二，`all-loss` 只在 `2e-5` 高学习率下测过，不能得出“全段 loss 会伤害目标段”的结论。因此将 `train_c4_continuation_smoke.py` 增加 `--eval-offset`，用同一正式 manifest 做 `前 15 条训练 / 后 5 条 held-out 评估`，并在 `5e-6` 下补齐 target-only 与 all-loss 对照。
+
+| held-out smoke | train N | eval offset/N | loss scope | lr | epochs | before held-out NLL | after held-out NLL | Δ after-before | 判断 |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---|
+| C4 smoke | 15 | 15 / 5 | target-only | 5e-6 | 1 | 1.489866 | 1.287174 | -0.202692 | held-out 也改善，说明不只是训练集记忆。 |
+| C4 smoke | 15 | 15 / 5 | all-loss | 5e-6 | 1 | 1.489866 | 1.317911 | -0.171955 | all-loss 同样正向，略弱于 target-only；不能排除。 |
+
+逐样本看，5 条 held-out 中 4 条 NLL 下降、1 条轻微上升；target-only 与 all-loss 都主要改善了原始 NLL 最高的样本。当前结论修正为：C4 continuation 目标具备初步 held-out teachability；`5e-6` 是比 `1e-6`/`2e-5` 更合理的全参 smoke 学习率；但正式 C4 训练不应过早锁死 target-only。下一步应按计划做 LoRA/冻结策略、放量 Wenet continuation 数据，并把 all-loss + history drop 与 target-only 作为训练消融，而不是把 E11 的高 LR 爆炸归因给 loss scope。
+
+同时，§8.5 的单样本 HF 生成结论已降级：那次贪心生成只能说明诊断现象，不能单独作为“基座不会 continuation”的证据；当前 C4 必要性的硬依据是 E10 正式 teacher-forcing NLL（N=20, ΔNLL +0.702, 19/20 更差）和 E9 within-engine corrected smoke。
