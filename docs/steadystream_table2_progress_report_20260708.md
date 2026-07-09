@@ -271,3 +271,22 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 2. 训推仍有一个必须收口的差异：训练 collate 的 prefix 是官方 finetune 8 槽结构，runtime full-current 的 cacheable prefix 是 21 槽结构。进入 LoRA 诊断前，应统一为同一个前缀构造函数或明确证明两者等价。
 3. 离线 HF 生成也崩，且表现为无 EOS、拖长、复读/乱码；因此“基座不经 continuation 训练无法消费续写排布”的判断进一步增强。
 4. 下一步优先级不是继续调 tail，而是先把 C4 collate 和 runtime full-current 共用前缀构造，再做最小 LoRA 训练诊断，看 continuation CER 是否从 29%/225% 方向显著回落。
+
+---
+
+## 9. 2026-07-09 E9 容量预算修复与 full-current 复测
+
+`24d181e` 新增 token-history 生成预算：在构造 `prefix + history_text + history_codes + current_text + codec_BOS` 时，先按 `当前文本 token 数 × 4.0 frames/token × 1.6` 预留当前段 decode 帧，再让历史 codes 使用剩余窗口；同时把 `generation_budget_frames`、`max_seq_len`、`trimmed_for_generation_budget` 写入 prefill metrics。目标单测已通过：`40 passed`。
+
+在 E8 分段修复 + E9 容量预算后，重跑 `prosody_mini_001..003` 的 full-current token-history 3 样本 smoke：
+
+| 变体 | CER 均值 | 时长现象 | overflow | 判断 |
+|---|---:|---|---:|---|
+| `full_current_silence` | 41.95% | 25.28s / 63.68s / 30.64s | 0/3 | 比 raw-KV 65%/259% 更可解释，但仍远离 3%-6% 基线。 |
+| `full_current_eos_only` | 69.19% | 41.92s / 64.16s / 49.44s | 0/3 | 保留完整尾部更容易拖长和复读。 |
+
+逐样本观察：`prosody_001` silence 仍复读开头一句但整体可读，CER 25.00%；`prosody_003` silence 较好，CER 16.38%；`prosody_002` silence 仍严重漏读/重复，CER 84.48%。所有样本 exact boundary 均有效，且本轮没有 overflow，因此旧“512 slot 截断”污染已经从这组实验中排除。
+
+需要注意：本次 3 样本里 `trimmed_for_generation_budget` 均为 0，说明 E8 逐子句分段后单段历史通常没有挤满 512；E9 的价值是防止长历史/长子句再次污染实验，而不是解释本轮所有失败。当前失败仍主要是模型行为问题：即使上一段 text+codes 和当前 text 都进入 full-current prefill，未训练基座仍会复读、串词或漏读，C2 门禁继续失败。
+
+下一步顺序不变但更明确：先做 teacher-forcing NLL 对比，判断真值 codes 在 continuation prefill 下的 NLL 是否显著劣于单段 prefill；再按官方采样配置重跑 HF 诊断。若 NLL 也差，C4 LoRA 的必要性才有干净证据；若 NLL 不差，问题更可能在采样/解码策略而非训练需求。
