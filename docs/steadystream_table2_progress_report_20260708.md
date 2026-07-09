@@ -557,3 +557,27 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 
 当前门禁：不扩大 1.7B LoRA，不导出新 TRT；先让 1.7B 生成装置通过单段健康门禁。
 
+---
+
+## 20. 2026-07-09 E19 1.7B Runtime Token-mode 单样本 Smoke
+
+为绕开 E18 中 PyTorch hand-prefill 对 1.7B custom 生成不健康的问题，改用已部署的 custom-1.7B TRT engine 跑真实表 2 runtime 口径：`input_mode=token`、`stream_group_policy=none`、默认启用 `force_text_chunk_boundary=true`，样本为 `seed=42/prosody_mini_001`。
+
+命令产物：`workspace/table2_1p7b_runtime_token_smoke_e19_20260709/`。该 run 成功生成 7 个 wav，并完成 Paraformer ASR/CER。
+
+| variant | audio sec | exact boundaries | CER | 形态 |
+|---|---:|---:|---:|---|
+| `stateless_once` | 21.20 | concat exact | 1.14% | 单段/offline 口径健康。 |
+| `stateful_stream` | 23.28 | 7/7 | 3.41% | runtime token-mode 健康。 |
+| `acoustic_tail_only` | 22.64 | 7/7 | 2.27% | C1 声学尾健康。 |
+| `offline_full` | 24.24 | n/a | 2.27% | offline 对照健康。 |
+| `kv_tail_only` | 78.32 | 7/7 | 259.09% | 严重历史复读，hyp 314 chars vs ref 88。 |
+| `tail_kv_pause_recovery` | 97.50 | event partially non-exact in summary | 270.45% | 更严重拖长/复读。 |
+| `full_steadystream` | 80.59 | event partially non-exact in summary | 244.32% | Full 当前仍退化为 KV 历史复读。 |
+
+这组结果非常关键：1.7B custom 的真实 runtime 单段/流式是健康的（1%-3% CER），所以 E18 的 PyTorch hand-prefill single=100% 不是模型本身坏，而是离线生成装置没有复现 custom runtime 前缀/推理形态。另一方面，runtime token-mode 下 KV/Full 仍 244%-270% CER，和 E8/E9 的“历史复读”诊断一致，说明当前线上 C2/C4-style history 仍不能直接交付表 2 Full 行。
+
+判读：后续 1.7B 生成级验证应以 runtime/token-mode 为准；PyTorch 离线生成只有在先复现 runtime 单段 1%-3% CER 后才可恢复使用。当前优先级变为：在 runtime 侧继续做 C2/C4 诊断（如 full-current / drop-mode / history text mask），而不是继续用 Wenet codes 训练 1.7B LoRA 或导出新 TRT。
+
+本地拉回状态：`table2_cer.json` 和部分 wav 已开始同步到 `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_1p7b_runtime_token_smoke_e19_20260709/`；但 SSH 文件流在拉取 wav 时两次断开，远端完整产物仍在上述 workspace 目录。若需要人工回听，下一步单独用分块/base64 或重新建立稳定传输通道拉取剩余 wav。
+
