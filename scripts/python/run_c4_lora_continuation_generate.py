@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate C4 continuation wavs with optional PEFT LoRA adapter."""
+"""Generate C4 single/continuation wavs with an optional PEFT LoRA adapter."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 from qwen_tts import Qwen3TTSModel  # noqa: E402
 from scripts.python.build_c4_continuation_batch import build_continuation_batch, read_jsonl  # noqa: E402
 from scripts.python.run_c4_forward_smoke import first_ref_audio, load_ref_mels, special_ids_from_model_config  # noqa: E402
+from scripts.python.run_c4_teacher_forcing_nll import row_for_single_segment  # noqa: E402
 
 
 def build_embeddings(
@@ -66,6 +67,63 @@ def build_embeddings(
     return input_embeddings, tts_pad_embed.to(device=device, dtype=dtype)
 
 
+def build_generation_batch(
+    *,
+    row: dict[str, Any],
+    processor: Any,
+    special_ids: Any,
+    args: argparse.Namespace,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any], int, str]:
+    if args.generation_mode == "single":
+        build_row = row_for_single_segment(row, args.target_segment_index)
+        target_index = 0
+        max_segments = 1
+    else:
+        build_row = row
+        target_index = args.target_segment_index
+        max_segments = args.target_segment_index + 1
+
+    batch, layouts = build_continuation_batch(
+        [build_row],
+        tokenizer=processor,
+        special_ids=special_ids,
+        max_segments=max_segments,
+    )
+    return batch, layouts[0], target_index, str(row.get("sample_id") or "sample")
+
+
+def summarize_generation_stop(result: Any, codes: torch.Tensor, eos_id: int, max_new_tokens: int) -> tuple[torch.Tensor, dict[str, Any]]:
+    sequences = getattr(result, "sequences", None)
+    sequence_tokens: list[int] = []
+    if sequences is not None:
+        sequence_tokens = [int(x) for x in sequences[0].detach().cpu().tolist()]
+
+    sequence_eos_positions = [i for i, token in enumerate(sequence_tokens) if token == eos_id]
+    sequence_eos_step = int(sequence_eos_positions[0]) if sequence_eos_positions else -1
+    hidden_eos_positions = (codes[:, 0] == eos_id).nonzero(as_tuple=False)
+    hidden_eos_step = int(hidden_eos_positions[0].item()) if hidden_eos_positions.numel() else -1
+
+    if 0 <= sequence_eos_step <= int(codes.shape[0]):
+        effective = codes[:sequence_eos_step]
+        stop_reason = "sequence_eos"
+    elif 0 <= hidden_eos_step < int(codes.shape[0]):
+        effective = codes[:hidden_eos_step]
+        stop_reason = "hidden_state_eos"
+    else:
+        effective = codes
+        stop_reason = "max_new_tokens" if int(codes.shape[0]) >= max_new_tokens - 1 else "unknown_short"
+
+    return effective, {
+        "raw_generated_steps": int(codes.shape[0]),
+        "sequence_len": len(sequence_tokens),
+        "sequence_last_token": int(sequence_tokens[-1]) if sequence_tokens else None,
+        "sequence_eos_step": sequence_eos_step,
+        "legacy_hidden_state_eos_step": hidden_eos_step,
+        "eos_step": sequence_eos_step,
+        "stop_reason": stop_reason,
+    }
+
+
 @torch.inference_mode()
 def generate_one(
     *,
@@ -76,17 +134,16 @@ def generate_one(
     args: argparse.Namespace,
     index: int,
 ) -> dict[str, Any]:
-    batch, layouts = build_continuation_batch(
-        [row],
-        tokenizer=qwen3tts.processor,
+    batch, layout, build_target_index, source_sample_id = build_generation_batch(
+        row=row,
+        processor=qwen3tts.processor,
         special_ids=special_ids,
-        max_segments=args.target_segment_index + 1,
+        args=args,
     )
-    layout = layouts[0]
-    target = layout["segments"][args.target_segment_index]
+    target = layout["segments"][build_target_index]
     prefill_len = int(target["codec_bos"]) + 1
     target_frames = int(target["codec_frames"])
-    max_new_tokens = args.max_new_tokens or max(target_frames + args.extra_tokens, 16)
+    max_new_tokens = args.max_new_tokens or args.official_max_new_tokens
 
     ref_mels = load_ref_mels(first_ref_audio(row, repo_root=args.repo_root))
     input_embeddings, tts_pad_embed = build_embeddings(
@@ -129,32 +186,32 @@ def generate_one(
         raise RuntimeError(f"{layout['sample_id']}: no codec steps")
     codes = torch.stack(code_steps, dim=1)[0]
     eos_id = int(model.config.talker_config.codec_eos_token_id)
-    eos_positions = (codes[:, 0] == eos_id).nonzero(as_tuple=False)
-    eos_step = int(eos_positions[0].item()) if eos_positions.numel() else -1
-    effective = codes[:eos_step] if eos_step >= 0 else codes
+    effective, stop_info = summarize_generation_stop(result, codes, eos_id, max_new_tokens)
 
-    sample_id_value = str(layout["sample_id"])
-    sample_dir = args.output_dir / f"{index:03d}_{sample_id_value}"
+    sample_dir = args.output_dir / f"{index:03d}_{args.generation_mode}_{source_sample_id}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     codes_path = sample_dir / "generated_codes.pt"
     wav_path = sample_dir / "hf_continuation.wav"
     torch.save(effective.detach().cpu(), codes_path)
     wavs, sample_rate = model.speech_tokenizer.decode([{"audio_codes": effective}])
     sf.write(str(wav_path), wavs[0], sample_rate)
+
     reference = str((row.get("segments") or [])[args.target_segment_index].get("text") or "")
     item = {
-        "key": f"{args.variant}:{sample_id_value}",
-        "sample_id": sample_id_value,
+        "key": f"{args.variant}:{args.generation_mode}:{source_sample_id}",
+        "sample_id": source_sample_id,
         "variant": args.variant,
+        "generation_mode": args.generation_mode,
         "seed": int(args.seed),
         "wav_path": str(wav_path),
         "reference": reference,
         "target_segment_index": args.target_segment_index,
+        "build_target_index": build_target_index,
         "prefill_len": prefill_len,
         "target_frames": target_frames,
         "max_new_tokens": max_new_tokens,
         "generated_frames": int(effective.shape[0]),
-        "eos_step": eos_step,
+        **stop_info,
         "layout": layout,
     }
     (sample_dir / "summary.json").write_text(json.dumps(item, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -170,14 +227,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="cuda:1")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--target-segment-index", type=int, default=2)
+    parser.add_argument("--generation-mode", choices=("continuation", "single"), default="continuation")
     parser.add_argument("--max-new-tokens", type=int)
-    parser.add_argument("--extra-tokens", type=int, default=32)
+    parser.add_argument("--official-max-new-tokens", type=int, default=4096)
+    parser.add_argument("--extra-tokens", type=int, default=32, help="Deprecated; kept for old command compatibility.")
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--do-sample", action="store_true")
+    parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.9)
-    parser.add_argument("--subtalker-dosample", action="store_true")
+    parser.add_argument("--subtalker-dosample", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--subtalker-top-k", type=int, default=50)
     parser.add_argument("--subtalker-top-p", type=float, default=1.0)
     parser.add_argument("--subtalker-temperature", type=float, default=0.9)
@@ -204,7 +263,12 @@ def main() -> int:
     for index, row in enumerate(rows):
         item = generate_one(row=row, qwen3tts=qwen3tts, model=model, special_ids=special_ids, args=args, index=index)
         items.append(item)
-        print(f"[generated] {index + 1}/{len(rows)} {item['sample_id']} frames={item['generated_frames']} eos={item['eos_step']}", flush=True)
+        print(
+            f"[generated] {index + 1}/{len(rows)} {item['generation_mode']} {item['sample_id']} "
+            f"frames={item['generated_frames']} raw={item['raw_generated_steps']} "
+            f"stop={item['stop_reason']} seq_eos={item['sequence_eos_step']}",
+            flush=True,
+        )
     manifest = {"rows": [{k: v for k, v in item.items() if k != "layout"} for item in items]}
     (args.output_dir / "asr_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     summary = {
@@ -214,6 +278,9 @@ def main() -> int:
         "variant": args.variant,
         "limit": args.limit,
         "target_segment_index": args.target_segment_index,
+        "generation_mode": args.generation_mode,
+        "max_new_tokens": args.max_new_tokens,
+        "official_max_new_tokens": args.official_max_new_tokens,
         "sampling": {
             "do_sample": args.do_sample,
             "top_k": args.top_k,

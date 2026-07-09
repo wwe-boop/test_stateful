@@ -475,3 +475,51 @@ LoRA 目标模块先用 `q_proj,v_proj`，评估固定为正式 20 条 NLL eval�
 
 下一步门禁保持不变：当前结果不批准启动表 2 完整 C4 大跑。应先在小样本上解决 `NLL 好但 generation 差` 的桥接问题，优先做三项：1）加入 C4 训练时的显式 current-text 对齐/历史 loss mask，降低历史语义串入；2）生成脚本增加 text-channel EOS、codec 有效码率和特殊码分布日志，定位为什么 `eos_step=-1` 仍提前停；3）在同一 3 条上补 `single current text -> codes` 生成对照，确认不是采样/声码器基础路径问题，再决定是否继续放大 LoRA 数据。
 
+---
+
+## 18. 2026-07-09 E17 生成评估装置复核与单段对照
+
+根据新增 review §12，先不继续放大训练，而是审计 E16 的生成评估装置。两项最低成本裁决如下：
+
+1. E16 三个 run 的 `summary.json` 均确认 `do_sample=true`、`subtalker_dosample=true`、`top_k=50`、`top_p=1.0`、`temperature=0.9`、`repetition_penalty=1.05`，因此 E16 不是“静默贪心”作废。
+2. 样本 002 的历史段 1 文本就是“我走过去，”；三条件输出“我走过去”是明确的历史串入，不是随机 ASR 幻觉。
+
+同时升级 `scripts/python/run_c4_lora_continuation_generate.py`：
+
+| 修改 | 目的 |
+|---|---|
+| `--do-sample/--subtalker-dosample` 默认改为官方 True，并支持 `--no-do-sample` 显式关闭 | 防止漏传 flag 退回贪心。 |
+| 增加 `--generation-mode single/continuation` | 同一手搓 prefill 管线直接跑单段健康对照。 |
+| EOS 改用 `result.sequences` 判定，记录 `sequence_eos_step/raw_generated_steps/stop_reason` | 修复 hidden_states 看不到 EOS 导致 `eos_step=-1` 的问题。 |
+| `--max-new-tokens` 显式记录；本轮统一设为 256 | 避免旧版 `target_frames+32` 真值长度泄漏和删失污染。 |
+
+E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuation 三组使用同一 `max_new_tokens=256`：
+
+| 生成模式 | adapter | CER 均值 | 帧数 / 目标帧 | stop reason | 判读 |
+|---|---|---:|---|---|---|
+| single | 无 | 1.75% | 61/64, 64/71, 57/55 | 全部 `sequence_eos` | 装置、采样、声码器、ASR 口径健康；单段无灾难性遗忘。 |
+| continuation | 无 | 97.88% | 99/64, 255/71, 13/55 | eos, max cap, eos | 放开 cap 后 base 更差，第二条撞 256；continuation 排布明显 OOD。 |
+| continuation | step200 | 74.70% | 66/64, 71/71, 10/55 | 全部 `sequence_eos` | 与 E16 一致；LoRA 能减少 base 的长复读，但历史串入和第三条早停仍在。 |
+| continuation | step250 | 69.55% | 39/64, 21/71, 10/55 | 全部 `sequence_eos` | CER 略低但靠短输出/删除换插入，不能视为真实达标。 |
+
+逐条关键 ASR：
+
+| 样本 | single base | continuation base | step200 | step250 |
+|---|---|---|---|---|
+| 000 | 完整正确 | 历史“他摇摇头...”+ 当前句 | 历史前缀 + 当前句 | 历史前缀 + 当前句，较短 |
+| 001 | 完整正确 | 跑到 255 帧 cap，明显胡言/复读 | 历史前缀 + 当前句 | 早停成无关短句 |
+| 002 | “摄魂香/射魂香”1 字差 | 直接输出历史段“我走过去” | 同左 | 同左 |
+
+本地回听包已同步：
+
+| 本地目录 | 内容 |
+|---|---|
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_base_single_eval3_e17/` | base 单段对照 wav/codes/ASR。 |
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_base_cont_eval3_e17/` | base continuation wav/codes/ASR。 |
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_lora_step200_cont_eval3_e17/` | step200 continuation wav/codes/ASR。 |
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_lora_step250_cont_eval3_e17/` | step250 continuation wav/codes/ASR。 |
+
+判读更新：E16 的“LoRA 有方向性改善但不达标”仍成立，且现在由单段健康对照加固；但 step250 的较低 CER 不能当成更好路线，因为它主要通过短输出减少插入。当前最可信结论是：0.6B base 单段生成健康，continuation 排布会触发历史语义串入；LoRA step200/250 只部分缓解，尚未压过 corrected C2 的 41.95% 门槛，更不能进入完整表 2 C4 大跑。
+
+项目决策同步：后续新实验按 review §12.3 切到 `1.7B 基座 + input_mode=token + force_text_chunk_boundary + exact-boundary gate`；0.6B E10-E17 保留为方法论记录。下一步不再扩大 0.6B 训练，先确认线上同源 custom-1.7B PyTorch 权重位置，然后在 1.7B 上重建 NLL 门禁和生成装置单段/continuation 对照。
+
