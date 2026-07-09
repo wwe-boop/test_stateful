@@ -828,3 +828,35 @@ API 判定：`http://39.101.65.229:44083/` 是 FastAPI WebUI，`/api/generate` �
 | 初次 ASR 抽检均值受数字拖高 | speechserver 缺 `cn2an`，`2026` vs “二零二六” 被当成错字 | 安装 `cn2an` 后按原脚本重跑；同时剔除 ASR>10% 和 `alnum_count>=35` 的高风险样本。 |
 
 当前状态：Phase 1.2/1.3 已完成，得到可进入 Phase 1.4 的 `clean500` full-passage wav+manifest。下一步不是训练，仍需先做 Phase 1.4：从整段 wav 获取 ASR/align 时间戳，按标点切成 continuation segments，抽 codec codes，构建 C4 continuation manifest 并跑 schema/pause 校验。
+
+---
+
+## 33. 2026-07-10 E35 C4 Phase 1.4 engine-event continuation manifest
+
+按 `steadystream_c4_execution_playbook_20260710.md` 阶段 1.4，完成 `clean500` full-passage wav 到 C4 continuation manifest 的第一版可训练数据构建。因为当前可用 Paraformer 批处理脚本只返回整句文本、没有稳定词级时间戳，本轮没有使用“按字符比例估算边界”的假切法，而是改用整段合成时 engine 记录的 `text_boundary_commit` 与 `segment_end(audio_steps)`：文本边界来自 full_text engine 真实提交事件，音频边界按各 engine segment 的 `audio_steps` 比例映射到整段 wav。该方案不是最终理想的 ASR word timestamp slicing，但比 proxy char split 更接近一次自回归整段合成内部的真实分段。
+
+新增脚本：
+
+| 文件 | 用途 |
+|---|---|
+| `scripts/python/build_c4_manifest_from_synth_events.py` | 从 full-passage manifest、engine event json、full wav 构建 C4 continuation segments；切出子段 wav，记录 `pause_ms`、`punct_class`、`engine_segment_id`、`audio_steps`、`split_source=engine_full_text_events`。 |
+
+关键产物在 5090-Host：`/home/zehan/workspace/Qwen3-TTS-Triton/workspace/c4_synth_v1_clean500/`；4090 侧已同步 summary 到 `workspace/c4_engine_chunk_manifest*_summary.json`。数据构建流程为：
+
+| 步骤 | 产物 | 数字 | 验收 |
+|---|---|---:|---|
+| engine event 切分 | `c4_engine_chunk_manifest.jsonl` | 499 usable rows / 1221 segments / 3.5954 h | 500 条 clean full-passage 中 1 条只有单 chunk，跳过；其余可用。 |
+| schema 校验 | `c4_engine_chunk_manifest_validation_summary.json` | 499 valid samples / issue_count=0 | speaker 全部 `001`，source 全部 `c4_synth_full_passage`。 |
+| 选 target segment=1 | `c4_engine_chunk_selected_t1.jsonl` + `prepare_data_input_t1.jsonl` | 498 selected samples / 996 prepare rows | 保证每条有 history+target 两段，target 文本长度达标。 |
+| codec 抽码 | `prepared_with_codes_t1.jsonl` | 996/996 complete | 使用官方 `../Qwen3-TTS/finetuning/prepare_data.py` 与 `Qwen3-TTS-Tokenizer-12Hz`。 |
+| attach codes + 校验 | `c4_engine_chunk_manifest_with_codes_t1.jsonl` | 498 samples / 996 coded segments / 149,796 code frames / 3.3288 h / issue_count=0 | 已满足 Phase 1.4 “≥500 级样本、≥3h、schema issues=0”的 500 试产门禁；严格计数为 498 条 continuation 样本。 |
+
+本轮的工程取舍和风险：
+
+| 项 | 说明 | 后续处理 |
+|---|---|---|
+| 边界来源 | engine full_text 事件是真实的合成内部 chunk 边界，不是外部 ASR 文本比例 proxy。 | 可用于先跑 C4 训练 plumbing 与 NLL 基线。 |
+| 音频切点 | 由 `audio_steps` 比例映射到 wav frame，无法保证达到词级 timestamp 精度。 | 后续若接入词级 ASR/aligner，应重建 word-timestamp manifest 并复核 pause 分布。 |
+| 样本结构 | 当前选择 target segment index=1，因此每条样本是 2 段 history→target，适合先做 Phase 2 NLL 和小 LoRA 格式消融。 | 正式扩训前再扩到多 target index、多段 history，避免只学“一句接一句”的窄分布。 |
+
+结论：Phase 1.4 的“可训练 continuation manifest”已经打通，并且不是坏的 proxy boundary 实验。下一步按 playbook 进入 Phase 2：从 Phase 1 产物中冻结一份不入训的 `eval20_001`，在 0701 checkpoint / speaker `001` 上跑 teacher-forcing NLL，先拿到可信的 single/continuation 格式 OOD 基线；在 NLL 基线完成前，不启动 C4 LoRA 训练。
