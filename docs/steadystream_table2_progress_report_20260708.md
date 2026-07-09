@@ -345,3 +345,21 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 判读：这组结果已经满足 review 的 `N>=20` 和目标文本 `>=20` 字门槛。因为它是 teacher-forcing，对同一目标段真值 codec_0 计算 NLL，不经过采样、声码器和 ASR，所以排除了“CER 归一化/ASR 听错/采样偶然性”作为主要解释。continuation prefill 使真值 codes 的平均 NLL 上升约 60%，且 19/20 更差，说明未训练 0.6B base 在 `history_text + history_codes + current_text` 的 C4 续写排布上确实处于分布外。
 
 这也解释了 E8/E9 后 full-current 仍复读、串词、漏读：工程侧的分段和容量污染已被修掉，但模型本身没有学会“带历史音频 token 的下一段 codec 续写”。因此 C2 门禁仍不应直接宣布通过；下一步可以启动最小 C4 LoRA 诊断，但训练目标必须使用与 runtime full-current 一致的 prefix/continuation 排布，并在训练前继续保留 E0/ASR 口径冻结问题作为最终表 2 风险项。
+
+---
+
+## 12. 2026-07-09 E11 C4 Continuation 训练可学习性 Smoke
+
+在 E10 正式 NLL 证明 base 不会稳定消费 continuation 排布后，新增 `scripts/python/train_c4_continuation_smoke.py` 做最小 C4 teachability 诊断。该脚本不是正式训练 recipe，不保存 checkpoint；它复用已验证的 C4 batch 排布，在同一 20 条 Wenet continuation 样本上做少量全参 step，并比较训练前/训练后 target segment teacher-forcing NLL。
+
+关键实现口径：历史段 `text+codes` 只作为上下文进入 attention；默认 `loss_scope=target`，只在当前目标段 codec frames + boundary EOS 上打 `codec_0_labels` 和 residual-code `codec_mask`。这比把历史段也纳入 loss 更符合 C2/C4 续写第一性原理：推理时历史已经发生，训练目标应是“给定历史，预测下一段”。
+
+| smoke | loss scope | lr | epochs | eval N | before target NLL | after target NLL | Δ after-before | 判断 |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| 全段 loss | all | 2e-5 | 1 | 5 | 1.825440 | 4.280673 | +2.455233 | 错误/不稳：历史也监督会伤害目标段。 |
+| target-only | target | 2e-5 | 1 | 5 | 1.825440 | 4.229811 | +2.404371 | 学习率过大，破坏 base 分布。 |
+| target-only | target | 1e-6 | 1 | 5 | 1.825440 | 1.817586 | -0.007854 | 稳但基本不动。 |
+| target-only | target | 5e-6 | 1 | 20 | 1.882413 | 1.669300 | -0.213113 | 当前最佳 smoke：C4 目标可优化。 |
+| target-only | target | 5e-6 | 3 | 5 | 1.825440 | 1.737562 | -0.087878 | 多 epoch 没继续改善，tiny 全参有漂移/过拟合风险。 |
+
+判读：C4 continuation 目标不是不可学，`target-only + 5e-6 + 1 epoch` 已在全 20 条正式 NLL 样本上把 target NLL 拉低约 0.21。但这还不能作为表 2 C4 交付数字，因为它没有保存/评估可生成 checkpoint，也没有跑 CER/音频；同时全参小数据训练对学习率非常敏感，高 LR 会快速破坏原模型分布。下一步应补 LoRA/冻结策略或使用官方训练框架改造后的 C4 collate，在更大 continuation 数据上训练，再回到 E8/E9 的 corrected token-mode runner 测 C2/C4 CER。
