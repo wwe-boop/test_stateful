@@ -1,0 +1,251 @@
+{
+  "manifest": "workspace/table2_0701_speaker001_c1_c3_e28_20260710/asr_manifest_c1_c3.json",
+  "n_rows": 12,
+  "normalization_note": "Same as table3: strip whitespace/punctuation; optional cn2an if installed.",
+  "rows": [
+    {
+      "key": "42:prosody_mini_001:stateful_stream",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateful_stream",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/tmp/table2_runs_asr/seed_42/prosody_mini_001/stateful_stream.wav",
+      "reference_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周浅两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆静泡14小时听起来很费时间但香气层次反而更干净",
+      "hypothesis_raw": "这 杯 咖 啡 加 了 三 次 糖 嗯 我 尝 着 确 实 有 点 甜 不 过 店 员 说 今 天 用 的 是 新 批 次 的 豆 子 烘 焙 程 度 比 上 周 前 两 度 对 了 你 试 过 他 们 家 的 冷 萃 吗 据 说 要 用 整 颗 咖 啡 豆 浸 泡 十 四 小 时 听 起 来 很 费 时 间 但 香 气 层 次 反 而 更 干 净",
+      "hypothesis_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周前两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆浸泡14小时听起来很费时间但香气层次反而更干净",
+      "cer": 0.022727,
+      "ref_chars": 88,
+      "hyp_chars": 88
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_only",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_only",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/tmp/table2_runs_asr/seed_42/prosody_mini_001/acoustic_tail_only.wav",
+      "reference_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周浅两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆静泡14小时听起来很费时间但香气层次反而更干净",
+      "hypothesis_raw": "这 杯 咖 啡 加 了 三 次 糖 嗯 我 尝 着 确 实 有 点 甜 不 过 店 员 说 今 天 用 的 是 新 批 次 的 豆 子 烘 焙 程 度 比 上 周 前 两 度 对 了 你 试 过 他 们 家 的 冷 萃 吗 据 说 要 用 整 颗 咖 啡 豆 浸 泡 十 四 小 时 听 起 来 很 费 时 间 但 香 气 层 次 反 而 更 干 净",
+      "hypothesis_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周前两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆浸泡14小时听起来很费时间但香气层次反而更干净",
+      "cer": 0.022727,
+      "ref_chars": 88,
+      "hyp_chars": 88
+    },
+    {
+      "key": "42:prosody_mini_001:acoustic_tail_pause_recovery",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pause_recovery",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_001/acoustic_tail_pause_recovery.wav",
+      "reference_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周浅两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆静泡14小时听起来很费时间但香气层次反而更干净",
+      "hypothesis_raw": "这 杯 咖 啡 加 了 三 次 糖 嗯 我 尝 着 确 实 有 点 甜 不 过 店 员 说 今 天 用 的 是 新 批 次 的 豆 子 烘 焙 程 度 比 上 周 前 两 度 对 了 你 试 过 他 们 家 的 冷 萃 吗 据 说 要 用 整 颗 咖 啡 豆 浸 泡 十 四 小 时 听 起 来 很 费 时 间 但 香 气 层 次 反 而 更 干 净",
+      "hypothesis_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周前两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆浸泡14小时听起来很费时间但香气层次反而更干净",
+      "cer": 0.022727,
+      "ref_chars": 88,
+      "hyp_chars": 88
+    },
+    {
+      "key": "42:prosody_mini_001:stateless_once",
+      "sample_id": "prosody_mini_001",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateless_once",
+      "reference": "这杯咖啡加了三次糖？嗯，我尝着确实有点甜。不过店员说今天用的是新批次的豆子，烘焙程度比上周浅两度。对了，你试过他们家的冷萃吗？据说要用整颗咖啡豆静泡十四小时。听起来很费时间，但香气层次反而更干净。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_001/stateless_once.wav",
+      "reference_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周浅两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆静泡14小时听起来很费时间但香气层次反而更干净",
+      "hypothesis_raw": "这 杯 咖 啡 加 了 三 次 糖 嗯 我 尝 着 确 实 有 点 甜 不 过 店 员 说 今 天 用 的 是 新 批 次 的 豆 子 烘 焙 程 度 比 上 周 前 两 度 对 了 你 试 过 他 们 家 的 冷 萃 吗 据 说 要 用 整 颗 咖 啡 豆 浸 泡 十 四 小 时 听 起 来 很 费 时 间 但 香 气 层 次 反 而 更 干 净",
+      "hypothesis_norm": "这杯咖啡加了3次糖嗯我尝着确实有点甜不过店员说今天用的是新批次的豆子烘焙程度比上周前两度对了你试过他们家的冷萃吗据说要用整颗咖啡豆浸泡14小时听起来很费时间但香气层次反而更干净",
+      "cer": 0.022727,
+      "ref_chars": 88,
+      "hyp_chars": 88
+    },
+    {
+      "key": "42:prosody_mini_002:stateful_stream",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateful_stream",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_002/stateful_stream.wav",
+      "reference_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiachinensis体长平均12米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海斗1号完成6200米级下潜任务",
+      "hypothesis_raw": "太 惊 人 了 这 是 我 国 首 次 在 深 海 热 液 区 发 现 活 体 管 状 蠕 虫 群 落 该 物 种 学 名 暂 定 为 riftia chenciis 体 长 平 均 一 点 二 米 耐 受 温 度 高 达 四 十 二 摄 氏 度 其 共 生 细 菌 能 将 硫 化 氢 转 化 为 有 机 物 本 次 科 考 由 探 索 一 号 科 考 船 执 行 搭 载 ROV 海 豆 一 号 完 成 六 千 万 百 米 及 下 潜 任 务",
+      "hypothesis_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiachenciis体长平均1.2米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海豆1号完成六千万百米及下潜任务",
+      "cer": 0.094828,
+      "ref_chars": 116,
+      "hyp_chars": 116
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_only",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_only",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_002/acoustic_tail_only.wav",
+      "reference_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiachinensis体长平均12米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海斗1号完成6200米级下潜任务",
+      "hypothesis_raw": "太 惊 人 了 这 是 我 国 首 次 在 深 海 热 液 区 发 现 活 体 管 状 蠕 虫 群 落 该 物 种 学 名 暂 定 为 riftia chenciis 体 长 平 均 一 点 二 米 耐 受 温 度 高 达 四 十 二 摄 氏 度 其 共 生 细 菌 能 将 硫 化 氢 转 化 为 有 机 物 本 次 科 考 由 探 索 一 号 科 考 船 执 行 搭 载 ROV 海 豆 一 号 完 成 六 千 二 百 米 级 下 潜 任 务",
+      "hypothesis_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiachenciis体长平均1.2米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海豆1号完成6200米级下潜任务",
+      "cer": 0.051724,
+      "ref_chars": 116,
+      "hyp_chars": 116
+    },
+    {
+      "key": "42:prosody_mini_002:acoustic_tail_pause_recovery",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pause_recovery",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_002/acoustic_tail_pause_recovery.wav",
+      "reference_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiachinensis体长平均12米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海斗1号完成6200米级下潜任务",
+      "hypothesis_raw": "太 惊 人 了 这 是 我 国 首 次 在 深 海 热 液 区 发 现 活 体 管 状 蠕 虫 群 落 该 物 种 学 名 暂 定 为 riftia t nasis 体 长 平 均 一 点 二 米 耐 受 温 度 高 达 四 十 二 摄 氏 度 其 共 生 细 菌 能 将 硫 化 氢 转 化 为 有 机 物 本 次 科 考 由 探 索 一 号 科 考 船 执 行 搭 载 ROV 海 豆 一 号 完 成 六 千 两 百 米 级 下 潜 任 务",
+      "hypothesis_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiatnasis体长平均1.2米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海豆1号完成6200米级下潜任务",
+      "cer": 0.060345,
+      "ref_chars": 116,
+      "hyp_chars": 114
+    },
+    {
+      "key": "42:prosody_mini_002:stateless_once",
+      "sample_id": "prosody_mini_002",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateless_once",
+      "reference": "太惊人了！这是我国首次在深海热液区发现活体管状蠕虫群落。该物种学名暂定为Riftia chinensis，体长平均1.2米，耐受温度高达42℃；其共生细菌能将硫化氢转化为有机物。本次科考由“探索一号”科考船执行，搭载ROV“海斗一号”完成6200米级下潜任务。",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_002/stateless_once.wav",
+      "reference_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftiachinensis体长平均12米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海斗1号完成6200米级下潜任务",
+      "hypothesis_raw": "太 惊 人 了 这 是 我 国 首 次 在 深 海 热 液 区 发 现 活 体 管 状 蠕 虫 群 落 该 物 种 学 名 暂 定 为 riftier chenciis 体 长 平 均 一 点 二 米 耐 受 温 度 高 达 四 十 二 摄 氏 度 其 共 生 细 菌 能 将 硫 化 氢 转 化 为 有 机 物 本 次 科 考 由 探 索 一 号 科 考 船 执 行 搭 载 ROV 海 斗 一 号 完 成 六 千 二 百 米 级 下 潜 任 务",
+      "hypothesis_norm": "太惊人了这是我国首次在深海热液区发现活体管状蠕虫群落该物种学名暂定为riftierchenciis体长平均1.2米耐受温度高达42℃其共生细菌能将硫化氢转化为有机物本次科考由探索1号科考船执行搭载rov海斗1号完成6200米级下潜任务",
+      "cer": 0.060345,
+      "ref_chars": 116,
+      "hyp_chars": 117
+    },
+    {
+      "key": "42:prosody_mini_003:stateful_stream",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateful_stream",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_003/stateful_stream.wav",
+      "reference_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老歌调子跑得特别可爱我笑了她递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "hypothesis_raw": "昨 天 下 午 我 绕 着 西 湖 走 了 整 整 三 圈 腿 都 快 断 了 不 过 湖 边 那 家 蓝 莓 松 饼 店 居 然 还 在 营 业 真 巧 老 板 娘 一 边 擦 杯 子 一 边 哼 周 杰 伦 的 老 哥 调 子 跑 的 特 别 可 爱 我 笑 了 他 递 给 我 一 杯 冰 镇 酸 梅 汤 瓶 身 还 挂 着 细 密 的 水 珠 凉 飕 飕 的 我 们 聊 了 不 到 五 分 钟 却 像 认 识 了 十 年 那 么 自 在 奇 怪 吧",
+      "hypothesis_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老哥调子跑的特别可爱我笑了他递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "cer": 0.025862,
+      "ref_chars": 116,
+      "hyp_chars": 116
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_only",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_only",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_003/acoustic_tail_only.wav",
+      "reference_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老歌调子跑得特别可爱我笑了她递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "hypothesis_raw": "昨 天 下 午 我 绕 着 西 湖 走 了 整 整 三 圈 腿 都 快 断 了 不 过 湖 边 那 家 蓝 莓 松 饼 店 居 然 还 在 营 业 真 巧 老 板 娘 一 边 擦 杯 子 一 边 哼 周 杰 伦 的 老 哥 调 子 跑 得 特 别 可 爱 我 笑 了 他 递 给 我 一 杯 冰 镇 酸 梅 汤 瓶 身 还 挂 着 细 密 的 水 珠 凉 飕 飕 的 我 们 聊 了 不 到 五 分 钟 却 像 认 识 了 十 年 那 么 自 在 奇 怪 吧",
+      "hypothesis_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老哥调子跑得特别可爱我笑了他递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "cer": 0.017241,
+      "ref_chars": 116,
+      "hyp_chars": 116
+    },
+    {
+      "key": "42:prosody_mini_003:acoustic_tail_pause_recovery",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "acoustic_tail_pause_recovery",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_003/acoustic_tail_pause_recovery.wav",
+      "reference_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老歌调子跑得特别可爱我笑了她递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "hypothesis_raw": "昨 天 下 午 我 绕 着 西 湖 走 了 整 整 三 圈 腿 都 快 断 了 不 过 湖 边 那 家 蓝 莓 松 饼 店 居 然 还 在 营 业 真 巧 老 板 娘 一 边 擦 杯 子 一 边 哼 周 杰 伦 的 老 哥 调 子 跑 的 特 别 可 爱 我 笑 了 他 递 给 我 一 杯 冰 镇 酸 梅 汤 瓶 身 还 挂 着 细 密 的 水 珠 凉 飕 飕 的 我 们 聊 了 不 到 五 分 钟 却 像 认 识 了 十 年 那 么 自 在 奇 怪 吧",
+      "hypothesis_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老哥调子跑的特别可爱我笑了他递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "cer": 0.025862,
+      "ref_chars": 116,
+      "hyp_chars": 116
+    },
+    {
+      "key": "42:prosody_mini_003:stateless_once",
+      "sample_id": "prosody_mini_003",
+      "seed": 42,
+      "speaker": "001",
+      "variant": "stateless_once",
+      "reference": "昨天下午我绕着西湖走了整整三圈，腿都快断了！不过湖边那家蓝莓松饼店居然还在营业，真巧。老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，我笑了。她递给我一杯冰镇酸梅汤，瓶身还挂着细密的水珠，凉飕飕的。我们聊了不到五分钟，却像认识了十年那么自在，奇怪吧？",
+      "wav_path": "/home/zehan/workspace/Qwen3-TTS-Triton/workspace/table2_0701_speaker001_c1_c3_e28_20260710/seed_42/prosody_mini_003/stateless_once.wav",
+      "reference_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老歌调子跑得特别可爱我笑了她递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "hypothesis_raw": "昨 天 下 午 我 绕 着 西 湖 走 了 整 整 三 圈 腿 都 快 断 了 不 过 湖 边 那 家 蓝 莓 松 饼 店 居 然 还 在 营 业 真 巧 老 板 娘 一 边 擦 杯 子 一 边 哼 周 杰 伦 的 老 歌 调 子 跑 的 特 别 可 爱 我 笑 了 他 递 给 我 一 杯 冰 镇 酸 梅 汤 瓶 身 还 挂 着 细 密 的 水 珠 凉 飕 飕 的 我 们 聊 了 不 到 五 分 钟 却 像 认 识 了 十 年 那 么 自 在 奇 怪 吧",
+      "hypothesis_norm": "昨天下午我绕着西湖走了整整3圈腿都快断了不过湖边那家蓝莓松饼店居然还在营业真巧老板娘1边擦杯子1边哼周杰伦的老歌调子跑的特别可爱我笑了他递给我1杯冰镇酸梅汤瓶身还挂着细密的水珠凉飕飕的我们聊了不到5分钟却像认识了10年那么自在奇怪吧",
+      "cer": 0.017241,
+      "ref_chars": 116,
+      "hyp_chars": 116
+    }
+  ],
+  "seed_rows": [
+    {
+      "variant": "acoustic_tail_only",
+      "seed": 42,
+      "n_samples": 3,
+      "cer_mean": 0.030564,
+      "cer_sample_std": 0.015129
+    },
+    {
+      "variant": "acoustic_tail_pause_recovery",
+      "seed": 42,
+      "n_samples": 3,
+      "cer_mean": 0.036311,
+      "cer_sample_std": 0.017042
+    },
+    {
+      "variant": "stateful_stream",
+      "seed": 42,
+      "n_samples": 3,
+      "cer_mean": 0.047806,
+      "cer_sample_std": 0.033274
+    },
+    {
+      "variant": "stateless_once",
+      "seed": 42,
+      "n_samples": 3,
+      "cer_mean": 0.033438,
+      "cer_sample_std": 0.019158
+    }
+  ],
+  "summary": {
+    "acoustic_tail_only": {
+      "n_seeds": 1,
+      "n_samples_per_seed": [
+        3
+      ],
+      "cer_mean": 0.030564,
+      "cer_seed_std": 0.0
+    },
+    "acoustic_tail_pause_recovery": {
+      "n_seeds": 1,
+      "n_samples_per_seed": [
+        3
+      ],
+      "cer_mean": 0.036311,
+      "cer_seed_std": 0.0
+    },
+    "stateful_stream": {
+      "n_seeds": 1,
+      "n_samples_per_seed": [
+        3
+      ],
+      "cer_mean": 0.047806,
+      "cer_seed_std": 0.0
+    },
+    "stateless_once": {
+      "n_seeds": 1,
+      "n_samples_per_seed": [
+        3
+      ],
+      "cer_mean": 0.033438,
+      "cer_seed_std": 0.0
+    }
+  }
+}

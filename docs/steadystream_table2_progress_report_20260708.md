@@ -715,3 +715,24 @@ E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 e
 | C1+C2+C3 | `tail_kv_pause_recovery` | 277.80% | 270.45% | 255.17% | 307.76% | 灾难来自 C2/KV，不是 C3 本身。 |
 
 暂停指标也支持该结论：`acoustic_tail_pause_recovery` 的 exact boundaries 正常（001/002 为 7/7，003 为 9/9），pause deviation 从 C1 的 `290.6/186.5/159.7ms` 降到 `0.0/0.0/14.5ms`，coverage 变为 1.0；同时 hyp/ref 字符数仍基本一致。结论：C3 pause recovery 是可用的边界后处理模块；此前 C3 prototype 的高 CER 是因为它和 C2/KV 绑定在 `tail_kv_pause_recovery` 行里，被历史复读污染。
+
+---
+
+## 28. 2026-07-10 E28 0701_trained_model / speaker=001 C1+C3 对照
+
+按最新要求，使用 5090-Host 上的 `/home/train/tts/qwen3-tts/trained/zehan/0701_trained_model`，音色固定为 `001`，补跑 C1+C3 组合。该 checkpoint 的 `config.json` 只有 `spk_id={"001": 3000}`，因此本轮生成临时数据集 `workspace/datasets/test-prosody-mini_speaker001.jsonl`，只把原 mini 数据集的 `speaker` 字段统一改为 `001`，文本和分段保持不变。产物目录：`workspace/table2_0701_speaker001_c1_c3_e28_20260710/`；本地已拉回音频到 Codex workspace 的 `outputs/table2_0701_speaker001_c1_c3_e28_20260710/`。
+
+工程处理：5090 老仓库最初缺新版 `SessionConfig.experimental`，导致无法开启 `force_text_chunk_boundary` 和 `steadystream_variant`，并复现了“8 个子句被合并成 2 个 engine segment”的坏设置。已从 4090 同步新版 `engine/` payload 并用原 0701 checkpoint、原 TRT engine 重启 `qwen3-engine-custom`；同时保留兼容 grpcio 1.80 的旧 `tts_pb2_grpc.py`，避免 25.10 容器因新版 stub 要求 grpcio>=1.82 而无法启动 gRPC/WS。重启后 health/capabilities 正常，active checkpoint 仍为 0701 model。
+
+有效性：3 条样本、seed=42、`input_mode=token`、`stream_group_policy=none`、默认强制 text chunk boundary。`stateful_stream`、`acoustic_tail_only`、`acoustic_tail_pause_recovery` 均拿到 exact boundary：001/002 为 7/7，003 为 9/9；因此本轮不是 proxy boundary，也不是 gateway 合并分段导致的假结果。
+
+| 组合 | variant | CER 均值 | prosody_mini_001 | prosody_mini_002 | prosody_mini_003 | 判读 |
+|---|---|---:|---:|---:|---:|---|
+| baseline | `stateful_stream` | 4.78% | 2.27% | 9.48% | 2.59% | 0701/001 普通流式健康，但样本 002 偏高。 |
+| C1 | `acoustic_tail_only` | **3.06%** | 2.27% | 5.17% | 1.72% | 本轮最佳，说明声学尾对 0701/001 有正收益。 |
+| C1+C3 | `acoustic_tail_pause_recovery` | 3.63% | 2.27% | 6.03% | 2.59% | 仍优于 stateful，语义健康；但 3 条 smoke 上略差于纯 C1。 |
+| baseline | `stateless_once` | 3.34% | 2.27% | 6.03% | 1.72% | 单段拼接同样健康，用作参考上界。 |
+
+音频时长也正常：`stateful_stream` 为 23.20/27.92/29.60s，C1 为 22.32/28.00/29.52s，C1+C3 为 24.02/29.10/30.87s。C1+C3 比 C1 略长，符合 pause recovery 在边界补足停顿的预期；没有出现 C2/KV 行那种 70-110s 的长复读。
+
+结论：在 0701 自定义音色 `001` 上，C1+C3 组合是成立的，CER=3.63%，比普通 stateful 的 4.78% 更好，并且 exact boundary 全有效；但当前 3 条 smoke 中纯 C1=3.06% 更优。下一步如果要交 Table2 的 CustomVoice 行，建议先扩到 10 条或全量 mini，用同一 0701/001 checkpoint 再确认 C1 vs C1+C3 的稳定性；C2/Full 仍不要混入该结论，因为 C2 历史条件是独立卡点。

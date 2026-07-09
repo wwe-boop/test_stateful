@@ -1,0 +1,20 @@
+[
+  {
+    "seed": 42,
+    "sample_id": "prosody_mini_001",
+    "status": "ok",
+    "elapsed_sec": 53.45
+  },
+  {
+    "seed": 42,
+    "sample_id": "prosody_mini_002",
+    "status": "ok",
+    "elapsed_sec": 52.78
+  },
+  {
+    "seed": 42,
+    "sample_id": "prosody_mini_003",
+    "status": "ok",
+    "elapsed_sec": 69.64
+  }
+]
