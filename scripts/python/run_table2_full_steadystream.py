@@ -110,6 +110,12 @@ EXPERIMENTAL_VARIANTS = [
         False,
     ),
     (
+        "acoustic_tail_pause_recovery",
+        "acoustic_tail_pause_recovery.wav",
+        {"steadystream_variant": "acoustic_tail_only"},
+        True,
+    ),
+    (
         "kv_tail_only",
         "kv_tail_only.wav",
         {"steadystream_variant": "kv_tail_only", "kv_tail_tokens": "384"},

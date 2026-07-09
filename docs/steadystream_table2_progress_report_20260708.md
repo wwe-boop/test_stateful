@@ -700,3 +700,18 @@ E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 e
 | `scripts/python/train_c4_continuation_smoke.py` | 同样在 `evaluate_rows()` 调用 NLL 时缺 `speaker`。 | 增加 `--speaker` 并传入 before/after eval，summary 记录 speaker。 |
 
 验证：`py_compile` 已通过。下一步如果继续 C4 LoRA/NLL 训练诊断，必须在命令里显式传 `--speaker Vivian/Serena/Ethan`，并把 speaker 作为结果维度记录；否则无法证明训练诊断与表 2 CustomVoice runtime 同源。
+
+---
+
+## 27. 2026-07-10 E27 C1+C3 纯组合对照
+
+补跑用户关心的 “C1+C3，但不含 C2/KV” 组合。runner 新增 `acoustic_tail_pause_recovery`：底层 experimental 仍是 `steadystream_variant=acoustic_tail_only`，只在输出后额外执行 C3 `pause_recovery`，因此它隔离的是 “声学尾 + 暂停恢复” 本身。运行目录：`workspace/table2_c1_c3_same_text_e27_20260710/`；样本、seed、token-mode 分段口径与 E23 完全一致。
+
+| 组合 | variant | CER 均值 | prosody_mini_001 | prosody_mini_002 | prosody_mini_003 | 判读 |
+|---|---|---:|---:|---:|---:|---|
+| baseline | `stateful_stream` | 4.01% | 3.41% | 5.17% | 3.45% | 普通流式健康。 |
+| C1 | `acoustic_tail_only` | 4.21% | 2.27% | 6.03% | 4.31% | 声学尾健康。 |
+| C1+C3 | `acoustic_tail_pause_recovery` | **3.34%** | 2.27% | 4.31% | 3.45% | C3 单独加在 C1 上不伤语义，CER 仍健康。 |
+| C1+C2+C3 | `tail_kv_pause_recovery` | 277.80% | 270.45% | 255.17% | 307.76% | 灾难来自 C2/KV，不是 C3 本身。 |
+
+暂停指标也支持该结论：`acoustic_tail_pause_recovery` 的 exact boundaries 正常（001/002 为 7/7，003 为 9/9），pause deviation 从 C1 的 `290.6/186.5/159.7ms` 降到 `0.0/0.0/14.5ms`，coverage 变为 1.0；同时 hyp/ref 字符数仍基本一致。结论：C3 pause recovery 是可用的边界后处理模块；此前 C3 prototype 的高 CER 是因为它和 C2/KV 绑定在 `tail_kv_pause_recovery` 行里，被历史复读污染。
