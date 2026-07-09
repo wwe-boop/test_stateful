@@ -44,6 +44,7 @@ _WHITESPACE_TO_STRIP = str.maketrans({
     "\t": " ",
     "\u3000": "",
 })
+_TRUE_EXPERIMENTAL_VALUES = frozenset({"1", "true", "yes", "on"})
 
 
 def _normalize_tts_text(text: str) -> str:
@@ -52,6 +53,11 @@ def _normalize_tts_text(text: str) -> str:
     while "  " in text:
         text = text.replace("  ", " ")
     return text
+
+
+def _experimental_enabled(config: SessionConfig, key: str) -> bool:
+    value = (config.experimental or {}).get(key, "")
+    return str(value).strip().lower() in _TRUE_EXPERIMENTAL_VALUES
 
 
 class FrontendInterface:
@@ -185,7 +191,15 @@ class FrontendInterface:
             return
 
         spliter: Spliter = session.spliter
-        if mode == InputMode.LONG_SEGMENT and session.config.group_policy != GroupPolicy.NONE:
+        force_chunk_boundary = _experimental_enabled(
+            session.config,
+            "force_text_chunk_boundary",
+        )
+        if force_chunk_boundary:
+            # Evaluation-only path: preserve each upstream TextChunk as its own
+            # queued group so concurrency backpressure cannot merge clauses.
+            seg_actions = spliter.push_group_tokens(tokens)
+        elif mode == InputMode.LONG_SEGMENT and session.config.group_policy != GroupPolicy.NONE:
             seg_actions = spliter.push_group_tokens(tokens)
         else:
             seg_actions = spliter.feed_tokens(tokens)

@@ -8,7 +8,9 @@
 
 表 2 当前已完成前 5 行的可运行实现、三种子音频生成、指标后处理和 CER 合并；新增的“完整可运行 SteadyStream 组合行”也已经完成 150/150 条音频生成、ASR/CER 合并和新版交付表生成。
 
-2026-07-09 最新进展：C2 的 RoPE `position_offset`、terminal tail trim、`token_counts` 默认 reset、三档 `kv_terminal_drop_mode`、bounded token-history re-prefill 诊断均已落地并推送；随后已重编并临时部署 Phase B profile512 诊断引擎，验证完整 token-history re-prefill 不再受 `max_input_len=128` 卡住。C2 门禁仍未通过：tail 长度 sweep 最佳 3 样本 smoke 为 30.19% CER，embedding replay re-prefill 为 50.69% CER，三档 drop-mode smoke 为 `eos_only=31.62%`、`silence=31.05%`、`pad_phase=58.48%`，bounded token-history profile128 为 55.22% CER，profile512 完整 token-history 为 `eos_only=29.04%`、`silence=36.42%`。结论是：`pad_phase` 明确过裁并显著恶化复读；补入上一段 text+完整 codes 后，基座仍提前终止/漏尾或局部乱码，说明当前 C2/C4-style continuation 排布尚不能作为表 2 正式行。
+2026-07-09 最新进展：C2 的 RoPE `position_offset`、terminal tail trim、`token_counts` 默认 reset、三档 `kv_terminal_drop_mode`、bounded token-history re-prefill 诊断均已落地并推送；随后已重编并临时部署 Phase B profile512 诊断引擎，验证完整 token-history re-prefill 不再受 `max_input_len=128` 卡住。用户复核后发现旧 profile512 `prosody_mini_002` smoke 存在实验设置污染：8 个设计子句被 gateway/driver 合并成 2 个 engine segment，7 个边界指标主要来自 `proxy_proportional` 假边界；同时 `eos_only` 的漏尾混入了 512 slot 容量截断。因此旧 `29.04%/36.42%` 只能作为污染诊断记录，不能作为 C2/C4 结论。
+
+2026-07-09 修正实验设置后：已新增评测专用 `force_text_chunk_boundary=true`，在 `input_mode=token` 下强制每个上游 `TextChunk` 作为独立 engine segment，并让表 2 runner 默认拒绝 proxy 边界。单样本 `prosody_mini_002` 重跑已恢复 `exact_boundary_count=7/7`；CER 为 `stateful_stream=5.17%`、`acoustic_tail_only=6.03%`、`kv_tail_only=243.97%`、`tail_kv_pause_recovery=255.17%`、`full_steadystream=260.34%`。新结论是：分段设置修正后，C1/stateful 基线有效，KV/Full SteadyStream 的主要失败形态变为严重拖长和历史复读，而不是旧报告里的“29% 漏尾”口径。
 
 需要特别说明：计划中真正的“完整 SteadyStream”定义为 C1+C2+C3+C4，其中 C4 是 continuation 后训练 checkpoint。当前没有找到真实 C4 continuation 训练 checkpoint，因此我没有把基座引擎或 smoke adapter 冒充成最终 C4 行；当前补测行标注为“C1+C2+C3，C4 未训练”。
 
@@ -107,6 +109,32 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 截至本文档更新时，完整行音频生成、ASR/CER 合并和 delivery 生成均已完成；C2 门禁诊断已证明 profile512 放开容量后仍未过线，尚未批准 C4 正式训练。
 
 ## 8. 2026-07-09 C2 门禁复测结论
+
+### 8.0 实验设置更正：token mode 必须逐 TextChunk 成段
+
+用户复核 `prosody_mini_002` 后指出，旧 smoke 虽然指定了 token 输入，但 frontend 的 streaming driver 仍会按阈值合并短子句：8 个设计子句实际只形成 2 个 engine segment，事件流里多数边界是 `boundary_reason=flush_eos` 后的粗粒度提交，runner 再用 `proxy_proportional` 按文本比例补出了 7 个假边界。因此 F0/停顿和部分 CER 解释都被污染。
+
+本轮已完成两个修正：
+
+| 修正 | 文件 | 作用 |
+|---|---|---|
+| `force_text_chunk_boundary=true` | `engine/frontend/interface.py` | 评测专用开关；每个上游 `TextChunk` 走 `push_group_tokens()`，并发窗口满时进入 group queue，不再和后续子句合并。 |
+| exact-boundary gate | `scripts/python/run_table2_full_steadystream.py` | 默认 `input_mode=token`、`group_policy=none`，并要求 `exact_boundary_count == len(segments)-1`；否则直接报错，不再产出 proxy 表 2 指标。 |
+
+验证：`tests/unit/test_frontend_interface.py` 新增短 TextChunk 分段测试，目标单测共 `11 passed`；`prosody_mini_002` 单样本重跑中 `stateful_stream/acoustic_tail_only/kv_tail_only/tail_kv_pause_recovery/full_steadystream` 均为 `exact_boundary_count=7/7`。
+
+修正后的单样本 CER/时长：
+
+| 变体 | 时长 | CER | 观察 |
+|---|---:|---:|---|
+| `stateless_once` | 24.48s | 6.90% | 文本基本完整。 |
+| `stateful_stream` | 24.64s | 5.17% | 文本基本完整，是当前修正 smoke 的强基线。 |
+| `acoustic_tail_only` | 24.08s | 6.03% | 接近基线，说明声学尾不是 CER 暴涨主因。 |
+| `kv_tail_only` | 77.68s | 243.97% | 大量历史复读，ASR 长度膨胀到 385 字符。 |
+| `tail_kv_pause_recovery` | 89.13s | 255.17% | C3 只修停顿，不修 KV 复读。 |
+| `full_steadystream` | 91.51s | 260.34% | 仍大量复读历史片段，当前不能作为完整 SteadyStream 行。 |
+
+关键判断：旧 `29.04%/36.42%` 不是可靠的悲观结论；新口径下问题更清楚，C2/C4-style KV 历史在逐子句正确输入后会把上一段当作可继续生成的内容，导致拖长和复读。下一步需要在新分段设置下重跑三档 `kv_terminal_drop_mode` 和 token-history/full-current 对照，再决定是否进入 C4 LoRA 训练诊断。
 
 ### 8.1 复测范围
 

@@ -140,6 +140,17 @@ def make_session_config(
     return cfg
 
 
+def stream_experimental_config(
+    base: dict[str, str] | None,
+    *,
+    force_text_chunk_boundary: bool,
+) -> dict[str, str]:
+    cfg = {str(k): str(v) for k, v in (base or {}).items()}
+    if force_text_chunk_boundary:
+        cfg.setdefault("force_text_chunk_boundary", "true")
+    return cfg
+
+
 def synthesize_once_timed(
     stub: Any,
     *,
@@ -429,9 +440,17 @@ def stream_variant_block(
     sample_rate: int,
     puncts: list[str],
     out_dir: Path,
+    stream_input_mode: str = "token",
+    stream_group_policy: str = "none",
+    require_exact_boundaries: bool = True,
+    force_text_chunk_boundary: bool = False,
     experimental: dict[str, str] | None = None,
     pause_recovery: bool = False,
 ) -> dict[str, Any]:
+    stream_experimental = stream_experimental_config(
+        experimental,
+        force_text_chunk_boundary=force_text_chunk_boundary,
+    )
     stream_audio, stream_sr, exact_boundaries, stream_timing = synthesize_stream_timed(
         stub,
         endpoint_timeout=endpoint_timeout,
@@ -442,18 +461,25 @@ def stream_variant_block(
         language=language,
         instruct=instruct,
         sample_rate=sample_rate,
-        input_mode="clause",
-        group_policy="none",
-        experimental=experimental,
+        input_mode=stream_input_mode,
+        group_policy=stream_group_policy,
+        experimental=stream_experimental,
     )
+    expected_boundary_count = max(0, len(segments) - 1)
+    boundary_valid = len(exact_boundaries) == expected_boundary_count
+    if require_exact_boundaries and not boundary_valid:
+        raise RuntimeError(
+            f"{session_id}: expected {expected_boundary_count} exact boundaries, "
+            f"got {len(exact_boundaries)}; refusing proxy-proportional Table 2 metrics"
+        )
     stream_boundaries = (
         exact_boundaries
-        if len(exact_boundaries) == max(0, len(segments) - 1)
+        if boundary_valid
         else boundary_positions_proportional(stream_audio, segments)
     )
     stream_source = (
         "exact_event"
-        if len(exact_boundaries) == max(0, len(segments) - 1)
+        if boundary_valid
         else "proxy_proportional"
     )
     pause_recovery_meta: list[dict[str, Any]] = []
@@ -480,8 +506,12 @@ def stream_variant_block(
         "pause_summary": {k: v for k, v in stream_pause.items() if k != "pause_metrics"},
         "pause_metrics": stream_pause.get("pause_metrics", []),
         "exact_boundary_count": len(exact_boundaries),
+        "boundary_expected_count": expected_boundary_count,
+        "boundary_valid": boundary_valid,
         "boundary_source_used": stream_source,
-        "experimental": experimental or {},
+        "stream_input_mode": stream_input_mode,
+        "stream_group_policy": stream_group_policy,
+        "experimental": stream_experimental,
         "timing": {
             "fasl_first_audio_ms": stream_timing.get("first_audio_ms"),
             "total_ms": stream_timing.get("total_ms"),
@@ -502,6 +532,10 @@ def run_sample(
     out_dir: Path,
     endpoint_timeout: float,
     sample_rate: int,
+    stream_input_mode: str = "token",
+    stream_group_policy: str = "none",
+    require_exact_boundaries: bool = True,
+    force_text_chunk_boundary: bool = False,
     resume: bool = False,
 ) -> dict[str, Any]:
     sample_id = row["sample_id"]
@@ -582,8 +616,13 @@ def run_sample(
             },
         }
 
-    # Row 2: current stateful clause stream.
+    # Row 2: current stateful stream. Table 2 SteadyStream measurements require
+    # token-mode input so each designed clause can become an engine segment.
     if not has_audio_block(result, out_dir, "stateful_stream", "stateful_stream.wav"):
+        stream_experimental = stream_experimental_config(
+            None,
+            force_text_chunk_boundary=force_text_chunk_boundary,
+        )
         stream_audio, stream_sr, stream_exact_boundaries, stream_timing = synthesize_stream_timed(
             stub,
             endpoint_timeout=endpoint_timeout,
@@ -594,17 +633,26 @@ def run_sample(
             language=language,
             instruct=instruct,
             sample_rate=sample_rate,
-            input_mode="clause",
-            group_policy="none",
+            input_mode=stream_input_mode,
+            group_policy=stream_group_policy,
+            experimental=stream_experimental,
         )
+        expected_boundary_count = max(0, len(segments) - 1)
+        boundary_valid = len(stream_exact_boundaries) == expected_boundary_count
+        if require_exact_boundaries and not boundary_valid:
+            raise RuntimeError(
+                f"t2-{seed}-{sample_id}-stateful: expected {expected_boundary_count} "
+                f"exact boundaries, got {len(stream_exact_boundaries)}; "
+                "refusing proxy-proportional Table 2 metrics"
+            )
         stream_boundaries = (
             stream_exact_boundaries
-            if len(stream_exact_boundaries) == max(0, len(segments) - 1)
+            if boundary_valid
             else boundary_positions_proportional(stream_audio, segments)
         )
         stream_source = (
             "exact_event"
-            if len(stream_exact_boundaries) == max(0, len(segments) - 1)
+            if boundary_valid
             else "proxy_proportional"
         )
         stream_metrics = measure_boundary_metrics(
@@ -622,7 +670,12 @@ def run_sample(
             "pause_summary": {k: v for k, v in stream_pause.items() if k != "pause_metrics"},
             "pause_metrics": stream_pause.get("pause_metrics", []),
             "exact_boundary_count": len(stream_exact_boundaries),
+            "boundary_expected_count": expected_boundary_count,
+            "boundary_valid": boundary_valid,
             "boundary_source_used": stream_source,
+            "stream_input_mode": stream_input_mode,
+            "stream_group_policy": stream_group_policy,
+            "experimental": stream_experimental,
             "timing": {
                 "fasl_first_audio_ms": stream_timing.get("first_audio_ms"),
                 "total_ms": stream_timing.get("total_ms"),
@@ -648,6 +701,10 @@ def run_sample(
             sample_rate=sample_rate,
             puncts=puncts,
             out_dir=out_dir,
+            stream_input_mode=stream_input_mode,
+            stream_group_policy=stream_group_policy,
+            require_exact_boundaries=require_exact_boundaries,
+            force_text_chunk_boundary=force_text_chunk_boundary,
             experimental=experimental,
             pause_recovery=pause_recovery,
         )
@@ -703,6 +760,27 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--stream-input-mode",
+        choices=["token", "clause", "long_segment"],
+        default="token",
+        help="Streaming mode for stateful/SteadyStream rows. Table 2 diagnostics default to token.",
+    )
+    parser.add_argument(
+        "--stream-group-policy",
+        choices=["none", "auto"],
+        default="none",
+    )
+    parser.add_argument(
+        "--allow-proxy-boundaries",
+        action="store_true",
+        help="Allow proxy_proportional boundary metrics when exact text_boundary_commit events are missing.",
+    )
+    parser.add_argument(
+        "--disable-force-text-chunk-boundary",
+        action="store_true",
+        help="Do not force each input TextChunk to become one engine segment in token-mode diagnostics.",
+    )
     args = parser.parse_args()
 
     rows = [
@@ -715,6 +793,10 @@ def main() -> int:
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
+    force_text_chunk_boundary = (
+        args.stream_input_mode == "token"
+        and not args.disable_force_text_chunk_boundary
+    )
 
     channel = grpc.insecure_channel(args.endpoint)
     grpc.channel_ready_future(channel).result(timeout=10.0)
@@ -739,6 +821,10 @@ def main() -> int:
                     out_dir=sample_dir,
                     endpoint_timeout=args.timeout,
                     sample_rate=args.sample_rate,
+                    stream_input_mode=args.stream_input_mode,
+                    stream_group_policy=args.stream_group_policy,
+                    require_exact_boundaries=not args.allow_proxy_boundaries,
+                    force_text_chunk_boundary=force_text_chunk_boundary,
                     resume=args.resume,
                 )
                 elapsed = time.perf_counter() - t0

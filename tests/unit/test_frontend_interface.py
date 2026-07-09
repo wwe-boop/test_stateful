@@ -228,6 +228,68 @@ def test_token_mode_final_punct_flush_sends_session_done_without_empty_segment()
     asyncio.run(run())
 
 
+def test_token_mode_force_text_chunk_boundary_keeps_short_chunks_separate():
+    async def run():
+        inbox = asyncio.Queue(maxsize=128)
+        events = []
+
+        async def on_event(sid: str, event: dict):
+            events.append((sid, event))
+
+        interface = FrontendInterface(
+            engine_inbox=inbox,
+            tokenizer=_CharTokenizer(),
+            max_sessions=2,
+            engine_max_decode_len=100,
+            ema_ratio=10.0,
+            max_concurrent_segments=2,
+        )
+
+        session = await interface.create_session(
+            "forced-chunk-boundary",
+            config=SessionConfig(
+                task_type="custom_voice",
+                speaker="Serena",
+                input_mode=InputMode.TOKEN,
+                group_policy=GroupPolicy.NONE,
+                experimental={"force_text_chunk_boundary": "true"},
+            ),
+            on_event=on_event,
+        )
+
+        await interface.push_text_input("forced-chunk-boundary", "甲乙，")
+        await interface.push_text_input("forced-chunk-boundary", "丙丁。")
+
+        requests = await _drain_requests(inbox)
+        start_segments = [
+            request.segment_idx
+            for request in requests
+            if request.type == RequestType.START_TOKENS
+        ]
+        done_segments = [
+            request.segment_idx
+            for request in requests
+            if request.type == RequestType.SEGMENT_TOKENS_DONE
+        ]
+        boundary_events = [
+            event
+            for _, event in events
+            if event["type"] == "text_boundary_commit"
+        ]
+
+        assert start_segments == [0, 1]
+        assert done_segments == [0, 1]
+        assert [event["text"] for event in boundary_events] == ["甲乙，", "丙丁。"]
+        assert [event["segment_idx"] for event in boundary_events] == [0, 1]
+
+        await session.result_queue.put(
+            EngineResult(type=ResultType.SESSION_DONE, session_id="forced-chunk-boundary")
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
 def test_prefill_done_event_exposes_reference_metadata():
     async def run():
         inbox = asyncio.Queue(maxsize=16)
