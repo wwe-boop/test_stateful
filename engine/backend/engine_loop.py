@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import queue
 import threading
 import time
@@ -1047,6 +1048,42 @@ class EngineLoop:
             value = 24
         return max(1, min(value, 64))
 
+    @staticmethod
+    def _steadystream_generation_budget_frames(group: EngineSessionGroup, text_tokens: int) -> int:
+        """Reserve decode room for the current segment before keeping history.
+
+        Token-history diagnostics can otherwise spend nearly the whole 512-slot
+        window on history and turn a model result into an engineering overflow.
+        """
+        exp = group.steadystream_experimental
+        explicit = str(exp.get("kv_generation_budget_frames", "")).strip()
+        if explicit:
+            try:
+                return max(1, int(explicit))
+            except ValueError:
+                pass
+
+        def _float_cfg(name: str, default: float) -> float:
+            try:
+                return float(str(exp.get(name, default)).strip())
+            except (TypeError, ValueError):
+                return default
+
+        frames_per_token = max(
+            0.1,
+            _float_cfg("kv_generation_budget_frames_per_text_token", 4.0),
+        )
+        multiplier = max(
+            0.1,
+            _float_cfg("kv_generation_budget_multiplier", 1.6),
+        )
+        min_frames = max(
+            1,
+            int(_float_cfg("kv_generation_budget_min_frames", 32.0)),
+        )
+        estimate = math.ceil(max(1, int(text_tokens)) * frames_per_token * multiplier)
+        return max(min_frames, int(estimate))
+
     def _snapshot_talker_kv_tail(
         self,
         slot: SlotKVState,
@@ -1471,6 +1508,7 @@ class EngineLoop:
         self,
         prefix_embeds: torch.Tensor,
         *,
+        generation_budget_frames: int,
         history_text_token_ids: list[int],
         history_text_include_eos: bool,
         history_full_codes: torch.Tensor,
@@ -1509,15 +1547,17 @@ class EngineLoop:
         )
         if current_text is not None:
             fixed_prefill_len += int(current_text.shape[1]) + 1  # current codec BOS
+        generation_budget_frames = max(1, int(generation_budget_frames))
         max_code_frames = min(
             max_input_len - fixed_prefill_len,
-            max_seq - fixed_prefill_len - 1,
+            max_seq - fixed_prefill_len - generation_budget_frames,
         )
         if max_code_frames <= 0:
             return None
         total_code_frames = int(history_full_codes.shape[0])
         if total_code_frames <= 0:
             return None
+        trimmed_for_generation_budget = max(0, total_code_frames - max_code_frames)
         if total_code_frames > max_code_frames:
             history_full_codes = history_full_codes[-max_code_frames:, :]
         codec_sum = self._steadystream_codec_sum_from_full_codes(
@@ -1560,10 +1600,13 @@ class EngineLoop:
             "history_text_tokens": len(history_text_token_ids),
             "history_code_frames": int(history_full_codes.shape[0]),
             "history_code_frames_total": total_code_frames,
+            "history_code_frames_trimmed_for_generation_budget": trimmed_for_generation_budget,
             "current_text_tokens": len(current_text_token_ids or []),
             "current_text_full_prefill": 1 if current_text is not None else 0,
             "prefill_len": int(prefill.shape[1]),
             "max_input_len": max_input_len,
+            "max_seq_len": max_seq,
+            "generation_budget_frames": generation_budget_frames,
         }
         return prefill, info
 
@@ -1618,6 +1661,10 @@ class EngineLoop:
         )
         built = self._build_steadystream_token_history_prefill(
             plan.cacheable_prefix_embeds,
+            generation_budget_frames=self._steadystream_generation_budget_frames(
+                group,
+                len(seg.pending_token_ids),
+            ),
             history_text_token_ids=[int(x) for x in history_text_token_ids],
             history_text_include_eos=bool(carry.get("history_text_include_eos", True)),
             history_full_codes=history_full_codes,
@@ -1673,6 +1720,9 @@ class EngineLoop:
         metrics["steadystream_token_history_code_frames_total"] = str(
             info["history_code_frames_total"]
         )
+        metrics["steadystream_token_history_code_frames_trimmed_for_generation_budget"] = str(
+            info["history_code_frames_trimmed_for_generation_budget"]
+        )
         metrics["steadystream_token_history_current_text_tokens"] = str(
             len(seg.pending_token_ids)
         )
@@ -1684,6 +1734,12 @@ class EngineLoop:
         )
         metrics["steadystream_token_history_max_input_len"] = str(
             info["max_input_len"]
+        )
+        metrics["steadystream_token_history_max_seq_len"] = str(
+            info["max_seq_len"]
+        )
+        metrics["steadystream_token_history_generation_budget_frames"] = str(
+            info["generation_budget_frames"]
         )
         metrics["steadystream_token_history_dropped_tail_tokens"] = str(
             int(carry.get("history_dropped_tail_tokens") or 0)

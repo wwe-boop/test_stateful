@@ -790,6 +790,7 @@ class TestSteadyStreamCarry:
                 "steadystream_variant": "kv_tail_only",
                 "kv_reprefill_token_history": "true",
                 "kv_tail_tokens": "16",
+                "kv_generation_budget_frames": "1",
             },
         )
         seg = EngineSegment("s1", 0)
@@ -849,6 +850,7 @@ class TestSteadyStreamCarry:
                 "steadystream_variant": "kv_tail_only",
                 "kv_reprefill_token_history": "true",
                 "kv_tail_tokens": "16",
+                "kv_generation_budget_frames": "1",
             },
         )
         group.steadystream_carry = {
@@ -914,6 +916,7 @@ class TestSteadyStreamCarry:
                 "kv_reprefill_token_history": "true",
                 "kv_reprefill_token_history_full_current": "true",
                 "kv_tail_tokens": "16",
+                "kv_generation_budget_frames": "1",
             },
         )
         group.steadystream_carry = {
@@ -945,6 +948,62 @@ class TestSteadyStreamCarry:
         assert slot.prefill_source == "steadystream_token_history_full_current_kv_tail_only"
         assert slot.trailing == []
         assert slot.steadystream_full_codecs == []
+
+    def test_reprefill_token_history_reserves_generation_budget(self, model_config):
+        hidden = model_config.hidden_size
+        weights = _FakeTokenHistoryWeights(hidden_size=hidden)
+        prefix = torch.full((1, 2, hidden), 1.0, dtype=torch.bfloat16)
+        plan = PrefillPlan(
+            prefill_embeds=prefix,
+            trailing=[torch.full((1, 1, hidden), 4.0)],
+            cacheable_prefix_embeds=prefix,
+            request_prefill_embeds=torch.full((1, 1, hidden), 3.0),
+        )
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(
+                plan=plan,
+                hidden_size=hidden,
+                weights=weights,
+            ),
+        )
+        seg = EngineSegment("s1", 1)
+        seg.pending_token_ids = [21, 22, 23]
+        seg.input_complete = True
+        group = _make_steadystream_group(
+            "s1",
+            {
+                "steadystream_variant": "kv_tail_only",
+                "kv_reprefill_token_history": "true",
+                "kv_tail_tokens": "16",
+                "kv_generation_budget_frames": "4",
+            },
+        )
+        group.steadystream_carry = {
+            "from_segment_idx": 0,
+            "history_text_token_ids": [11, 12],
+            "history_text_include_eos": True,
+            "history_full_codes": torch.ones(8, 16, dtype=torch.long),
+        }
+        slot = SlotKVState(slot_id=0)
+        metrics: dict[str, str] = {}
+
+        assert engine_loop._try_prefill_from_steadystream_carry(
+            group,
+            seg,
+            slot,
+            TaskType.CUSTOM_VOICE,
+            metrics,
+        ) == (None, False)
+
+        assert metrics["steadystream_token_history_generation_budget_frames"] == "4"
+        assert metrics["steadystream_token_history_code_frames_total"] == "8"
+        assert metrics["steadystream_token_history_code_frames"] == "5"
+        assert metrics["steadystream_token_history_code_frames_trimmed_for_generation_budget"] == "3"
+        assert executor.prefill_prefix_only_inputs[0].shape[1] == 2 + 3 + 1 + 5 + 1
 
     def test_restore_reports_reset_or_inherited_token_counts(self, model_config):
         hidden = model_config.hidden_size
