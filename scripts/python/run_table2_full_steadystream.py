@@ -82,6 +82,26 @@ C2_DIAGNOSTIC_VARIANTS = [
     ),
 ]
 
+def c2_diagnostic_variants(
+    kv_tail_tokens: int | None = None,
+) -> list[tuple[str, str, dict[str, str], bool]]:
+    tail = 384 if kv_tail_tokens is None else int(kv_tail_tokens)
+    suffix = "" if kv_tail_tokens is None else f"_tail{tail}"
+    variants: list[tuple[str, str, dict[str, str], bool]] = []
+    for key, wav_name, experimental, pause_recovery in C2_DIAGNOSTIC_VARIANTS:
+        config = dict(experimental)
+        config["kv_tail_tokens"] = str(tail)
+        variants.append(
+            (
+                f"{key}{suffix}",
+                wav_name.replace(".wav", f"{suffix}.wav"),
+                config,
+                pause_recovery,
+            )
+        )
+    return variants
+
+
 EXPERIMENTAL_VARIANTS = [
     (
         "acoustic_tail_only",
@@ -121,14 +141,26 @@ def has_audio_block(result: dict[str, Any], out_dir: Path, key: str, wav_name: s
     return key in result and (out_dir / wav_name).is_file()
 
 
-def audio_blocks_for_run(include_c2_diagnostics: bool = False) -> list[tuple[str, str]]:
+def audio_blocks_for_run(
+    include_c2_diagnostics: bool = False,
+    c2_diagnostic_kv_tail_tokens: int | None = None,
+) -> list[tuple[str, str]]:
     blocks = list(REQUIRED_AUDIO_BLOCKS)
     if include_c2_diagnostics:
-        blocks.extend((key, wav_name) for key, wav_name, _, _ in C2_DIAGNOSTIC_VARIANTS)
+        blocks.extend(
+            (key, wav_name)
+            for key, wav_name, _, _ in c2_diagnostic_variants(
+                c2_diagnostic_kv_tail_tokens
+            )
+        )
     return blocks
 
 
-def sample_complete(sample_dir: Path, include_c2_diagnostics: bool = False) -> bool:
+def sample_complete(
+    sample_dir: Path,
+    include_c2_diagnostics: bool = False,
+    c2_diagnostic_kv_tail_tokens: int | None = None,
+) -> bool:
     result_path = sample_dir / "results.json"
     if not result_path.is_file():
         return False
@@ -138,7 +170,10 @@ def sample_complete(sample_dir: Path, include_c2_diagnostics: bool = False) -> b
         return False
     return all(
         has_audio_block(result, sample_dir, key, wav_name)
-        for key, wav_name in audio_blocks_for_run(include_c2_diagnostics)
+        for key, wav_name in audio_blocks_for_run(
+            include_c2_diagnostics,
+            c2_diagnostic_kv_tail_tokens,
+        )
     )
 
 
@@ -585,6 +620,7 @@ def run_sample(
     force_text_chunk_boundary: bool = False,
     resume: bool = False,
     include_c2_diagnostics: bool = False,
+    c2_diagnostic_kv_tail_tokens: int | None = None,
 ) -> dict[str, Any]:
     sample_id = row["sample_id"]
     task_type = "custom_voice"
@@ -734,7 +770,7 @@ def run_sample(
 
     variants_to_run = list(EXPERIMENTAL_VARIANTS)
     if include_c2_diagnostics:
-        variants_to_run.extend(C2_DIAGNOSTIC_VARIANTS)
+        variants_to_run.extend(c2_diagnostic_variants(c2_diagnostic_kv_tail_tokens))
     for variant_key, wav_name, experimental, pause_recovery in variants_to_run:
         if has_audio_block(result, out_dir, variant_key, wav_name):
             continue
@@ -837,6 +873,12 @@ def main() -> int:
         action="store_true",
         help="Also run token-history full-current C2 diagnostic variants.",
     )
+    parser.add_argument(
+        "--c2-diagnostic-kv-tail-tokens",
+        type=int,
+        default=None,
+        help="Override kv_tail_tokens for C2 diagnostic variants and suffix their output keys.",
+    )
     args = parser.parse_args()
 
     rows = [
@@ -863,7 +905,11 @@ def main() -> int:
         for idx, row in enumerate(rows, start=1):
             sample_id = row["sample_id"]
             sample_dir = out_root / f"seed_{seed}" / sample_id
-            if args.resume and sample_complete(sample_dir, args.include_c2_diagnostics):
+            if args.resume and sample_complete(
+                sample_dir,
+                args.include_c2_diagnostics,
+                args.c2_diagnostic_kv_tail_tokens,
+            ):
                 print(f"[skip] seed={seed} {idx:03d}/{len(rows)} {sample_id}", flush=True)
                 progress.append({"seed": seed, "sample_id": sample_id, "status": "skipped"})
                 continue
@@ -883,6 +929,7 @@ def main() -> int:
                     force_text_chunk_boundary=force_text_chunk_boundary,
                     resume=args.resume,
                     include_c2_diagnostics=args.include_c2_diagnostics,
+                    c2_diagnostic_kv_tail_tokens=args.c2_diagnostic_kv_tail_tokens,
                 )
                 elapsed = time.perf_counter() - t0
                 print(f"[ok] seed={seed} {sample_id} elapsed={elapsed:.1f}s", flush=True)
