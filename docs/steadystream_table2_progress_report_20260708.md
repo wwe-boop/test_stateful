@@ -792,3 +792,39 @@ artifact 指标支持 F1/F2：`acoustic_tail_only` 的 `max_sample_delta_mean=0.
 | `input_source.jsonl` 原始路径 | `/x2robot_v2/...` | 当前 5090 未挂载 | 不能回溯原始整段录音。 |
 
 路线判定：当前没有找到 speaker `001` 的真实连续长录音，因此 C4 主线应进入 Phase 1：用健康的 001 模型整段合成多子句段落，再从整段 wav 按边界切出 continuation 样本。这个路线和旧的“逐子句合成再拼接”不同，训练目标来自一次自回归整段生成中的真实跨句韵律，不把断裂拼接当作正样本。已有短句数据只作为音色/领域参考、可选 replay 正则，不进入主 C4 续写数据路线。
+
+---
+
+## 32. 2026-07-10 E32-E34 C4 Phase 1 文本与整段合成生产线
+
+按 `steadystream_c4_execution_playbook_20260710.md` 阶段 1，完成 speaker `001` 的合成训练数据生产线前半段：API 探测、500 条段落文本生成、整段一次合成、时长/字数 QC、ASR 抽检。关键产物在 5090-Host：`/home/zehan/workspace/Qwen3-TTS-Triton/workspace/c4_synth_v1_clean500/`；4090 侧已同步 summary/manifest 到 `workspace/c4_synth_v1_clean500_summary_clean500.json` 和 `workspace/c4_synth_full_manifest_clean500.jsonl`。本地抽听样本已拉到 `outputs/c4_synth_v1_qc500_audio_samples/`。
+
+API 判定：`http://39.101.65.229:44083/` 是 FastAPI WebUI，`/api/generate` 支持 `custom_voice`，但 preset speakers 只有 `Vivian/Serena/...`，没有 `001`，因此不能作为本轮 speaker001 训练数据源。改用 5090 `qwen3-engine-custom` gRPC `SynthesizeOnce`，能力返回 `variant=custom-1.7b`、`loaded_model_type=custom_voice`，speaker `001` 整段 smoke 通过。记录见 `docs/c4_synth_api_notes.md`。
+
+代码新增：
+
+| 文件 | 用途 |
+|---|---|
+| `eval/data_synth/prompts_c4.py` | C4 full-passage 文本 prompt，约束 4-12 段、80-250 汉字、多标点、speaker001。 |
+| `scripts/python/generate_c4_synth_passages.py` | LLM 批量生成段落文本，逐条校验、去重、避开 test/eval 文本。 |
+| `scripts/python/synthesize_c4_full_passages.py` | gRPC `SynthesizeOnce` 整段合成 runner，显式记录采样参数：`do_sample=false, temperature=0.9, top_k=50, top_p=1.0, repetition_penalty=1.05, max_new_tokens=4096`。 |
+
+文本与音频结果：
+
+| 阶段 | 数字 | 判定 |
+|---|---:|---|
+| `c4_synth_passages_v1.jsonl` | 500 条文本，speaker 全部 `001`，4-11 段，80-165 汉字 | 文本门禁通过。 |
+| 初次整段合成 | 500/500 成功，3.6448 h；`sec_per_char` 494/500 通过 | 6 条略慢，已剔除补样。 |
+| `qc500` | 500 条，3.6275 h，`sec_per_char=0.2115-0.3467` | 时长/字数门禁通过。 |
+| `clean500` | 500 条，3.6006 h，`sec_per_char=0.2115-0.3407`，`alnum_ge35_count=0` | 进一步剔除型号/英文数字过密和 ASR 实测高风险样本。 |
+| clean500 ASR 抽检 | 25 条，每 20 条抽 1 条；CER mean=2.2873%，max=13.6842% | 平均 CER ≤5%，通过 Phase 1.3 抽检门禁。 |
+
+处理过的问题：
+
+| 问题 | 原因 | 处理 |
+|---|---|---|
+| LLM 偶尔生成短样本/空 segments | prompt 约束不够硬，批内个别样本不合格 | 改成逐条验收，合格保留，不合格跳过补齐；prompt 加强到优先 100-220 汉字。 |
+| 6 条 `sec_per_char>0.35` | product briefing 数字/英文型号密集，读速/ASR 更不稳定 | 剔除并用 extra20 补样。 |
+| 初次 ASR 抽检均值受数字拖高 | speechserver 缺 `cn2an`，`2026` vs “二零二六” 被当成错字 | 安装 `cn2an` 后按原脚本重跑；同时剔除 ASR>10% 和 `alnum_count>=35` 的高风险样本。 |
+
+当前状态：Phase 1.2/1.3 已完成，得到可进入 Phase 1.4 的 `clean500` full-passage wav+manifest。下一步不是训练，仍需先做 Phase 1.4：从整段 wav 获取 ASR/align 时间戳，按标点切成 continuation segments，抽 codec codes，构建 C4 continuation manifest 并跑 schema/pause 校验。
