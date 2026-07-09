@@ -776,3 +776,19 @@ CER 结果：
 artifact 指标支持 F1/F2：`acoustic_tail_only` 的 `max_sample_delta_mean=0.1418`、`flux_peak_mean=9.796`；`acoustic_tail_smooth` 降到 `0.0238 / 4.832`；`acoustic_tail_smooth_tdrop` 进一步为 `0.0217 / 3.319`。C3 变体因为边界被替换为目标静音，当前 artifact 窗口指标为 0。F3 的 `steadystream_c1_terminal_dropped_frames` 本轮未在事件 metrics 中出现，说明这 3 条没有稳定触发尾部静音快照 carry，或该指标仍需进一步透传核验；因此当前不能把 F3 单独定型。
 
 结论：E30 证明 F1/F2 是低风险的边界 click/瞬态抑制手段，语义没有灾难性回退；全开 `acoustic_tail_pr_smooth_tdrop` 在 3 条 smoke 上 CER=3.06%，与纯 C1 并列最佳，并且具备 C3 停顿恢复。建议下一步扩到 10 条或全量 mini，并抽听重点对比 `acoustic_tail_only`、`acoustic_tail_smooth_tdrop`、`acoustic_tail_pr_smooth_tdrop` 三档，再决定 Lite 行是否采用“C1+C3+F1/F2（F3 待定）”。
+
+---
+
+## 31. 2026-07-10 E31 C4 Phase 0 speaker001 真实数据盘点
+
+按 `steadystream_c4_execution_playbook_20260710.md` 阶段 0，先在 5090-Host 盘点 speaker `001` 的真实训练数据形态，目标是确认是否存在可直接用于 C4 续写训练的连续长录音。产物：`docs/c4_speaker001_data_inventory.md`；本地已拉回 3 条代表音频到 Codex workspace 的 `outputs/c4_phase0_inventory_audio/` 供抽听。
+
+盘点范围包括 `/home/train/tts`、`/home/train/tts/qwen3-tts/trained/zehan/0701_trained_model`、`spk001_60min_lr4e7_bs4_ep3_epoch2_20260701`、`/home/zehan/workspace/datasets/cosyvoice2_train_raw_single_ref_20260520`、`/home/zehan/workspace/WashDataset` 和 `instrcutTtsEval/*001*`。结论是：checkpoint 目录只有模型/config，未找到真实连续长录音；唯一明确可用的是 001 短句 clean 数据集。
+
+| 数据源 | 形态 | 数字 | 判定 |
+|---|---|---:|---|
+| `cosyvoice2_train_raw_single_ref_20260520/audio_clean` | 短句 wav | 2673 条 / 7.873 h | 可作 001 短句健康参考，不适合作主 C4 续写数据。 |
+| 同数据集单条时长 | 已切短句 | mean 10.60s / median 8.68s / max 28.88s | 没有 >30s 连续段。 |
+| `input_source.jsonl` 原始路径 | `/x2robot_v2/...` | 当前 5090 未挂载 | 不能回溯原始整段录音。 |
+
+路线判定：当前没有找到 speaker `001` 的真实连续长录音，因此 C4 主线应进入 Phase 1：用健康的 001 模型整段合成多子句段落，再从整段 wav 按边界切出 continuation 样本。这个路线和旧的“逐子句合成再拼接”不同，训练目标来自一次自回归整段生成中的真实跨句韵律，不把断裂拼接当作正样本。已有短句数据只作为音色/领域参考、可选 replay 正则，不进入主 C4 续写数据路线。
