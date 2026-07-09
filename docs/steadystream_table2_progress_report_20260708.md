@@ -204,3 +204,34 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 当前卡点已经从“TRT profile 放不下完整历史”推进为“完整 text+codes re-prefill 仍不能让未训练基座稳定续写”。旧 KV carry、position-offset KV、terminal trim、tail sweep、embedding replay、drop-mode sweep、profile128 bounded token-history 和 profile512 完整 token-history 都不能让 CER 回到基线。下一步应先做 C4 collate/reference 排布对拍，确保训练样本、推理 re-prefill 和 loss mask 是同一种 token 序列；在这个对拍完成前，C2 应在表 2 中标注为未通过，不应启动正式 C4 训练。
 
 对 C4 的决策保持不变：C4 continuation SFT 要模拟“正确的 C2 推理形态”。在 C2 仍会复读/漏读的情况下启动 C4，会把推理侧实现 bug 混进训练目标，风险高且不可解释。
+
+## 8.5 2026-07-09 第 0 步：离线 HF 复现与排布对拍
+
+根据 `steadystream_table2_next_steps_20260709.md`，本轮开始执行“先离线 HF 复现 + 训推排布对拍，再进入 C4 LoRA 诊断”的收口路径。新增两个只服务于 Table 2/C4 的诊断脚本：
+
+| 脚本 | 作用 | 当前结果 |
+|---|---|---|
+| `scripts/python/check_c4_runtime_layout_parity.py` | 对拍 C4 collate 的 `prefix + text1 + codes1 + text2 + codec_BOS` 槽位顺序，并和 runtime full-current 日志 prefix 长度比较 | Wenet pilot 前 5 条 `overall_status=warn`：continuation 顺序自洽，无槽位错位；但 C4 collate prefix 长度为 8，runtime full-current `prefix_len=21`，训推前缀仍不一致。 |
+| `scripts/python/run_c4_hf_continuation_generate.py` | 直接用本地 PyTorch Qwen3-TTS 基座生成 continuation：喂入第 1 段 text+codes 和第 2 段 text+codec_BOS，只让模型生成第 2 段 codes | 0.6B Base 单样本生成成功但严重失败：目标 40 帧，生成 95 帧仍无 EOS；ASR 为“嗯有没有据据据据据据据据据据有没有证据”，CER=225%。 |
+
+同时复跑已有 `run_c4_forward_smoke.py`，确认官方 PyTorch 模型可以吃进同一个 C4 continuation batch：
+
+| 项目 | 结果 |
+|---|---|
+| manifest | `workspace/c4_wenet_premium0_pilot_20260708/c4_wenet_manifest_with_codes.jsonl` |
+| model | `workspace/hf_models/Qwen3-TTS-12Hz-0.6B-Base` |
+| device | `cuda:1` |
+| 输入 | 1 条 Wenet pilot，前 2 段 |
+| batch shape | `[1, 194, 2]`，实际 sequence length 100 |
+| codec frames / loss positions | 72 / 74 |
+| combined loss | 15.897184 |
+| 显存 | reserved 约 2.35GB |
+
+离线生成产物：`workspace/c4_wenet_premium0_pilot_20260708/hf_06b_continuation_generate_limit1_seg2/`；本地已拉回到 `outputs/c4_wenet_premium0_pilot_20260708_hf_06b_continuation_generate_limit1_seg2/`。生成音频 `hf_continuation.wav` 时长 7.6s，参考文本只有“笑得有些阴森研默，”8 个归一化字符，但 ASR 出现重复“据”字串，说明不经训练的 HF 基座同样不能稳定消费 continuation 排布。这排除了“TRT 临时 profile512 是唯一主因”的解释。
+
+当前第 0 步结论：
+
+1. C4 continuation batch 的内部顺序是对的：`current_codec_bos` 均与 `text1 + codes1 + text2` 推导位置一致。
+2. 训推仍有一个必须收口的差异：训练 collate 的 prefix 是官方 finetune 8 槽结构，runtime full-current 的 cacheable prefix 是 21 槽结构。进入 LoRA 诊断前，应统一为同一个前缀构造函数或明确证明两者等价。
+3. 离线 HF 生成也崩，且表现为无 EOS、拖长、复读/乱码；因此“基座不经 continuation 训练无法消费续写排布”的判断进一步增强。
+4. 下一步优先级不是继续调 tail，而是先把 C4 collate 和 runtime full-current 共用前缀构造，再做最小 LoRA 训练诊断，看 continuation CER 是否从 29%/225% 方向显著回落。
