@@ -417,3 +417,28 @@ LoRA 目标模块先用 `q_proj,v_proj`，评估固定为正式 20 条 NLL eval�
 | train200 r8 | 200 | 8 | 5e-6 | all-loss | 1.180→1.220 | 1.882→1.609 | 0.389 | 44.63% | 当前最佳健康档：single 小退化，gap 闭合更好。 |
 
 判读：LoRA 路径已经跑通，且 200 条训练在冻结正式 eval 上能稳定改善 continuation gap。当前最可用配置是 `r=8, lr=5e-6, all-loss, q_proj/v_proj`，比 target-only 更好，支持 review 里“all-loss + history/drop 不能排除”的判断。`r32` 或较大学习率会造成 single NLL 退化，说明下一阶段门禁必须同时约束：`gap 闭合率上升` + `single NLL 不明显退化`。下一步建议在当前健康档上加大数据量并实现 history drop/lookahead，同时加入 10% single/replay 防遗忘，再考虑 PyTorch 离线生成 CER。
+
+---
+
+## 16. 2026-07-09 E15 LoRA 数据放量与早停曲线
+
+按 E14 review，固定健康基线 `r=8, lr=5e-6, all-loss, q_proj/v_proj`，不再继续调 rank/LR；先做数据量和早停曲线。将 Wenet Premium_0 manifest 扩到 3000 windows，从中筛选 `target_segment_index=2`、目标段 ≥12 字、排除正式 20 eval 的 1000 条训练样本，并提取 3000 段 audio codes：
+
+| 文件 | 说明 |
+|---|---|
+| `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_manifest_3000.jsonl` | 3000 window pool。 |
+| `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_train_idx2_min12_limit1000_with_codes.jsonl` | 1000 条 C4 train，和正式 eval overlap=0。 |
+
+新增 `train_c4_lora_gap.py --max-steps` 支持早停曲线；同时加 `--single-replay-ratio` 做 10% single replay 防遗忘试验。结果如下：
+
+| 配置 | steps | replay | single before→after | continuation before→after | gap after | gap 闭合率 | 判定 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 200 train baseline | 200 | 0 | 1.180→1.220 | 1.882→1.609 | 0.389 | 44.63% | E14 健康基线。 |
+| 1000 pool early stop | 200 | 0 | 1.180→1.213 | 1.882→1.594 | 0.381 | 45.70% | 严格 single 预算内，略优于 E14。 |
+| 1000 pool early stop | 250 | 0 | 1.180→1.255 | 1.882→1.563 | 0.308 | 56.12% | 更高闭合，但 single +0.075，略超 ≤0.05 预算。 |
+| 1000 pool early stop | 250 | 10% | 1.180→1.251 | 1.882→1.589 | 0.338 | 51.89% | replay10 对 single 仅小幅帮助，换来 closure 下降。 |
+| 1000 pool early stop | 350 | 0 | 1.180→1.410 | 1.882→1.605 | 0.195 | 72.20% | closure 高但 single 退化明显，不健康。 |
+| 1000 pool early stop | 350 | 10% | 1.180→1.403 | 1.882→1.596 | 0.192 | 72.60% | replay10 未解决 350-step single 退化。 |
+| 1000 pool full epoch | 1000 | 0 | 1.180→4.007 | 1.882→4.039 | 0.032 | 95.37% | 假闭合，整体 NLL 崩坏。 |
+
+判读：数据放量有效，但训练步数是主要风险。`1000 pool + 200 steps` 是当前严格健康档，single 只退化 +0.033 且 gap 闭合 45.70%；`250 steps` 可作为激进候选，closure 到 56.12%，但 single 预算略超。10% single replay 在当前随机替换实现下帮助有限，说明防遗忘可能需要更强的 replay 比例、显式 single batch 调度或学习率/warmup/decay，而不是简单随机 10%。下一步优先不是继续拉长训练，而是用 `step200/250` 两个 adapter 做 PyTorch 离线生成 CER 小样本校准，看 NLL closure 对 CER 是否有实际收益；若 CER 有回落，再加 history drop/lookahead 与更稳的 replay 调度。

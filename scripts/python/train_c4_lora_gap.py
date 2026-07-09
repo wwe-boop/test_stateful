@@ -100,8 +100,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-limit", type=int, default=200)
     parser.add_argument("--eval-limit", type=int, default=20)
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--loss-scope", choices=["all", "target"], default="target")
+    parser.add_argument("--single-replay-ratio", type=float, default=0.0)
     parser.add_argument("--lora-r", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -154,16 +156,25 @@ def main() -> int:
 
     losses = []
     model.train()
+    global_step = 0
+    stop_training = False
     for epoch in range(args.epochs):
         order = list(train_rows)
         random.shuffle(order)
         for step, row in enumerate(order, start=1):
-            ref_mels = load_ref_mels(first_ref_audio(row, repo_root=args.repo_root))
+            if args.max_steps and global_step >= args.max_steps:
+                stop_training = True
+                break
+            global_step += 1
+            use_replay = args.single_replay_ratio > 0 and random.random() < args.single_replay_ratio
+            train_row = row_for_single_segment(row, args.target_segment_index) if use_replay else row
+            train_target_index = 0 if use_replay else args.target_segment_index
+            ref_mels = load_ref_mels(first_ref_audio(train_row, repo_root=args.repo_root))
             batch, layouts = build_continuation_batch(
-                [row], tokenizer=qwen3tts.processor, special_ids=special_ids, max_segments=args.target_segment_index + 1
+                [train_row], tokenizer=qwen3tts.processor, special_ids=special_ids, max_segments=train_target_index + 1
             )
             if args.loss_scope == "target":
-                batch = restrict_loss_to_segment(batch, layouts[0], args.target_segment_index)
+                batch = restrict_loss_to_segment(batch, layouts[0], train_target_index)
             optimizer.zero_grad(set_to_none=True)
             loss = train_step(model=model, batch=batch, ref_mels=ref_mels)
             loss.backward()
@@ -171,8 +182,11 @@ def main() -> int:
             optimizer.step()
             loss_value = float(loss.detach().cpu())
             losses.append(loss_value)
-            if step == 1 or step % 25 == 0 or step == len(order):
-                print(f"[lora-train] epoch={epoch} step={step}/{len(order)} loss={loss_value:.6f}", flush=True)
+            if global_step == 1 or global_step % 25 == 0 or step == len(order):
+                replay_tag = " replay=1" if use_replay else ""
+                print(f"[lora-train] epoch={epoch} step={step}/{len(order)} global_step={global_step} loss={loss_value:.6f}{replay_tag}", flush=True)
+        if stop_training:
+            break
 
     after = evaluate_gap(
         model=model,
@@ -198,8 +212,11 @@ def main() -> int:
         "train_samples": len(train_rows),
         "eval_samples": len(eval_rows),
         "epochs": args.epochs,
+        "max_steps": args.max_steps,
+        "actual_steps": len(losses),
         "lr": args.lr,
         "loss_scope": args.loss_scope,
+        "single_replay_ratio": args.single_replay_ratio,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
