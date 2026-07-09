@@ -921,6 +921,7 @@ class EngineLoop:
         )
         slot.last_codec_sum = None
         slot.steadystream_replay_embeds = []
+        slot.steadystream_full_codecs = []
         slot.trailing = [self._coerce_embed_tensor(t) for t in trailing]
         slot.text_idx = 0
 
@@ -997,6 +998,13 @@ class EngineLoop:
     def _steadystream_uses_reprefill_history(group: EngineSessionGroup) -> bool:
         raw = str(
             group.steadystream_experimental.get("kv_reprefill_history", "")
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _steadystream_uses_token_history(group: EngineSessionGroup) -> bool:
+        raw = str(
+            group.steadystream_experimental.get("kv_reprefill_token_history", "")
         ).strip().lower()
         return raw in {"1", "true", "yes", "on"}
 
@@ -1177,6 +1185,23 @@ class EngineLoop:
                     carry["replay_len"] = int(keep)
                     carry["replay_dropped_tail_tokens"] = int(drop_talker_tail_tokens)
 
+            if self._steadystream_uses_token_history(group):
+                codec_items = list(slot.steadystream_full_codecs or [])
+                if drop_talker_tail_tokens > 0:
+                    codec_items = codec_items[:-int(drop_talker_tail_tokens)]
+                keep = min(
+                    len(codec_items),
+                    self._steadystream_kv_tail_tokens(group),
+                )
+                if keep > 0:
+                    full_codes = torch.cat(codec_items[-keep:], dim=0)
+                    carry["history_text_token_ids"] = list(seg.pending_token_ids)
+                    carry["history_text_include_eos"] = bool(seg.input_complete)
+                    carry["history_full_codes"] = full_codes.detach().clone().cpu()
+                    carry["history_total_codec_frames"] = len(codec_items)
+                    carry["history_kept_codec_frames"] = int(keep)
+                    carry["history_dropped_tail_tokens"] = int(drop_talker_tail_tokens)
+
             talker_kv, compact_len, logical_past_len = self._snapshot_talker_kv_tail(
                 slot,
                 max_tokens=self._steadystream_kv_tail_tokens(group),
@@ -1272,6 +1297,16 @@ class EngineLoop:
         if task_type == TaskType.VOICE_CLONE_ICL:
             return None
         carry = group.steadystream_carry or {}
+        if self._steadystream_uses_token_history(group):
+            reprefill = self._try_reprefill_from_steadystream_token_history(
+                group,
+                seg,
+                slot,
+                task_type,
+                metrics,
+            )
+            if reprefill is not None:
+                return reprefill
         if self._steadystream_uses_reprefill_history(group):
             reprefill = self._try_reprefill_from_steadystream_history(
                 group,
@@ -1361,6 +1396,269 @@ class EngineLoop:
             compact_len,
             logical_past_len,
             slot.position_offset,
+        )
+        return None, False
+
+    def _steadystream_codec_sum_from_full_codes(
+        self,
+        full_codes: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if self._prefill_builder is None:
+            return None
+        w = self._prefill_builder.w
+        table = getattr(w, "codec_embeddings_3d", None)
+        if table is None:
+            return None
+        codes = full_codes.to(device=table.device, dtype=torch.int64)
+        if codes.dim() == 3 and codes.shape[0] == 1:
+            codes = codes[0]
+        if codes.dim() != 2 or codes.shape[1] != 16 or codes.shape[0] <= 0:
+            return None
+        group_ids = torch.arange(
+            16,
+            device=table.device,
+            dtype=torch.int64,
+        ).reshape(1, 16).expand(codes.shape[0], 16)
+        with torch.no_grad():
+            codec_sum = table[group_ids, codes, :].sum(dim=1).unsqueeze(0)
+        return codec_sum.to(device=self._embed_device, dtype=self._embed_dtype)
+
+    def _steadystream_text_block_embed(
+        self,
+        token_ids: list[int],
+        *,
+        include_eos: bool,
+    ) -> Optional[torch.Tensor]:
+        if self._prefill_builder is None:
+            return None
+        w = self._prefill_builder.w
+        ids = list(token_ids)
+        if include_eos:
+            ids.append(int(w.tts_eos_token_id))
+        if not ids:
+            return torch.zeros(
+                1,
+                0,
+                self._hidden_size,
+                device=self._embed_device,
+                dtype=self._embed_dtype,
+            )
+        ids_tensor = torch.tensor([ids], device=w.device, dtype=torch.int64)
+        codec_pad_ids = torch.full(
+            (1, len(ids)),
+            int(w.codec_pad_id),
+            device=w.device,
+            dtype=torch.int64,
+        )
+        with torch.no_grad():
+            text_embed = w.text_embed(ids_tensor)
+            codec_pad = w.codec_embed(codec_pad_ids)
+        return (text_embed + codec_pad).to(
+            device=self._embed_device,
+            dtype=self._embed_dtype,
+        )
+
+    def _build_steadystream_token_history_prefill(
+        self,
+        prefix_embeds: torch.Tensor,
+        *,
+        history_text_token_ids: list[int],
+        history_text_include_eos: bool,
+        history_full_codes: torch.Tensor,
+        current_token_ids: list[int],
+        current_include_eos: bool,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, dict[str, int]]]:
+        if self._prefill_builder is None:
+            return None
+        w = self._prefill_builder.w
+        history_text = self._steadystream_text_block_embed(
+            history_text_token_ids,
+            include_eos=history_text_include_eos,
+        )
+        current_text = self._steadystream_text_block_embed(
+            current_token_ids,
+            include_eos=current_include_eos,
+        )
+        if history_text is None or current_text is None:
+            return None
+
+        prefix_embeds = prefix_embeds.to(
+            device=self._embed_device,
+            dtype=self._embed_dtype,
+        )
+        max_seq = int(self._executor.kv_pool.max_seq_len)
+        fixed_len = (
+            int(prefix_embeds.shape[1])
+            + int(history_text.shape[1])
+            + 1  # history codec BOS
+            + 1  # history boundary codec EOS
+            + int(current_text.shape[1])
+            + 1  # request codec BOS after prefill
+        )
+        max_code_frames = max_seq - fixed_len
+        if max_code_frames <= 0:
+            return None
+        total_code_frames = int(history_full_codes.shape[0])
+        if total_code_frames <= 0:
+            return None
+        if total_code_frames > max_code_frames:
+            history_full_codes = history_full_codes[-max_code_frames:, :]
+        codec_sum = self._steadystream_codec_sum_from_full_codes(
+            history_full_codes,
+        )
+        if codec_sum is None:
+            return None
+
+        pad = w.tts_pad_embed.to(device=self._embed_device, dtype=self._embed_dtype)
+        codec_bos = w.codec_embed(
+            torch.tensor([[w.codec_bos_id]], device=w.device, dtype=torch.int64)
+        ).to(device=self._embed_device, dtype=self._embed_dtype)
+        codec_eos_id = int(
+            getattr(
+                w,
+                "codec_eos_id",
+                getattr(w, "codec_eos_token_id", 0),
+            )
+        )
+        codec_eos = w.codec_embed(
+            torch.tensor([[codec_eos_id]], device=w.device, dtype=torch.int64)
+        ).to(device=self._embed_device, dtype=self._embed_dtype)
+
+        history_codec_bos = pad + codec_bos
+        history_codes = pad.expand(1, codec_sum.shape[1], self._hidden_size) + codec_sum
+        history_boundary = pad + codec_eos
+        request_codec_bos = history_codec_bos.clone()
+        prefill = torch.cat(
+            [
+                prefix_embeds,
+                history_text,
+                history_codec_bos,
+                history_codes,
+                history_boundary,
+                current_text,
+            ],
+            dim=1,
+        ).contiguous()
+        info = {
+            "prefix_len": int(prefix_embeds.shape[1]),
+            "history_text_tokens": len(history_text_token_ids),
+            "history_code_frames": int(history_full_codes.shape[0]),
+            "history_code_frames_total": total_code_frames,
+            "current_text_tokens": len(current_token_ids),
+            "prefill_len": int(prefill.shape[1]),
+        }
+        return prefill, request_codec_bos.contiguous(), info
+
+    def _try_reprefill_from_steadystream_token_history(
+        self,
+        group: EngineSessionGroup,
+        seg: EngineSegment,
+        slot: SlotKVState,
+        task_type: TaskType,
+        metrics: dict,
+    ) -> Optional[tuple[Optional[bytes], bool]]:
+        carry = group.steadystream_carry or {}
+        history_full_codes = carry.get("history_full_codes")
+        history_text_token_ids = carry.get("history_text_token_ids")
+        if (
+            history_full_codes is None
+            or not isinstance(history_text_token_ids, list)
+            or not seg.pending_token_ids
+        ):
+            return None
+
+        req_cfg = group.request.session_config
+
+        def _cfg_attr(name: str, default=None):
+            return getattr(req_cfg, name, default) if req_cfg is not None else default
+
+        def _cfg_token_ids(name: str):
+            spec = _cfg_attr(name)
+            return list(spec.token_ids) if spec is not None else None
+
+        plan = self._prefill_builder.build_plan_from_ids(
+            task_type=task_type,
+            token_ids=seg.pending_token_ids,
+            language=_cfg_attr("language", "auto"),
+            speaker=_cfg_attr("speaker", group.request.speaker_key),
+            instruct=_cfg_attr("instruct"),
+            instruct_token_ids=_cfg_token_ids("instruct_spec"),
+            spk_embedding=_cfg_attr("spk_embedding"),
+            ref_text=_cfg_attr("ref_text"),
+            ref_text_token_ids=_cfg_token_ids("ref_text_spec"),
+            ref_codec_sum_vec=_cfg_attr("ref_codec_sum_vec"),
+            ref_audio_sha256=_cfg_attr("ref_audio_sha256"),
+            ref_feature_cache_key=_cfg_attr("ref_feature_cache_key"),
+            include_eos=seg.input_complete,
+        )
+        if plan.cacheable_prefix_embeds is None:
+            return None
+
+        built = self._build_steadystream_token_history_prefill(
+            plan.cacheable_prefix_embeds,
+            history_text_token_ids=[int(x) for x in history_text_token_ids],
+            history_text_include_eos=bool(carry.get("history_text_include_eos", True)),
+            history_full_codes=history_full_codes,
+            current_token_ids=list(seg.pending_token_ids),
+            current_include_eos=bool(seg.input_complete),
+        )
+        if built is None:
+            return None
+        replay_prefill, request_embed, info = built
+
+        self._executor.prefill_prefix_only(slot, replay_prefill)
+        self._prime_decode_after_prefix_prefill(
+            slot,
+            request_embed,
+            [],
+            source=f"steadystream_token_history_{group.steadystream_variant}",
+        )
+        if self._steadystream_uses_acoustic(group):
+            self._restore_steadystream_c2w_carry(group, slot, metrics)
+        metrics["steadystream_variant"] = group.steadystream_variant
+        metrics["steadystream_kv_tail"] = "reprefill_token_history"
+        metrics["steadystream_kv_prefix"] = "recomputed"
+        metrics["steadystream_kv_prefix_len"] = str(info["prefix_len"])
+        metrics["steadystream_token_history_prefill_len"] = str(info["prefill_len"])
+        metrics["steadystream_token_history_text_tokens"] = str(
+            info["history_text_tokens"]
+        )
+        metrics["steadystream_token_history_code_frames"] = str(
+            info["history_code_frames"]
+        )
+        metrics["steadystream_token_history_code_frames_total"] = str(
+            info["history_code_frames_total"]
+        )
+        metrics["steadystream_token_history_current_text_tokens"] = str(
+            info["current_text_tokens"]
+        )
+        metrics["steadystream_token_history_dropped_tail_tokens"] = str(
+            int(carry.get("history_dropped_tail_tokens") or 0)
+        )
+        metrics["steadystream_kv_terminal_drop_mode"] = str(
+            carry.get("talker_terminal_drop_mode", "")
+        )
+        metrics["steadystream_kv_tail_source_frames"] = str(
+            int(carry.get("talker_tail_source_frames") or 0)
+        )
+        metrics["steadystream_kv_dropped_tail_ratio"] = str(
+            carry.get("talker_dropped_tail_ratio", "")
+        )
+        metrics["steadystream_token_counts"] = "reset"
+        metrics["steadystream_carry_from_segment"] = str(
+            carry.get("from_segment_idx", "")
+        )
+        logger.info(
+            "Applied SteadyStream token-history prefill: session=%s variant=%s "
+            "seg=%d prefix=%d hist_text=%d hist_codes=%d/%d current_text=%d",
+            group.session_id,
+            group.steadystream_variant,
+            seg.segment_idx,
+            info["prefix_len"],
+            info["history_text_tokens"],
+            info["history_code_frames"],
+            info["history_code_frames_total"],
+            info["current_text_tokens"],
         )
         return None, False
 
@@ -1643,6 +1941,16 @@ class EngineLoop:
                 replay_limit = self._steadystream_replay_buffer_limit(group)
                 if len(slot.steadystream_replay_embeds) > replay_limit:
                     del slot.steadystream_replay_embeds[:-replay_limit]
+            if (
+                output.full_codec is not None
+                and self._steadystream_uses_token_history(group)
+            ):
+                slot.steadystream_full_codecs.append(
+                    output.full_codec[i:i + 1].detach().cpu().clone().contiguous()
+                )
+                codec_limit = self._steadystream_replay_buffer_limit(group)
+                if len(slot.steadystream_full_codecs) > codec_limit:
+                    del slot.steadystream_full_codecs[:-codec_limit]
             slot.past_len += 1
             slot.frame_idx += 1
             slot.touch()

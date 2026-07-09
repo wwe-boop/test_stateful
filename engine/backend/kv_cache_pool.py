@@ -113,6 +113,9 @@ class SlotKVState:
     # SteadyStream diagnostic path: decode-step input embeddings that can be
     # replayed through a fresh prefill instead of carrying RoPE-rotated KV.
     steadystream_replay_embeds: list = field(default_factory=list)
+    # Token-history diagnostic path: full 16-codebook codec frames emitted by
+    # the fused decoder, used to rebuild a bounded text+codes prefill.
+    steadystream_full_codecs: list = field(default_factory=list)
 
     # Pad phase tracking (aligned with old engine's Phase B controls)
     pad_start_frame: int = -1
@@ -276,6 +279,7 @@ class KVCachePool:
         slot.trailing = []
         slot.token_queue = []
         slot.steadystream_replay_embeds = []
+        slot.steadystream_full_codecs = []
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
         slot.sampling_seed = None
@@ -313,6 +317,7 @@ class KVCachePool:
         slot.trailing = []
         slot.token_queue = []
         slot.steadystream_replay_embeds = []
+        slot.steadystream_full_codecs = []
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
         slot.sampling_seed = None
@@ -362,6 +367,7 @@ class KVCachePool:
         slot.last_codec_sum = None
         slot.token_queue = []
         slot.steadystream_replay_embeds = []
+        slot.steadystream_full_codecs = []
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
         slot.sampling_seed = None

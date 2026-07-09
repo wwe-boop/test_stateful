@@ -445,6 +445,7 @@ class GPUFuture:
             split_c2w_conv=split_c2w_conv,
             split_c2w_transconv=split_c2w_transconv,
             codec_sum=codec_sum,
+            full_codec=full_codec,
             updated_tc=updated_tc,
             used_pingpong=self._used_pingpong,
             step_input_embeds=self._step_input_embeds,
@@ -473,6 +474,7 @@ class StepOutput:
     split_c2w_conv: List[List[Optional[torch.Tensor]]] = field(default_factory=list)
     split_c2w_transconv: List[List[Optional[torch.Tensor]]] = field(default_factory=list)
     codec_sum: Optional[torch.Tensor] = None
+    full_codec: Optional[torch.Tensor] = None
     updated_tc: Optional[torch.Tensor] = None
     used_pingpong: bool = False
     step_input_embeds: Optional[torch.Tensor] = None
