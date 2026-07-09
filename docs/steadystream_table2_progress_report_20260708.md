@@ -860,3 +860,41 @@ API 判定：`http://39.101.65.229:44083/` 是 FastAPI WebUI，`/api/generate` �
 | 样本结构 | 当前选择 target segment index=1，因此每条样本是 2 段 history→target，适合先做 Phase 2 NLL 和小 LoRA 格式消融。 | 正式扩训前再扩到多 target index、多段 history，避免只学“一句接一句”的窄分布。 |
 
 结论：Phase 1.4 的“可训练 continuation manifest”已经打通，并且不是坏的 proxy boundary 实验。下一步按 playbook 进入 Phase 2：从 Phase 1 产物中冻结一份不入训的 `eval20_001`，在 0701 checkpoint / speaker `001` 上跑 teacher-forcing NLL，先拿到可信的 single/continuation 格式 OOD 基线；在 NLL 基线完成前，不启动 C4 LoRA 训练。
+
+---
+
+## 34. 2026-07-10 E36 C4 Phase 2 eval20_001 NLL baseline
+
+按 playbook 阶段 2，从 Phase 1.4 coded manifest 中冻结 speaker `001` 的 `eval20_001`。由于 `clean500` 补样阶段存在 6 行重复 `sample_id`，本轮没有直接取末尾 20 行，而是先按 `sample_id` 保留首个唯一项，再冻结最后 20 个唯一 `sample_id`；训练池显式排除这 20 个 eval ids。新增可复现 split 工具：`scripts/python/split_c4_eval_train.py`。
+
+冻结产物：
+
+| 文件 | 位置 | 数字 |
+|---|---|---:|
+| eval split summary | 5090 `workspace/c4_synth_v1_clean500/eval20_001_split_summary.json`；4090 同步到 `workspace/eval20_001_split_summary.json` | 498 total rows / 492 unique ids / 20 eval / 472 train pool |
+| eval manifest | 5090 `workspace/c4_synth_v1_clean500/eval20_001_with_codes.jsonl` | 20 条，target segment index=1 |
+| train pool | 5090 `workspace/c4_synth_v1_clean500/train_pool_excluding_eval20_001_with_codes.jsonl` | 472 条，排除 eval ids |
+| NLL summary | 5090 `workspace/c4_synth_v1_clean500/teacher_forcing_nll_eval20_001_idx1_limit20.json`；4090 同步到 `workspace/teacher_forcing_nll_eval20_001_idx1_limit20.json` | 20 条 |
+
+NLL 结果（0701 checkpoint `/home/train/tts/qwen3-tts/trained/zehan/0701_trained_model`，speaker=`001`，device=`cuda:0`）：
+
+| 指标 | 数值 | 判读 |
+|---|---:|---|
+| single NLL mean | 7.168064 | 绝对值未达到 playbook 预期 1-2，不能当作“条件完全健康”的证据。 |
+| continuation NLL mean | 7.445304 | continuation 仍比 single 更难。 |
+| ΔNLL mean | +0.277240 | 同口径下 history+target 排布有 OOD gap。 |
+| ΔNLL min/max | -0.695578 / +1.142250 | 样本差异较大。 |
+| continuation worse count | 15/20 | 多数样本 continuation 更差。 |
+
+异常排查：
+
+| 排查项 | 结果 | 结论 |
+|---|---|---|
+| speaker map | `config.talker_config.spk_id={'001': 3000}` | speaker key 存在。 |
+| codes 范围 | eval20 target codes `0-2047` | codec id 未越界。 |
+| C4 single collate vs 官方 finetuning collate | 对同一 target 单句，`input_ids/codec_ids/labels/masks` 全部逐位一致 | 高 NLL 不是 C4 batch offset 错位。 |
+| speaker embedding 入口 | `model.talker.get_input_embeddings()(3000)` 与 `model.talker.model.codec_embedding(3000)` max diff=0 | 不是 speaker embedding 入口错。 |
+| language prefix probe | Auto/no-language single≈7.71，Chinese-prefix single≈8.91 | 不是缺 Chinese language prefix。 |
+| 001 短句 clean 诊断 | `workspace/teacher_forcing_nll_short001_single.json`：single=9.146412 | 高绝对 NLL 不是 synthetic continuation 独有，说明当前 teacher-forcing 绝对量尺与 0701/custom 数据分布仍不匹配。 |
+
+当前决策：Phase 2 已产出同口径 baseline，但它只能作为“后续训练前后相对变化”的量尺，不能声称满足 playbook 中 single NLL 1-2 的健康假设。下一步若继续 Phase 3 小 LoRA，门禁必须更严格写成：同一 `eval20_001` 上 continuation gap 下降，同时 single NLL 退化 ≤0.05；并在报告里保留“绝对 NLL 偏高，待进一步查明 PyTorch 0701 与 TRT/prepare_data code 分布差异”的风险。不要用这组 NLL 直接宣布 C4 已可交付。
