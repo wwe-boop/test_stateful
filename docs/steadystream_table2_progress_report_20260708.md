@@ -654,3 +654,19 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 | C3 prototype | `tail_kv_pause_recovery` | 277.80% | 270.45% | 255.17% | 307.76% | C3 停顿恢复无法修复 C2/KV 历史复读。 |
 
 进一步检查：`stateful_stream`、`acoustic_tail_only`、`tail_kv_pause_recovery` 都拿到 exact boundaries（001/002 为 7/7，003 为 9/9），所以这次不是 proxy boundary 或分段合并导致的假结果。C3 的 pause deviation 在样本 001 上从 stateful 的约 196.8ms、C1 的约 290.6ms 被校正到 0ms，但 CER 同时爆炸，hyp_chars 变成 324/409/469，而 ref_chars 只有 88/116/116。结论是：C3 后处理确实能把“停顿列”做漂亮，但它不能恢复语义；当前 C3 行差的根因仍是 C2/KV 历史条件导致的长复读，而不是 baseline、C1、ASR 或同文本设置问题。
+
+---
+
+## 24. 2026-07-09 E24 Serving prefix 收口对照：language=auto + 空 instruct
+
+按 E7 review §3.2，补一个最小 serving-prefix 消融：runner 新增 `--override-language` 和 `--override-instruct`，同一批 `prosody_mini_001-003`、seed=42、`input_mode=token`，只把数据集默认的 `language="Chinese"`、非空 instruct 覆盖为 `language="auto"`、`instruct=""`，使 serving 前缀从带 instruct/language tag 的长前缀收敛到更接近官方 8 槽核心。产物目录：`workspace/table2_prefix_auto_empty_e24_20260709/`。
+
+| variant | E23 原始前缀 | E24 auto/空 instruct | 判读 |
+|---|---:|---:|---|
+| `stateless_once` | 4.40% | 5.36% | baseline 仍健康。 |
+| `stateful_stream` | 4.01% | 4.21% | 普通流式基本不变。 |
+| `offline_full` | 4.78% | 4.78% | 离线整段不变。 |
+| `acoustic_tail_only` | 4.21% | 6.69% | C1 仍是健康量级，略有波动。 |
+| `tail_kv_pause_recovery` | 277.80% | 280.49% | C3/KV 灾难复读没有改善。 |
+
+E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 exact boundaries 正常（001/002 为 7/7，003 为 9/9）。因此，21 槽 serving 前缀膨胀不是当前 runtime C3/KV 复读的主因；即使收敛到 auto/空 instruct，KV/history conditioning 仍会把输出拖长到 89-122 秒并造成 250%-320% CER。下一步不应继续押注前缀长度本身，而应做 content-level layout parity 与 token-level text+codes re-prefill/训练同构门禁。

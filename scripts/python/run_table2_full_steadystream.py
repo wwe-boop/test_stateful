@@ -621,12 +621,14 @@ def run_sample(
     resume: bool = False,
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
+    override_language: str | None = None,
+    override_instruct: str | None = None,
 ) -> dict[str, Any]:
     sample_id = row["sample_id"]
     task_type = "custom_voice"
     speaker = row.get("speaker", "Vivian")
-    language = row.get("language", "Chinese")
-    instruct = row.get("instruct", "")
+    language = override_language if override_language is not None else row.get("language", "Chinese")
+    instruct = override_instruct if override_instruct is not None else row.get("instruct", "")
     segments = [seg["text"] for seg in row["segments"]]
     puncts = row.get("boundary_punct_classes", [])
     full_text = "".join(segments)
@@ -882,6 +884,16 @@ def main() -> int:
         default=None,
         help="Override kv_tail_tokens for C2 diagnostic variants and suffix their output keys.",
     )
+    parser.add_argument(
+        "--override-language",
+        default=None,
+        help="Override dataset language for serving-prefix diagnostics, e.g. auto.",
+    )
+    parser.add_argument(
+        "--override-instruct",
+        default=None,
+        help="Override dataset instruct for serving-prefix diagnostics; pass an empty string to disable instruct.",
+    )
     args = parser.parse_args()
 
     rows = [
@@ -933,6 +945,8 @@ def main() -> int:
                     resume=args.resume,
                     include_c2_diagnostics=args.include_c2_diagnostics,
                     c2_diagnostic_kv_tail_tokens=args.c2_diagnostic_kv_tail_tokens,
+                    override_language=args.override_language,
+                    override_instruct=args.override_instruct,
                 )
                 elapsed = time.perf_counter() - t0
                 print(f"[ok] seed={seed} {sample_id} elapsed={elapsed:.1f}s", flush=True)
