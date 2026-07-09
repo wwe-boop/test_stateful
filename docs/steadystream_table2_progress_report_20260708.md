@@ -898,3 +898,31 @@ NLL 结果（0701 checkpoint `/home/train/tts/qwen3-tts/trained/zehan/0701_train
 | 001 短句 clean 诊断 | `workspace/teacher_forcing_nll_short001_single.json`：single=9.146412 | 高绝对 NLL 不是 synthetic continuation 独有，说明当前 teacher-forcing 绝对量尺与 0701/custom 数据分布仍不匹配。 |
 
 当前决策：Phase 2 已产出同口径 baseline，但它只能作为“后续训练前后相对变化”的量尺，不能声称满足 playbook 中 single NLL 1-2 的健康假设。下一步若继续 Phase 3 小 LoRA，门禁必须更严格写成：同一 `eval20_001` 上 continuation gap 下降，同时 single NLL 退化 ≤0.05；并在报告里保留“绝对 NLL 偏高，待进一步查明 PyTorch 0701 与 TRT/prepare_data code 分布差异”的风险。不要用这组 NLL 直接宣布 C4 已可交付。
+
+---
+
+## 35. 2026-07-10 E37 C4 Phase 3 interleaved LoRA smoke
+
+进入 playbook 阶段 3 的第一档格式消融：先跑现有 interleaved C4 排布（`build_c4_continuation_batch.py`），配置按计划固定为 LoRA `r=8, alpha=16, q_proj/v_proj, lr=5e-6, all-loss`，底座为 0701 checkpoint，speaker=`001`，训练集使用 Phase 2 的 `train_pool_excluding_eval20_001_with_codes.jsonl`，评估固定 `eval20_001_with_codes.jsonl`。
+
+先修复一个训练脚本卡点：`train_c4_continuation_smoke.py` 的训练 embedding 旧逻辑只支持带 `speaker_encoder` 的 voice-clone 模型，直接调用 `model.speaker_encoder(ref_mels)`；0701 custom checkpoint 没有 speaker_encoder，而是 `talker_config.spk_id={'001':3000}`。已改为复用 NLL 脚本中验证过的 `resolve_speaker_embedding()`：有 speaker_encoder 时走 ref_mel；无 speaker_encoder 时走 `spk_id` 的 codec embedding。`train_c4_lora_gap.py` 同步把 `--speaker` 传进 `train_step()`。5-step smoke 通过，证明 custom speaker-id LoRA 训练路径已打通。
+
+结果：
+
+| 实验 | train/eval | steps | before single | before cont | before gap | after single | after cont | after gap | single 退化 | gap closure | 判读 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| smoke | train20/eval5 | 5 | eval5 | eval5 | eval5 | eval5 | eval5 | eval5 | n/a | 1.53% | 只验证训练/保存/评估链路。 |
+| interleaved all-loss | train200/eval20 | 200 | 7.168064 | 7.445304 | 0.277240 | 5.680097 | 5.807849 | 0.127752 | -1.487967 | **53.92%** | 当前优选档；gap 明显闭合且 single 没退化。 |
+| interleaved all-loss | train250/eval20 | 250 | 7.168064 | 7.445304 | 0.277240 | 5.638144 | 5.789114 | 0.150970 | -1.529920 | 45.55% | single 继续改善，但 continuation gap 反而比 200-step 差。 |
+
+产物：
+
+| 文件 | 位置 |
+|---|---|
+| 5-step smoke summary | 5090 `workspace/c4_synth_v1_clean500/lora_smoke_interleaved_r8_lr5e6_steps5_summary.json`；4090 同步到 `workspace/lora_smoke_interleaved_r8_lr5e6_steps5_summary.json` |
+| 200-step adapter | 5090 `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps200/` |
+| 200-step summary | 5090 `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps200_summary.json`；4090 同步到 `workspace/lora_interleaved_all_r8_lr5e6_steps200_summary.json` |
+| 250-step adapter | 5090 `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps250/` |
+| 250-step summary | 5090 `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps250_summary.json`；4090 同步到 `workspace/lora_interleaved_all_r8_lr5e6_steps250_summary.json` |
+
+当前判读：interleaved C4 训练在 held-out `eval20_001` 上有明确学习信号，且没有触发 single NLL 退化预算；200-step 比 250-step 更适合作为当前候选 checkpoint。注意这仍是 teacher-forcing NLL 层面的成功，不等价于生成级 CER 成功；下一步必须按计划补 ICL layout 消融，或至少用 200-step adapter 做 PyTorch/runtime 生成 smoke，确认 NLL gap 能否转化为自回归生成质量。

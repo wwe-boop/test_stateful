@@ -29,7 +29,7 @@ from scripts.python.run_c4_forward_smoke import (  # noqa: E402
     load_ref_mels,
     special_ids_from_model_config,
 )
-from scripts.python.run_c4_teacher_forcing_nll import codec0_nll_for_segment  # noqa: E402
+from scripts.python.run_c4_teacher_forcing_nll import codec0_nll_for_segment, resolve_speaker_embedding  # noqa: E402
 
 
 def move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
@@ -41,11 +41,12 @@ def build_training_embeddings(
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
     ref_mels: torch.Tensor,
+    speaker: str,
 ) -> torch.Tensor:
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    speaker_embedding = model.speaker_encoder(ref_mels.to(device=device, dtype=dtype)).detach()
+    speaker_embedding = resolve_speaker_embedding(model=model, ref_mels=ref_mels, speaker=speaker)
 
     input_ids = batch["input_ids"].to(device)
     codec_ids = batch["codec_ids"].to(device)
@@ -101,9 +102,10 @@ def train_step(
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
     ref_mels: torch.Tensor,
+    speaker: str,
 ) -> torch.Tensor:
     device = next(model.parameters()).device
-    input_embeddings = build_training_embeddings(model=model, batch=batch, ref_mels=ref_mels)
+    input_embeddings = build_training_embeddings(model=model, batch=batch, ref_mels=ref_mels, speaker=speaker)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["codec_0_labels"].to(device)
     codec_ids = batch["codec_ids"].to(device)
@@ -232,7 +234,7 @@ def main() -> int:
             if args.loss_scope == "target":
                 batch = restrict_loss_to_segment(batch, layouts[0], args.target_segment_index)
             optimizer.zero_grad(set_to_none=True)
-            loss = train_step(model=model, batch=batch, ref_mels=ref_mels)
+            loss = train_step(model=model, batch=batch, ref_mels=ref_mels, speaker=args.speaker)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()

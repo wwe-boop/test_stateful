@@ -181,7 +181,7 @@ def main() -> int:
             if args.loss_scope == "target":
                 batch = restrict_loss_to_segment(batch, layouts[0], train_target_index)
             optimizer.zero_grad(set_to_none=True)
-            loss = train_step(model=model, batch=batch, ref_mels=ref_mels)
+            loss = train_step(model=model, batch=batch, ref_mels=ref_mels, speaker=args.speaker)
             loss.backward()
             torch.nn.utils.clip_grad_norm_((p for p in model.parameters() if p.requires_grad), 1.0)
             optimizer.step()
