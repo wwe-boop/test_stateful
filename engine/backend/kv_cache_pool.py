@@ -117,6 +117,10 @@ class SlotKVState:
     # the fused decoder, used to rebuild a bounded text+codes prefill.
     steadystream_full_codecs: list = field(default_factory=list)
 
+    # C1/F3 diagnostic path: c2w state snapped at the onset of a trailing
+    # silence run so the acoustic-tail carry can exclude the silent tail.
+    c2w_voiced_snapshot: Optional[dict] = None
+
     # Pad phase tracking (aligned with old engine's Phase B controls)
     pad_start_frame: int = -1
     pad_consecutive_silence: int = 0
@@ -280,6 +284,7 @@ class KVCachePool:
         slot.token_queue = []
         slot.steadystream_replay_embeds = []
         slot.steadystream_full_codecs = []
+        slot.c2w_voiced_snapshot = None
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
         slot.sampling_seed = None
@@ -318,6 +323,7 @@ class KVCachePool:
         slot.token_queue = []
         slot.steadystream_replay_embeds = []
         slot.steadystream_full_codecs = []
+        slot.c2w_voiced_snapshot = None
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
         slot.sampling_seed = None
@@ -368,6 +374,7 @@ class KVCachePool:
         slot.token_queue = []
         slot.steadystream_replay_embeds = []
         slot.steadystream_full_codecs = []
+        slot.c2w_voiced_snapshot = None
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
         slot.sampling_seed = None

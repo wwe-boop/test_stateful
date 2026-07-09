@@ -736,3 +736,20 @@ E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 e
 音频时长也正常：`stateful_stream` 为 23.20/27.92/29.60s，C1 为 22.32/28.00/29.52s，C1+C3 为 24.02/29.10/30.87s。C1+C3 比 C1 略长，符合 pause recovery 在边界补足停顿的预期；没有出现 C2/KV 行那种 70-110s 的长复读。
 
 结论：在 0701 自定义音色 `001` 上，C1+C3 组合是成立的，CER=3.63%，比普通 stateful 的 4.78% 更好，并且 exact boundary 全有效；但当前 3 条 smoke 中纯 C1=3.06% 更优。下一步如果要交 Table2 的 CustomVoice 行，建议先扩到 10 条或全量 mini，用同一 0701/001 checkpoint 再确认 C1 vs C1+C3 的稳定性；C2/Full 仍不要混入该结论，因为 C2 历史条件是独立卡点。
+
+---
+
+## 29. 2026-07-10 E29 C1 boundary artifact fixes 吸收
+
+收到 `c1_fixes.patch` 后先做兼容性审查：整包基于较早 `origin/exp`，当前分支已包含 E20-E28 的 token-mode、exact-boundary gate、C2 diagnostics、C1+C3 等演进，因此 `git apply --check` 不能直接通过。处理方式改为手工吸收与当前代码兼容的核心修复，避免回退已有 Table2 口径。
+
+已落地内容：
+
+| 修复 | 当前实现 | 说明 |
+|---|---|---|
+| F1/F2 | 新增 `scripts/python/table2_boundary_dsp.py` + runner `--include-c1-diagnostics` | 支持边界前 8ms raised-cosine fade-out、边界后 15ms fade-in；新增 `boundary_artifact` 指标（最大相邻样点跳变、谱通量峰值）。 |
+| C3 splice fade | `apply_pause_recovery()` 插入/替换静音后调用 `fade_silence_edges()` | C3 补静音两侧加 5ms 边缘淡化，避免硬切零点产生 click。 |
+| F3 | `c1_terminal_drop_mode=silence` | C1 acoustic tail 在尾部静音串开始时保存 C2W 快照；EOS carry 时若存在快照，则继承静音前 C2W 状态，并记录 `steadystream_c1_terminal_dropped_frames`。 |
+| 对比变体 | `--include-c1-diagnostics` | 新增 `acoustic_tail_smooth`、`acoustic_tail_tdrop`、`acoustic_tail_smooth_tdrop`、`acoustic_tail_pr_smooth_tdrop`；原有 `acoustic_tail_pause_recovery` 保持为 C1+C3 基线。 |
+
+验证：`py_compile` 已覆盖 `engine/backend/engine_loop.py`、`engine/backend/kv_cache_pool.py`、`scripts/python/run_table2_full_steadystream.py`、`scripts/python/table2_boundary_dsp.py`；`tests/unit/test_table2_boundary_dsp.py` 9 项通过。尚未把新版 engine payload 部署到 5090 重跑 smoke，因此当前只代表代码和单测通过，不代表 F1/F2/F3 的音频收益已确认。下一步应在 0701/001 或当前 1.7B custom 服务上跑 `--include-c1-diagnostics --limit 3`，对比 CER、pause、`boundary_artifact` 和抽听音频后再决定 Lite 定型配置。

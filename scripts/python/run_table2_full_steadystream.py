@@ -31,6 +31,11 @@ from eval.boundary_metrics import (
     summarize_boundary_metrics,
 )
 from eval.pause_metrics import measure_pause_metrics, summarize_pause_metrics
+from scripts.python.table2_boundary_dsp import (
+    boundary_artifact_metrics,
+    fade_silence_edges,
+    smooth_boundaries,
+)
 
 
 EXPECTED_PAUSE_MS = {
@@ -102,6 +107,56 @@ def c2_diagnostic_variants(
     return variants
 
 
+C1_DIAGNOSTIC_VARIANTS = [
+    (
+        "acoustic_tail_smooth",
+        "acoustic_tail_smooth.wav",
+        {"steadystream_variant": "acoustic_tail_only"},
+        False,
+    ),
+    (
+        "acoustic_tail_tdrop",
+        "acoustic_tail_tdrop.wav",
+        {
+            "steadystream_variant": "acoustic_tail_only",
+            "c1_terminal_drop_mode": "silence",
+        },
+        False,
+    ),
+    (
+        "acoustic_tail_smooth_tdrop",
+        "acoustic_tail_smooth_tdrop.wav",
+        {
+            "steadystream_variant": "acoustic_tail_only",
+            "c1_terminal_drop_mode": "silence",
+        },
+        False,
+    ),
+    (
+        "acoustic_tail_pr_smooth_tdrop",
+        "acoustic_tail_pr_smooth_tdrop.wav",
+        {
+            "steadystream_variant": "acoustic_tail_only",
+            "c1_terminal_drop_mode": "silence",
+        },
+        True,
+    ),
+]
+
+POST_SMOOTH_VARIANT_KEYS = {
+    "acoustic_tail_smooth",
+    "acoustic_tail_smooth_tdrop",
+    "acoustic_tail_pr_smooth_tdrop",
+}
+
+
+def c1_diagnostic_variants() -> list[tuple[str, str, dict[str, str], bool]]:
+    return [
+        (key, wav_name, dict(experimental), pause_recovery)
+        for key, wav_name, experimental, pause_recovery in C1_DIAGNOSTIC_VARIANTS
+    ]
+
+
 EXPERIMENTAL_VARIANTS = [
     (
         "acoustic_tail_only",
@@ -150,6 +205,7 @@ def has_audio_block(result: dict[str, Any], out_dir: Path, key: str, wav_name: s
 def audio_blocks_for_run(
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
+    include_c1_diagnostics: bool = False,
 ) -> list[tuple[str, str]]:
     blocks = list(REQUIRED_AUDIO_BLOCKS)
     if include_c2_diagnostics:
@@ -159,6 +215,10 @@ def audio_blocks_for_run(
                 c2_diagnostic_kv_tail_tokens
             )
         )
+    if include_c1_diagnostics:
+        blocks.extend(
+            (key, wav_name) for key, wav_name, _, _ in c1_diagnostic_variants()
+        )
     return blocks
 
 
@@ -166,6 +226,7 @@ def sample_complete(
     sample_dir: Path,
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
+    include_c1_diagnostics: bool = False,
 ) -> bool:
     result_path = sample_dir / "results.json"
     if not result_path.is_file():
@@ -179,6 +240,7 @@ def sample_complete(
         for key, wav_name in audio_blocks_for_run(
             include_c2_diagnostics,
             c2_diagnostic_kv_tail_tokens,
+            include_c1_diagnostics,
         )
     )
 
@@ -462,12 +524,14 @@ def apply_pause_recovery(
     puncts: list[str],
     *,
     tolerance_ms: float = 80.0,
+    edge_fade_ms: float = 5.0,
 ) -> tuple[np.ndarray, list[int], list[dict[str, Any]]]:
     """Inference-side C3 pause recovery for table probes.
 
     It replaces the detected silent span around each boundary with the
     punctuation-conditioned target silence. If no silence is detected, it
-    inserts the target silence at the boundary.
+    inserts the target silence at the boundary. Spliced silence edges get a
+    short raised-cosine fade so the zero-insertion has no hard step.
     """
     if not boundaries:
         return audio, boundaries, []
@@ -495,6 +559,14 @@ def apply_pause_recovery(
         else:
             replacement = np.zeros(target, dtype=np.float32)
             out = np.concatenate([out[:left], replacement, out[right:]])
+            if edge_fade_ms > 0:
+                out = fade_silence_edges(
+                    out,
+                    left,
+                    left + target,
+                    sample_rate,
+                    edge_fade_ms=edge_fade_ms,
+                )
             new_boundary = left + target // 2
             delta = target - current
             offset += delta
@@ -534,6 +606,7 @@ def stream_variant_block(
     force_text_chunk_boundary: bool = False,
     experimental: dict[str, str] | None = None,
     pause_recovery: bool = False,
+    post_smooth: bool = False,
 ) -> dict[str, Any]:
     stream_experimental = stream_experimental_config(
         experimental,
@@ -579,6 +652,9 @@ def stream_variant_block(
             puncts,
         )
         stream_source = f"{stream_source}+pause_recovery"
+    if post_smooth:
+        stream_audio = smooth_boundaries(stream_audio, stream_boundaries, stream_sr)
+        stream_source = f"{stream_source}+smooth"
     stream_metrics = measure_boundary_metrics(
         stream_audio,
         stream_sr,
@@ -587,6 +663,11 @@ def stream_variant_block(
     )
     sf.write(out_dir / wav_name, stream_audio, stream_sr)
     stream_pause = pause_summary_for(stream_audio, stream_sr, stream_boundaries, puncts)
+    stream_artifact = boundary_artifact_metrics(
+        stream_audio,
+        stream_sr,
+        stream_boundaries,
+    )
     block = {
         "audio_sec": round(len(stream_audio) / stream_sr, 3) if stream_sr else 0.0,
         "boundary_metrics": stream_metrics,
@@ -597,6 +678,11 @@ def stream_variant_block(
         "boundary_expected_count": expected_boundary_count,
         "boundary_valid": boundary_valid,
         "boundary_source_used": stream_source,
+        "boundary_artifact": {
+            k: v for k, v in stream_artifact.items() if k != "boundaries"
+        },
+        "boundary_artifact_items": stream_artifact.get("boundaries", []),
+        "post_smooth": post_smooth,
         "stream_input_mode": stream_input_mode,
         "stream_group_policy": stream_group_policy,
         "experimental": stream_experimental,
@@ -627,6 +713,7 @@ def run_sample(
     resume: bool = False,
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
+    include_c1_diagnostics: bool = False,
     override_language: str | None = None,
     override_instruct: str | None = None,
 ) -> dict[str, Any]:
@@ -782,6 +869,8 @@ def run_sample(
     variants_to_run = list(EXPERIMENTAL_VARIANTS)
     if include_c2_diagnostics:
         variants_to_run.extend(c2_diagnostic_variants(c2_diagnostic_kv_tail_tokens))
+    if include_c1_diagnostics:
+        variants_to_run.extend(c1_diagnostic_variants())
     for variant_key, wav_name, experimental, pause_recovery in variants_to_run:
         if has_audio_block(result, out_dir, variant_key, wav_name):
             continue
@@ -805,6 +894,7 @@ def run_sample(
             force_text_chunk_boundary=force_text_chunk_boundary,
             experimental=experimental,
             pause_recovery=pause_recovery,
+            post_smooth=variant_key in POST_SMOOTH_VARIANT_KEYS,
         )
 
     # Offline full reference for SIM/topline.
@@ -891,6 +981,14 @@ def main() -> int:
         help="Override kv_tail_tokens for C2 diagnostic variants and suffix their output keys.",
     )
     parser.add_argument(
+        "--include-c1-diagnostics",
+        action="store_true",
+        help=(
+            "Also run C1 boundary-artifact fix variants: F1/F2 smoothing, "
+            "F3 c2w terminal drop, and combined Lite candidates."
+        ),
+    )
+    parser.add_argument(
         "--override-language",
         default=None,
         help="Override dataset language for serving-prefix diagnostics, e.g. auto.",
@@ -930,6 +1028,7 @@ def main() -> int:
                 sample_dir,
                 args.include_c2_diagnostics,
                 args.c2_diagnostic_kv_tail_tokens,
+                args.include_c1_diagnostics,
             ):
                 print(f"[skip] seed={seed} {idx:03d}/{len(rows)} {sample_id}", flush=True)
                 progress.append({"seed": seed, "sample_id": sample_id, "status": "skipped"})
@@ -951,6 +1050,7 @@ def main() -> int:
                     resume=args.resume,
                     include_c2_diagnostics=args.include_c2_diagnostics,
                     c2_diagnostic_kv_tail_tokens=args.c2_diagnostic_kv_tail_tokens,
+                    include_c1_diagnostics=args.include_c1_diagnostics,
                     override_language=args.override_language,
                     override_instruct=args.override_instruct,
                 )

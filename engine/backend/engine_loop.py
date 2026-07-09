@@ -903,6 +903,7 @@ class EngineLoop:
         slot.frame_idx = 0
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
+        slot.c2w_voiced_snapshot = None
 
         slot.c2w_kv = None
         slot.c2w_conv_states = self._executor.make_zero_conv_states()
@@ -939,6 +940,7 @@ class EngineLoop:
         slot.last_codec_sum = None
         slot.pad_start_frame = -1
         slot.pad_consecutive_silence = 0
+        slot.c2w_voiced_snapshot = None
         logger.debug(
             "Resumed paused streaming segment %s:%d (trailing=%d, text_idx=%d)",
             seg.session_id,
@@ -968,6 +970,29 @@ class EngineLoop:
     @staticmethod
     def _steadystream_uses_kv(group: EngineSessionGroup) -> bool:
         return group.steadystream_variant in _SS_KV_VARIANTS
+
+    @staticmethod
+    def _steadystream_c1_terminal_drop_enabled(group: EngineSessionGroup) -> bool:
+        raw = str(
+            group.steadystream_experimental.get("c1_terminal_drop_mode", "")
+        ).strip().lower().replace("-", "_")
+        return raw in {"silence", "tail_silence"}
+
+    @staticmethod
+    def _snapshot_c2w_state(slot: SlotKVState) -> Optional[dict]:
+        """Clone the live C2W decoder state for C1 terminal-drop diagnostics."""
+        if slot.c2w_kv is None or not slot.c2w_conv_states:
+            return None
+        return {
+            "c2w_kv": slot.c2w_kv.clone().contiguous(),
+            "c2w_conv_states": [
+                t.clone().contiguous() for t in slot.c2w_conv_states
+            ],
+            "c2w_transconv_states": [
+                t.clone().contiguous() for t in (slot.c2w_transconv_states or [])
+            ],
+            "c2w_frame_idx": int(slot.frame_idx),
+        }
 
     def _steadystream_kv_tail_tokens(self, group: EngineSessionGroup) -> int:
         raw = group.steadystream_experimental.get("kv_tail_tokens", "")
@@ -1290,17 +1315,31 @@ class EngineLoop:
                     carry["token_counts"] = slot.token_counts.clone()
 
         if self._steadystream_uses_acoustic(group):
-            if slot.c2w_kv is not None:
-                carry["c2w_kv"] = slot.c2w_kv.clone().contiguous()
-            if slot.c2w_conv_states:
-                carry["c2w_conv_states"] = [
-                    t.clone().contiguous() for t in slot.c2w_conv_states
-                ]
-            if slot.c2w_transconv_states:
-                carry["c2w_transconv_states"] = [
-                    t.clone().contiguous() for t in slot.c2w_transconv_states
-                ]
-            carry["c2w_frame_idx"] = int(slot.frame_idx)
+            snapshot = (
+                slot.c2w_voiced_snapshot
+                if self._steadystream_c1_terminal_drop_enabled(group)
+                else None
+            )
+            if snapshot is not None:
+                carry["c2w_kv"] = snapshot["c2w_kv"]
+                carry["c2w_conv_states"] = snapshot["c2w_conv_states"]
+                carry["c2w_transconv_states"] = snapshot["c2w_transconv_states"]
+                carry["c2w_frame_idx"] = int(snapshot["c2w_frame_idx"])
+                carry["c2w_terminal_dropped_frames"] = max(
+                    0, int(slot.frame_idx) - int(snapshot["c2w_frame_idx"])
+                )
+            else:
+                if slot.c2w_kv is not None:
+                    carry["c2w_kv"] = slot.c2w_kv.clone().contiguous()
+                if slot.c2w_conv_states:
+                    carry["c2w_conv_states"] = [
+                        t.clone().contiguous() for t in slot.c2w_conv_states
+                    ]
+                if slot.c2w_transconv_states:
+                    carry["c2w_transconv_states"] = [
+                        t.clone().contiguous() for t in slot.c2w_transconv_states
+                    ]
+                carry["c2w_frame_idx"] = int(slot.frame_idx)
 
         if len(carry) > 1:
             group.steadystream_carry = carry
@@ -1336,6 +1375,10 @@ class EngineLoop:
             metrics["steadystream_carry_from_segment"] = str(
                 carry.get("from_segment_idx", "")
             )
+            if "c2w_terminal_dropped_frames" in carry:
+                metrics["steadystream_c1_terminal_dropped_frames"] = str(
+                    carry["c2w_terminal_dropped_frames"]
+                )
         return warmed
 
     def _try_prefill_from_steadystream_carry(
@@ -2126,6 +2169,18 @@ class EngineLoop:
                 self._handle_segment_eos(group, seg)
             else:
                 audio = output.audio_chunks[i]
+
+                if (
+                    audio is not None
+                    and len(audio) > 0
+                    and self._steadystream_uses_acoustic(group)
+                    and self._steadystream_c1_terminal_drop_enabled(group)
+                ):
+                    if self._is_pad_silence(audio):
+                        if slot.c2w_voiced_snapshot is None:
+                            slot.c2w_voiced_snapshot = self._snapshot_c2w_state(slot)
+                    else:
+                        slot.c2w_voiced_snapshot = None
 
                 if in_pad:
                     if audio is not None and len(audio) > 0:
