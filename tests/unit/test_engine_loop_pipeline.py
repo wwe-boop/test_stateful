@@ -822,9 +822,10 @@ class TestSteadyStreamCarry:
         hidden = model_config.hidden_size
         weights = _FakeTokenHistoryWeights(hidden_size=hidden)
         prefix = torch.full((1, 2, hidden), 1.0, dtype=torch.bfloat16)
+        trailing = [torch.full((1, 1, hidden), 4.0)]
         plan = PrefillPlan(
             prefill_embeds=prefix,
-            trailing=[],
+            trailing=trailing,
             cacheable_prefix_embeds=prefix,
             request_prefill_embeds=torch.full((1, 1, hidden), 3.0),
         )
@@ -869,16 +870,17 @@ class TestSteadyStreamCarry:
 
         assert len(executor.prefill_prefix_only_inputs) == 1
         # prefix + (history text + eos) + history codec BOS + 4 code frames
-        # + boundary EOS + (current text + eos)
-        assert executor.prefill_prefix_only_inputs[0].shape[1] == 2 + 3 + 1 + 4 + 1 + 4
+        # + boundary EOS. Current text stays in request/trailing streaming path.
+        assert executor.prefill_prefix_only_inputs[0].shape[1] == 2 + 3 + 1 + 4 + 1
         assert metrics["steadystream_kv_tail"] == "reprefill_token_history"
         assert metrics["steadystream_kv_prefix_len"] == "2"
         assert metrics["steadystream_token_history_text_tokens"] == "2"
         assert metrics["steadystream_token_history_code_frames"] == "4"
         assert metrics["steadystream_token_history_current_text_tokens"] == "3"
+        assert metrics["steadystream_token_history_current_trailing"] == "1"
         assert metrics["steadystream_token_counts"] == "reset"
         assert slot.prefill_source == "steadystream_token_history_kv_tail_only"
-        assert slot.trailing == []
+        assert len(slot.trailing) == 1
         assert slot.steadystream_full_codecs == []
 
     def test_restore_reports_reset_or_inherited_token_counts(self, model_config):

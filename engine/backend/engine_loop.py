@@ -1465,9 +1465,7 @@ class EngineLoop:
         history_text_token_ids: list[int],
         history_text_include_eos: bool,
         history_full_codes: torch.Tensor,
-        current_token_ids: list[int],
-        current_include_eos: bool,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor, dict[str, int]]]:
+    ) -> Optional[tuple[torch.Tensor, dict[str, int]]]:
         if self._prefill_builder is None:
             return None
         w = self._prefill_builder.w
@@ -1475,11 +1473,7 @@ class EngineLoop:
             history_text_token_ids,
             include_eos=history_text_include_eos,
         )
-        current_text = self._steadystream_text_block_embed(
-            current_token_ids,
-            include_eos=current_include_eos,
-        )
-        if history_text is None or current_text is None:
+        if history_text is None:
             return None
 
         prefix_embeds = prefix_embeds.to(
@@ -1487,15 +1481,17 @@ class EngineLoop:
             dtype=self._embed_dtype,
         )
         max_seq = int(self._executor.kv_pool.max_seq_len)
-        fixed_len = (
+        max_input_len = int(getattr(self._executor, "_max_input_len", 0) or max_seq)
+        fixed_prefill_len = (
             int(prefix_embeds.shape[1])
             + int(history_text.shape[1])
             + 1  # history codec BOS
             + 1  # history boundary codec EOS
-            + int(current_text.shape[1])
-            + 1  # request codec BOS after prefill
         )
-        max_code_frames = max_seq - fixed_len
+        max_code_frames = min(
+            max_input_len - fixed_prefill_len,
+            max_seq - fixed_prefill_len - 1,
+        )
         if max_code_frames <= 0:
             return None
         total_code_frames = int(history_full_codes.shape[0])
@@ -1527,7 +1523,6 @@ class EngineLoop:
         history_codec_bos = pad + codec_bos
         history_codes = pad.expand(1, codec_sum.shape[1], self._hidden_size) + codec_sum
         history_boundary = pad + codec_eos
-        request_codec_bos = history_codec_bos.clone()
         prefill = torch.cat(
             [
                 prefix_embeds,
@@ -1535,7 +1530,6 @@ class EngineLoop:
                 history_codec_bos,
                 history_codes,
                 history_boundary,
-                current_text,
             ],
             dim=1,
         ).contiguous()
@@ -1544,10 +1538,10 @@ class EngineLoop:
             "history_text_tokens": len(history_text_token_ids),
             "history_code_frames": int(history_full_codes.shape[0]),
             "history_code_frames_total": total_code_frames,
-            "current_text_tokens": len(current_token_ids),
             "prefill_len": int(prefill.shape[1]),
+            "max_input_len": max_input_len,
         }
-        return prefill, request_codec_bos.contiguous(), info
+        return prefill, info
 
     def _try_reprefill_from_steadystream_token_history(
         self,
@@ -1599,18 +1593,18 @@ class EngineLoop:
             history_text_token_ids=[int(x) for x in history_text_token_ids],
             history_text_include_eos=bool(carry.get("history_text_include_eos", True)),
             history_full_codes=history_full_codes,
-            current_token_ids=list(seg.pending_token_ids),
-            current_include_eos=bool(seg.input_complete),
         )
         if built is None:
             return None
-        replay_prefill, request_embed, info = built
+        replay_prefill, info = built
+        if plan.request_prefill_embeds is None:
+            return None
 
         self._executor.prefill_prefix_only(slot, replay_prefill)
         self._prime_decode_after_prefix_prefill(
             slot,
-            request_embed,
-            [],
+            plan.request_prefill_embeds,
+            plan.trailing,
             source=f"steadystream_token_history_{group.steadystream_variant}",
         )
         if self._steadystream_uses_acoustic(group):
@@ -1630,7 +1624,13 @@ class EngineLoop:
             info["history_code_frames_total"]
         )
         metrics["steadystream_token_history_current_text_tokens"] = str(
-            info["current_text_tokens"]
+            len(seg.pending_token_ids)
+        )
+        metrics["steadystream_token_history_current_trailing"] = str(
+            len(plan.trailing)
+        )
+        metrics["steadystream_token_history_max_input_len"] = str(
+            info["max_input_len"]
         )
         metrics["steadystream_token_history_dropped_tail_tokens"] = str(
             int(carry.get("history_dropped_tail_tokens") or 0)
@@ -1658,7 +1658,7 @@ class EngineLoop:
             info["history_text_tokens"],
             info["history_code_frames"],
             info["history_code_frames_total"],
-            info["current_text_tokens"],
+            len(seg.pending_token_ids),
         )
         return None, False
 
