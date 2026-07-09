@@ -670,3 +670,18 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 | `tail_kv_pause_recovery` | 277.80% | 280.49% | C3/KV 灾难复读没有改善。 |
 
 E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 exact boundaries 正常（001/002 为 7/7，003 为 9/9）。因此，21 槽 serving 前缀膨胀不是当前 runtime C3/KV 复读的主因；即使收敛到 auto/空 instruct，KV/history conditioning 仍会把输出拖长到 89-122 秒并造成 250%-320% CER。下一步不应继续押注前缀长度本身，而应做 content-level layout parity 与 token-level text+codes re-prefill/训练同构门禁。
+
+---
+
+## 25. 2026-07-09 E25 Content-level runtime/C4 prefix parity
+
+按 E7 review §3.2，将 `scripts/python/check_c4_runtime_layout_parity.py` 从符号/长度检查升级为内容级 prefix token-pair 检查：脚本现在可用 `--runtime-language/--runtime-speaker/--runtime-instruct` 从 tokenizer/config 构造 runtime prefix 的双通道 token 槽，并与 C4 collate 的 `input_ids[:, :prefix_len, :]` 逐位比对；不一致时 exit 非 0，并在 summary 中记录前 8 个 mismatch。产物在 `workspace/c4_wenet_premium0_nll20_20260709/`。
+
+| 检查 | summary | overall | 关键结果 |
+|---|---|---|---|
+| 旧符号级 prefix8 | `runtime_layout_parity_prefix8_e25_summary.json` | pass | C4 collate 内部顺序通过，prefix_len=8 与 auto/空 instruct 目标长度一致。 |
+| 旧符号级 prefix21 | `runtime_layout_parity_prefix21_e25_summary.json` | warn | C4 prefix_len=8，不等于原始 serving 的 21 槽长前缀。 |
+| 内容级 auto/空 instruct + Vivian | `runtime_layout_content_parity_auto_empty_e25_summary.json` | fail | 长度同为 8，但 speaker 槽不一致：runtime pos6=`[tts_pad, 3065]`，C4 pos6=`[tts_pad, 0]`。 |
+| 内容级 Chinese + instruct + Vivian | `runtime_layout_content_parity_chinese_instruct_e25_summary.json` | fail | 长度 21 vs 8，且 instruct/language/speaker 多处内容 mismatch。 |
+
+判读：E24 已经说明“前缀长度从 21 收到 8”不能单独解决 runtime 复读；E25 则进一步证明即便在 auto/空 instruct 条件下，C4 collate 与 runtime 仍没有内容级同构，最小差异集中在 speaker 槽。当前 C4 collate 的 8 槽核心使用 `[nothink, think_bos, think_eos, 0, codec_pad]`，而 custom runtime 会按 speaker 查表写入 Vivian=`3065`。这解释了为什么“8 槽长度一致”不能等价于“训推一致”。下一步若要让 C4 训练诊断真正服务 CustomVoice 表 2，必须先决定 speaker 槽策略：要么训练 collate 写入与 runtime 相同的 `spk_id`，要么在导出/运行时证明训练中的 `0` 槽与 custom speaker embedding 等价；否则 LoRA 训练和 runtime Full 仍有隐性分布差。
