@@ -319,3 +319,29 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 |---|---|
 | `workspace/c4_wenet_premium0_pilot_20260708/teacher_forcing_nll_pilot_seg2_min12_limit6.json` | target segment 1 pilot，6 条。 |
 | `workspace/c4_wenet_premium0_pilot_20260708/teacher_forcing_nll_pilot_seg3_min12_limit5.json` | target segment 2 pilot，5 条。 |
+
+---
+
+## 11. 2026-07-09 E10 正式 Teacher-Forcing NLL 门禁
+
+按最新 review 要求，将 teacher-forcing NLL 从 pilot 扩到正式门槛：`N=20`、`target_segment_index=2`、目标文本 `>=20` 字。数据仍来自 WenetSpeech4TTS Premium_0，同一切分规则，窗口扩大到 1000 后筛选前 20 条合格样本；每条保留前 3 段，目标段为第 3 段，因此 continuation 条件包含两段真实历史 text+codes。
+
+新增辅助脚本 `scripts/python/expand_c4_manifest_for_prepare.py`，只做 sample-level C4 manifest 到 segment-level `prepare_data.py` 输入的格式展开，并把筛选口径写入 manifest meta。随后复用官方 `../Qwen3-TTS/finetuning/prepare_data.py` 提取 60 段 audio codes，再 attach 回 20 条 continuation manifest。
+
+| 项目 | 结果 |
+|---|---|
+| 源 manifest | `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_manifest_1000.jsonl` |
+| 正式 manifest | `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_manifest_idx2_min20_limit20_with_codes.jsonl` |
+| NLL summary | `workspace/c4_wenet_premium0_nll20_20260709/teacher_forcing_nll_idx2_min20_limit20.json` |
+| 样本数 | 20 |
+| target segment | index 2，第 3 段 |
+| min target chars | 20 |
+| single NLL mean | 1.180001 |
+| continuation NLL mean | 1.882413 |
+| ΔNLL mean | +0.702412 |
+| continuation worse count | 19/20 |
+| ratio mean | 1.600726 |
+
+判读：这组结果已经满足 review 的 `N>=20` 和目标文本 `>=20` 字门槛。因为它是 teacher-forcing，对同一目标段真值 codec_0 计算 NLL，不经过采样、声码器和 ASR，所以排除了“CER 归一化/ASR 听错/采样偶然性”作为主要解释。continuation prefill 使真值 codes 的平均 NLL 上升约 60%，且 19/20 更差，说明未训练 0.6B base 在 `history_text + history_codes + current_text` 的 C4 续写排布上确实处于分布外。
+
+这也解释了 E8/E9 后 full-current 仍复读、串词、漏读：工程侧的分段和容量污染已被修掉，但模型本身没有学会“带历史音频 token 的下一段 codec 续写”。因此 C2 门禁仍不应直接宣布通过；下一步可以启动最小 C4 LoRA 诊断，但训练目标必须使用与 runtime full-current 一致的 prefix/continuation 排布，并在训练前继续保留 E0/ASR 口径冻结问题作为最终表 2 风险项。
