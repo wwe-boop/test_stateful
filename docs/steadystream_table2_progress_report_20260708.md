@@ -613,3 +613,28 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 关键结论：E20 基本确认“当前文本必须进入 token-history re-prefill”，它把 244%-286% 的灾难复读压到 50% 左右，是目前最有效的 runtime 侧杠杆。但这还不能作为完整 SteadyStream 表 2 结果交付，因为健康 runtime 对照只有约 4%，而 full-current 仍差一个数量级。`codes_only` 变体反而更差，说明问题不是简单的“历史 text token 串入”；如果把 history text 拿掉，模型会更容易丢当前文本，证明 current/history 的联合排布和 history codes 长度才是下一步要拆的变量。
 
 当前卡点更新：完整 SteadyStream 还卡在 C2 history conditioning，不是模型/声码器/ASR 基线坏。1.7B runtime 正常单段、普通流式、C1 acoustic tail 都稳定在 4%-5%；坏的是 KV/Full 的历史条件如何进入自回归上下文。下一步建议在同一 3 条样本上做 `full_current_silence/eos_only` 的 history code tail sweep（例如 16/32/64/128/384），判断 384 帧历史是否过长导致复读；如果短尾能回到基线 ±1pp，再扩 10 条/全量；如果短尾仍在 30%-50%，再进入 C4 训练或更强 alignment 设计。
+
+---
+
+## 22. 2026-07-09 E21 History code tail sweep
+
+按 E20 下一步，新增 runner 参数 `--c2-diagnostic-kv-tail-tokens`，对 full-current C2 诊断扫 history code tail 长度。该参数只影响 `--include-c2-diagnostics` 追加的三类诊断变体，并把输出 key/wav 自动加后缀，例如 `full_current_silence_tail64`，便于同一目录 resume 多档。产物目录：`workspace/table2_1p7b_runtime_tail_sweep_e21_20260709/`；ASR/CER 文件：`table2_cer_tail_sweep.json`。
+
+本轮 3 样本、seed=42、`input_mode=token`、`stream_group_policy=none`，扫 `kv_tail_tokens=16/32/64/128`，并与 E20 的 384 结果对照：
+
+| 变体 | tail16 | tail32 | tail64 | tail128 | tail384/E20 |
+|---|---:|---:|---:|---:|---:|
+| `full_current_silence` | 55.54% | 79.56% | **43.93%** | 64.00% | 49.69% |
+| `full_current_eos_only` | 93.40% | **44.91%** | 74.33% | 94.75% | 56.82% |
+| `full_current_codes_only_silence` | 85.38% | **63.53%** | 77.21% | 111.29% | 73.26% |
+
+逐样本看，最佳两档仍不稳定：
+
+| 变体 | prosody_mini_001 | prosody_mini_002 | prosody_mini_003 | 均值 |
+|---|---:|---:|---:|---:|
+| `full_current_silence_tail64` | 35.23% | 59.48% | 37.07% | 43.93% |
+| `full_current_eos_only_tail32` | 4.55% | 67.24% | 62.93% | 44.91% |
+
+判读：history code tail 长度确实影响生成，短尾可把 E20 的 50%-57% 进一步压到约 44%-45%，而且运行时长明显缩短，说明 384 帧长历史会加重长复读/长生成。但它没有解决根因：最好的 `silence_tail64` 仍比 4%-5% 健康 streaming baseline 高约 10 倍；`eos_only_tail32` 在样本 001 可到 4.55%，但样本 002/003 仍 60%+，说明这不是可定型策略。`codes_only` 全部劣于 text+codes，继续支持 E20 结论：简单去掉 history text 不是解法。
+
+当前门禁结论：C2 还没有确认回到 baseline ±1pp，不能启动 C4 训练/完整 Full 表 2 大跑。下一步优先级应从“裁剪多少历史 codes”转向“history/current 的排布和对齐”：要么做 token-level text+codes re-prefill 的整句滑窗诊断，保证当前 text 在 decode 前最后、最强；要么进入 C4 训练前先构造与 runtime 完全同构的 collate/teacher-forcing gate。E21 还暴露了一个工程小问题：同一目录扫多档时旧版 resume 只保留基础变体 metadata，早期 tail wav 和 ASR 不丢，但 `results.json` 会只保留最新 tail metadata；已修复为 resume 时保留所有已有 variant key。

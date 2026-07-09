@@ -647,6 +647,9 @@ def run_sample(
             existing = json.loads(result_path.read_text(encoding="utf-8"))
         except Exception:
             existing = {}
+        for key, value in existing.items():
+            if key not in result:
+                result[key] = value
         for key, _wav_name in REQUIRED_AUDIO_BLOCKS:
             if key in existing:
                 result[key] = existing[key]
