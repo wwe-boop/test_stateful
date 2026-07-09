@@ -8,7 +8,7 @@
 
 表 2 当前已完成前 5 行的可运行实现、三种子音频生成、指标后处理和 CER 合并；新增的“完整可运行 SteadyStream 组合行”也已经完成 150/150 条音频生成、ASR/CER 合并和新版交付表生成。
 
-2026-07-08 最新进展：C2 的 CER 劣化已经拆成两层 P0 问题处理。第一层是裁剪 KV tail 后 RoPE 逻辑位置被重置：本轮已落地 `position_offset`，紧凑 KV 继续紧凑存放，但后续 decode 的 `position_ids` 按原始逻辑时间线继续递增。第二层是 smoke 发现未发生裁剪时仍早停：原因更像是段末 pad/stop phase 的 terminal tail 被带进下一段；已改为保存 SteadyStream carry 时根据 `pad_start_frame` 丢掉 terminal tail token。`kv_inherit_token_counts` 默认也已从继承改为 reset。旧 C2/C3 数字仍保留作“修复前原型”记录，不能当作修复后结果。
+2026-07-09 最新进展：C2 的 RoPE `position_offset`、terminal tail trim、`token_counts` 默认 reset 均已落地并推送；但 C2 门禁复测仍未通过。tail 长度 sweep 的最佳 3 样本 smoke 仍为 30.19% CER，新增 embedding replay re-prefill 诊断路径也只有 50.69% CER。证据显示当前问题已不再是单纯早停或 RoPE offset，而是“旧 KV/embedding replay 不等价于计划要求的 text+codec token-history continuation”，会重复上一段内容或漏掉末段。因此 C2 不能进入正式表 2，C4 训练也不应在该 C2 形态上启动。
 
 需要特别说明：计划中真正的“完整 SteadyStream”定义为 C1+C2+C3+C4，其中 C4 是 continuation 后训练 checkpoint。当前没有找到真实 C4 continuation 训练 checkpoint，因此我没有把基座引擎或 smoke adapter 冒充成最终 C4 行；当前补测行标注为“C1+C2+C3，C4 未训练”。
 
@@ -72,8 +72,8 @@
 | P0 | 为 6a 全开补测行生成 ASR manifest，复用已有 750 条 CER，只新增 150 条全开音频 ASR | 已完成，产物为 `table2_cer_full.json`。 |
 | P0 | 合并 full-row CER 并重新生成交付表 | 已完成，产物为 `table2_current_full.md` 和 `table2_current_delivery_full_20260708.md`。 |
 | P0 | 拉回本地 outputs，并提交/推送新增汇报与必要代码变更 | 已完成，本地目录为 `outputs/table2_current_delivery_full/`。 |
-| P0 | 用 P0 C2 修复重跑 `kv_tail_only` 和 `tail_kv_pause_recovery` | 正在执行 smoke；通过标准是 CER 回到无状态/stateful 基线约 1 个百分点范围内，同时保持边界 F0/能量收益。 |
-| P0 | 如果修复后 C2 仍不达标，继续补 sink/window/token-history re-prefill 或 position-offset KV 细节 | 不启动 C4 训练，避免把 C2 实现 bug 误归因到 C4。 |
+| P0 | 用 P0 C2 修复重跑 `kv_tail_only` 和 `tail_kv_pause_recovery` | 已完成 3 样本门禁 smoke：trim-tail 默认 384 仍为 65.57%/63.51% CER；tail sweep 最佳 `kv64` 为 30.19% CER；embedding replay re-prefill 为 50.69% CER。均未达标。 |
+| P0 | 如果修复后 C2 仍不达标，继续补 sink/window/token-history re-prefill 或 position-offset KV 细节 | 已新增 `kv_reprefill_history=true` 诊断路径并提交 `0179be1`，证明“embedding replay”仍会复读历史。下一步必须实现真正 text+codec token history，或将 C2 路径降级为未通过，不启动 C4 正式训练。 |
 | P1 | C2 门禁通过后，扩大 WenetSpeech4TTS Premium manifest，启动 continuation SFT | 真实 C4 checkpoint。 |
 | P1 | 训练路径复用父目录官方 finetuning，但要改成多片段 continuation collate、history drop、lookahead 和 loss mask | LoRA 或全参 C4 checkpoint。 |
 
@@ -90,3 +90,43 @@
 完整行日志：`workspace/logs/table2_full_steadystream_20260708.log`
 
 截至本文档更新时，完整行音频生成、ASR/CER 合并和 delivery 生成均已完成。
+
+## 8. 2026-07-09 C2 门禁复测结论
+
+### 8.1 复测范围
+
+本轮只验证 C2 是否能恢复文本完整性，不更新正式表 2 数字。所有结果均为 `seed=42`、`prosody_mini_001..003` 的 3 样本 smoke，用同一个 `workspace/table2_asr_batch.py` Paraformer/CER 口径。
+
+| 产物 | 路径 | 说明 |
+|---|---|---|
+| terminal-tail trim 默认 384 | `workspace/table2_c2fix_p0_trim_tail_smoke_20260708/table2_cer.json` | 已消除 3 step 早停，但 384 tail 严重复读。 |
+| tail 长度 sweep | `workspace/table2_c2_tail_sweep_20260708/table2_cer.json` | 补齐 `kv16/32/64/128` x 3 样本。 |
+| embedding replay re-prefill | `workspace/table2_c2_reprefill_smoke_20260709/table2_cer.json` | 新增 `kv_reprefill_history=true` 诊断路径，已提交 `0179be1`。 |
+
+### 8.2 结果表
+
+| 变体 | CER 均值 | 关键现象 | 判断 |
+|---|---:|---|---|
+| stateless smoke 基线 | 3.34% | 3 样本文本基本完整 | smoke 口径下的可接受参考。 |
+| stateful smoke 基线 | 3.63% | 3 样本文本基本完整 | smoke 口径下的可接受参考。 |
+| acoustic tail only | 4.21% | 接近基线 | C1 仍是安全组件。 |
+| trim-tail `kv_tail_only` 384 | 65.57% | 大量复读上一段 | 不通过。 |
+| trim-tail `tail_kv_pause_recovery` 384 | 63.51% | C3 修停顿但不修语义 | 不通过。 |
+| tail sweep `kv16` | 34.35% | 小 tail 多次 overflow/漏末段 | 不通过。 |
+| tail sweep `kv32` | 30.47% | 部分样本 overflow，末段缺失 | 不通过。 |
+| tail sweep `kv64` | 30.19% | sweep 最佳但仍远离基线 | 不通过。 |
+| tail sweep `kv128` | 57.50% | 不 overflow 但复读历史 | 不通过。 |
+| embedding replay re-prefill | 50.69% | replay 触发且不 overflow，但复读历史 | 不通过。 |
+
+### 8.3 失败模式
+
+1. `position_offset` + terminal tail trim 的确修掉了早停：第二段不再只有 3 个 audio steps。
+2. tail sweep 证明问题不是简单 tail 长度。小 tail 容易 overflow 或漏后半句，大 tail 不 overflow 但复读上一段。
+3. embedding replay re-prefill 真实触发：3 条样本的 `prefix_len=21`，`replay_len=62/64/67`，第二段均 `overflow=False`；但 ASR 仍显示上一段内容被重复插入。
+4. 因此当前实现还没有达到计划里的“sink + 近 W 秒文本+语音 token 序列重新 prefill”。我们 replay 的是 decode input embedding 历史，不是可控的 text+codec token-history，无法可靠表达边界、已读文本和下一段监督关系。
+
+### 8.4 当前卡点和决策
+
+当前卡点是 C2 的语义 continuation 形态仍不正确。旧 KV carry、position-offset KV、terminal trim、tail sweep、embedding replay 都不能让 CER 回到基线。下一步需要做真正 token-history 路径：记录每步 `full_codec`/codec token、文本 token 对齐和段边界，构造 `sink + 历史 text/codec token + 当前文本首 token` 的 bounded re-prefill；否则 C2 应在表 2 中标注为未通过，不应启动 C4 正式训练。
+
+对 C4 的决策保持不变：C4 continuation SFT 要模拟“正确的 C2 推理形态”。在 C2 仍会复读/漏读的情况下启动 C4，会把推理侧实现 bug 混进训练目标，风险高且不可解释。
