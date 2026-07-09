@@ -638,3 +638,19 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 判读：history code tail 长度确实影响生成，短尾可把 E20 的 50%-57% 进一步压到约 44%-45%，而且运行时长明显缩短，说明 384 帧长历史会加重长复读/长生成。但它没有解决根因：最好的 `silence_tail64` 仍比 4%-5% 健康 streaming baseline 高约 10 倍；`eos_only_tail32` 在样本 001 可到 4.55%，但样本 002/003 仍 60%+，说明这不是可定型策略。`codes_only` 全部劣于 text+codes，继续支持 E20 结论：简单去掉 history text 不是解法。
 
 当前门禁结论：C2 还没有确认回到 baseline ±1pp，不能启动 C4 训练/完整 Full 表 2 大跑。下一步优先级应从“裁剪多少历史 codes”转向“history/current 的排布和对齐”：要么做 token-level text+codes re-prefill 的整句滑窗诊断，保证当前 text 在 decode 前最后、最强；要么进入 C4 训练前先构造与 runtime 完全同构的 collate/teacher-forcing gate。E21 还暴露了一个工程小问题：同一目录扫多档时旧版 resume 只保留基础变体 metadata，早期 tail wav 和 ASR 不丢，但 `results.json` 会只保留最新 tail metadata；已修复为 resume 时保留所有已有 variant key。
+
+---
+
+## 23. 2026-07-09 E23 Baseline / C1 / C3 同文本对比
+
+按最新要求，用同一批文本重跑 baseline、C1、C3 对照，避免把 C2 tail sweep 的额外诊断混入口径。运行目录：`workspace/table2_baseline_c1_c3_same_text_e23_20260709/`；样本为 `prosody_mini_001-003`、seed=42、`input_mode=token`、`stream_group_policy=none`、默认强制 text chunk boundary。C3 采用当前表 2 runner 中已有定义：`tail_kv_pause_recovery`，即 C1+C2+C3 prototype，不是纯 pause-only 单独开关。
+
+| 行 | variant | CER 均值 | prosody_mini_001 | prosody_mini_002 | prosody_mini_003 | 判读 |
+|---|---|---:|---:|---:|---:|---|
+| baseline | `stateless_once` | 4.40% | 1.14% | 6.90% | 5.17% | 单段拼接健康。 |
+| baseline | `stateful_stream` | 4.01% | 3.41% | 5.17% | 3.45% | 普通流式健康。 |
+| baseline | `offline_full` | 4.78% | 2.27% | 9.48% | 2.59% | 离线整段健康。 |
+| C1 | `acoustic_tail_only` | 4.21% | 2.27% | 6.03% | 4.31% | 声学尾本身不破坏语义。 |
+| C3 prototype | `tail_kv_pause_recovery` | 277.80% | 270.45% | 255.17% | 307.76% | C3 停顿恢复无法修复 C2/KV 历史复读。 |
+
+进一步检查：`stateful_stream`、`acoustic_tail_only`、`tail_kv_pause_recovery` 都拿到 exact boundaries（001/002 为 7/7，003 为 9/9），所以这次不是 proxy boundary 或分段合并导致的假结果。C3 的 pause deviation 在样本 001 上从 stateful 的约 196.8ms、C1 的约 290.6ms 被校正到 0ms，但 CER 同时爆炸，hyp_chars 变成 324/409/469，而 ref_chars 只有 88/116/116。结论是：C3 后处理确实能把“停顿列”做漂亮，但它不能恢复语义；当前 C3 行差的根因仍是 C2/KV 历史条件导致的长复读，而不是 baseline、C1、ASR 或同文本设置问题。
