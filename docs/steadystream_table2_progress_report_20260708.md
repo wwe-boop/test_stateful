@@ -394,3 +394,26 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 判读：held-out 单段基线不是 E10 全 20 条的 1.180，而是更低的 1.017；因此 E12 的 `1.287` 还没有“接近单段基线”，但已经在 held-out 上闭合约 43% 的 continuation gap。all-loss 也闭合约 36%，仍应保留为正式 C4 训练消融项。后续 headline 指标统一改为 gap 闭合率，目标是让 held-out continuation NLL 接近同样本 single NLL，而不是只看绝对 NLL 是否下降。
 
 下一步执行口径同步更新：正式 20 条 `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_manifest_idx2_min20_limit20_with_codes.jsonl` 冻结为常设 NLL eval，不再进入训练；训练数据应从 `c4_wenet_manifest_1000.jsonl` 的其余窗口另抽，放量后用 LoRA/冻结策略训练，并继续报告 held-out gap 闭合率。
+
+---
+
+## 15. 2026-07-09 E14 LoRA 放量首轮 NLL Gap
+
+按 review §9.3/§10，正式 20 条 eval 已冻结不入训；从 `c4_wenet_manifest_1000.jsonl` 另抽 200 条训练样本（`target_segment_index=2`、目标段 ≥12 字、排除正式 eval sample_id），用官方 tokenizer 提取 600 段 codes 后得到：
+
+| 文件 | 说明 |
+|---|---|
+| `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_train_idx2_min12_limit200_with_codes.jsonl` | 200 条 C4 LoRA train，和正式 20 eval overlap=0。 |
+| `scripts/python/train_c4_lora_gap.py` | PEFT LoRA 训练 + 冻结 eval single/continuation NLL gap 统计脚本。 |
+
+LoRA 目标模块先用 `q_proj,v_proj`，评估固定为正式 20 条 NLL eval。核心门禁不只看 gap 闭合率，还同时看 single NLL 是否退化；否则会出现“single 被打坏导致 gap 假闭合”。
+
+| LoRA smoke | train N | r | lr | loss scope | single before→after | continuation before→after | gap after | gap 闭合率 | 判断 |
+|---|---:|---:|---:|---|---:|---:|---:|---:|---|
+| train20 r8 | 20 | 8 | 5e-5 | target | 1.180→1.200 | 1.882→1.697 | 0.497 | 29.25% | 路径可跑，single 基本不退。 |
+| train200 r32 | 200 | 32 | 5e-6 | target | 1.180→1.783 | 1.882→1.978 | 0.195 | 72.18% | gap 大幅闭合但 single 明显退化，不可直接作为候选。 |
+| train200 r8 | 200 | 8 | 5e-5 | target | 1.180→4.691 | 1.882→4.689 | -0.002 | 100.27% | 假闭合：整体 NLL 崩坏。 |
+| train200 r8 | 200 | 8 | 5e-6 | target | 1.180→1.204 | 1.882→1.695 | 0.491 | 30.12% | 稳但改善有限。 |
+| train200 r8 | 200 | 8 | 5e-6 | all-loss | 1.180→1.220 | 1.882→1.609 | 0.389 | 44.63% | 当前最佳健康档：single 小退化，gap 闭合更好。 |
+
+判读：LoRA 路径已经跑通，且 200 条训练在冻结正式 eval 上能稳定改善 continuation gap。当前最可用配置是 `r=8, lr=5e-6, all-loss, q_proj/v_proj`，比 target-only 更好，支持 review 里“all-loss + history/drop 不能排除”的判断。`r32` 或较大学习率会造成 single NLL 退化，说明下一阶段门禁必须同时约束：`gap 闭合率上升` + `single NLL 不明显退化`。下一步建议在当前健康档上加大数据量并实现 history drop/lookahead，同时加入 10% single/replay 防遗忘，再考虑 PyTorch 离线生成 CER。
