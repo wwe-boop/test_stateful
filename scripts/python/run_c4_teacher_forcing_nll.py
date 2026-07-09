@@ -39,17 +39,36 @@ def row_for_single_segment(row: dict[str, Any], segment_index: int) -> dict[str,
     return out
 
 
+def resolve_speaker_embedding(*, model, ref_mels, speaker: str):
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    if getattr(model, "speaker_encoder", None) is not None:
+        return model.speaker_encoder(ref_mels.to(device=device, dtype=dtype)).detach()
+
+    talker_config = getattr(model.config, "talker_config", None)
+    spk_id = getattr(talker_config, "spk_id", None) or {}
+    speaker_key = str(speaker or "").strip().lower()
+    if speaker_key not in spk_id:
+        speaker_key = "serena" if "serena" in spk_id else next(iter(spk_id), "")
+    if not speaker_key:
+        raise RuntimeError("model has no speaker_encoder and no talker_config.spk_id map")
+    speaker_id = int(spk_id[speaker_key])
+    speaker_ids = torch.tensor([[speaker_id]], device=device, dtype=torch.long)
+    return model.talker.model.codec_embedding(speaker_ids).to(dtype=dtype).detach()
+
+
 def build_embeddings(
     *,
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
     ref_mels: torch.Tensor,
+    speaker: str,
 ) -> torch.Tensor:
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
     with torch.no_grad():
-        speaker_embedding = model.speaker_encoder(ref_mels.to(device=device, dtype=dtype)).detach()
+        speaker_embedding = resolve_speaker_embedding(model=model, ref_mels=ref_mels, speaker=speaker)
 
     input_ids = batch["input_ids"].to(device)
     codec_ids = batch["codec_ids"].to(device)
@@ -87,9 +106,10 @@ def codec0_nll_for_segment(
     layout: dict[str, Any],
     segment_index: int,
     ref_mels: torch.Tensor,
+    speaker: str,
 ) -> dict[str, Any]:
     device = next(model.parameters()).device
-    input_embeddings = build_embeddings(model=model, batch=batch, ref_mels=ref_mels)
+    input_embeddings = build_embeddings(model=model, batch=batch, ref_mels=ref_mels, speaker=speaker)
     attention_mask = batch["attention_mask"].to(device)
     labels = batch["codec_0_labels"].to(device)
 
@@ -195,6 +215,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             layout=continuation_layouts[0],
             segment_index=args.target_segment_index,
             ref_mels=ref_mels,
+            speaker=args.speaker,
         )
 
         single_row = row_for_single_segment(row, args.target_segment_index)
@@ -210,6 +231,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             layout=single_layouts[0],
             segment_index=0,
             ref_mels=ref_mels,
+            speaker=args.speaker,
         )
         delta = float(continuation["nll_mean"]) - float(single["nll_mean"])
         ratio = float(continuation["nll_mean"]) / max(float(single["nll_mean"]), 1e-8)
@@ -217,6 +239,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "index": idx,
             "sample_id": str(row.get("sample_id")),
             "target_segment_index": args.target_segment_index,
+        "speaker": args.speaker,
             "target_text": continuation["target_text"],
             "single_segment": single,
             "continuation": continuation,
@@ -249,6 +272,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--device-map", default="cuda:1")
+    parser.add_argument("--speaker", default="serena")
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--target-segment-index", type=int, default=1)
     parser.add_argument("--min-target-chars", type=int, default=8)

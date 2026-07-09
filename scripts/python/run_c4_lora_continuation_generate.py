@@ -24,17 +24,36 @@ from scripts.python.run_c4_forward_smoke import first_ref_audio, load_ref_mels, 
 from scripts.python.run_c4_teacher_forcing_nll import row_for_single_segment  # noqa: E402
 
 
+def resolve_speaker_embedding(*, model, ref_mels, speaker: str):
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    if getattr(model, "speaker_encoder", None) is not None:
+        return model.speaker_encoder(ref_mels.to(device=device, dtype=dtype)).detach()
+
+    talker_config = getattr(model.config, "talker_config", None)
+    spk_id = getattr(talker_config, "spk_id", None) or {}
+    speaker_key = str(speaker or "").strip().lower()
+    if speaker_key not in spk_id:
+        speaker_key = "serena" if "serena" in spk_id else next(iter(spk_id), "")
+    if not speaker_key:
+        raise RuntimeError("model has no speaker_encoder and no talker_config.spk_id map")
+    speaker_id = int(spk_id[speaker_key])
+    speaker_ids = torch.tensor([[speaker_id]], device=device, dtype=torch.long)
+    return model.talker.model.codec_embedding(speaker_ids).to(dtype=dtype).detach()
+
+
 def build_embeddings(
     *,
     model: torch.nn.Module,
     batch: dict[str, torch.Tensor],
     ref_mels: torch.Tensor,
     prefill_len: int,
+    speaker: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     with torch.no_grad():
-        speaker_embedding = model.speaker_encoder(ref_mels.to(device=device, dtype=dtype)).detach()
+        speaker_embedding = resolve_speaker_embedding(model=model, ref_mels=ref_mels, speaker=speaker)
 
     input_ids = batch["input_ids"][:, :prefill_len, :].to(device)
     codec_ids = batch["codec_ids"][:, :prefill_len, :].to(device)
@@ -151,6 +170,7 @@ def generate_one(
         batch=batch,
         ref_mels=ref_mels,
         prefill_len=prefill_len,
+        speaker=args.speaker,
     )
     device = next(model.parameters()).device
     attention_mask = torch.ones(input_embeddings.shape[:2], device=device, dtype=torch.long)
@@ -202,6 +222,7 @@ def generate_one(
         "sample_id": source_sample_id,
         "variant": args.variant,
         "generation_mode": args.generation_mode,
+        "speaker": args.speaker,
         "seed": int(args.seed),
         "wav_path": str(wav_path),
         "reference": reference,
@@ -225,6 +246,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-dir", type=Path)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--device-map", default="cuda:1")
+    parser.add_argument("--speaker", default="serena")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--target-segment-index", type=int, default=2)
     parser.add_argument("--generation-mode", choices=("continuation", "single"), default="continuation")
@@ -279,6 +301,7 @@ def main() -> int:
         "limit": args.limit,
         "target_segment_index": args.target_segment_index,
         "generation_mode": args.generation_mode,
+        "speaker": args.speaker,
         "max_new_tokens": args.max_new_tokens,
         "official_max_new_tokens": args.official_max_new_tokens,
         "sampling": {

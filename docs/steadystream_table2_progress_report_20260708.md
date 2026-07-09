@@ -523,3 +523,37 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 
 项目决策同步：后续新实验按 review §12.3 切到 `1.7B 基座 + input_mode=token + force_text_chunk_boundary + exact-boundary gate`；0.6B E10-E17 保留为方法论记录。下一步不再扩大 0.6B 训练，先确认线上同源 custom-1.7B PyTorch 权重位置，然后在 1.7B 上重建 NLL 门禁和生成装置单段/continuation 对照。
 
+---
+
+## 19. 2026-07-09 E18 1.7B CustomVoice NLL 门禁与生成装置降级
+
+按 review §12.3，后续新实验切到线上同源 `1.7B + input_mode=token`。远端确认 `workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice/` 是完整 HF/PyTorch 模型（约 4.3GB，含 `model.safetensors` 和 speech tokenizer），`workspace/exported/custom-1.7b/` 是 24GB TRT 导出包。该 1.7B custom 模型没有 `speaker_encoder`，speaker 槽应按引擎逻辑从 `talker_config.spk_id` 取 codec embedding；本轮已为 NLL/生成脚本增加兼容：0.6B 继续走 x-vector，1.7B custom 走 `spk_id`，默认 speaker=`serena`。
+
+### 19.1 1.7B teacher-forcing NLL
+
+| 模型 | N | single NLL | continuation NLL | Δ cont-single | continuation worse | 判读 |
+|---|---:|---:|---:|---:|---:|---|
+| 0.6B Base（E10） | 20 | 1.180 | 1.882 | +0.702 | 19/20 | 续写排布强 OOD。 |
+| 1.7B CustomVoice | 3 | 7.837 | 7.306 | -0.531 | 0/3 | 小样本 continuation 反而更低，不可外推。 |
+| 1.7B CustomVoice | 20 | 7.436 | 7.809 | +0.372 | 11/20 | 仍有 continuation gap，但明显弱于 0.6B。 |
+
+判读：1.7B custom 上，continuation 排布不是 0.6B 那种“一边倒失败”；正式 20 条只有 11/20 更差，平均 gap 约为 0.6B 的一半。绝对 NLL 很高，原因是当前 eval 的真值 codes 来自 Wenet 公开音色，而 1.7B custom 的 speaker 槽固定为 `serena`，所以绝对值不能和 0.6B 直接比；当前只把 ΔNLL 作为相对门禁。
+
+### 19.2 1.7B PyTorch 生成装置未过单段健康门禁
+
+同 E17 生成脚本、官方采样、`max_new_tokens=256`、speaker=`serena`，跑前 3 条单段/continuation：
+
+| 生成模式 | CER 均值 | 帧数 / 目标帧 | stop reason | ASR 形态 | 判读 |
+|---|---:|---|---|---|---|
+| single | 100.00% | 255/64, 255/71, 175/55 | max cap, max cap, eos | 三条基本空识别 | 单段金标准失败，装置不健康。 |
+| continuation | 98.33% | 255/64, 15/71, 20/55 | max cap, eos, eos | 空识别或无关短句 | 不能用于判断 C4。 |
+
+这和 0.6B 的 E17 不同：0.6B 同一手搓生成装置的 single CER 是 1.75%，可以作为健康对照；1.7B custom single 直接 100%，说明问题不在 C4 continuation 本身，而是 1.7B custom 的 PyTorch 手搓 prefill 路径没有复现线上/官方 CustomVoice 生成形态。可能原因包括：custom 模型依赖 speaker/language/instruct 的官方 runtime 前缀；Wenet ref/codes 与 custom speaker 分布不匹配；或 8 槽 C4 collate 前缀不适合直接驱动 custom 生成。
+
+因此 E18 生成级结论必须降级：1.7B 目前只完成 teacher-forcing NLL 门禁，不能用当前 PyTorch hand-prefill 生成 CER 评价 C4。下一步改走两条更可信路径：
+
+1. **runtime/token-mode 路径**：用已部署的 custom-1.7B TRT engine，在 `input_mode=token + force_text_chunk_boundary + exact-boundary gate` 下做单段/continuation smoke，这是表 2 的真实测量口径。
+2. **官方 CustomVoice PyTorch 前缀路径**：若必须离线生成，先复现官方 `speaker/language/instruct` 单段生成到 CER 3%-6%，再把 C4 continuation 接入；单段不过线不得评 C4。
+
+当前门禁：不扩大 1.7B LoRA，不导出新 TRT；先让 1.7B 生成装置通过单段健康门禁。
+
