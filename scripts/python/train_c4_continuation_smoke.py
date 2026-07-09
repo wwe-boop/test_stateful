@@ -131,6 +131,7 @@ def evaluate_rows(
     special_ids: Any,
     target_segment_index: int,
     repo_root: Path,
+    speaker: str,
 ) -> dict[str, Any]:
     model.eval()
     items = []
@@ -148,6 +149,7 @@ def evaluate_rows(
             layout=layouts[0],
             segment_index=target_segment_index,
             ref_mels=ref_mels,
+            speaker=speaker,
         )
         items.append(item)
     nlls = [float(item["nll_mean"]) for item in items]
@@ -166,6 +168,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--device-map", default="cuda:1")
+    parser.add_argument("--speaker", default="serena")
     parser.add_argument("--target-segment-index", type=int, default=2)
     parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--epochs", type=int, default=1)
@@ -210,6 +213,7 @@ def main() -> int:
         special_ids=special_ids,
         target_segment_index=args.target_segment_index,
         repo_root=args.repo_root,
+        speaker=args.speaker,
     )
 
     losses = []
@@ -243,12 +247,14 @@ def main() -> int:
         special_ids=special_ids,
         target_segment_index=args.target_segment_index,
         repo_root=args.repo_root,
+        speaker=args.speaker,
     )
 
     summary = {
         "model_dir": str(args.model_dir),
         "manifest_jsonl": str(args.manifest_jsonl),
         "device": str(device),
+        "speaker": args.speaker,
         "target_segment_index": args.target_segment_index,
         "train_samples": len(rows),
         "eval_samples": len(eval_rows_subset),

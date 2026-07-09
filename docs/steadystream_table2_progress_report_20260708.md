@@ -685,3 +685,18 @@ E24 metadata 确认三条样本均为 `language=auto`、`instruct=""`，并且 e
 | 内容级 Chinese + instruct + Vivian | `runtime_layout_content_parity_chinese_instruct_e25_summary.json` | fail | 长度 21 vs 8，且 instruct/language/speaker 多处内容 mismatch。 |
 
 判读：E24 已经说明“前缀长度从 21 收到 8”不能单独解决 runtime 复读；E25 则进一步证明即便在 auto/空 instruct 条件下，C4 collate 与 runtime 仍没有内容级同构，最小差异集中在 speaker 槽。当前 C4 collate 的 8 槽核心使用 `[nothink, think_bos, think_eos, 0, codec_pad]`，而 custom runtime 会按 speaker 查表写入 Vivian=`3065`。这解释了为什么“8 槽长度一致”不能等价于“训推一致”。下一步若要让 C4 训练诊断真正服务 CustomVoice 表 2，必须先决定 speaker 槽策略：要么训练 collate 写入与 runtime 相同的 `spk_id`，要么在导出/运行时证明训练中的 `0` 槽与 custom speaker embedding 等价；否则 LoRA 训练和 runtime Full 仍有隐性分布差。
+
+---
+
+## 26. 2026-07-09 E26 Speaker 槽复核与 C4 训练诊断接口修复
+
+复核 E25 后补充一个重要 nuance：C4 batch 的 token-level speaker 槽确实写 `0`，但现有 teacher-forcing NLL 与 LoRA generation 的 embedding 构造路径会显式把第 6 槽覆盖为 speaker embedding。对 1.7B CustomVoice，没有 `speaker_encoder` 时 `resolve_speaker_embedding()` 会从 `talker_config.spk_id` 查表，例如 `Vivian -> 3065`，再取 `model.talker.model.codec_embedding(3065)`；因此 E25 的 token-level mismatch 不一定等价于 embedding-level mismatch。真正的风险是：所有训练/评估脚本必须显式携带同一个 speaker，否则这个覆盖逻辑会漂移。
+
+本轮发现并修复两个接口漂移：
+
+| 脚本 | 问题 | 修复 |
+|---|---|---|
+| `scripts/python/train_c4_lora_gap.py` | `codec0_nll_for_segment()` 已要求 `speaker`，但 eval gap 调用未传；后续重跑会直接 TypeError。 | 增加 `--speaker`（默认 `serena`），before/after eval 均传入并写入 summary。 |
+| `scripts/python/train_c4_continuation_smoke.py` | 同样在 `evaluate_rows()` 调用 NLL 时缺 `speaker`。 | 增加 `--speaker` 并传入 before/after eval，summary 记录 speaker。 |
+
+验证：`py_compile` 已通过。下一步如果继续 C4 LoRA/NLL 训练诊断，必须在命令里显式传 `--speaker Vivian/Serena/Ethan`，并把 speaker 作为结果维度记录；否则无法证明训练诊断与表 2 CustomVoice runtime 同源。

@@ -38,6 +38,7 @@ def evaluate_gap(
     special_ids: Any,
     target_segment_index: int,
     repo_root: Path,
+    speaker: str,
 ) -> dict[str, Any]:
     model.eval()
     items = []
@@ -52,6 +53,7 @@ def evaluate_gap(
             layout=cont_layouts[0],
             segment_index=target_segment_index,
             ref_mels=ref_mels,
+            speaker=speaker,
         )
         single_row = row_for_single_segment(row, target_segment_index)
         single_batch, single_layouts = build_continuation_batch(
@@ -63,6 +65,7 @@ def evaluate_gap(
             layout=single_layouts[0],
             segment_index=0,
             ref_mels=ref_mels,
+            speaker=speaker,
         )
         items.append(
             {
@@ -96,6 +99,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--device-map", default="cuda:1")
+    parser.add_argument("--speaker", default="serena")
     parser.add_argument("--target-segment-index", type=int, default=2)
     parser.add_argument("--train-limit", type=int, default=200)
     parser.add_argument("--eval-limit", type=int, default=20)
@@ -152,6 +156,7 @@ def main() -> int:
         special_ids=special_ids,
         target_segment_index=args.target_segment_index,
         repo_root=args.repo_root,
+        speaker=args.speaker,
     )
 
     losses = []
@@ -195,6 +200,7 @@ def main() -> int:
         special_ids=special_ids,
         target_segment_index=args.target_segment_index,
         repo_root=args.repo_root,
+        speaker=args.speaker,
     )
     before_gap = float(before["gap_mean"])
     after_gap = float(after["gap_mean"])
@@ -208,6 +214,7 @@ def main() -> int:
         "eval_manifest_jsonl": str(args.eval_manifest_jsonl),
         "adapter_out": str(args.adapter_out),
         "device": str(device),
+        "speaker": args.speaker,
         "target_segment_index": args.target_segment_index,
         "train_samples": len(train_rows),
         "eval_samples": len(eval_rows),
