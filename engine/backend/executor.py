@@ -369,6 +369,7 @@ class GPUFuture:
     _c2w_transconv_output_names: List[str] = field(default_factory=list)
     _codec_eos_id: int = 2150
     _used_pingpong: bool = False
+    _step_input_embeds: Optional[torch.Tensor] = None
     _inputs: Dict[str, Any] = field(default_factory=dict)
     _dump_meta: Dict[str, Any] = field(default_factory=dict)
     _debug_dumper: Optional[EngineDebugDumper] = None
@@ -446,6 +447,7 @@ class GPUFuture:
             codec_sum=codec_sum,
             updated_tc=updated_tc,
             used_pingpong=self._used_pingpong,
+            step_input_embeds=self._step_input_embeds,
         )
 
 
@@ -473,6 +475,7 @@ class StepOutput:
     codec_sum: Optional[torch.Tensor] = None
     updated_tc: Optional[torch.Tensor] = None
     used_pingpong: bool = False
+    step_input_embeds: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1098,7 +1101,10 @@ class Executor:
             for s in slots:
                 s.past_len += 1
                 s.frame_idx += 1
-            return GPUFuture(_slots=slots)
+            return GPUFuture(
+                _slots=slots,
+                _step_input_embeds=input_embeds.detach().clone(),
+            )
 
         slot_ids = [s.slot_id for s in slots]
         max_past_len = max(original_past_lens) if original_past_lens else 0
@@ -1168,6 +1174,7 @@ class Executor:
             _c2w_transconv_output_names=self._c2w_transconv_output_names,
             _codec_eos_id=self._codec_eos_id,
             _used_pingpong=output_overrides is not None,
+            _step_input_embeds=input_embeds.detach().clone(),
             _inputs=input_snapshot,
             _dump_meta=dump_meta,
             _debug_dumper=self._debug_dumper if self._debug_dumper.enabled else None,

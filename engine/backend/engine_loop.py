@@ -920,6 +920,7 @@ class EngineLoop:
             dtype=torch.float32,
         )
         slot.last_codec_sum = None
+        slot.steadystream_replay_embeds = []
         slot.trailing = [self._coerce_embed_tensor(t) for t in trailing]
         slot.text_idx = 0
 
@@ -991,6 +992,19 @@ class EngineLoop:
             group.steadystream_experimental.get("kv_prepend_prefix", "")
         ).strip().lower()
         return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _steadystream_uses_reprefill_history(group: EngineSessionGroup) -> bool:
+        raw = str(
+            group.steadystream_experimental.get("kv_reprefill_history", "")
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _steadystream_replay_buffer_limit(self, group: EngineSessionGroup) -> int:
+        return min(
+            max(64, self._steadystream_kv_tail_tokens(group) + 256),
+            max(64, self._executor.kv_pool.max_seq_len * 2),
+        )
 
     def _snapshot_talker_kv_tail(
         self,
@@ -1111,6 +1125,20 @@ class EngineLoop:
         carry: dict[str, Any] = {"from_segment_idx": int(seg.segment_idx)}
 
         if self._steadystream_uses_kv(group):
+            if self._steadystream_uses_reprefill_history(group):
+                replay_items = list(slot.steadystream_replay_embeds or [])
+                if drop_talker_tail_tokens > 0:
+                    replay_items = replay_items[:-int(drop_talker_tail_tokens)]
+                keep = min(
+                    len(replay_items),
+                    self._steadystream_kv_tail_tokens(group),
+                )
+                if keep > 0:
+                    replay = torch.cat(replay_items[-keep:], dim=1).detach().clone()
+                    carry["replay_embeds"] = replay.contiguous()
+                    carry["replay_len"] = int(keep)
+                    carry["replay_dropped_tail_tokens"] = int(drop_talker_tail_tokens)
+
             talker_kv, compact_len, logical_past_len = self._snapshot_talker_kv_tail(
                 slot,
                 max_tokens=self._steadystream_kv_tail_tokens(group),
@@ -1195,6 +1223,16 @@ class EngineLoop:
         if task_type == TaskType.VOICE_CLONE_ICL:
             return None
         carry = group.steadystream_carry or {}
+        if self._steadystream_uses_reprefill_history(group):
+            reprefill = self._try_reprefill_from_steadystream_history(
+                group,
+                seg,
+                slot,
+                task_type,
+                metrics,
+            )
+            if reprefill is not None:
+                return reprefill
         talker_kv = carry.get("talker_kv")
         compact_len = int(carry.get("talker_past_len") or 0)
         logical_past_len = int(
@@ -1265,6 +1303,100 @@ class EngineLoop:
             compact_len,
             logical_past_len,
             slot.position_offset,
+        )
+        return None, False
+
+    def _try_reprefill_from_steadystream_history(
+        self,
+        group: EngineSessionGroup,
+        seg: EngineSegment,
+        slot: SlotKVState,
+        task_type: TaskType,
+        metrics: dict,
+    ) -> Optional[tuple[Optional[bytes], bool]]:
+        carry = group.steadystream_carry or {}
+        replay = carry.get("replay_embeds")
+        if replay is None or not seg.pending_token_ids:
+            return None
+
+        req_cfg = group.request.session_config
+
+        def _cfg_attr(name: str, default=None):
+            return getattr(req_cfg, name, default) if req_cfg is not None else default
+
+        def _cfg_token_ids(name: str):
+            spec = _cfg_attr(name)
+            return list(spec.token_ids) if spec is not None else None
+
+        plan = self._prefill_builder.build_plan_from_ids(
+            task_type=task_type,
+            token_ids=seg.pending_token_ids,
+            language=_cfg_attr("language", "auto"),
+            speaker=_cfg_attr("speaker", group.request.speaker_key),
+            instruct=_cfg_attr("instruct"),
+            instruct_token_ids=_cfg_token_ids("instruct_spec"),
+            spk_embedding=_cfg_attr("spk_embedding"),
+            ref_text=_cfg_attr("ref_text"),
+            ref_text_token_ids=_cfg_token_ids("ref_text_spec"),
+            ref_codec_sum_vec=_cfg_attr("ref_codec_sum_vec"),
+            ref_audio_sha256=_cfg_attr("ref_audio_sha256"),
+            ref_feature_cache_key=_cfg_attr("ref_feature_cache_key"),
+            include_eos=seg.input_complete,
+        )
+        if plan.cacheable_prefix_embeds is None or plan.request_prefill_embeds is None:
+            return None
+
+        prefix_embeds = plan.cacheable_prefix_embeds.to(
+            device=self._embed_device,
+            dtype=self._embed_dtype,
+        )
+        request_embeds = plan.request_prefill_embeds.to(
+            device=self._embed_device,
+            dtype=self._embed_dtype,
+        )
+        replay = replay.to(device=self._embed_device, dtype=self._embed_dtype)
+        prefix_len = int(prefix_embeds.shape[1])
+        max_history = max(
+            0,
+            int(self._executor.kv_pool.max_seq_len) - prefix_len - 1,
+        )
+        if max_history <= 0:
+            return None
+        original_replay_len = int(replay.shape[1])
+        if original_replay_len > max_history:
+            replay = replay[:, -max_history:, :]
+
+        replay_prefill = torch.cat([prefix_embeds, replay], dim=1).contiguous()
+        self._executor.prefill_prefix_only(slot, replay_prefill)
+        self._prime_decode_after_prefix_prefill(
+            slot,
+            request_embeds,
+            plan.trailing,
+            source=f"steadystream_reprefill_{group.steadystream_variant}",
+        )
+        if self._steadystream_uses_acoustic(group):
+            self._restore_steadystream_c2w_carry(group, slot, metrics)
+        metrics["steadystream_variant"] = group.steadystream_variant
+        metrics["steadystream_kv_tail"] = "reprefill_history"
+        metrics["steadystream_kv_prefix"] = "recomputed"
+        metrics["steadystream_kv_prefix_len"] = str(prefix_len)
+        metrics["steadystream_replay_len"] = str(int(replay.shape[1]))
+        metrics["steadystream_replay_original_len"] = str(original_replay_len)
+        metrics["steadystream_replay_dropped_tail_tokens"] = str(
+            int(carry.get("replay_dropped_tail_tokens") or 0)
+        )
+        metrics["steadystream_token_counts"] = "reset"
+        metrics["steadystream_carry_from_segment"] = str(
+            carry.get("from_segment_idx", "")
+        )
+        logger.info(
+            "Applied SteadyStream replay prefill: session=%s variant=%s seg=%d "
+            "prefix=%d replay=%d",
+            group.session_id,
+            group.steadystream_variant,
+            seg.segment_idx,
+            prefix_len,
+            int(replay.shape[1]),
         )
         return None, False
 
@@ -1434,6 +1566,16 @@ class EngineLoop:
                     ]
             if output.updated_tc is not None:
                 slot.token_counts = output.updated_tc[i:i+1].clone()
+            if (
+                output.step_input_embeds is not None
+                and self._steadystream_uses_kv(group)
+            ):
+                slot.steadystream_replay_embeds.append(
+                    output.step_input_embeds[i:i + 1].detach().clone().contiguous()
+                )
+                replay_limit = self._steadystream_replay_buffer_limit(group)
+                if len(slot.steadystream_replay_embeds) > replay_limit:
+                    del slot.steadystream_replay_embeds[:-replay_limit]
             slot.past_len += 1
             slot.frame_idx += 1
             slot.touch()

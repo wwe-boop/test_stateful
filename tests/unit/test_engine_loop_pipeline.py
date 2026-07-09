@@ -773,6 +773,72 @@ class TestSteadyStreamCarry:
         assert metrics["steadystream_token_counts"] == "inherited"
         torch.testing.assert_close(slot.token_counts, inherited_counts)
 
+    def test_reprefill_history_recomputes_prefix_and_replay(self, model_config):
+        hidden = model_config.hidden_size
+        prefix = torch.full((1, 2, hidden), 1.0)
+        replay = torch.full((1, 3, hidden), 2.0)
+        request = torch.full((1, 1, hidden), 3.0)
+        trailing = [torch.full((1, 1, hidden), 4.0)]
+        plan = PrefillPlan(
+            prefill_embeds=torch.cat([prefix, request], dim=1),
+            trailing=trailing,
+            cacheable_prefix_embeds=prefix,
+            request_prefill_embeds=request,
+        )
+        executor = _StubExecutorForPrefill(model_config)
+        engine_loop = EngineLoop(
+            engine_inbox=queue.Queue(),
+            async_loop=_ImmediateLoop(),
+            executor=executor,
+            prefill_builder=_StubPrefillBuilder(
+                plan=plan,
+                hidden_size=hidden,
+            ),
+        )
+        seg = EngineSegment("s1", 1)
+        seg.pending_token_ids = [1, 2]
+        seg.input_complete = True
+        group = _make_steadystream_group(
+            "s1",
+            {
+                "steadystream_variant": "kv_tail_only",
+                "kv_reprefill_history": "true",
+                "kv_tail_tokens": "16",
+            },
+        )
+        group.steadystream_carry = {
+            "from_segment_idx": 0,
+            "replay_embeds": replay,
+            "replay_len": 3,
+            "talker_kv": _make_talker_kv(model_config, seq=4),
+            "talker_past_len": 4,
+        }
+        slot = SlotKVState(slot_id=0)
+        metrics: dict[str, str] = {}
+
+        assert engine_loop._try_prefill_from_steadystream_carry(
+            group,
+            seg,
+            slot,
+            TaskType.CUSTOM_VOICE,
+            metrics,
+        ) == (None, False)
+
+        expected_prefill = torch.cat([prefix, replay], dim=1).to(model_config.dtype)
+        assert len(executor.prefill_prefix_only_inputs) == 1
+        torch.testing.assert_close(
+            executor.prefill_prefix_only_inputs[0],
+            expected_prefill,
+        )
+        assert executor.prefill_from_prefix_inputs == []
+        assert metrics["steadystream_kv_tail"] == "reprefill_history"
+        assert metrics["steadystream_kv_prefix"] == "recomputed"
+        assert metrics["steadystream_replay_len"] == "3"
+        assert metrics["steadystream_token_counts"] == "reset"
+        assert slot.prefill_source == "steadystream_reprefill_kv_tail_only"
+        torch.testing.assert_close(slot.next_embed, request.to(torch.float32))
+        assert slot.steadystream_replay_embeds == []
+
     def test_restore_can_prepend_cached_prefix_before_kv_tail(self, model_config):
         hidden = model_config.hidden_size
         req_embeds = torch.randn(1, 1, hidden)
