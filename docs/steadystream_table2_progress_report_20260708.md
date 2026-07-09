@@ -141,6 +141,35 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 | bounded token-history `silence` | 55.22% | `prefill_len=128`，上一段 text token 62/64/67，codes tail 42/40/37 帧 | 仍复读，不通过；说明当前受限 profile 不是可用 C2。 |
 | profile512 token-history `eos_only` | 29.04% | `prefill_len` 放宽到 512，上一段 codes 完整放入；最佳但仍漏尾/乱码 | 不通过；容量不是唯一瓶颈。 |
 | profile512 token-history `silence` | 36.42% | `hist_codes=222-235/222-235`，第 1 条第二段 `overflow=True` | 不通过；比 `eos_only` 差，定型不宜全裁尾部静音。 |
+| profile512 full-current token-history `eos_only` | 43.51% | 真实 C4-style 诊断：`prefix + history text + history codes + current text + codec BOS` 全量 prefill 后再解当前 codes | 不通过；保留全部尾部静音时更容易拖长并复读。 |
+| profile512 full-current token-history `silence` | 28.46% | 同上，但段末裁掉连续 pad-silence + EOS，上限 24 帧 | 不通过；是当前 full-current 最佳，但仍远离 3%-4% smoke baseline。 |
+
+### 8.2.1 full-current 诊断新增结果
+
+本轮新增 `kv_reprefill_token_history_full_current=true`，用于验证计划和评审要求的 C2/C4-style token 级 re-prefill。旧 profile512 token-history 形态是：
+
+`prefix + history_text + history_codes + boundary_EOS` 进入 prefill，当前段文本仍通过 request prefill/trailing 走流式解码。
+
+新 full-current 形态是：
+
+`prefix + history_text + history_codes + boundary_EOS + current_text + current_codec_BOS` 一次性进入 prefill，然后只让模型续写当前段 audio codes。
+
+服务端日志已确认完整历史和当前文本进入同一个 prefill：例如第 1/2/3 条 `silence` 分别记录 `hist_text=62/64/67`、`hist_codes=221/221, 238/238, 268/268`、`current_text=12/32/32`，`mode=full_current`。
+
+| 变体 | prosody_001 | prosody_002 | prosody_003 | 均值 |
+|---|---:|---:|---:|---:|
+| full-current `eos_only` | 44.32% | 48.28% | 37.93% | 43.51% |
+| full-current `silence` | 21.59% | 30.17% | 33.62% | 28.46% |
+
+逐样本 ASR 观察：
+
+| 样本 | `silence` 主要错误 | `eos_only` 主要错误 |
+|---|---|---|
+| prosody_001 | 前半段对齐，末尾把“整颗咖啡豆静泡十四小时”重复，漏掉“听起来很费时间，但香气层次反而更干净”。 | 中后段开始复读“有点甜/新批次/烘焙程度”，音频时长 28.96s，明显拖长。 |
+| prosody_002 | 前半段对齐，后段“探索一号/海斗一号/下潜任务”退化成串词。 | 尾部出现大量无意义重复和数字/音节串，CER 最高。 |
+| prosody_003 | 前半段对齐，后段从“酸梅汤”附近回跳到开头并串词。 | 后段复读“绕着西湖走了整整三圈”，随后进入乱码。 |
+
+本地已拉回音频和 ASR 结果：`outputs/table2_c2_token_history_fullcurrent_profile512_smoke_20260709/`。建议听同一样本的两档 wav：`silence` 通常更短、更少拖尾；`eos_only` 更容易保留过长尾部上下文后诱发复读。需要说明的是，我无法像人耳一样主观试听音频，只能基于已拉回 wav、时长、ASR 文本和服务端日志做可复核判断；本地 wav 已可直接播放复听。
 
 ### 8.3 失败模式
 
@@ -152,7 +181,23 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 6. bounded token-history 已经补入上一段 text token，但受当前 TRT `max_input_len=128` 限制，只能保留 37-42 帧 codes tail；ASR 显示它仍会重复上一段中段内容，CER 55.22%。
 7. profile512 诊断已解除容量限制：`eos_only` 三条实际为 `hist_codes=243/243、226/226、254/254`，`silence` 三条实际为 `234/234、235/235、222/222`，说明完整上一段 codes 已进入 re-prefill。
 8. 解除容量限制后仍未恢复：`eos_only=29.04%`、`silence=36.42%`；失败形态从 profile128 的明显复读转为第二段漏尾、提前终止或局部乱码。样例：`eos_only` 第 2 条尾部出现“科大雾残...探索探索”，`silence` 第 1 条第二段 `overflow=True` 且只识别到“冷萃吗”附近。
-9. 因此当前实现已经达到“prefix + 历史 text + 历史 codes + 当前 text”的容量要求，但未达到“可用 C2 续写”的行为要求；下一步要对齐 C4 collate/reference 排布，确认训练格式和推理格式是否逐 token 一致。
+9. full-current 诊断进一步把当前文本也放入 prefill，排布已更接近 C4：`prefix + text1 + codes1 + text2 + codec_BOS -> decode codes2`。但最佳仍只有 28.46% CER，说明未训练基座对这种跨段 text+codes 续写分布仍不稳定。
+10. 因此当前实现已经达到“prefix + 历史 text + 历史 codes + 当前 text”的容量要求，但未达到“可用 C2 续写”的行为要求；下一步要对齐 C4 collate/reference 排布，确认训练格式和推理格式是否逐 token 一致。
+
+### 8.3.1 当前对比方法的第一性原理
+
+表 2 C2 要验证的不是“音频能不能拼起来”，而是“模型在续写当前段 audio codes 时，能否同时保留上一段声学状态和当前段文本语义”。所以对照必须逐层拆开：
+
+| 对照 | 控制变量 | 它回答的问题 |
+|---|---|---|
+| `stateless_once` / `stateful_stream` | 不启用实验 KV/token carry | 基座和普通 stateful 在同一 3 样本上最低能到什么 CER，这是门禁参考线。 |
+| `acoustic_tail_only` | 只传声学尾，不传 KV/token 历史 | 如果它接近 baseline，说明音色/声学尾不是 CER 暴涨主因。 |
+| `pad_phase/eos_only/silence` | 只改变段末丢多少 codec 帧 | 判断是不是 terminal tail over-trim 导致历史被裁坏。结果 `pad_phase` 最差，说明过裁确实有害。 |
+| bounded token-history profile128 | 加入上一段 text + codes，但受 128 profile 限制 | 判断“没有上一段文本 token”是不是主因，同时暴露 profile 容量是否够。结果只保留 37-42 帧 codes，容量不够。 |
+| profile512 token-history | 放宽到 512，让上一段完整 codes 进入 prefill | 判断容量放开后是否恢复。结果仍 29%-36%，说明容量不是唯一问题。 |
+| profile512 full-current token-history | 再把当前完整 text 放进同一个 prefill | 判断真正 C4-style 排布能否让未训练基座直接续写。结果最佳 28.46%，说明还需要 C4 collate 对拍/continuation 训练，而不是继续盲调 tail。 |
+
+从第一性原理看，CER 变差来自两个可分离层面。第一层是工程形态错误：RoPE 位置、terminal over-trim、profile 容量都会把历史 KV 变成错误上下文；这些已经逐项修复或量化。第二层是分布不匹配：即使 token 序列形态已经接近 `text1+codes1+text2->codes2`，未经过 continuation SFT 的基座仍可能把历史 codes 当成要复读的目标，或者在当前 codes 解码中丢失后半段语义。因此 C2 仍未过 baseline +/-1pp 门禁，不能批准正式 C4 训练或把当前行写成完整 SteadyStream。
 
 ### 8.4 当前卡点和决策
 

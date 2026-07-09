@@ -1008,6 +1008,15 @@ class EngineLoop:
         ).strip().lower()
         return raw in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _steadystream_token_history_full_current(group: EngineSessionGroup) -> bool:
+        raw = str(
+            group.steadystream_experimental.get(
+                "kv_reprefill_token_history_full_current", ""
+            )
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
     def _steadystream_replay_buffer_limit(self, group: EngineSessionGroup) -> int:
         return min(
             max(64, self._steadystream_kv_tail_tokens(group) + 256),
@@ -1465,6 +1474,8 @@ class EngineLoop:
         history_text_token_ids: list[int],
         history_text_include_eos: bool,
         history_full_codes: torch.Tensor,
+        current_text_token_ids: list[int] | None = None,
+        current_text_include_eos: bool = False,
     ) -> Optional[tuple[torch.Tensor, dict[str, int]]]:
         if self._prefill_builder is None:
             return None
@@ -1475,6 +1486,14 @@ class EngineLoop:
         )
         if history_text is None:
             return None
+        current_text = None
+        if current_text_token_ids is not None:
+            current_text = self._steadystream_text_block_embed(
+                current_text_token_ids,
+                include_eos=current_text_include_eos,
+            )
+            if current_text is None:
+                return None
 
         prefix_embeds = prefix_embeds.to(
             device=self._embed_device,
@@ -1488,6 +1507,8 @@ class EngineLoop:
             + 1  # history codec BOS
             + 1  # history boundary codec EOS
         )
+        if current_text is not None:
+            fixed_prefill_len += int(current_text.shape[1]) + 1  # current codec BOS
         max_code_frames = min(
             max_input_len - fixed_prefill_len,
             max_seq - fixed_prefill_len - 1,
@@ -1523,21 +1544,24 @@ class EngineLoop:
         history_codec_bos = pad + codec_bos
         history_codes = pad.expand(1, codec_sum.shape[1], self._hidden_size) + codec_sum
         history_boundary = pad + codec_eos
-        prefill = torch.cat(
-            [
-                prefix_embeds,
-                history_text,
-                history_codec_bos,
-                history_codes,
-                history_boundary,
-            ],
-            dim=1,
-        ).contiguous()
+        parts = [
+            prefix_embeds,
+            history_text,
+            history_codec_bos,
+            history_codes,
+            history_boundary,
+        ]
+        if current_text is not None:
+            current_codec_bos = pad + codec_bos
+            parts.extend([current_text, current_codec_bos])
+        prefill = torch.cat(parts, dim=1).contiguous()
         info = {
             "prefix_len": int(prefix_embeds.shape[1]),
             "history_text_tokens": len(history_text_token_ids),
             "history_code_frames": int(history_full_codes.shape[0]),
             "history_code_frames_total": total_code_frames,
+            "current_text_tokens": len(current_text_token_ids or []),
+            "current_text_full_prefill": 1 if current_text is not None else 0,
             "prefill_len": int(prefill.shape[1]),
             "max_input_len": max_input_len,
         }
@@ -1588,29 +1612,55 @@ class EngineLoop:
         if plan.cacheable_prefix_embeds is None:
             return None
 
+        full_current = (
+            self._steadystream_token_history_full_current(group)
+            and bool(seg.input_complete)
+        )
         built = self._build_steadystream_token_history_prefill(
             plan.cacheable_prefix_embeds,
             history_text_token_ids=[int(x) for x in history_text_token_ids],
             history_text_include_eos=bool(carry.get("history_text_include_eos", True)),
             history_full_codes=history_full_codes,
+            current_text_token_ids=(
+                [int(x) for x in seg.pending_token_ids] if full_current else None
+            ),
+            current_text_include_eos=bool(seg.input_complete),
         )
         if built is None:
             return None
         replay_prefill, info = built
-        if plan.request_prefill_embeds is None:
+        if not full_current and plan.request_prefill_embeds is None:
             return None
 
-        self._executor.prefill_prefix_only(slot, replay_prefill)
-        self._prime_decode_after_prefix_prefill(
-            slot,
-            plan.request_prefill_embeds,
-            plan.trailing,
-            source=f"steadystream_token_history_{group.steadystream_variant}",
-        )
-        if self._steadystream_uses_acoustic(group):
-            self._restore_steadystream_c2w_carry(group, slot, metrics)
+        prefill_audio: Optional[bytes] = None
+        prefill_eos = False
+        source = f"steadystream_token_history_{group.steadystream_variant}"
+        if full_current:
+            source = f"steadystream_token_history_full_current_{group.steadystream_variant}"
+            if self._steadystream_uses_acoustic(group):
+                self._restore_steadystream_c2w_carry(group, slot, metrics)
+            prefill_audio, prefill_eos = self._executor.prefill(slot, replay_prefill)
+            slot.prefill_source = source
+            slot.trailing = []
+            slot.text_idx = 0
+            slot.steadystream_replay_embeds = []
+            slot.steadystream_full_codecs = []
+        else:
+            self._executor.prefill_prefix_only(slot, replay_prefill)
+            self._prime_decode_after_prefix_prefill(
+                slot,
+                plan.request_prefill_embeds,
+                plan.trailing,
+                source=source,
+            )
+            if self._steadystream_uses_acoustic(group):
+                self._restore_steadystream_c2w_carry(group, slot, metrics)
         metrics["steadystream_variant"] = group.steadystream_variant
-        metrics["steadystream_kv_tail"] = "reprefill_token_history"
+        metrics["steadystream_kv_tail"] = (
+            "reprefill_token_history_full_current"
+            if full_current
+            else "reprefill_token_history"
+        )
         metrics["steadystream_kv_prefix"] = "recomputed"
         metrics["steadystream_kv_prefix_len"] = str(info["prefix_len"])
         metrics["steadystream_token_history_prefill_len"] = str(info["prefill_len"])
@@ -1627,7 +1677,10 @@ class EngineLoop:
             len(seg.pending_token_ids)
         )
         metrics["steadystream_token_history_current_trailing"] = str(
-            len(plan.trailing)
+            0 if full_current else len(plan.trailing)
+        )
+        metrics["steadystream_token_history_full_current"] = str(
+            bool(info["current_text_full_prefill"])
         )
         metrics["steadystream_token_history_max_input_len"] = str(
             info["max_input_len"]
@@ -1650,17 +1703,18 @@ class EngineLoop:
         )
         logger.info(
             "Applied SteadyStream token-history prefill: session=%s variant=%s "
-            "seg=%d prefix=%d hist_text=%d hist_codes=%d/%d current_text=%d",
+            "seg=%d mode=%s prefix=%d hist_text=%d hist_codes=%d/%d current_text=%d",
             group.session_id,
             group.steadystream_variant,
             seg.segment_idx,
+            "full_current" if full_current else "streaming_current",
             info["prefix_len"],
             info["history_text_tokens"],
             info["history_code_frames"],
             info["history_code_frames_total"],
             len(seg.pending_token_ids),
         )
-        return None, False
+        return prefill_audio, prefill_eos
 
     def _try_reprefill_from_steadystream_history(
         self,
