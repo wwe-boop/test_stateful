@@ -442,3 +442,36 @@ LoRA 目标模块先用 `q_proj,v_proj`，评估固定为正式 20 条 NLL eval�
 | 1000 pool full epoch | 1000 | 0 | 1.180→4.007 | 1.882→4.039 | 0.032 | 95.37% | 假闭合，整体 NLL 崩坏。 |
 
 判读：数据放量有效，但训练步数是主要风险。`1000 pool + 200 steps` 是当前严格健康档，single 只退化 +0.033 且 gap 闭合 45.70%；`250 steps` 可作为激进候选，closure 到 56.12%，但 single 预算略超。10% single replay 在当前随机替换实现下帮助有限，说明防遗忘可能需要更强的 replay 比例、显式 single batch 调度或学习率/warmup/decay，而不是简单随机 10%。下一步优先不是继续拉长训练，而是用 `step200/250` 两个 adapter 做 PyTorch 离线生成 CER 小样本校准，看 NLL closure 对 CER 是否有实际收益；若 CER 有回落，再加 history drop/lookahead 与更稳的 replay 调度。
+
+---
+
+## 17. 2026-07-09 E16 C4 LoRA 生成级 Smoke 与音频回听包
+
+按 E15 结论，不再只看 teacher-forcing NLL gap，而是把两个候选 LoRA adapter 放到 PyTorch 生成路径里做小样本 CER 校准。新增脚本 `scripts/python/run_c4_lora_continuation_generate.py`，输入仍是冻结的 20 条正式 eval manifest；本次只取前 3 条，排布为 `history text + history codes + current text + codec_BOS`，并使用官方采样参数 `top_k=50, top_p=1.0, temperature=0.9, repetition_penalty=1.05`，同时打开 `--subtalker-dosample`。为了判断 LoRA 是否真实改善，还增加同条件 `c4_base` 对照。
+
+| 生成 smoke | adapter | NLL 侧状态 | 生成帧 / 目标帧 | 音频时长 | CER 均值 | 逐条失败形态 |
+|---|---|---|---|---|---:|---|
+| `c4_base` | 无 | E10 continuation OOD | 95/64, 102/71, 13/55 | 7.60s, 8.16s, 1.04s | 87.73% | 前两条长输出但历史串入/胡言，第三条短成“我走过去”。 |
+| `c4_lora_step200` | `lora_train1000_r8_all_lr5e-6_step200` | single +0.033, gap closure 45.70% | 66/64, 71/71, 10/55 | 5.28s, 5.68s, 0.80s | 74.70% | 前两条长度达标但句首混入历史文本，第三条塌缩。 |
+| `c4_lora_step250` | `lora_train1000_r8_all_lr5e-6_step250` | single +0.075, gap closure 56.12% | 39/64, 21/71, 10/55 | 3.12s, 1.68s, 0.80s | 69.55% | 第一条 CER 较好但明显短，第二/三条早停式塌缩。 |
+
+逐条 ASR 关键信息：
+
+| 样本 | reference | base hypothesis | step200 hypothesis | step250 hypothesis |
+|---|---|---|---|---|
+| 000 | 我点头看他平时做什么都好像一副玩世不恭的样子 | 他摇摇头等最后一起拿出来乌乌点头看他平时做什么都好像一副玩世不恭的样 | 他摇摇头等最后一起拿出来我我点头看他平时做什么都好像一副玩世不恭的样子 | 他摇摇头看他平时做什么都好像一副玩世不恭的样子 |
+| 001 | 也不能将我们分开摊开的手掌上是两枚同心结 | 然后他回头看着我我是555 | 然后他回头看着我是那么懂将我们分开摊开德手掌上是两枚同心结 | 要算是轮回往生 |
+| 002 | 伸手从袖子里拿出带出来的最后一点射魂香 | 我走过去 | 我走过去 | 我走过去 |
+
+音频与 ASR 结果已拉回本地：
+
+| 本地目录 | 内容 |
+|---|---|
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_base_eval3/` | base continuation 3 条 wav、codes、`asr_cer.json`。 |
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_lora_step200_eval3/` | step200 LoRA continuation 3 条 wav、codes、`asr_cer.json`。 |
+| `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/generate_c4_lora_step250_eval3/` | step250 LoRA continuation 3 条 wav、codes、`asr_cer.json`。 |
+
+判读：LoRA 不是无效，`step200/250` 都比 base continuation 的 87.73% CER 有所下降，说明 C4 continuation 排布确实可被训练拉回一部分；但它还不能交付为完整 SteadyStream/C4 行，因为最佳小样本 CER 仍在约 70%，明显差于 corrected C2 smoke 的 41.95%，更远离 3%-6% 单段基线。失败原因从音频/ASR 形态看分成两类：第一，历史文本/音频仍会被插到当前句前面，说明模型还没学会“历史只作声学/韵律条件，不参与语义续写”；第二，部分样本出现短输出或固定短句，说明生成停止机制仍受 text-channel EOS / codec 无效步影响，NLL gap closure 还没有稳定转化为自回归生成质量。
+
+下一步门禁保持不变：当前结果不批准启动表 2 完整 C4 大跑。应先在小样本上解决 `NLL 好但 generation 差` 的桥接问题，优先做三项：1）加入 C4 训练时的显式 current-text 对齐/历史 loss mask，降低历史语义串入；2）生成脚本增加 text-channel EOS、codec 有效码率和特殊码分布日志，定位为什么 `eos_step=-1` 仍提前停；3）在同一 3 条上补 `single current text -> codes` 生成对照，确认不是采样/声码器基础路径问题，再决定是否继续放大 LoRA 数据。
+
