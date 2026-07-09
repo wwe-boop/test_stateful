@@ -581,3 +581,35 @@ E17 重跑同 3 条样本，base 单段作为装置健康金标准；continuatio
 
 本地拉回状态：`table2_cer.json` 和部分 wav 已开始同步到 `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_1p7b_runtime_token_smoke_e19_20260709/`；但 SSH 文件流在拉取 wav 时两次断开，远端完整产物仍在上述 workspace 目录。若需要人工回听，下一步单独用分块/base64 或重新建立稳定传输通道拉取剩余 wav。
 
+---
+
+## 21. 2026-07-09 E20 1.7B Runtime Full-current C2 诊断
+
+按最新 review 要求，本轮不再用 PyTorch hand-prefill 评价 1.7B，而是在真实 TRT runtime/token-mode 上补 C2 诊断。核心修复与实验口径如下：
+
+| 项 | 内容 | 目的 |
+|---|---|---|
+| 引擎新增 flag | `kv_reprefill_token_history_drop_history_text=true` | 允许 token-history re-prefill 时只保留历史 codes，不带历史 text token。 |
+| runner 新增 flag | `--include-c2-diagnostics` | 在表 2 runner 里追加 C2 诊断变体，避免手工脚本口径漂移。 |
+| 新变体 1 | `full_current_silence` | history text + history codes + current text，尾部按 silence 裁剪。 |
+| 新变体 2 | `full_current_eos_only` | history text + history codes + current text，只丢 EOS，保留真实尾部静音。 |
+| 新变体 3 | `full_current_codes_only_silence` | history codes + current text，不带 history text，验证“历史文本串入”是否主因。 |
+
+命令产物：`workspace/table2_1p7b_runtime_c2diag3_e20_20260709/`。本轮跑 3 条样本、seed=42、`input_mode=token`、`stream_group_policy=none`、默认强制 text chunk boundary。Paraformer ASR/CER 汇总如下：
+
+| variant | CER 均值 | 逐样本 CER | 判读 |
+|---|---:|---|---|
+| `stateless_once` | 4.40% | 1.14%, 6.90%, 5.17% | 单段基线健康。 |
+| `stateful_stream` | 4.01% | 3.41%, 5.17%, 3.45% | 普通流式健康。 |
+| `acoustic_tail_only` | 4.21% | 2.27%, 6.03%, 4.31% | C1 声学尾健康。 |
+| `offline_full` | 4.78% | 2.27%, 9.48%, 2.59% | offline 对照健康。 |
+| `kv_tail_only` | 286.08% | 259.09%, 243.97%, 355.17% | KV-only 严重历史复读。 |
+| `tail_kv_pause_recovery` | 277.80% | 270.45%, 255.17%, 307.76% | pause recovery 不能救 KV 复读。 |
+| `full_steadystream` | 276.55% | 244.32%, 260.34%, 325.00% | 现状 Full 仍退化为历史复读。 |
+| `full_current_silence` | 49.69% | 56.82%, 49.14%, 43.10% | current text re-prefill 显著降低复读，但仍远高于 4% 基线。 |
+| `full_current_eos_only` | 56.82% | 45.45%, 85.34%, 39.66% | 保留尾部静音不稳定，样本 002 明显变差。 |
+| `full_current_codes_only_silence` | 73.26% | 78.41%, 71.55%, 69.83% | 去掉 history text 更差，主要表现为删字/漏尾。 |
+
+关键结论：E20 基本确认“当前文本必须进入 token-history re-prefill”，它把 244%-286% 的灾难复读压到 50% 左右，是目前最有效的 runtime 侧杠杆。但这还不能作为完整 SteadyStream 表 2 结果交付，因为健康 runtime 对照只有约 4%，而 full-current 仍差一个数量级。`codes_only` 变体反而更差，说明问题不是简单的“历史 text token 串入”；如果把 history text 拿掉，模型会更容易丢当前文本，证明 current/history 的联合排布和 history codes 长度才是下一步要拆的变量。
+
+当前卡点更新：完整 SteadyStream 还卡在 C2 history conditioning，不是模型/声码器/ASR 基线坏。1.7B runtime 正常单段、普通流式、C1 acoustic tail 都稳定在 4%-5%；坏的是 KV/Full 的历史条件如何进入自回归上下文。下一步建议在同一 3 条样本上做 `full_current_silence/eos_only` 的 history code tail sweep（例如 16/32/64/128/384），判断 384 帧历史是否过长导致复读；如果短尾能回到基线 ±1pp，再扩 10 条/全量；如果短尾仍在 30%-50%，再进入 C4 训练或更强 alignment 设计。

@@ -1018,6 +1018,15 @@ class EngineLoop:
         ).strip().lower()
         return raw in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _steadystream_token_history_drop_history_text(group: EngineSessionGroup) -> bool:
+        raw = str(
+            group.steadystream_experimental.get(
+                "kv_reprefill_token_history_drop_history_text", ""
+            )
+        ).strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
     def _steadystream_replay_buffer_limit(self, group: EngineSessionGroup) -> int:
         return min(
             max(64, self._steadystream_kv_tail_tokens(group) + 256),
@@ -1659,14 +1668,19 @@ class EngineLoop:
             self._steadystream_token_history_full_current(group)
             and bool(seg.input_complete)
         )
+        drop_history_text = self._steadystream_token_history_drop_history_text(group)
         built = self._build_steadystream_token_history_prefill(
             plan.cacheable_prefix_embeds,
             generation_budget_frames=self._steadystream_generation_budget_frames(
                 group,
                 len(seg.pending_token_ids),
             ),
-            history_text_token_ids=[int(x) for x in history_text_token_ids],
-            history_text_include_eos=bool(carry.get("history_text_include_eos", True)),
+            history_text_token_ids=(
+                [] if drop_history_text else [int(x) for x in history_text_token_ids]
+            ),
+            history_text_include_eos=(
+                False if drop_history_text else bool(carry.get("history_text_include_eos", True))
+            ),
             history_full_codes=history_full_codes,
             current_text_token_ids=(
                 [int(x) for x in seg.pending_token_ids] if full_current else None

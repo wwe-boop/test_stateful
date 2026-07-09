@@ -42,6 +42,46 @@ EXPECTED_PAUSE_MS = {
     "colon": 260.0,
 }
 
+C2_DIAGNOSTIC_VARIANTS = [
+    (
+        "full_current_silence",
+        "full_current_silence.wav",
+        {
+            "steadystream_variant": "full_steadystream",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_terminal_drop_mode": "silence",
+        },
+        False,
+    ),
+    (
+        "full_current_eos_only",
+        "full_current_eos_only.wav",
+        {
+            "steadystream_variant": "full_steadystream",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_terminal_drop_mode": "eos_only",
+        },
+        False,
+    ),
+    (
+        "full_current_codes_only_silence",
+        "full_current_codes_only_silence.wav",
+        {
+            "steadystream_variant": "full_steadystream",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_terminal_drop_mode": "silence",
+            "kv_reprefill_token_history_drop_history_text": "true",
+        },
+        False,
+    ),
+]
+
 EXPERIMENTAL_VARIANTS = [
     (
         "acoustic_tail_only",
@@ -81,7 +121,14 @@ def has_audio_block(result: dict[str, Any], out_dir: Path, key: str, wav_name: s
     return key in result and (out_dir / wav_name).is_file()
 
 
-def sample_complete(sample_dir: Path) -> bool:
+def audio_blocks_for_run(include_c2_diagnostics: bool = False) -> list[tuple[str, str]]:
+    blocks = list(REQUIRED_AUDIO_BLOCKS)
+    if include_c2_diagnostics:
+        blocks.extend((key, wav_name) for key, wav_name, _, _ in C2_DIAGNOSTIC_VARIANTS)
+    return blocks
+
+
+def sample_complete(sample_dir: Path, include_c2_diagnostics: bool = False) -> bool:
     result_path = sample_dir / "results.json"
     if not result_path.is_file():
         return False
@@ -91,7 +138,7 @@ def sample_complete(sample_dir: Path) -> bool:
         return False
     return all(
         has_audio_block(result, sample_dir, key, wav_name)
-        for key, wav_name in REQUIRED_AUDIO_BLOCKS
+        for key, wav_name in audio_blocks_for_run(include_c2_diagnostics)
     )
 
 
@@ -537,6 +584,7 @@ def run_sample(
     require_exact_boundaries: bool = True,
     force_text_chunk_boundary: bool = False,
     resume: bool = False,
+    include_c2_diagnostics: bool = False,
 ) -> dict[str, Any]:
     sample_id = row["sample_id"]
     task_type = "custom_voice"
@@ -684,7 +732,10 @@ def run_sample(
             "events": stream_timing.get("events", []),
         }
 
-    for variant_key, wav_name, experimental, pause_recovery in EXPERIMENTAL_VARIANTS:
+    variants_to_run = list(EXPERIMENTAL_VARIANTS)
+    if include_c2_diagnostics:
+        variants_to_run.extend(C2_DIAGNOSTIC_VARIANTS)
+    for variant_key, wav_name, experimental, pause_recovery in variants_to_run:
         if has_audio_block(result, out_dir, variant_key, wav_name):
             continue
         result[variant_key] = stream_variant_block(
@@ -781,6 +832,11 @@ def main() -> int:
         action="store_true",
         help="Do not force each input TextChunk to become one engine segment in token-mode diagnostics.",
     )
+    parser.add_argument(
+        "--include-c2-diagnostics",
+        action="store_true",
+        help="Also run token-history full-current C2 diagnostic variants.",
+    )
     args = parser.parse_args()
 
     rows = [
@@ -807,7 +863,7 @@ def main() -> int:
         for idx, row in enumerate(rows, start=1):
             sample_id = row["sample_id"]
             sample_dir = out_root / f"seed_{seed}" / sample_id
-            if args.resume and sample_complete(sample_dir):
+            if args.resume and sample_complete(sample_dir, args.include_c2_diagnostics):
                 print(f"[skip] seed={seed} {idx:03d}/{len(rows)} {sample_id}", flush=True)
                 progress.append({"seed": seed, "sample_id": sample_id, "status": "skipped"})
                 continue
@@ -826,6 +882,7 @@ def main() -> int:
                     require_exact_boundaries=not args.allow_proxy_boundaries,
                     force_text_chunk_boundary=force_text_chunk_boundary,
                     resume=args.resume,
+                    include_c2_diagnostics=args.include_c2_diagnostics,
                 )
                 elapsed = time.perf_counter() - t0
                 print(f"[ok] seed={seed} {sample_id} elapsed={elapsed:.1f}s", flush=True)
