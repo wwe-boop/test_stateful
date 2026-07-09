@@ -379,3 +379,18 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 逐样本看，5 条 held-out 中 4 条 NLL 下降、1 条轻微上升；target-only 与 all-loss 都主要改善了原始 NLL 最高的样本。当前结论修正为：C4 continuation 目标具备初步 held-out teachability；`5e-6` 是比 `1e-6`/`2e-5` 更合理的全参 smoke 学习率；但正式 C4 训练不应过早锁死 target-only。下一步应按计划做 LoRA/冻结策略、放量 Wenet continuation 数据，并把 all-loss + history drop 与 target-only 作为训练消融，而不是把 E11 的高 LR 爆炸归因给 loss scope。
 
 同时，§8.5 的单样本 HF 生成结论已降级：那次贪心生成只能说明诊断现象，不能单独作为“基座不会 continuation”的证据；当前 C4 必要性的硬依据是 E10 正式 teacher-forcing NLL（N=20, ΔNLL +0.702, 19/20 更差）和 E9 within-engine corrected smoke。
+
+---
+
+## 14. 2026-07-09 E13 Held-out Single-NLL Gap 闭合率
+
+根据最新 review §9.2，补报同 5 条 held-out 样本的 single-segment NLL，并把 C4 smoke 进度改写为 `continuation NLL - single NLL` 的 gap 闭合率。该统计直接复用 E10 正式 NLL JSON 与 E12 held-out smoke JSON，无需重新跑模型。
+
+| held-out 口径 | single NLL | continuation before | continuation after | 原始 gap | 训后 gap | gap 闭合率 |
+|---|---:|---:|---:|---:|---:|---:|
+| target-only, lr=5e-6, 15 train / 5 held-out | 1.017207 | 1.489866 | 1.287174 | 0.472659 | 0.269967 | 42.88% |
+| all-loss, lr=5e-6, 15 train / 5 held-out | 1.017207 | 1.489866 | 1.317911 | 0.472659 | 0.300704 | 36.38% |
+
+判读：held-out 单段基线不是 E10 全 20 条的 1.180，而是更低的 1.017；因此 E12 的 `1.287` 还没有“接近单段基线”，但已经在 held-out 上闭合约 43% 的 continuation gap。all-loss 也闭合约 36%，仍应保留为正式 C4 训练消融项。后续 headline 指标统一改为 gap 闭合率，目标是让 held-out continuation NLL 接近同样本 single NLL，而不是只看绝对 NLL 是否下降。
+
+下一步执行口径同步更新：正式 20 条 `workspace/c4_wenet_premium0_nll20_20260709/c4_wenet_manifest_idx2_min20_limit20_with_codes.jsonl` 冻结为常设 NLL eval，不再进入训练；训练数据应从 `c4_wenet_manifest_1000.jsonl` 的其余窗口另抽，放量后用 LoRA/冻结策略训练，并继续报告 held-out gap 闭合率。
