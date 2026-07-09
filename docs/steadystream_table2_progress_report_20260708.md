@@ -134,7 +134,15 @@ profile512 构建日志：`workspace/logs/build_fused_profile512_20260709.log`
 | `tail_kv_pause_recovery` | 89.13s | 255.17% | C3 只修停顿，不修 KV 复读。 |
 | `full_steadystream` | 91.51s | 260.34% | 仍大量复读历史片段，当前不能作为完整 SteadyStream 行。 |
 
-关键判断：旧 `29.04%/36.42%` 不是可靠的悲观结论；新口径下问题更清楚，C2/C4-style KV 历史在逐子句正确输入后会把上一段当作可继续生成的内容，导致拖长和复读。下一步需要在新分段设置下重跑三档 `kv_terminal_drop_mode` 和 token-history/full-current 对照，再决定是否进入 C4 LoRA 训练诊断。
+同一新口径下已补跑 `kv_tail_only` 的三档 `kv_terminal_drop_mode` 对照：
+
+| drop mode | 时长 | CER | dropped tail | 判断 |
+|---|---:|---:|---:|---|
+| `eos_only` | 19.76s | 65.52% | 末段 1/22 帧 | 不再拖到 90s，但后半段局部乱码/漏读严重。 |
+| `silence` | 20.72s | 65.52% | 末段 1/60 帧 | 与 `eos_only` 接近，说明只裁静音不能恢复语义。 |
+| `pad_phase` | 92.24s | 258.62% | 末段 259/278 帧 | 明确 over-trim，严重诱发历史复读。 |
+
+关键判断：旧 `29.04%/36.42%` 不是可靠的悲观结论；新口径下问题更清楚，`pad_phase` 过裁会把结果推向超长复读，但即使只丢 EOS 或尾部静音，C2 也停在 65.52% CER，仍远离 `stateful_stream=5.17%` 基线。因此当前卡点不是单纯边界裁剪，而是 KV 历史本身缺少可靠的当前文本语义约束，下一步应重跑 token-history/full-current 对照并收口 C4 collate/runtime 前缀一致性。
 
 ### 8.1 复测范围
 
