@@ -1426,3 +1426,35 @@ E49 生成级 ICL eval20：
 | prosody_mini_003 | 7.685 st | 3.195 dB | 59.4 ms | 0.87% | 文本最完整，但 F0 边界跳变最高，是当前 full-combo 放大前的主要卡点。 |
 
 结论：E50 证明完整组合路径已经跑通，并且 full-combo 在 CER、停顿、artifact 上不差，尤其 artifact 从 `c4_icl_prefill_c3` 的 `0.1430/0.00158` 降到 `0.0191/0.00027`。但它没有满足 smoke 门槛里“F0/能量跳变回落到 2-3 档”的 F0 条件：能量接近 2-3 档，F0 仍为 5.678 st，且由 sample003 明显拉高。因此本轮不建议直接启动 eval20 正式行；下一步应先定位 F0：复核 sample003 边界窗、比较 full-combo vs stateful 的边界 F0 事件，并做轻量 C1/F1F2 平滑参数或 F0 continuity 后处理 sweep。与此同时，CER 中 prosody_mini_002 的英文/数字噪声支持后续加入数字/英文文本归一化重算。
+
+## 48. 2026-07-10 E51 F0 failure diagnosis for full-combo smoke
+
+基于 E50 结果继续定位 full-combo 未过 smoke gate 的唯一硬卡点：F0 raw jump 没回到 2-3 st。诊断对象选 `prosody_mini_003`，因为它的 full-combo CER 最好（0.87%），但 F0 最差（7.685 st），能排除“文本已经坏掉导致 F0 无意义”的干扰。
+
+sample003 文本边界：
+
+| boundary | 前后文本 |
+|---:|---|
+| 5 | `老板娘一边擦杯子一边哼周杰伦的老歌，调子跑得特别可爱，` -> `我笑了。` |
+
+边界 F0 对比：
+
+| 变体 | F0 coverage | F0 mean | 触发高跳变的边界 | 观察 |
+|---|---:|---:|---|---|
+| `stateful_stream` | 6/9 | 2.513 st | 多个边界 1.5-3.8 st | 覆盖较高，均值稳定。 |
+| `c4_icl_prefill` | 3/9 | 6.169 st | b9 = 15.84 st | 少量边界支配均值。 |
+| `c4_icl_prefill_c3` | 3/9 | 6.779 st | b5 = 11.327 st | C3 后停顿准，但 F0 可测窗更稀疏。 |
+| `full_steadystream_icl_c3_smooth` | 1/9 | 7.685 st | b5 = 7.685 st | 只有一个边界左右 F0 同时可测，均值完全由 b5 决定。 |
+
+full-combo 的 b5 具体为 `242.05 Hz -> 377.30 Hz`，跳变 `7.685 st`；其余 8 个边界因静音、轻声或缺少左右有效 F0 被记为 null。也就是说 E50 的 full-combo F0 均值不是“9 个边界普遍跳变 5-8 st”，而是“F0 coverage 只有 1/9，一个高边界支配了均值”。
+
+本地已切试听/诊断包：`/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_full_combo_f0_diag_e51_20260710/`，包含：
+
+| 文件 | 说明 |
+|---|---|
+| `prosody_mini_003_boundary5_stateful_stream_pm2s.wav` | stateful 边界 5 前后 2 秒。 |
+| `prosody_mini_003_boundary5_c4_icl_prefill_c3_pm2s.wav` | ICL+C3 边界 5 前后 2 秒。 |
+| `prosody_mini_003_boundary5_full_steadystream_icl_c3_smooth_pm2s.wav` | full-combo 边界 5 前后 2 秒。 |
+| `prosody_mini_003_boundary5_f0_diag.png` | waveform + 粗略 F0 轨迹图。 |
+
+结论：当前不应把 E50 F0 fail 解读为 full-combo 语义或音色整体失败；它更像是边界级 F0 指标在 C3 插停顿/轻声窗下 coverage 过低，导致单个高音起句支配均值。下一步比直接 eval20 更有价值的是做一个轻量 F0 gate 修正/对照：同时报告 `F0 coverage`、`median`、`trimmed mean`，并对 b5 这类“停顿后高音起句”验证人耳是否突兀。如果人耳不突兀，应把 full-combo 的 hard gate 从 raw mean 改为 coverage-aware；如果人耳确实突兀，再做 F0 continuity 后处理或缩短 C3 后右窗统计。
