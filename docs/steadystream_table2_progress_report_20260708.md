@@ -1183,3 +1183,54 @@ prefix(role/custom tags) + text(text1 + text2) + text_eos + codec_bos + codes1
 结论：这是 C4 从离线 PyTorch 走到 TRT runtime/token-mode 的第一个强阳性结果。它同时解释了旧 `full_steadystream` 的失败原因：不是 C4 checkpoint 不会续写，而是 KV-tail 排布会把历史语义带入当前段，导致复读和拖长；ICL prefill 通过“文本侧知道 text1+text2，codec 侧只给 codes1”的排布，把历史音频作为条件而不是要继续说的文本。
 
 下一步门禁：先扩到 `prosody_mini_001..003` 三样本，若 CER/时长稳定，再扩到 eval20/Table2 mini；同时再做一个 `c4_icl_prefill + C3 pause_recovery` 组合，用来补 C3 停顿但不改变 ICL semantic carry。
+
+---
+
+## 43. 2026-07-10 E45 runtime ICL prefill 三样本稳定性
+
+按 E44 门禁，将新增 `c4_icl_prefill` 从 `prosody_mini_001` 扩到 `prosody_mini_001..003` 三样本。设置保持 Table2 官方口径：`input_mode=token`、`force_text_chunk_boundary=true`、`stream_group_policy=none`，并要求 exact boundary，不接受 proxy proportional。
+
+产物：
+
+| 产物 | 路径 |
+|---|---|
+| 5090 runtime run | `workspace/table2_c4_runtime_icl_smoke3_e45_20260710/` |
+| 4090 ASR/CER | `workspace/table2_c4_runtime_icl_smoke3_e45_20260710/table2_cer_key4.json` |
+| 本地 ICL wav | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_c4_runtime_icl_smoke3_e45_20260710/icl_wavs/` |
+
+结构指标：
+
+| sample | stateful | offline_full | old full_steadystream | new c4_icl_prefill | exact boundary |
+|---|---:|---:|---:|---:|---:|
+| `prosody_mini_001` | 22.16s | 21.44s | 75.43s | **20.56s** | 7/7 |
+| `prosody_mini_002` | 27.20s | 25.92s | 89.82s | **25.20s** | 7/7 |
+| `prosody_mini_003` | 27.20s | 26.64s | 121.83s | **26.48s** | 9/9 |
+
+ICL budget 观察：
+
+| sample | history code frames | 裁剪 |
+|---|---|---|
+| `prosody_mini_001` | 29/29, 32/32, 40/40, 33/33, 33/33, 44/44, 19/19 | 0 |
+| `prosody_mini_002` | 14/14, 63/63, 41/41, 23/23, 32/32, 47/47, 41/41 | 0 |
+| `prosody_mini_003` | 44/44, 15/15, 47/47, 11/11, 71/71, 9/9, 59/59, 13/13, 51/51 | 0 |
+
+ASR/CER 汇总：
+
+| 变体 | CER mean | 判读 |
+|---|---:|---|
+| `offline_full` | 2.4817% | 同模型离线整段参考。 |
+| `stateful_stream` | 4.2058% | 普通在线流式；`prosody_mini_002` 的英文/数字拉高。 |
+| 旧 `full_steadystream` | 291.9801% | 三条均历史复读/拖长，旧 KV-tail 路线失败。 |
+| 新 `c4_icl_prefill` | **3.6311%** | 与 offline/stateful 同量级，三条均未出现系统性历史复读。 |
+
+逐条 `c4_icl_prefill` CER：
+
+| sample | CER | 主要错误 |
+|---|---:|---|
+| `prosody_mini_001` | 2.27% | “浅两度/前两度”“静泡/浸泡”一类近音/ASR 归一化。 |
+| `prosody_mini_002` | 6.90% | 英文 `Riftia chinensis`、ROV/数字等 ASR 高风险内容。 |
+| `prosody_mini_003` | 1.72% | “她/他、细密/细腻”等近音小错。 |
+
+结论：E45 通过三样本稳定性门禁。C4-ICL runtime 现在已经同时满足：`token-mode`、`force_text_chunk_boundary`、exact-boundary、TRT runtime、512 profile、merged checkpoint、无历史复读、CER 接近 offline/stateful。旧 `full_steadystream` 的 291.98% CER 继续作为强阴性对照，说明问题根因确实在 KV-tail 续写排布，而不是 checkpoint 或 0701 音色本身。
+
+下一步：扩到 eval20/Table2 mini；并新增 `c4_icl_prefill_c3` 组合，只在 ICL 语义生成后做 C3 pause recovery，不改变 semantic carry。
