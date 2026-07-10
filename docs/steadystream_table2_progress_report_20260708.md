@@ -1234,3 +1234,44 @@ ASR/CER 汇总：
 结论：E45 通过三样本稳定性门禁。C4-ICL runtime 现在已经同时满足：`token-mode`、`force_text_chunk_boundary`、exact-boundary、TRT runtime、512 profile、merged checkpoint、无历史复读、CER 接近 offline/stateful。旧 `full_steadystream` 的 291.98% CER 继续作为强阴性对照，说明问题根因确实在 KV-tail 续写排布，而不是 checkpoint 或 0701 音色本身。
 
 下一步：扩到 eval20/Table2 mini；并新增 `c4_icl_prefill_c3` 组合，只在 ICL 语义生成后做 C3 pause recovery，不改变 semantic carry。
+
+---
+
+## 44. 2026-07-10 E46 runtime ICL + C3 pause recovery
+
+按 E45 下一步，在 runner 中新增 `c4_icl_prefill_c3`。它复用 `c4_icl_prefill` 的 semantic carry，不改变 text+codes ICL prefill，只在生成后对 exact boundary 位置做 C3 pause recovery：检测边界附近静音 span，按标点目标时长替换/插入静音，并做边缘 fade。
+
+三样本结果：
+
+| sample | c4_icl sec | c4_icl pause mean/max | c4_icl_c3 sec | c4_icl_c3 pause mean/max | pause coverage |
+|---|---:|---:|---:|---:|---:|
+| `prosody_mini_001` | 20.56s | 93.1 / 252.0ms | 21.02s | **30.3 / 212.0ms** | 1.0 |
+| `prosody_mini_002` | 25.20s | 105.0 / 241.3ms | 25.82s | **19.6 / 137.3ms** | 1.0 |
+| `prosody_mini_003` | 26.48s | 23.0 / 104.7ms | 26.79s | 32.1 / 153.3ms | 1.0 |
+
+边界 artifact 也同步下降：
+
+| sample | c4_icl flux_peak_mean | c4_icl_c3 flux_peak_mean |
+|---|---:|---:|
+| `prosody_mini_001` | 0.8212 | **0.0000** |
+| `prosody_mini_002` | 0.3288 | **0.0813** |
+| `prosody_mini_003` | 1.4279 | **0.0189** |
+
+ASR/CER：
+
+| 变体 | CER mean | 判读 |
+|---|---:|---|
+| `c4_icl_prefill` | 3.6311% | E45 semantic carry 基线。 |
+| `c4_icl_prefill_c3` | 4.8720% | 插入/替换静音后 ASR 略升，但仍与 stateful 同量级；需 eval20 再确认。 |
+
+产物：
+
+| 产物 | 路径 |
+|---|---|
+| 5090 run | `workspace/table2_c4_runtime_icl_c3_smoke3_e46_20260710/` |
+| 4090 ASR/CER | `workspace/table2_c4_runtime_icl_c3_smoke3_e46_20260710/table2_cer_icl_c3.json` |
+| 本地 C3 wav | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_c4_runtime_icl_c3_smoke3_e46_20260710/c3_wavs/` |
+
+结论：`c4_icl_prefill_c3` 是当前最接近完整 SteadyStream 表2目标的 runtime 组合：C4 负责语义连续和避免复读，C3 负责标点停顿和边界 artifact。短板是 CER 在 3 样本上比纯 ICL 高约 1.24pp，可能是 ASR 对插入停顿更敏感，也可能是真实节奏变化影响发音；必须在 eval20 上和纯 ICL 同时跑，不能只凭 3 样本定型。
+
+下一步：跑 eval20 key variants（`offline_full/stateful_stream/c4_icl_prefill/c4_icl_prefill_c3`），再决定 Table2 正式行采用纯 ICL 还是 ICL+C3。
