@@ -1536,3 +1536,39 @@ E54 与 E52 横比：
 判读：去掉 smoothing 后完整组合确实改善：F0 `7.857 -> 6.144`，energy `4.035 -> 3.235`，pause `19.0 -> 16.6ms`，CER `4.27% -> 4.13%`。但它仍未达到正式末行要求：F0 仍显著高于 `c4_icl_prefill_c3` 的 4.749 st，也远高于 stateful/offline 的 3 st 左右；artifact flux 虽低于 C3-only，但 max sample delta 反而略高。
 
 结论：`full_steadystream_icl_c3` 是当前 full-combo 系列里更好的候选，但仍不足以替代表 2 正式行。最终建议不变：Table2 正式结果以 E47 为准，`c4_icl_prefill` 作为文字优先行，`c4_icl_prefill_c3` 作为停顿优化备选；完整 SteadyStream 行需要继续做 C1 声学尾权重/长度和局部 smoothing 参数，而不是直接进入 3 seeds 稳定性。
+
+## 52. 2026-07-10 E55/E56 F0 gate calibration
+
+按外部评审 §22 修复 E50-E54 的 F0 门禁：停止继续扫 C1/smoothing 参数，先补 offline/stateless 天花板，并把裸 `±250ms` F0 均值改为 coverage-aware 的同逻辑边界配对比较。
+
+### E55：旧 F0 尺子确认失效
+
+E47 保留了同一 eval20 的 20 条 `offline_full.wav`，但原 results 只有 `proxy_proportional` 边界，不能用于正式 F0 配对。本轮用 Paraformer 返回的逐 token 毫秒 timestamp，将参考全文与 ASR token 做 Levenshtein 对齐，再把 135 个设计子句边界映射到真实 offline 音频位置；20 条对齐 reference coverage 为 98.3%-100%，无 alignment_failed 边界。同时补跑 `stateless_once` eval20，其边界为 exact concat。
+
+在旧 `±250ms` 窗口下：offline F0 coverage 仅 `5/135`，stateless 为 `0/135`。这证明 E50-E54 的 raw F0 mean 不能作为淘汰门禁：停顿边界窗口大部分是静音，幸存测量由少量停顿后高音重起边界支配，不同变体测的是不同边界子集。
+
+### E56：最近有声窗 F0
+
+新口径在每个逻辑边界左右各 1.5s 内搜索离边界最近、通过现有 VAD/pyin 门禁的 250ms 有声窗，再计算 F0 reset；F0 算法本身仍复用 `eval/boundary_metrics.py::side_f0_mean`，只修正取窗位置。
+
+| 变体 | logical boundaries | raw F0 coverage | nearest-voiced coverage | nearest F0 mean | 与 offline 配对 n | paired signed median | paired abs median |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `offline_full` | 135 | 5/135 | 135/135 | 7.293 st | 135 | 0 | 0 |
+| `stateless_once` | 135 | 0/135 | 135/135 | 7.269 st | 135 | -0.029 st | 2.367 st |
+| `stateful_stream` | 135 | 63/135 | 95/135 | 4.202 st | 95 | -2.015 st | 3.970 st |
+| `c4_icl_prefill` | 135 | 6/135 | 97/135 | 8.246 st | 97 | +0.912 st | 4.782 st |
+| `c4_icl_prefill_c3` | 135 | 20/135 | 95/135 | 7.341 st | 95 | +0.301 st | 4.756 st |
+| `full_steadystream_icl_c3` | 135 | 25/135 | 95/135 | **6.766 st** | 95 | **+0.077 st** | **4.489 st** |
+
+修正口径后的判读与 E54 裸均值相反：`full_steadystream_icl_c3` 的 F0 reset 比 C3-only/pure ICL 更接近 offline，paired signed median 仅 +0.077st，几乎无系统偏移。结合 E54 的 pause 16.6ms、energy 3.235dB、artifact flux 0.1717、cn2an CER 4.13%，该变体通过末行候选门禁。
+
+产物：
+
+| 项 | 路径 |
+|---|---|
+| stateless eval20 | `workspace/table2_f0_calibration_stateless_eval20_e55_20260710/` |
+| 第一版 raw paired | `workspace/table2_f0_paired_calibration_e55_20260710/` |
+| nearest-voiced paired | `workspace/table2_f0_paired_calibration_e56_20260710/` |
+| 分析脚本 | `scripts/python/table2_f0_paired_calibration.py` |
+
+决策：按甲方“韵律主排序、CER 只做稳定门禁”的裁定，`full_steadystream_icl_c3` 升级为表 2 末行第一候选，立即进入 E57 `3 seeds x eval20` 稳定性；纯 ICL 保留为语义层消融，不再作为正式末行。
