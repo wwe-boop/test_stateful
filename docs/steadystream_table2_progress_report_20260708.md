@@ -1572,3 +1572,72 @@ E47 保留了同一 eval20 的 20 条 `offline_full.wav`，但原 results 只有
 | 分析脚本 | `scripts/python/table2_f0_paired_calibration.py` |
 
 决策：按甲方“韵律主排序、CER 只做稳定门禁”的裁定，`full_steadystream_icl_c3` 升级为表 2 末行第一候选，立即进入 E57 `3 seeds x eval20` 稳定性；纯 ICL 保留为语义层消融，不再作为正式末行。
+
+## 53. 2026-07-10 E57 full-combo 3 seeds stability
+
+按 E56 修复后的 F0 门禁，补跑 `3 seeds x eval20`，只保留表 2 关键三行：`stateful_stream`、`c4_icl_prefill_c3`、`full_steadystream_icl_c3`。冻结口径：`input_mode=token`、`stream_group_policy=none`、`force_text_chunk_boundary=true`、exact boundary gate；F0 使用 E56 的 nearest-voiced/offline-paired 口径；停顿同时报告标点表偏差与同文本 `offline_full` 实测停顿偏差，避免 C3 循环论证。
+
+产物：
+
+| 项 | 路径 |
+|---|---|
+| 5090 generation | `workspace/table2_full_combo_no_smooth_3seeds_eval20_e57_20260710/` |
+| E57 stability metrics | `workspace/table2_full_combo_no_smooth_3seeds_eval20_e57_20260710/e57_stability_metrics.json` |
+| 5090 ASR hypothesis/raw CER | `workspace/table2_full_combo_no_smooth_3seeds_eval20_e57_20260710/asr_cer_key3_5090_raw.json` |
+| 4090 cn2an CER | `workspace/table2_full_combo_no_smooth_3seeds_eval20_e57_20260710/asr_cer_key3_cn2an.json` |
+| stability script | `scripts/python/table2_e57_stability.py` |
+| cn2an recompute script | `scripts/python/table2_recompute_cer_cn2an.py` |
+| local audio review pack | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_e57_audio_review_20260710/` |
+
+机制验收：
+
+| 变体 | exact | C1 acoustic tail | ICL full-current | input mode |
+|---|---:|---:|---:|---|
+| `stateful_stream` | 405/405 | 0/405 | 0/405 | token |
+| `c4_icl_prefill_c3` | 405/405 | 0/405 | 405/405 | token |
+| `full_steadystream_icl_c3` | 405/405 | 405/405 | 405/405 | token |
+
+E57 稳定性主表：
+
+| 变体 | nearest F0 mean↓ | paired F0 signed median | paired F0 abs median↓ | energy↓ | pause punct↓ | pause offline↓ | artifact flux↓ | FASL↓ | RTF↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `stateful_stream` | 4.478 st | -1.763 st | 3.638 st | 2.605 dB | 104.571 ms | 92.140 ms | — | 15.833 ms | 0.076 |
+| `c4_icl_prefill_c3` | 7.136 st | +0.602 st | 4.574 st | 4.692 dB | 20.770 ms | 84.708 ms | 0.232 | 14.963 ms | 0.138 |
+| `full_steadystream_icl_c3` | **6.491 st** | **-0.123 st** | **4.383 st** | **4.494 dB** | **17.874 ms** | **84.266 ms** | **0.153** | **14.837 ms** | 0.140 |
+
+按 seed 拆分：
+
+| seed | 变体 | nearest F0 mean | paired signed median | energy | pause offline | artifact flux |
+|---:|---|---:|---:|---:|---:|---:|
+| 42 | `c4_icl_prefill_c3` | 7.341 | +0.301 | 4.337 | 81.952 | 0.291 |
+| 42 | `full_steadystream_icl_c3` | 6.766 | +0.077 | 3.747 | 85.048 | 0.172 |
+| 42 | `stateful_stream` | 4.522 | -1.928 | 2.805 | 79.917 | — |
+| 123 | `c4_icl_prefill_c3` | 6.793 | +0.732 | 5.056 | 84.194 | 0.143 |
+| 123 | `full_steadystream_icl_c3` | 6.779 | +0.338 | 4.968 | 83.153 | 0.089 |
+| 123 | `stateful_stream` | 4.010 | -1.936 | 2.598 | 105.227 | — |
+| 456 | `c4_icl_prefill_c3` | 7.274 | +0.594 | 4.730 | 87.979 | 0.261 |
+| 456 | `full_steadystream_icl_c3` | 5.929 | -0.692 | 4.737 | 84.599 | 0.198 |
+| 456 | `stateful_stream` | 4.901 | -1.067 | 2.417 | 91.489 | — |
+
+CER（Paraformer hypothesis from 5090, cn2an 0.5.24 recompute on 4090）：
+
+| 变体 | CER mean↓ | seed std | max CER | >25% samples |
+|---|---:|---:|---:|---:|
+| `stateful_stream` | **3.37%** | 0.12% | 20.95% | 0 |
+| `c4_icl_prefill_c3` | 3.89% | 0.32% | 26.67% | 1 |
+| `full_steadystream_icl_c3` | 3.72% | 0.37% | 22.86% | 0 |
+
+判读：
+
+1. `full_steadystream_icl_c3` 正式满足机制门禁：C1 acoustic tail 与 ICL full-current re-prefill 在全部 405 个边界同时生效，没有分段合并、非 token 输入或 proxy boundary。
+2. `full_steadystream_icl_c3` 的韵律指标稳定优于 `c4_icl_prefill_c3`：nearest F0 mean `7.136 -> 6.491 st`，paired signed median `+0.602 -> -0.123 st`，paired abs median `4.574 -> 4.383 st`，artifact flux `0.232 -> 0.153`，标点表停顿 `20.770 -> 17.874 ms`，offline 实测停顿 `84.708 -> 84.266 ms`。
+3. CER 稳定门禁通过：full-combo 比 stateful 高 `0.35pp`，小于 `1pp` 门槛；且 full-combo 没有单样本超过 25%。C3-only 有 1 条 `26.67%` 尖峰，因此语义稳定性反而略弱于 full-combo。
+4. 成本侧可接受：full-combo FASL `14.837ms`，与 C3-only `14.963ms` 基本等同，RTF `0.140`，比 stateful 高但仍远低于实时。
+
+剩余风险：
+
+1. full-combo 仍未追上 stateful 的 F0/energy 绝对水平，因此末行应描述为“完整 SteadyStream 候选行，通过稳定门禁并优于 C3-only”，不是“完全等同 stateful 声学连续性”。
+2. `prosody_mini_004` 这类数字/英文密集文本仍是 ASR/CER 最高风险样本；已把 full-combo 最坏样本和 C3-only 尖峰样本拉回本地试听包。
+3. artifact 最坏样本为 `seed456/prosody_mini_013`，full-combo boundary 1 `flux_peak=11.227669`；已切 ±2s clip 便于确认是否是可感知 click/pop。
+
+结论：按当前计划口径，`full_steadystream_icl_c3` 可以提升为表 2 末行正式候选。推荐最终交付表中保留 `stateful_stream`、`c4_icl_prefill_c3`、`full_steadystream_icl_c3` 三行，并在脚注说明 F0 为 nearest-voiced/offline-paired 口径，CER 为 4090 cn2an 重算。
