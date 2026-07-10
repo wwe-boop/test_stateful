@@ -961,3 +961,35 @@ NLL 结果（0701 checkpoint `/home/train/tts/qwen3-tts/trained/zehan/0701_train
 | 旧脚本 base single 都失败，说明它不能作为 Phase 6 合法门禁。 | 后续生成级验证以官方 single 为健康门禁；continuation 脚本修到 base single 先通过后，才评 adapter continuation。 |
 
 当前状态：C4 训练在 NLL 上有效，LoRA200 single 生成健康，但完整 SteadyStream/C4 还没有通过生成级 continuation。下一步优先级是修/重写 continuation generation 装置，而不是继续扩大训练或部署 adapter。
+
+---
+
+## 37. 2026-07-10 E39 official-prefill continuation generation smoke
+
+根据 E38 结论，旧 `run_c4_lora_continuation_generate.py` 的 hand-prefill single 都失败，不能作为 C4 生成门禁。本轮新增 `scripts/python/run_c4_official_prefill_generate.py`，按官方 `Qwen3TTSForConditionalGeneration.generate()` 的 CustomVoice non-streaming 构造重写 prefill：
+
+| 构造项 | 旧脚本 | E39 official-prefill |
+|---|---|---|
+| language prefix | Auto/no-language 3-token prefix | `Chinese` 走 `codec_think_id, codec_think_bos_id, language_id, codec_think_eos_id` |
+| speaker slot | 固定 slot=6 | 按官方 prefix 长度插入 `spk_id['001']=3000` embedding |
+| single target | 手搓 C4 batch prefix | 复现官方 wrapper：role + CustomVoice prefix + full text + codec BOS |
+| continuation history | 旧 batch 直接截到 target codec BOS | official prefix 后追加 history `text + codec BOS + codes + codec EOS`，再追加 current text + codec BOS |
+
+先验收 single：`c4_base_prefill_single` 生成 6.00/6.00/12.40s，CER=8.6053%；`c4_lora200_prefill_single_m256` 生成 5.76/6.16/12.64s，CER=7.0901%。这与 E38 官方 wrapper single 一致，说明新的 hand-prefill single 已修好。
+
+随后在同一 eval3 上跑 continuation（`max_new_tokens=256`，避免 4096 长空转）：
+
+| 变体 | 生成帧 vs target | 时长 | CER | 失败形态 |
+|---|---|---:|---:|---|
+| base official-prefill continuation | 174/51/255 vs 83/82/156 | 13.92/4.08/20.40s | 113.12% | 历史串入、漏目标、重复绿字。 |
+| LoRA200 official-prefill continuation | 145/49/255 vs 83/82/156 | 11.60/3.92/20.40s | 107.06% | 比 base 略低但仍不可用，复述历史和目标混杂。 |
+
+逐条 ASR 说明根因：
+
+| sample | base continuation hyp | LoRA200 continuation hyp | 判读 |
+|---|---|---|---|
+| `c4_synth_00496` | “晾衣裳把厚被子摊开两小时... 他从不催人收衣...” | “晾衣区打狼该他从不催人收医... 又重复目标片段” | 先复述 history，再夹带 target；历史没有被当作纯声学条件。 |
+| `c4_synth_00497` | “电梯在七楼和九楼之间补了一枚语音提示器” | 同左 | 只生成 history 语义，完全没进入 target “它不会大声播报...” |
+| `c4_synth_00498` | “上午十点点... 绿绿绿...” | “上午吃上午整理...” | history/current 语义混乱并重复。 |
+
+结论：E39 已把生成装置从“single 都坏”的状态修到“single 健康、continuation 真实暴露问题”。当前 C4 interleaved LoRA200 虽然 NLL gap 闭合 53.92%，但生成时仍把 history 当作可继续说的语义上下文，而不是韵律/音色记忆；因此不能进入部署或 Table2 full row。下一步不应继续拉长 interleaved 训练，而应做 Phase 3 的 ICL layout 消融：让文本侧一次性给出 `text1+text2`，codec 侧给出 `codes1` 作为 reference，再只对 `codes2` 打 loss，减少“历史文本被当作待生成内容”的诱因。
