@@ -1458,3 +1458,33 @@ full-combo 的 b5 具体为 `242.05 Hz -> 377.30 Hz`，跳变 `7.685 st`；其�
 | `prosody_mini_003_boundary5_f0_diag.png` | waveform + 粗略 F0 轨迹图。 |
 
 结论：当前不应把 E50 F0 fail 解读为 full-combo 语义或音色整体失败；它更像是边界级 F0 指标在 C3 插停顿/轻声窗下 coverage 过低，导致单个高音起句支配均值。下一步比直接 eval20 更有价值的是做一个轻量 F0 gate 修正/对照：同时报告 `F0 coverage`、`median`、`trimmed mean`，并对 b5 这类“停顿后高音起句”验证人耳是否突兀。如果人耳不突兀，应把 full-combo 的 hard gate 从 raw mean 改为 coverage-aware；如果人耳确实突兀，再做 F0 continuity 后处理或缩短 C3 后右窗统计。
+
+## 49. 2026-07-10 E52 full-combo eval20 diagnostic
+
+因为 E50 的 full-combo F0 fail 可能受 3 样本和低 F0 coverage 影响，本轮把同一组合放大到 eval20，但定位为诊断而非正式通过门槛的候选行。运行口径仍为 `input_mode=token`、`stream_group_policy=none`、`force_text_chunk_boundary=true`，变体为 `stateful_stream,c4_icl_prefill,c4_icl_prefill_c3,full_steadystream_icl_c3_smooth`。
+
+产物：
+
+| 项 | 路径 |
+|---|---|
+| 5090 runtime eval20 | `workspace/table2_full_combo_icl_c3_smooth_eval20_e52_20260710/` |
+| 5090 ASR 原始 CER（无 cn2an） | `workspace/table2_full_combo_icl_c3_smooth_eval20_e52_20260710/asr_cer_key4.json` |
+| 4090 cn2an 重算 CER | `workspace/table2_full_combo_icl_c3_smooth_eval20_e52_20260710/asr_cer_key4_cn2an.json` |
+| 本地最坏 F0 试听包 | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_full_combo_eval20_e52_listen/` |
+
+注意：5090 环境缺 `cn2an`，直接跑出的 CER 为 `8.7%-9.1%`，不能和 E47 横比；已把 5090 ASR hypothesis 拷到 4090，用 `cn2an 0.5.24` 重算，口径回到 E47 同量级。
+
+E52 eval20 汇总：
+
+| 变体 | exact | F0 raw↓ | F0 coverage | 有效 F0 边界 | 能量 raw↓ | 停顿偏差↓ | artifact flux↓ | max sample delta↓ | CER（cn2an）↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `stateful_stream` | 135/135 | 3.574 st | 0.449 | 61/135 | 2.719 dB | 95.8 ms | — | — | 3.06% |
+| `c4_icl_prefill` | 135/135 | 5.028 st | 0.035 | 6/135 | 7.395 dB | 100.8 ms | 0.9324 | 0.01647 | 3.11% |
+| `c4_icl_prefill_c3` | 135/135 | 4.749 st | 0.144 | 20/135 | 3.677 dB | 21.9 ms | 0.2914 | 0.00293 | 4.24% |
+| `full_steadystream_icl_c3_smooth` | 135/135 | 7.857 st | 0.157 | 22/135 | 4.035 dB | 19.0 ms | 0.1209 | 0.00199 | 4.27% |
+
+full-combo 机制仍通过：`steadystream_acoustic_tail=true` 覆盖 135/135 边界，说明 C1 acoustic carry 与 ICL full-current re-prefill 共存没有退化。语义也没有塌：cn2an 后 CER 4.27%，基本等同 `c4_icl_prefill_c3` 的 4.24%，但差于纯 `c4_icl_prefill`/`stateful_stream` 的 3.1%。
+
+真正失败项是韵律连续性：full-combo 的 F0 raw 从 E50 smoke 的 5.678 st 放大后变成 7.857 st，能量 4.035 dB 也高于 C3-only，artifact 虽比纯 ICL 小很多，但仍高于 E50 smoke。最坏样本是 `prosody_mini_018`，full-combo F0=16.775 st；已拉回 `stateful_stream`、`c4_icl_prefill_c3`、`full_steadystream_icl_c3_smooth` 三条 wav 做本地试听对照。
+
+结论：E52 否定了“E50 F0 只是 3 样本偶然”的乐观假设。完整 SteadyStream 组合在当前实现下的机制和文本正确率可接受，但 F0/能量/边界 artifact 不满足表 2 末行的正式候选要求。因此当前 Table2 正式建议仍保持 E47：文字优先用 `c4_icl_prefill`，停顿/听感备选用 `c4_icl_prefill_c3`；`full_steadystream_icl_c3_smooth` 暂列诊断行，不进正式末行。下一步如果继续救 full-combo，应优先做 C1 acoustic tail 与 F1/F2 smoothing 的参数拆分，而不是继续 C4 训练或直接上 3 seeds。
