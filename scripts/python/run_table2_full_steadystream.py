@@ -147,6 +147,7 @@ POST_SMOOTH_VARIANT_KEYS = {
     "acoustic_tail_smooth",
     "acoustic_tail_smooth_tdrop",
     "acoustic_tail_pr_smooth_tdrop",
+    "full_steadystream_icl_c3_smooth",
 }
 
 
@@ -206,6 +207,19 @@ EXPERIMENTAL_VARIANTS = [
         "c4_icl_prefill_c3.wav",
         {
             "steadystream_variant": "kv_tail_only",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_reprefill_token_history_layout": "icl",
+            "kv_terminal_drop_mode": "eos_only",
+        },
+        True,
+    ),
+    (
+        "full_steadystream_icl_c3_smooth",
+        "full_steadystream_icl_c3_smooth.wav",
+        {
+            "steadystream_variant": "full_steadystream",
             "kv_tail_tokens": "384",
             "kv_reprefill_token_history": "true",
             "kv_reprefill_token_history_full_current": "true",
@@ -514,6 +528,24 @@ def pause_summary_for(
     }
 
 
+def summarize_event_meta(events: list[dict[str, Any]]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for event in events:
+        meta = event.get("meta") or {}
+        for key, value in meta.items():
+            if not str(key).startswith("steadystream_"):
+                continue
+            item = summary.setdefault(
+                key,
+                {"true_count": 0, "values": {}},
+            )
+            text_value = str(value)
+            item["values"][text_value] = item["values"].get(text_value, 0) + 1
+            if text_value.lower() == "true":
+                item["true_count"] += 1
+    return summary
+
+
 def silence_span_around_boundary(
     audio: np.ndarray,
     sample_rate: int,
@@ -727,6 +759,7 @@ def stream_variant_block(
             "audio_chunks": stream_timing.get("audio_chunks"),
         },
         "events": stream_timing.get("events", []),
+        "event_meta_summary": summarize_event_meta(stream_timing.get("events", [])),
     }
     if pause_recovery_meta:
         block["pause_recovery"] = pause_recovery_meta

@@ -1380,3 +1380,49 @@ E49 生成级 ICL eval20：
 | 本地 E49 wav | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/c4_e49_train472_steps200_eval20/` |
 
 结论：训练继续推进后，当前最稳 checkpoint 仍是旧 `lora_interleaved_all_r8_lr5e6_steps200`/merged runtime 版本；E49 说明扩大数据池不是坏方向，但单纯把 472 条随机喂 200 steps 没有带来生成 CER 收益。下一步若继续训练，应改策略而不是继续加步数：例如 curriculum/采样权重、数字/英文样本单独归一化、或保持 200-step 但换 seed 做 variance check。
+
+## 47. 2026-07-10 E50 full-combo ICL+C3+F1/F2 smoke
+
+按下一步计划补跑正式候选行：`steadystream_variant=full_steadystream + layout=icl + eos_only + C3 + F1/F2`。运行口径仍固定为 `input_mode=token`、`stream_group_policy=none`、`force_text_chunk_boundary=true`，并要求 exact boundary，不接受 proxy boundary。
+
+产物：
+
+| 项 | 路径 |
+|---|---|
+| 5090 runtime smoke | `workspace/table2_full_combo_icl_c3_smooth_smoke3_e50_20260710/` |
+| ASR/CER | `workspace/table2_full_combo_icl_c3_smooth_smoke3_e50_20260710/asr_cer_key4.json` |
+| 本地试听 wav | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_full_combo_icl_c3_smooth_smoke3_e50_20260710/` |
+
+运行配置新增变体 `full_steadystream_icl_c3_smooth`：
+
+| 配置 | 值 |
+|---|---|
+| `steadystream_variant` | `full_steadystream` |
+| `kv_reprefill_token_history` | `true` |
+| `kv_reprefill_token_history_full_current` | `true` |
+| `kv_reprefill_token_history_layout` | `icl` |
+| `kv_terminal_drop_mode` | `eos_only` |
+| `kv_tail_tokens` | `384` |
+| C3 pause recovery | enabled |
+| F1/F2 post smoothing | enabled |
+
+机制验收：三条 smoke 全部 exact boundary 通过，`full_steadystream_icl_c3_smooth` 的 `steadystream_acoustic_tail=true` 覆盖所有 23 个边界（sample001=7、sample002=7、sample003=9）。事件 meta 同时记录 `steadystream_token_history_full_current=True`、`steadystream_token_history_layout=icl`、`steadystream_kv_terminal_drop_mode=eos_only`，说明 C1 acoustic carry 与 ICL token-history re-prefill 确实共存，不是只开了配置名。
+
+三样本 smoke 指标：
+
+| 变体 | exact | F0 raw↓ | 能量 raw↓ | 停顿偏差↓ | artifact flux↓ | max sample delta↓ | CER↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `stateful_stream` | 23/23 | 2.931 st | 3.543 dB | 143.1 ms | — | — | 8.24% |
+| `c4_icl_prefill` | 23/23 | 6.169 st | 1.069 dB | 105.1 ms | 0.9992 | 0.01428 | 7.09% |
+| `c4_icl_prefill_c3` | 23/23 | 5.772 st | 2.489 dB | 7.6 ms | 0.1430 | 0.00158 | 7.37% |
+| `full_steadystream_icl_c3_smooth` | 23/23 | 5.678 st | 2.671 dB | 20.9 ms | 0.0191 | 0.00027 | 6.51% |
+
+逐样本关键点：
+
+| 样本 | full-combo F0 | energy | pause | CER | 备注 |
+|---|---:|---:|---:|---:|---|
+| prosody_mini_001 | 3.618 st | 1.583 dB | 0.8 ms | 2.27% | 基本达标，artifact 很低。 |
+| prosody_mini_002 | 5.731 st | 3.235 dB | 2.5 ms | 16.38% | 主要是英文物种名、数字、科学术语引发 ASR/CER 噪声；所有变体都在 16%-18%。 |
+| prosody_mini_003 | 7.685 st | 3.195 dB | 59.4 ms | 0.87% | 文本最完整，但 F0 边界跳变最高，是当前 full-combo 放大前的主要卡点。 |
+
+结论：E50 证明完整组合路径已经跑通，并且 full-combo 在 CER、停顿、artifact 上不差，尤其 artifact 从 `c4_icl_prefill_c3` 的 `0.1430/0.00158` 降到 `0.0191/0.00027`。但它没有满足 smoke 门槛里“F0/能量跳变回落到 2-3 档”的 F0 条件：能量接近 2-3 档，F0 仍为 5.678 st，且由 sample003 明显拉高。因此本轮不建议直接启动 eval20 正式行；下一步应先定位 F0：复核 sample003 边界窗、比较 full-combo vs stateful 的边界 F0 事件，并做轻量 C1/F1F2 平滑参数或 F0 continuity 后处理 sweep。与此同时，CER 中 prosody_mini_002 的英文/数字噪声支持后续加入数字/英文文本归一化重算。
