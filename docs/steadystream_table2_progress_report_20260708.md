@@ -1512,3 +1512,27 @@ E53 smoke3 结果：
 判读：C1 acoustic tail 本身不是坏方向；在不加 smooth 时，它把 F0 从 `c4_icl_prefill_c3` 的 5.772 st 降到 4.415 st，同时 artifact 也从 0.1430 降到 0.0972。当前 F1/F2 post smoothing 对 F0/能量不友好：无 C1 时 smooth 把能量从 2.489 dB 抬到 5.627 dB，F0 从 5.772 st 抬到 6.748 st；有 C1 时 smooth 虽继续压低 waveform artifact，但 F0 从 4.415 st 回升到 5.678 st。
 
 结论：如果继续救完整 SteadyStream，下一候选不应是 `full_steadystream_icl_c3_smooth`，而应是 `full_steadystream_icl_c3` 或“更弱/只跨边界局部的 smoothing”。这条路比继续 C4 训练更直接，因为 C4/ICL 语义已经回到 3%-4% CER，当前瓶颈是后处理和声学尾巴组合方式。下一步建议用 `full_steadystream_icl_c3` 跑 eval20，若 F0 比 E52 full-combo 明显下降且 CER 不差，再作为新的完整 SteadyStream 候选；否则正式表 2 仍保持 E47 口径。
+
+## 51. 2026-07-10 E54 full-combo without smoothing eval20
+
+按 E53 的因子拆分结论，继续把更合理的完整组合 `full_steadystream_icl_c3`（C1 acoustic tail + ICL full-current + C3，无 F1/F2 post smoothing）放大到 eval20。该 run 只跑单变体，用于和 E52 的 `full_steadystream_icl_c3_smooth` 及 `c4_icl_prefill_c3` 横比。
+
+产物：
+
+| 项 | 路径 |
+|---|---|
+| 5090 runtime eval20 | `workspace/table2_full_combo_no_smooth_eval20_e54_20260710/` |
+| 5090 ASR 原始 CER（无 cn2an） | `workspace/table2_full_combo_no_smooth_eval20_e54_20260710/asr_cer_5090_raw.json` |
+| 4090 cn2an 重算 CER | `workspace/table2_full_combo_no_smooth_eval20_e54_20260710/asr_cer_cn2an.json` |
+
+E54 与 E52 横比：
+
+| 变体 | C1 | smooth | exact | F0 raw↓ | F0 coverage | 有效 F0 边界 | 能量 raw↓ | 停顿偏差↓ | artifact flux↓ | max sample delta↓ | CER（cn2an）↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `c4_icl_prefill_c3` | no | no | 135/135 | **4.749 st** | 0.144 | 20/135 | 3.677 dB | 21.9 ms | 0.2914 | 0.00293 | 4.24% |
+| `full_steadystream_icl_c3_smooth` | yes | yes | 135/135 | 7.857 st | 0.157 | 22/135 | 4.035 dB | 19.0 ms | **0.1209** | **0.00199** | 4.27% |
+| `full_steadystream_icl_c3` | yes | no | 135/135 | 6.144 st | 0.186 | 25/135 | **3.235 dB** | **16.6 ms** | 0.1717 | 0.00329 | **4.13%** |
+
+判读：去掉 smoothing 后完整组合确实改善：F0 `7.857 -> 6.144`，energy `4.035 -> 3.235`，pause `19.0 -> 16.6ms`，CER `4.27% -> 4.13%`。但它仍未达到正式末行要求：F0 仍显著高于 `c4_icl_prefill_c3` 的 4.749 st，也远高于 stateful/offline 的 3 st 左右；artifact flux 虽低于 C3-only，但 max sample delta 反而略高。
+
+结论：`full_steadystream_icl_c3` 是当前 full-combo 系列里更好的候选，但仍不足以替代表 2 正式行。最终建议不变：Table2 正式结果以 E47 为准，`c4_icl_prefill` 作为文字优先行，`c4_icl_prefill_c3` 作为停顿优化备选；完整 SteadyStream 行需要继续做 C1 声学尾权重/长度和局部 smoothing 参数，而不是直接进入 3 seeds 稳定性。
