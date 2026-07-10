@@ -1031,3 +1031,43 @@ ICL generation eval3（`max_new_tokens=256`，5090 产物同步到本地 `output
 | `c4_synth_00498` | 3.85% | “他轻轻调高枕台旁...”，主要是她/他、诊台/枕台。 |
 
 结论：C4 的可行路径发生更新。最有希望的不是“interleaved 训练 + interleaved 推理”，而是 **interleaved LoRA200 adapter + ICL 推理排布**。解释是：interleaved 训练让模型适应了 history codes/current target 的 joint 分布；ICL 推理排布把 history text 与 current text 合并放在文本侧，减少历史语义被复述的诱因。下一步必须扩到 `eval20_001` 全 20 条，并抽听本地音频；若 eval20 仍在 5-10% 区间，再进入 full mini/Table2 runtime 改造，而不是继续纠结 E39 的 interleaved continuation 失败。
+
+---
+
+## 39. 2026-07-10 E41 ICL eval20 生成级验证
+
+按 E40 的决策，将当前最佳组合 **interleaved LoRA200 adapter + ICL prefill 推理排布** 从 eval3 扩到冻结的 `eval20_001` 全 20 条。底座仍为 0701 checkpoint `/home/train/tts/qwen3-tts/trained/zehan/0701_trained_model`，speaker=`001`，adapter 为 `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps200/`，生成脚本为 `scripts/python/run_c4_official_prefill_generate.py --generation-mode icl --max-new-tokens 256`。
+
+产物路径：
+
+| 产物 | 路径 |
+|---|---|
+| 5090 生成目录 | `workspace/c4_synth_v1_clean500/generate_prefill_lora_interleaved200_icl_eval20_m256/` |
+| 4090 ASR/CER | `workspace/c4_synth_v1_clean500/generate_prefill_lora_interleaved200_icl_eval20_m256/asr_cer.json` |
+| 本地回听包 | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/c4_lora_interleaved200_prefill_icl_eval20_m256_20260710/` |
+
+eval20 Paraformer/CER 结果：
+
+| 指标 | 数值 | 判读 |
+|---|---:|---|
+| 样本数 | 20 | 冻结 eval20 全量完成。 |
+| CER mean | **2.4710%** | 明显优于 eval3 的 5.7013%，已经进入可继续工程化的区间。 |
+| CER median | 1.8868% | 多数样本很稳。 |
+| CER max | 9.0909% | 最差样本仍是代词/语气词小错，不再是历史复读。 |
+| CER=0 | 7/20 | 三分之一以上完全匹配归一化文本。 |
+| CER > 5% | 2/20 | 只有 `c4_synth_00496` 和 `c4_synth_00517` 超过 5%。 |
+| generated/target frames | mean 0.9486, median 0.9692, min 0.7590, max 1.0361 | 生成长度整体贴近目标，没有 E39 的长复读/严重早停。 |
+
+最差 5 条错误形态：
+
+| sample | CER | 生成帧/目标帧 | ASR 观察 |
+|---|---:|---:|---|
+| `c4_synth_00496` | 9.09% | 63/83 | “她/他”、“啦/了”类小错；无历史串入。 |
+| `c4_synth_00517` | 6.12% | 129/150 | “搅/嚼”、“季/剂”等听辨近音；无历史串入。 |
+| `c4_synth_00510` | 5.00% | 117/120 | “她/他”、“午后/舞后”等 ASR/发音近似错误。 |
+| `c4_synth_00497` | 4.17% | 75/82 | “它/他”一类代词错误。 |
+| `c4_synth_00498` | 3.85% | 151/156 | “诊台/枕台”等近音错。 |
+
+关键结论：E41 是目前 C4 路线的第一个生成级强阳性结果。它说明 E39 的 107% continuation CER 并不是 adapter 完全没学会，而是 interleaved 推理排布会诱发历史语义复述；切到 ICL prefill 后，同一个 interleaved LoRA200 adapter 可以在 20 条冻结 eval 上稳定生成当前段，CER 降到 2.47%，且没有发现系统性历史串入或拖长。
+
+但交付边界也必须写清：这仍是 **PyTorch/offline official-prefill ICL generation**，不是已经接入 Triton runtime 的 Table2 full SteadyStream 行。下一步不能直接把它填成线上完整 SteadyStream，而应做两步工程化验证：第一，把 ICL prefill 形态搬进 token-mode/runtime runner，保持 `input_mode=token + force_text_chunk_boundary + exact-boundary gate`；第二，在同一 Table2 文本上复跑 baseline/C1/C3/ICL-C4，确认 runtime 侧仍能复现 eval20 的低 CER。若 runtime 复现成功，完整 SteadyStream 的方向就从“KV tail 续写”正式切到“ICL prefill + C4 adapter”。
