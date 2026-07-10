@@ -1488,3 +1488,27 @@ full-combo 机制仍通过：`steadystream_acoustic_tail=true` 覆盖 135/135 �
 真正失败项是韵律连续性：full-combo 的 F0 raw 从 E50 smoke 的 5.678 st 放大后变成 7.857 st，能量 4.035 dB 也高于 C3-only，artifact 虽比纯 ICL 小很多，但仍高于 E50 smoke。最坏样本是 `prosody_mini_018`，full-combo F0=16.775 st；已拉回 `stateful_stream`、`c4_icl_prefill_c3`、`full_steadystream_icl_c3_smooth` 三条 wav 做本地试听对照。
 
 结论：E52 否定了“E50 F0 只是 3 样本偶然”的乐观假设。完整 SteadyStream 组合在当前实现下的机制和文本正确率可接受，但 F0/能量/边界 artifact 不满足表 2 末行的正式候选要求。因此当前 Table2 正式建议仍保持 E47：文字优先用 `c4_icl_prefill`，停顿/听感备选用 `c4_icl_prefill_c3`；`full_steadystream_icl_c3_smooth` 暂列诊断行，不进正式末行。下一步如果继续救 full-combo，应优先做 C1 acoustic tail 与 F1/F2 smoothing 的参数拆分，而不是继续 C4 训练或直接上 3 seeds。
+
+## 50. 2026-07-10 E53 C1 vs F1/F2 factor smoke
+
+根据 E52 结论，继续拆分 full-combo 的 F0/能量问题来源。本轮新增两个诊断变体，构成四格对照：
+
+| 变体 | C1 acoustic tail | ICL full-current | C3 | F1/F2 post smooth |
+|---|---:|---:|---:|---:|
+| `c4_icl_prefill_c3` | no | yes | yes | no |
+| `c4_icl_prefill_c3_smooth` | no | yes | yes | yes |
+| `full_steadystream_icl_c3` | yes | yes | yes | no |
+| `full_steadystream_icl_c3_smooth` | yes | yes | yes | yes |
+
+E53 smoke3 结果：
+
+| 变体 | exact | acoustic tail | F0 raw↓ | F0 coverage | 能量 raw↓ | 停顿偏差↓ | artifact flux↓ | max sample delta↓ |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `c4_icl_prefill_c3` | 23/23 | 0/23 | 5.772 st | 0.206 | 2.489 dB | 7.6 ms | 0.1430 | 0.00158 |
+| `c4_icl_prefill_c3_smooth` | 23/23 | 0/23 | 6.748 st | 0.180 | 5.627 dB | 21.5 ms | 0.0000 | 0.00000 |
+| `full_steadystream_icl_c3` | 23/23 | 23/23 | **4.415 st** | 0.169 | 2.523 dB | 14.9 ms | 0.0972 | 0.00069 |
+| `full_steadystream_icl_c3_smooth` | 23/23 | 23/23 | 5.678 st | 0.228 | 2.671 dB | 20.9 ms | 0.0191 | 0.00027 |
+
+判读：C1 acoustic tail 本身不是坏方向；在不加 smooth 时，它把 F0 从 `c4_icl_prefill_c3` 的 5.772 st 降到 4.415 st，同时 artifact 也从 0.1430 降到 0.0972。当前 F1/F2 post smoothing 对 F0/能量不友好：无 C1 时 smooth 把能量从 2.489 dB 抬到 5.627 dB，F0 从 5.772 st 抬到 6.748 st；有 C1 时 smooth 虽继续压低 waveform artifact，但 F0 从 4.415 st 回升到 5.678 st。
+
+结论：如果继续救完整 SteadyStream，下一候选不应是 `full_steadystream_icl_c3_smooth`，而应是 `full_steadystream_icl_c3` 或“更弱/只跨边界局部的 smoothing”。这条路比继续 C4 训练更直接，因为 C4/ICL 语义已经回到 3%-4% CER，当前瓶颈是后处理和声学尾巴组合方式。下一步建议用 `full_steadystream_icl_c3` 跑 eval20，若 F0 比 E52 full-combo 明显下降且 CER 不差，再作为新的完整 SteadyStream 候选；否则正式表 2 仍保持 E47 口径。

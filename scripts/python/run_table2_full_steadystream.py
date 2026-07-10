@@ -147,6 +147,7 @@ POST_SMOOTH_VARIANT_KEYS = {
     "acoustic_tail_smooth",
     "acoustic_tail_smooth_tdrop",
     "acoustic_tail_pr_smooth_tdrop",
+    "c4_icl_prefill_c3_smooth",
     "full_steadystream_icl_c3_smooth",
 }
 
@@ -207,6 +208,32 @@ EXPERIMENTAL_VARIANTS = [
         "c4_icl_prefill_c3.wav",
         {
             "steadystream_variant": "kv_tail_only",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_reprefill_token_history_layout": "icl",
+            "kv_terminal_drop_mode": "eos_only",
+        },
+        True,
+    ),
+    (
+        "c4_icl_prefill_c3_smooth",
+        "c4_icl_prefill_c3_smooth.wav",
+        {
+            "steadystream_variant": "kv_tail_only",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_reprefill_token_history_layout": "icl",
+            "kv_terminal_drop_mode": "eos_only",
+        },
+        True,
+    ),
+    (
+        "full_steadystream_icl_c3",
+        "full_steadystream_icl_c3.wav",
+        {
+            "steadystream_variant": "full_steadystream",
             "kv_tail_tokens": "384",
             "kv_reprefill_token_history": "true",
             "kv_reprefill_token_history_full_current": "true",
