@@ -188,6 +188,19 @@ EXPERIMENTAL_VARIANTS = [
         {"steadystream_variant": "full_steadystream", "kv_tail_tokens": "384"},
         True,
     ),
+    (
+        "c4_icl_prefill",
+        "c4_icl_prefill.wav",
+        {
+            "steadystream_variant": "kv_tail_only",
+            "kv_tail_tokens": "384",
+            "kv_reprefill_token_history": "true",
+            "kv_reprefill_token_history_full_current": "true",
+            "kv_reprefill_token_history_layout": "icl",
+            "kv_terminal_drop_mode": "eos_only",
+        },
+        False,
+    ),
 ]
 
 REQUIRED_AUDIO_BLOCKS = [

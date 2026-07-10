@@ -1052,6 +1052,17 @@ class EngineLoop:
         ).strip().lower()
         return raw in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _steadystream_token_history_layout(group: EngineSessionGroup) -> str:
+        raw = str(
+            group.steadystream_experimental.get(
+                "kv_reprefill_token_history_layout", "legacy"
+            )
+        ).strip().lower().replace("-", "_")
+        if raw in {"icl", "c4_icl", "text12_codes1"}:
+            return "icl"
+        return "legacy"
+
     def _steadystream_replay_buffer_limit(self, group: EngineSessionGroup) -> int:
         return min(
             max(64, self._steadystream_kv_tail_tokens(group) + 256),
@@ -1560,6 +1571,7 @@ class EngineLoop:
         self,
         prefix_embeds: torch.Tensor,
         *,
+        layout: str = "legacy",
         generation_budget_frames: int,
         history_text_token_ids: list[int],
         history_text_include_eos: bool,
@@ -1570,20 +1582,37 @@ class EngineLoop:
         if self._prefill_builder is None:
             return None
         w = self._prefill_builder.w
-        history_text = self._steadystream_text_block_embed(
-            history_text_token_ids,
-            include_eos=history_text_include_eos,
-        )
-        if history_text is None:
-            return None
-        current_text = None
-        if current_text_token_ids is not None:
-            current_text = self._steadystream_text_block_embed(
-                current_text_token_ids,
+        layout = (layout or "legacy").strip().lower().replace("-", "_")
+        if layout not in {"legacy", "icl"}:
+            layout = "legacy"
+        current_ids = list(current_text_token_ids or [])
+
+        if layout == "icl":
+            # C4/E41 layout: text side sees text1+text2+EOS, codec side sees
+            # codec_bos+codes1, then decode starts from pad text channel.
+            combined_text = self._steadystream_text_block_embed(
+                [int(x) for x in history_text_token_ids] + [int(x) for x in current_ids],
                 include_eos=current_text_include_eos,
             )
-            if current_text is None:
+            if combined_text is None:
                 return None
+            history_text = combined_text
+            current_text = None
+        else:
+            history_text = self._steadystream_text_block_embed(
+                history_text_token_ids,
+                include_eos=history_text_include_eos,
+            )
+            if history_text is None:
+                return None
+            current_text = None
+            if current_text_token_ids is not None:
+                current_text = self._steadystream_text_block_embed(
+                    current_ids,
+                    include_eos=current_text_include_eos,
+                )
+                if current_text is None:
+                    return None
 
         prefix_embeds = prefix_embeds.to(
             device=self._embed_device,
@@ -1595,9 +1624,10 @@ class EngineLoop:
             int(prefix_embeds.shape[1])
             + int(history_text.shape[1])
             + 1  # history codec BOS
-            + 1  # history boundary codec EOS
         )
-        if current_text is not None:
+        if layout != "icl":
+            fixed_prefill_len += 1  # history boundary codec EOS
+        if layout != "icl" and current_text is not None:
             fixed_prefill_len += int(current_text.shape[1]) + 1  # current codec BOS
         generation_budget_frames = max(1, int(generation_budget_frames))
         max_code_frames = min(
@@ -1622,39 +1652,41 @@ class EngineLoop:
         codec_bos = w.codec_embed(
             torch.tensor([[w.codec_bos_id]], device=w.device, dtype=torch.int64)
         ).to(device=self._embed_device, dtype=self._embed_dtype)
-        codec_eos_id = int(
-            getattr(
-                w,
-                "codec_eos_id",
-                getattr(w, "codec_eos_token_id", 0),
-            )
-        )
-        codec_eos = w.codec_embed(
-            torch.tensor([[codec_eos_id]], device=w.device, dtype=torch.int64)
-        ).to(device=self._embed_device, dtype=self._embed_dtype)
 
         history_codec_bos = pad + codec_bos
         history_codes = pad.expand(1, codec_sum.shape[1], self._hidden_size) + codec_sum
-        history_boundary = pad + codec_eos
         parts = [
             prefix_embeds,
             history_text,
             history_codec_bos,
             history_codes,
-            history_boundary,
         ]
-        if current_text is not None:
+        if layout != "icl":
+            codec_eos_id = int(
+                getattr(
+                    w,
+                    "codec_eos_id",
+                    getattr(w, "codec_eos_token_id", 0),
+                )
+            )
+            codec_eos = w.codec_embed(
+                torch.tensor([[codec_eos_id]], device=w.device, dtype=torch.int64)
+            ).to(device=self._embed_device, dtype=self._embed_dtype)
+            history_boundary = pad + codec_eos
+            parts.append(history_boundary)
+        if layout != "icl" and current_text is not None:
             current_codec_bos = pad + codec_bos
             parts.extend([current_text, current_codec_bos])
         prefill = torch.cat(parts, dim=1).contiguous()
         info = {
+            "layout": 1 if layout == "icl" else 0,
             "prefix_len": int(prefix_embeds.shape[1]),
             "history_text_tokens": len(history_text_token_ids),
             "history_code_frames": int(history_full_codes.shape[0]),
             "history_code_frames_total": total_code_frames,
             "history_code_frames_trimmed_for_generation_budget": trimmed_for_generation_budget,
-            "current_text_tokens": len(current_text_token_ids or []),
-            "current_text_full_prefill": 1 if current_text is not None else 0,
+            "current_text_tokens": len(current_ids),
+            "current_text_full_prefill": 1 if (layout == "icl" or current_text is not None) else 0,
             "prefill_len": int(prefill.shape[1]),
             "max_input_len": max_input_len,
             "max_seq_len": max_seq,
@@ -1712,8 +1744,12 @@ class EngineLoop:
             and bool(seg.input_complete)
         )
         drop_history_text = self._steadystream_token_history_drop_history_text(group)
+        layout = self._steadystream_token_history_layout(group)
+        if layout == "icl" and (not full_current or drop_history_text):
+            return None
         built = self._build_steadystream_token_history_prefill(
             plan.cacheable_prefix_embeds,
+            layout=layout,
             generation_budget_frames=self._steadystream_generation_budget_frames(
                 group,
                 len(seg.pending_token_ids),
@@ -1744,6 +1780,11 @@ class EngineLoop:
             if self._steadystream_uses_acoustic(group):
                 self._restore_steadystream_c2w_carry(group, slot, metrics)
             prefill_audio, prefill_eos = self._executor.prefill(slot, replay_prefill)
+            if layout == "icl":
+                # The final prefill step corresponds to history codes, not the
+                # current segment.  Keep the warmed state but do not emit that
+                # historical audio into the current Table 2 segment.
+                prefill_audio = None
             slot.prefill_source = source
             slot.trailing = []
             slot.text_idx = 0
@@ -1768,6 +1809,9 @@ class EngineLoop:
         metrics["steadystream_kv_prefix"] = "recomputed"
         metrics["steadystream_kv_prefix_len"] = str(info["prefix_len"])
         metrics["steadystream_token_history_prefill_len"] = str(info["prefill_len"])
+        metrics["steadystream_token_history_layout"] = (
+            "icl" if info["layout"] else "legacy"
+        )
         metrics["steadystream_token_history_text_tokens"] = str(
             info["history_text_tokens"]
         )

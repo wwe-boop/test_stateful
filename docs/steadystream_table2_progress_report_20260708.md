@@ -1096,3 +1096,90 @@ eval20 Paraformer/CER 结果：
 | merged checkpoint + ICL prefill（E42） | 3 | **5.7013%** | 9.09%, 4.17%, 3.85% | 合并无漂移，可进入 export/build 前置。 |
 
 E42 的意义：C4 现在已经从“只能加载 PEFT adapter 的离线实验”推进到“有普通 HF checkpoint 可供导出”的状态。下一步是真正的 runtime 工程化：检查 5090 可用镜像与导出脚本，使用 merged checkpoint 构建/替换 custom runtime，并在 token-mode runner 中实现/验证 ICL prefill 末行。当前部署风险是 5090 没有 `qwen3-engine:26.02-dev` 镜像，但有 `qwen3-engine:26.02` 和 `nvcr.io/nvidia/tensorrt:26.02-py3`；因此若继续构建 TRT，应显式使用已有 `qwen3-engine:26.02`，并把镜像差异写入部署记录。
+
+---
+
+## 41. 2026-07-10 E43 merged C4 runtime 部署
+
+按 playbook 阶段 7，将 E42 的 merged checkpoint 部署到 5090 CustomVoice runtime。关键修正是放弃 `autorun.sh build --ngc-tag 26.02` 的隐式路径，因为它会落到 `.local-build-cache` 并错误使用 `25.10` 构建；本轮改为直接调用 `scripts/bash/build_engines.sh build --image nvcr.io/nvidia/tritonserver:26.02-py3 --max-input-len 512 --max-seq-len 512`。
+
+部署事实：
+
+| 项 | 结果 |
+|---|---|
+| active checkpoint | `workspace/c4_synth_v1_clean500/merged_0701_c4_interleaved_lora200/` |
+| exported variant | `workspace/exported/custom-1.7b/` |
+| TRT engine | `talker_code2wav_fused.engine`，3.6GB |
+| build image | `nvcr.io/nvidia/tritonserver:26.02-py3` |
+| TensorRT | 10.15.1 |
+| profile | `max_batch=64, max_input_len=512, max_seq_len=512, dtype=bf16` |
+| runtime image | `qwen3-engine:26.02` |
+| custom service | `qwen3-engine-custom`，gRPC `50071`，WS `50072`，health `8082` |
+
+部署中发现全局 `workspace/exported/artifact_manifest.json` 仍残留旧 `25.10` 记录，虽然 engine 已经是 26.02。已重写 artifact manifest，重新计算当前 engine sha256，并用 `engine_fingerprint_check` 验证通过；容器启动日志也确认 `Engine fingerprint OK (sm=sm_120 trt=10.15.1)`。
+
+最小 runtime smoke：
+
+| 项 | 结果 |
+|---|---|
+| 文本 | `她把药盒轻轻放回抽屉，然后提醒大家按时喝水。` |
+| 输出 | `workspace/c4_synth_v1_clean500/runtime_c4_smoke_20260710/e43_runtime_full_text_smoke.wav` |
+| 本地回听 | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/runtime_c4_smoke_20260710/e43_runtime_full_text_smoke.wav` |
+| 音频时长 | 4.56s |
+| 首包 | 106ms |
+| 总耗时 | 0.70s |
+
+结论：merged C4 checkpoint 已可在线上 TRT runtime 合成，且 profile 512/512 与 E41 eval20 的长度预算匹配。但此时 runtime 默认 `full_steadystream` 仍是旧 KV-tail 排布，不是 E41 成功的 ICL 排布；因此不能直接把部署成功等价为完整 SteadyStream 成功。
+
+---
+
+## 42. 2026-07-10 E44 runtime ICL prefill 接入与单样本强阳性
+
+新增 runtime 诊断路径 `kv_reprefill_token_history_layout=icl`，并在 `scripts/python/run_table2_full_steadystream.py` 增加独立输出块 `c4_icl_prefill.wav`。这个路径严格对齐 E41 的 ICL 公式：
+
+```text
+prefix(role/custom tags) + text(text1 + text2) + text_eos + codec_bos + codes1
+然后用 pad text channel 自回归生成 codes2
+```
+
+实现要点：
+
+| 点 | 处理 |
+|---|---|
+| 上一段音频来源 | 不再跑 audio tokenizer；直接复用 runtime 每步已产生的 `full_codec`。 |
+| codes 填充量 | 默认保留上一整段 codes，并按 `max_input_len/max_seq_len` 与当前段生成预算裁剪；本次样本无裁剪。 |
+| EOS/静音 | `kv_terminal_drop_mode=eos_only`，只丢 1 个 EOS 帧，避免 pad_phase 过裁。 |
+| 历史音频泄漏 | prefill 最后一帧属于 history codes，已在 engine loop 中丢弃该 prefill audio，只保留 warmed state。 |
+| 旧路径兼容 | 旧 `full_steadystream` 不改，新增 ICL layout 只在 experimental flag 打开时生效。 |
+
+单样本 runtime smoke：`prosody_mini_001`，`input_mode=token`，`force_text_chunk_boundary=true`，`exact_boundary_count=7/7`。
+
+| 变体 | 音频时长 | CER | 判读 |
+|---|---:|---:|---|
+| `stateful_stream` | 22.16s | 2.27% | 普通在线流式，同文本基线。 |
+| `offline_full` | 21.44s | 2.27% | 离线整段，ASR 错主要是“浅/前、静/浸”等近音。 |
+| 旧 `full_steadystream` | 75.43s | 268.18% | 仍然严重历史复读，是旧 KV-tail 路线失败对照。 |
+| 新 `c4_icl_prefill` | 20.56s | **2.27%** | 与 stateful/offline 同档，未出现历史复读，runtime 侧复现 E41 ICL 强阳性。 |
+
+关键 metrics（最后两段摘录）：
+
+| 指标 | 值 |
+|---|---|
+| `steadystream_token_history_layout` | `icl` |
+| `steadystream_kv_tail` | `reprefill_token_history_full_current` |
+| `steadystream_kv_terminal_drop_mode` | `eos_only` |
+| segment 6 history codes | 44/44，无 generation-budget 裁剪 |
+| segment 7 history codes | 19/19，无 generation-budget 裁剪 |
+| segment 6/7 dropped tail | 1 帧 EOS |
+
+产物路径：
+
+| 产物 | 路径 |
+|---|---|
+| 5090 runtime smoke | `workspace/table2_c4_runtime_icl_smoke_e44_20260710/` |
+| 4090 ASR/CER | `workspace/table2_c4_runtime_icl_smoke_e44_20260710/table2_cer_key4.json` |
+| 本地试听 | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_c4_runtime_icl_smoke_e44_20260710/prosody_mini_001/c4_icl_prefill.wav` |
+
+结论：这是 C4 从离线 PyTorch 走到 TRT runtime/token-mode 的第一个强阳性结果。它同时解释了旧 `full_steadystream` 的失败原因：不是 C4 checkpoint 不会续写，而是 KV-tail 排布会把历史语义带入当前段，导致复读和拖长；ICL prefill 通过“文本侧知道 text1+text2，codec 侧只给 codes1”的排布，把历史音频作为条件而不是要继续说的文本。
+
+下一步门禁：先扩到 `prosody_mini_001..003` 三样本，若 CER/时长稳定，再扩到 eval20/Table2 mini；同时再做一个 `c4_icl_prefill + C3 pause_recovery` 组合，用来补 C3 停顿但不改变 ICL semantic carry。
