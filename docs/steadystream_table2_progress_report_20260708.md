@@ -926,3 +926,38 @@ NLL 结果（0701 checkpoint `/home/train/tts/qwen3-tts/trained/zehan/0701_train
 | 250-step summary | 5090 `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps250_summary.json`；4090 同步到 `workspace/lora_interleaved_all_r8_lr5e6_steps250_summary.json` |
 
 当前判读：interleaved C4 训练在 held-out `eval20_001` 上有明确学习信号，且没有触发 single NLL 退化预算；200-step 比 250-step 更适合作为当前候选 checkpoint。注意这仍是 teacher-forcing NLL 层面的成功，不等价于生成级 CER 成功；下一步必须按计划补 ICL layout 消融，或至少用 200-step adapter 做 PyTorch/runtime 生成 smoke，确认 NLL gap 能否转化为自回归生成质量。
+
+---
+
+## 36. 2026-07-10 E38 C4 generation smoke：手搓 continuation 失败，官方 single 健康
+
+按 playbook 阶段 6 的纪律，先做生成级 smoke，而不是只看 NLL。对象为 `eval20_001` 前 3 条，底座 0701/speaker=`001`，adapter 使用 E37 当前候选 `lora_interleaved_all_r8_lr5e6_steps200`。本轮分成两组：
+
+1. 旧的手搓 `run_c4_lora_continuation_generate.py`：直接构造 `inputs_embeds + trailing_text_hidden`，跑 base/LoRA 的 single 与 continuation。
+2. 新增官方 single probe `scripts/python/run_c4_official_custom_single_generate.py`：调用 `Qwen3TTSModel.generate_custom_voice()` 官方入口，只验证 single 健康，不伪装成 continuation。
+
+手搓生成结果（5090 `workspace/c4_synth_v1_clean500/generate_*_eval3/`；4090/本地已同步到 `outputs/c4_generate_eval3_20260710/`）：
+
+| 变体 | 生成帧/停止 | 音频时长 | CER | ASR/听感判读 |
+|---|---|---:|---:|---|
+| base single | 3/3 打满 255 帧，`max_new_tokens` | 20.4s ×3 | 100.00% | ASR 为空或“嗯嗯你”，单句路径本身坏。 |
+| base continuation | 2 条打满 255 帧，1 条 EOS 118 帧 | 20.4/9.44/20.4s | 100.00% | 同样空转/无关短词。 |
+| LoRA200 single | EOS 59/3/34 帧 | 4.72/0.24/2.72s | 99.36% | 过早 EOS，ASR 为“喂你好”等无关词。 |
+| LoRA200 continuation | EOS 2/5/18 帧 | 0.16/0.40/1.44s | 97.97% | 严重早停，ASR 为“行/你们说/我是1位”。 |
+
+这组不能用来否定 adapter，因为 base single 都已经失败；它证明的是旧 PyTorch hand-prefill generation 装置不可信。为确认模型/adapter 本身是否保住单句能力，补跑官方 `generate_custom_voice()` single：
+
+| 变体 | 生成时长 | CER | 判读 |
+|---|---|---:|---|
+| base official single | 6.00 / 6.00 / 12.40s | 8.6053% | 官方单句入口健康，ASR 主要是“她/他”“极/吉”等小误差。 |
+| LoRA200 official single | 5.76 / 6.16 / 12.64s | 7.0901% | adapter 未破坏 single，且 3 条 smoke 上略优于 base。 |
+
+关键结论：
+
+| 结论 | 影响 |
+|---|---|
+| E37 的 LoRA200 adapter 没有把官方 single 打坏。 | 训练路线仍有希望，不能因为手搓 generation CER 约 100% 就否定 C4。 |
+| 当前 continuation generation 失败点在 hand-prefill 构造/停止机制，不在 ASR，也不在 adapter 单句能力。 | 下一步不应继续盲训；必须把 C4 continuation 生成迁移到官方 `model.generate()` 同源的 prefix/trailing_text 构造，或进入 runtime/TRT 同源评测。 |
+| 旧脚本 base single 都失败，说明它不能作为 Phase 6 合法门禁。 | 后续生成级验证以官方 single 为健康门禁；continuation 脚本修到 base single 先通过后，才评 adapter continuation。 |
+
+当前状态：C4 训练在 NLL 上有效，LoRA200 single 生成健康，但完整 SteadyStream/C4 还没有通过生成级 continuation。下一步优先级是修/重写 continuation generation 装置，而不是继续扩大训练或部署 adapter。
