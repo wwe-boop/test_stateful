@@ -1071,3 +1071,28 @@ eval20 Paraformer/CER 结果：
 关键结论：E41 是目前 C4 路线的第一个生成级强阳性结果。它说明 E39 的 107% continuation CER 并不是 adapter 完全没学会，而是 interleaved 推理排布会诱发历史语义复述；切到 ICL prefill 后，同一个 interleaved LoRA200 adapter 可以在 20 条冻结 eval 上稳定生成当前段，CER 降到 2.47%，且没有发现系统性历史串入或拖长。
 
 但交付边界也必须写清：这仍是 **PyTorch/offline official-prefill ICL generation**，不是已经接入 Triton runtime 的 Table2 full SteadyStream 行。下一步不能直接把它填成线上完整 SteadyStream，而应做两步工程化验证：第一，把 ICL prefill 形态搬进 token-mode/runtime runner，保持 `input_mode=token + force_text_chunk_boundary + exact-boundary gate`；第二，在同一 Table2 文本上复跑 baseline/C1/C3/ICL-C4，确认 runtime 侧仍能复现 eval20 的低 CER。若 runtime 复现成功，完整 SteadyStream 的方向就从“KV tail 续写”正式切到“ICL prefill + C4 adapter”。
+
+---
+
+## 40. 2026-07-10 E42 LoRA 合并 checkpoint 与部署前 smoke
+
+进入 playbook 阶段 7 前，先把 E41 的 PEFT adapter 合并成可导出/可部署的普通 HF checkpoint。新增复现脚本 `scripts/python/merge_c4_lora_checkpoint.py`，采用 `peft.merge_and_unload()` 合并权重；保存时不走 Transformers `save_pretrained(use_diff=True)`，因为 0701/Qwen3-TTS 自定义 config 在 diff 序列化时会触发 `KeyError: dtype`。当前脚本改为复制 base checkpoint 的 config/tokenizer 文件，并直接写 merged `model.safetensors`，避免 config 序列化分支污染权重合并。
+
+合并产物：
+
+| 项 | 路径/结果 |
+|---|---|
+| base checkpoint | `/home/train/tts/qwen3-tts/trained/zehan/0701_trained_model` |
+| adapter | `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_steps200/` |
+| merged checkpoint | `workspace/c4_synth_v1_clean500/merged_0701_c4_interleaved_lora200/` |
+| merged weight | `model.safetensors`，3.6GB，bf16 |
+| metadata | `c4_merge_meta.json`，记录 base、adapter、dtype 与 ICL 推理意图 |
+
+合并正确性 smoke：用 merged checkpoint 直接跑 E40/E41 同一 `official-prefill --generation-mode icl` 的 eval3，并在 4090 `speechserver` 内复用 Paraformer/CER 口径。结果与未合并 adapter 版逐条一致：
+
+| 变体 | 样本数 | CER mean | 逐样本 CER | 判读 |
+|---|---:|---:|---|---|
+| adapter 版 interleaved-LoRA200 + ICL prefill（E40） | 3 | 5.7013% | 9.09%, 4.17%, 3.85% | 当前最佳 eval3。 |
+| merged checkpoint + ICL prefill（E42） | 3 | **5.7013%** | 9.09%, 4.17%, 3.85% | 合并无漂移，可进入 export/build 前置。 |
+
+E42 的意义：C4 现在已经从“只能加载 PEFT adapter 的离线实验”推进到“有普通 HF checkpoint 可供导出”的状态。下一步是真正的 runtime 工程化：检查 5090 可用镜像与导出脚本，使用 merged checkpoint 构建/替换 custom runtime，并在 token-mode runner 中实现/验证 ICL prefill 末行。当前部署风险是 5090 没有 `qwen3-engine:26.02-dev` 镜像，但有 `qwen3-engine:26.02` 和 `nvcr.io/nvidia/tensorrt:26.02-py3`；因此若继续构建 TRT，应显式使用已有 `qwen3-engine:26.02`，并把镜像差异写入部署记录。
