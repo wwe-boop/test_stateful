@@ -216,10 +216,14 @@ EXPERIMENTAL_VARIANTS = [
     ),
 ]
 
-REQUIRED_AUDIO_BLOCKS = [
+BASE_AUDIO_BLOCKS = [
     ("stateless_once", "stateless_once.wav"),
     ("stateful_stream", "stateful_stream.wav"),
     ("offline_full", "offline_full.wav"),
+]
+
+REQUIRED_AUDIO_BLOCKS = [
+    *BASE_AUDIO_BLOCKS,
     *[(key, wav_name) for key, wav_name, _, _ in EXPERIMENTAL_VARIANTS],
 ]
 
@@ -232,6 +236,7 @@ def audio_blocks_for_run(
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
     include_c1_diagnostics: bool = False,
+    variant_keys: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     blocks = list(REQUIRED_AUDIO_BLOCKS)
     if include_c2_diagnostics:
@@ -245,6 +250,8 @@ def audio_blocks_for_run(
         blocks.extend(
             (key, wav_name) for key, wav_name, _, _ in c1_diagnostic_variants()
         )
+    if variant_keys is not None:
+        blocks = [(key, wav_name) for key, wav_name in blocks if key in variant_keys]
     return blocks
 
 
@@ -253,6 +260,7 @@ def sample_complete(
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
     include_c1_diagnostics: bool = False,
+    variant_keys: set[str] | None = None,
 ) -> bool:
     result_path = sample_dir / "results.json"
     if not result_path.is_file():
@@ -267,6 +275,7 @@ def sample_complete(
             include_c2_diagnostics,
             c2_diagnostic_kv_tail_tokens,
             include_c1_diagnostics,
+            variant_keys,
         )
     )
 
@@ -740,6 +749,7 @@ def run_sample(
     include_c2_diagnostics: bool = False,
     c2_diagnostic_kv_tail_tokens: int | None = None,
     include_c1_diagnostics: bool = False,
+    variant_keys: set[str] | None = None,
     override_language: str | None = None,
     override_instruct: str | None = None,
 ) -> dict[str, Any]:
@@ -771,13 +781,21 @@ def run_sample(
         for key, value in existing.items():
             if key not in result:
                 result[key] = value
-        for key, _wav_name in REQUIRED_AUDIO_BLOCKS:
+        for key, _wav_name in audio_blocks_for_run(
+            include_c2_diagnostics,
+            c2_diagnostic_kv_tail_tokens,
+            include_c1_diagnostics,
+            variant_keys,
+        ):
             if key in existing:
                 result[key] = existing[key]
 
     # Row 1: stateless per-segment oneshot.
     sr = sample_rate
-    if not has_audio_block(result, out_dir, "stateless_once", "stateless_once.wav"):
+    if (
+        (variant_keys is None or "stateless_once" in variant_keys)
+        and not has_audio_block(result, out_dir, "stateless_once", "stateless_once.wav")
+    ):
         stateless_parts: list[np.ndarray] = []
         stateless_timings: list[dict[str, Any]] = []
         for idx, seg in enumerate(segments):
@@ -826,7 +844,10 @@ def run_sample(
 
     # Row 2: current stateful stream. Table 2 SteadyStream measurements require
     # token-mode input so each designed clause can become an engine segment.
-    if not has_audio_block(result, out_dir, "stateful_stream", "stateful_stream.wav"):
+    if (
+        (variant_keys is None or "stateful_stream" in variant_keys)
+        and not has_audio_block(result, out_dir, "stateful_stream", "stateful_stream.wav")
+    ):
         stream_experimental = stream_experimental_config(
             None,
             force_text_chunk_boundary=force_text_chunk_boundary,
@@ -897,6 +918,10 @@ def run_sample(
         variants_to_run.extend(c2_diagnostic_variants(c2_diagnostic_kv_tail_tokens))
     if include_c1_diagnostics:
         variants_to_run.extend(c1_diagnostic_variants())
+    if variant_keys is not None:
+        variants_to_run = [
+            item for item in variants_to_run if item[0] in variant_keys
+        ]
     for variant_key, wav_name, experimental, pause_recovery in variants_to_run:
         if has_audio_block(result, out_dir, variant_key, wav_name):
             continue
@@ -924,7 +949,10 @@ def run_sample(
         )
 
     # Offline full reference for SIM/topline.
-    if not has_audio_block(result, out_dir, "offline_full", "offline_full.wav"):
+    if (
+        (variant_keys is None or "offline_full" in variant_keys)
+        and not has_audio_block(result, out_dir, "offline_full", "offline_full.wav")
+    ):
         offline_audio, offline_sr, offline_timing = synthesize_once_timed(
             stub,
             endpoint_timeout=endpoint_timeout,
@@ -1015,6 +1043,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--variant-keys",
+        default="",
+        help=(
+            "Comma-separated audio block keys to run, e.g. "
+            "stateful_stream,offline_full,c4_icl_prefill,c4_icl_prefill_c3. "
+            "Empty keeps the historical all-block behavior."
+        ),
+    )
+    parser.add_argument(
         "--override-language",
         default=None,
         help="Override dataset language for serving-prefix diagnostics, e.g. auto.",
@@ -1034,6 +1071,26 @@ def main() -> int:
     if args.limit > 0:
         rows = rows[: args.limit]
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    variant_keys = {
+        key.strip()
+        for key in args.variant_keys.split(",")
+        if key.strip()
+    } or None
+    if variant_keys is not None:
+        known_keys = {
+            key
+            for key, _wav_name in audio_blocks_for_run(
+                args.include_c2_diagnostics,
+                args.c2_diagnostic_kv_tail_tokens,
+                args.include_c1_diagnostics,
+                None,
+            )
+        }
+        unknown_keys = sorted(variant_keys - known_keys)
+        if unknown_keys:
+            raise ValueError(
+                f"Unknown --variant-keys: {unknown_keys}; known keys: {sorted(known_keys)}"
+            )
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
     force_text_chunk_boundary = (
@@ -1055,6 +1112,7 @@ def main() -> int:
                 args.include_c2_diagnostics,
                 args.c2_diagnostic_kv_tail_tokens,
                 args.include_c1_diagnostics,
+                variant_keys,
             ):
                 print(f"[skip] seed={seed} {idx:03d}/{len(rows)} {sample_id}", flush=True)
                 progress.append({"seed": seed, "sample_id": sample_id, "status": "skipped"})
@@ -1077,6 +1135,7 @@ def main() -> int:
                     include_c2_diagnostics=args.include_c2_diagnostics,
                     c2_diagnostic_kv_tail_tokens=args.c2_diagnostic_kv_tail_tokens,
                     include_c1_diagnostics=args.include_c1_diagnostics,
+                    variant_keys=variant_keys,
                     override_language=args.override_language,
                     override_instruct=args.override_instruct,
                 )

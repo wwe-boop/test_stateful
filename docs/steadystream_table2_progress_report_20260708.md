@@ -1275,3 +1275,63 @@ ASR/CER：
 结论：`c4_icl_prefill_c3` 是当前最接近完整 SteadyStream 表2目标的 runtime 组合：C4 负责语义连续和避免复读，C3 负责标点停顿和边界 artifact。短板是 CER 在 3 样本上比纯 ICL 高约 1.24pp，可能是 ASR 对插入停顿更敏感，也可能是真实节奏变化影响发音；必须在 eval20 上和纯 ICL 同时跑，不能只凭 3 样本定型。
 
 下一步：跑 eval20 key variants（`offline_full/stateful_stream/c4_icl_prefill/c4_icl_prefill_c3`），再决定 Table2 正式行采用纯 ICL 还是 ICL+C3。
+
+---
+
+## 45. 2026-07-10 E47 runtime C4 ICL eval20 key variants
+
+按 E46 下一步，完成 20 条 `speaker=001` Table2 原生文本的 runtime key variants 评测。为避免旧 KV-tail 阴性对照拖慢 eval20，本轮先给 `scripts/python/run_table2_full_steadystream.py` 增加 `--variant-keys`，只选择本轮需要交付判断的音频块；不传该参数时保持历史 all-block 行为不变。
+
+评测设置：
+
+| 项 | 设置 |
+|---|---|
+| 数据 | `workspace/datasets/test-prosody-mini_speaker001.jsonl` 前 20 条 |
+| seed | `42` |
+| endpoint | 5090 custom runtime `127.0.0.1:50071` |
+| 输入模式 | `--stream-input-mode token` |
+| 分段门禁 | `force_text_chunk_boundary=true`，不允许 proxy boundary |
+| 变体 | `stateful_stream,offline_full,acoustic_tail_pause_recovery,c4_icl_prefill,c4_icl_prefill_c3` |
+
+边界与产物检查：
+
+| 项 | 结果 |
+|---|---|
+| 生成进度 | 20/20 samples，100/100 wav |
+| exact boundary | 4 个流式/SteadyStream 变体全部通过，无 proxy |
+| 边界数范围 | 每条 5-9 个设计边界 |
+| 5090 run | `workspace/table2_c4_runtime_icl_eval20_e47_20260710/` |
+| 4090 ASR/CER | `workspace/table2_c4_runtime_icl_eval20_e47_20260710/table2_cer_key5.json` |
+| 本地试听 | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/table2_c4_runtime_icl_eval20_e47_20260710/listen/` |
+
+ASR/CER 汇总：
+
+| 变体 | CER mean | median | max | 判读 |
+|---|---:|---:|---:|---|
+| `acoustic_tail_pause_recovery` | **2.5031%** | 1.684% | 9.756% | C1+C3 过渡对照，语义不依赖历史 ICL；本轮 CER 最低。 |
+| `stateful_stream` | 3.1026% | 1.853% | 9.756% | 普通在线流式基线。 |
+| `c4_icl_prefill` | 3.1100% | 2.429% | 9.756% | 纯 C4 ICL，已回到 stateful 同量级。 |
+| `c4_icl_prefill_c3` | 4.2417% | 2.107% | 21.905% | C4 ICL + C3，停顿显著更准，但数字/ID 样本 ASR 更敏感。 |
+| `offline_full` | 4.8454% | 2.107% | 23.171% | 离线整段参考；本 eval20 含较多英文/数字/ID，ASR 归一化拉高。 |
+
+停顿/边界结构汇总：
+
+| 变体 | audio mean | pause deviation mean | F0 jump mean | energy jump mean |
+|---|---:|---:|---:|---:|
+| `stateful_stream` | 25.624s | 98.295ms | 3.211st | 3.258dB |
+| `offline_full` | 24.080s | 91.137ms | 3.341st | 3.028dB |
+| `acoustic_tail_pause_recovery` | 27.062s | 137.790ms | n/a | **2.083dB** |
+| `c4_icl_prefill` | 23.988s | 100.820ms | 5.028st | 7.395dB |
+| `c4_icl_prefill_c3` | 23.585s | **21.875ms** | 4.749st | 3.677dB |
+
+异常样本观察：
+
+| 样本 | 现象 | 判读 |
+|---|---|---|
+| `prosody_mini_004` | `c4_icl_prefill_c3` CER 21.90%，ASR 把会议 ID `9876543210` 听成大数字串 | C3 插入停顿后 ASR 更容易把连续数字重组，不是历史复读。 |
+| `prosody_mini_013` | 多变体 CER 高，`offline_full` 也到 23.17% | 审计/采样频率/比特等数字密集，属于 ASR/归一化高风险文本。 |
+| `prosody_mini_016` | `Cambricon`、指数点位和百分比造成 7%-12% CER | 英文实体和金融数字混合，所有生成方式都被拉高。 |
+
+结论：E47 证明 C4 ICL runtime 路线是对的。纯 `c4_icl_prefill` 在 20 条上与 `stateful_stream` 基本持平，且 exact boundary 全通过，没有旧 `full_steadystream` 的复读/拖尾灾难。`c4_icl_prefill_c3` 的价值是把停顿偏差从约 100.8ms 降到 21.9ms，但 CER 平均升到 4.24%，主要被数字/英文/ID 样本拉高。若 Table2 优先文字正确率，当前建议正式行先用纯 `c4_icl_prefill`；若优先边界停顿/听感，可报告 `c4_icl_prefill_c3` 为 pause-optimized 备选。
+
+下一步：保留 E47 作为 Table2 key result，补一版 delivery 表格；如时间允许，再对 `c4_icl_prefill` 做 3 seeds 或剔除数字密集样本的 sensitivity check，确认 3.11% 不是 seed 偶然。
