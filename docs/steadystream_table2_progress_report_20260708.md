@@ -993,3 +993,41 @@ NLL 结果（0701 checkpoint `/home/train/tts/qwen3-tts/trained/zehan/0701_train
 | `c4_synth_00498` | “上午十点点... 绿绿绿...” | “上午吃上午整理...” | history/current 语义混乱并重复。 |
 
 结论：E39 已把生成装置从“single 都坏”的状态修到“single 健康、continuation 真实暴露问题”。当前 C4 interleaved LoRA200 虽然 NLL gap 闭合 53.92%，但生成时仍把 history 当作可继续说的语义上下文，而不是韵律/音色记忆；因此不能进入部署或 Table2 full row。下一步不应继续拉长 interleaved 训练，而应做 Phase 3 的 ICL layout 消融：让文本侧一次性给出 `text1+text2`，codec 侧给出 `codes1` 作为 reference，再只对 `codes2` 打 loss，减少“历史文本被当作待生成内容”的诱因。
+
+---
+
+## 38. 2026-07-10 E40 ICL layout 消融与生成突破
+
+按 E39 的结论，补做 playbook 阶段 3 的 ICL layout 消融。新增 `scripts/python/train_c4_lora_gap_icl.py`，排布为：
+
+`[CustomVoice official prefix][text1 + text2 + tts_eos][codec_bos + codes1][codes2 + codec_eos]`
+
+训练/eval 只看 target `codes2` 的 codec0 NLL；生成时新增 `run_c4_official_prefill_generate.py --generation-mode icl`，即文本侧一次给 `text1+text2`，codec 侧只 prefill `codes1`，再自回归生成 `codes2`。这比 E39 interleaved continuation 更接近官方 `generate_icl_prompt(non_streaming=True)` 的形态，也避免“history text 后面紧跟 history codes，再继续追加 target text”导致模型复述历史。
+
+ICL NLL：
+
+| 实验 | before single | before ICL-cont | before gap | after single | after ICL-cont | after gap | gap closure | 判读 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| ICL smoke 5-step/eval5 | 7.225734 | 2.338687 | -4.887047 | 7.246883 | 2.340203 | -4.906680 | -0.40% | 链路通过；ICL-cont 原本就远低于 single。 |
+| ICL LoRA 200-step/eval20 | 7.168064 | 2.159289 | -5.008775 | 7.058134 | 2.084059 | -4.974075 | 0.69% | 训练没有明显改善 gap，但也不伤 single。 |
+| interleaved LoRA 200-step/eval20 | 7.168064 | 7.445304 | +0.277240 | 5.680097 | 5.807849 | +0.127752 | 53.92% | interleaved 训练有 NLL 学习信号，但 interleaved 推理会复述历史。 |
+
+关键发现：ICL layout 在 base 上的 teacher-forcing NLL 已经很低，说明它不是主要 OOD 难点；真正要看生成。
+
+ICL generation eval3（`max_new_tokens=256`，5090 产物同步到本地 `outputs/c4_icl_prefill_eval3_m256_20260710/`，4090 ASR 结果 `workspace/c4_icl_prefill_eval3_m256_20260710/asr_cer.json`）：
+
+| 变体 | 生成时长 | CER | 判读 |
+|---|---|---:|---|
+| base + ICL prefill | 5.28 / 5.68 / 12.16s | 10.1204% | 已摆脱 E39 的历史复述，语义基本对；主要错在“她/他、赚/转、吉/极、枕台/诊台”。 |
+| ICL-LoRA200 + ICL prefill | 4.64 / 4.48 / 9.28s | 8.6053% | 时长略短，CER 略优于 base。 |
+| interleaved-LoRA200 + ICL prefill | 5.04 / 6.00 / 12.08s | **5.7013%** | 当前最佳；三条均没有历史串入，语义接近 single baseline。 |
+
+逐条看，最佳 `interleaved-LoRA200 + ICL prefill` 的错误不再是结构性失败：
+
+| sample | CER | ASR hyp 简述 |
+|---|---:|---|
+| `c4_synth_00496` | 9.09% | “他从不催人收衣...该收了”，主要是她/他、啦/了。 |
+| `c4_synth_00497` | 4.17% | “他不会大声播报...用极轻的声音说请稍等”，主要是它/他。 |
+| `c4_synth_00498` | 3.85% | “他轻轻调高枕台旁...”，主要是她/他、诊台/枕台。 |
+
+结论：C4 的可行路径发生更新。最有希望的不是“interleaved 训练 + interleaved 推理”，而是 **interleaved LoRA200 adapter + ICL 推理排布**。解释是：interleaved 训练让模型适应了 history codes/current target 的 joint 分布；ICL 推理排布把 history text 与 current text 合并放在文本侧，减少历史语义被复述的诱因。下一步必须扩到 `eval20_001` 全 20 条，并抽听本地音频；若 eval20 仍在 5-10% 区间，再进入 full mini/Table2 runtime 改造，而不是继续纠结 E39 的 interleaved continuation 失败。

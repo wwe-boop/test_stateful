@@ -123,11 +123,20 @@ def build_prefill_embeddings(
     if generation_mode == "single":
         history_segments: list[dict[str, Any]] = []
         target_segment = all_segments[target_segment_index]
+    elif generation_mode == "icl":
+        if target_segment_index <= 0:
+            raise ValueError("ICL generation needs at least one history segment")
+        history_segments = [all_segments[target_segment_index - 1]]
+        target_segment = all_segments[target_segment_index]
     else:
         history_segments = all_segments[:target_segment_index]
         target_segment = all_segments[target_segment_index]
 
-    first_ids = assistant_ids(processor, str((history_segments or [target_segment])[0]["text"]), device)
+    if generation_mode == "icl":
+        first_text = str(history_segments[0]["text"]) + str(target_segment["text"])
+    else:
+        first_text = str((history_segments or [target_segment])[0]["text"])
+    first_ids = assistant_ids(processor, first_text, device)
     prefix, tts_eos_embed, tts_pad_embed = build_custom_prefix(
         model=model,
         input_id=first_ids,
@@ -161,27 +170,41 @@ def build_prefill_embeddings(
             )
         )
 
-    for history_index, segment in enumerate(history_segments):
-        append_text(str(segment["text"]))
+    if generation_mode == "icl":
+        append_text(first_text)
         append_codec_bos(first_ids.dtype)
-        codes = torch.tensor(segment["codes"], dtype=torch.long, device=device)
+        codes = torch.tensor(history_segments[0]["codes"], dtype=torch.long, device=device)
         pieces.append(codec_frame_embed(model, codes, tts_pad_embed))
-        pieces.append(
-            tts_pad_embed
-            + model.talker.get_input_embeddings()(
-                torch.tensor([[talk.codec_eos_token_id]], device=device, dtype=first_ids.dtype)
-            )
-        )
         layout["history_segments"].append(
             {
-                "segment_index": history_index,
-                "text": segment["text"],
+                "segment_index": target_segment_index - 1,
+                "text": history_segments[0]["text"],
                 "frames": int(codes.shape[0]),
             }
         )
+    else:
+        for history_index, segment in enumerate(history_segments):
+            append_text(str(segment["text"]))
+            append_codec_bos(first_ids.dtype)
+            codes = torch.tensor(segment["codes"], dtype=torch.long, device=device)
+            pieces.append(codec_frame_embed(model, codes, tts_pad_embed))
+            pieces.append(
+                tts_pad_embed
+                + model.talker.get_input_embeddings()(
+                    torch.tensor([[talk.codec_eos_token_id]], device=device, dtype=first_ids.dtype)
+                )
+            )
+            layout["history_segments"].append(
+                {
+                    "segment_index": history_index,
+                    "text": segment["text"],
+                    "frames": int(codes.shape[0]),
+                }
+            )
 
-    append_text(str(target_segment["text"]))
-    append_codec_bos(first_ids.dtype)
+    if generation_mode != "icl":
+        append_text(str(target_segment["text"]))
+        append_codec_bos(first_ids.dtype)
     inputs_embeds = torch.cat(pieces, dim=1)
     layout.update(
         {
@@ -277,7 +300,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-dir", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--variant", required=True)
-    parser.add_argument("--generation-mode", choices=["single", "continuation"], default="continuation")
+    parser.add_argument("--generation-mode", choices=["single", "continuation", "icl"], default="continuation")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--target-segment-index", type=int, default=1)
     parser.add_argument("--speaker", default="001")
