@@ -1335,3 +1335,48 @@ ASR/CER 汇总：
 结论：E47 证明 C4 ICL runtime 路线是对的。纯 `c4_icl_prefill` 在 20 条上与 `stateful_stream` 基本持平，且 exact boundary 全通过，没有旧 `full_steadystream` 的复读/拖尾灾难。`c4_icl_prefill_c3` 的价值是把停顿偏差从约 100.8ms 降到 21.9ms，但 CER 平均升到 4.24%，主要被数字/英文/ID 样本拉高。若 Table2 优先文字正确率，当前建议正式行先用纯 `c4_icl_prefill`；若优先边界停顿/听感，可报告 `c4_icl_prefill_c3` 为 pause-optimized 备选。
 
 下一步：保留 E47 作为 Table2 key result，补一版 delivery 表格；如时间允许，再对 `c4_icl_prefill` 做 3 seeds 或剔除数字密集样本的 sensitivity check，确认 3.11% 不是 seed 偶然。
+
+---
+
+## 46. 2026-07-10 E48/E49 C4 training continuation on 4090
+
+按“继续推进训练”的要求，先把训练环境从 5090 迁到 4090，避免占用 5090 runtime 服务。同步内容包括 `c4_synth_v1_clean500/segments`、train/eval manifest、训练脚本，以及完整 0701 model root 权重。4090 原 `workspace/models/0701_trained_model` 只有部署最小包，缺 `model.safetensors`；同时 `speech_tokenizer/model.safetensors` 是 63MB 的不完整文件，会触发 safetensors metadata 错误。本轮修复为：补齐 0701 root 权重，并将 `speech_tokenizer` 指向完整 `workspace/models/Qwen3-TTS-Tokenizer-12Hz`。
+
+训练 smoke：
+
+| 项 | 结果 |
+|---|---|
+| 数据 | train pool 472 条，frozen eval20 20 条 |
+| GPU | 4090 GPU1 via `CUDA_VISIBLE_DEVICES=1` |
+| smoke | `max_steps=1` 通过，adapter 成功保存 |
+| 修复点 | 0701 root 权重缺失、speech tokenizer 半文件 |
+
+训练候选：
+
+| run | train samples | steps | loss first/last | NLL gap closure | 结论 |
+|---|---:|---:|---:|---:|---|
+| old deployed `lora_interleaved_all_r8_lr5e6_steps200` | 200 | 200 | 13.3949 / 9.4420 | 53.9201% | 当前 runtime 已部署 checkpoint 来源。 |
+| E48 `train472_steps350` | 472 | 350 | 14.0511 / 8.8421 | 40.6252% | 步数更长但 gap closure 变差，说明过训/分布偏移风险上升。 |
+| E49 `train472_steps200` | 472 | 200 | 14.0511 / 9.4533 | **54.0229%** | NLL 略优于旧 200-step，但幅度很小。 |
+
+E49 生成级 ICL eval20：
+
+| 变体 | CER mean | 对比 |
+|---|---:|---|
+| old `lora_interleaved200_prefill_icl_m256_eval20` | **2.4710%** | 旧最佳，仍然保留为当前 C4 checkpoint。 |
+| E49 `train472_steps200_prefill_icl_m256_eval20` | 2.5733% | NLL 略好但生成 CER 略差，不建议替换。 |
+
+逐样本观察：E49 最差仍是 `c4_synth_00496`，CER 13.64%，主要是“风要转了”被 ASR 为“风要赚了”；旧最佳同样在该样本较高但为 9.09%。`c4_synth_00517` 两者均 6.12%，主要是“搅/嚼”“蓝莓季/剂”等近音/ASR 问题。没有出现旧 KV-tail 的历史复读或短输出塌缩。
+
+产物：
+
+| 产物 | 路径 |
+|---|---|
+| E48 adapter | `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_train472_steps350_e48_4090/` |
+| E48 summary | `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_train472_steps350_e48_4090_summary.json` |
+| E49 adapter | `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_train472_steps200_e49_4090/` |
+| E49 summary | `workspace/c4_synth_v1_clean500/lora_interleaved_all_r8_lr5e6_train472_steps200_e49_4090_summary.json` |
+| E49 generation/CER | `workspace/c4_synth_v1_clean500/generate_prefill_lora_interleaved_train472_steps200_e49_icl_eval20_m256/asr_cer.json` |
+| 本地 E49 wav | `/Users/liuzehan/Documents/Codex/2026-07-08/ssh-4090-host-home-zehan-workspace/outputs/c4_e49_train472_steps200_eval20/` |
+
+结论：训练继续推进后，当前最稳 checkpoint 仍是旧 `lora_interleaved_all_r8_lr5e6_steps200`/merged runtime 版本；E49 说明扩大数据池不是坏方向，但单纯把 472 条随机喂 200 steps 没有带来生成 CER 收益。下一步若继续训练，应改策略而不是继续加步数：例如 curriculum/采样权重、数字/英文样本单独归一化、或保持 200-step 但换 seed 做 variance check。
